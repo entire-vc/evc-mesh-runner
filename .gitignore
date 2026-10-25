@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite-journal
+.venv/
+dist/
+build/
+*.egg-info/
+# Local agent tooling never ships in this public repository.
+CLAUDE.md
+AGENTS.md
+.claude/
+.codex/
+dev-docs/
+runner.toml

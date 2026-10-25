@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "id": "agent-runner",
+  "name": "Agent Runner",
+  "version": "0.1.0",
+  "kind": "plugin",
+  "runtime": "external",
+  "mesh_api": ">=1 <2",
+  "publisher": "entire-vc",
+  "description": "Runs Claude Code and Codex agents on their Mesh tasks: several sessions per agent up to its concurrency limit, an isolated worktree per task, and waits that resume the same session.",
+  "category": "agents",
+  "tags": ["agents", "runner", "claude-code", "codex"],
+  "license": "Apache-2.0",
+  "repository": "https://github.com/entire-vc/evc-mesh-runner",
+  "levels": {"instance": false, "workspace": true, "project": false},
+  "capabilities": {
+    "api": ["tasks:read", "tasks:write", "comments:read", "comments:write", "agents:read"],
+    "events": ["task.assigned", "task.updated", "comment.created"],
+    "network": {"allowed_domains": [], "reasoning": "Runs on the operator's host; talks only to this Mesh instance and, optionally, the operator's GitLab."}
+  },
+  "settings": {
+    "workspace": {
+      "type": "object",
+      "properties": {
+        "runner_url": {"type": "string", "format": "uri", "x-help": "Where the runner's service endpoint is reachable from Mesh."}
+      },
+      "required": ["runner_url"]
+    }
+  },
+  "external": {
+    "base_url_setting": "runner_url",
+    "health_path": "/healthz",
+    "install_path": "/mesh/install",
+    "events_path": "/mesh/events"
+  }
+}
