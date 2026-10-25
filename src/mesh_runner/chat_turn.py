@@ -151,6 +151,8 @@ class ChatTurnRunner:
                 elif ev is not ...:
                     seq += 1
                     pending.append({**ev, "seq": seq})
+                    if ev.get("type") == "error":
+                        state["error"] = str(ev.get("code") or "error")   # the reason a failed turn reports
                     if ev.get("type") in TERMINAL:
                         finished = True
                 now = self.clock()
@@ -194,7 +196,7 @@ class ChatTurnRunner:
             return TurnOutcome("failed", state["broken"])
         if not finished or not state["terminal"]:
             return TurnOutcome("failed", "no terminal event")
-        return TurnOutcome(state["terminal"])
+        return TurnOutcome(state["terminal"], state.get("error", ""))
 
     # ------------------------------------------------------------------ wire helpers
     def _post(self, tid: str, tok: str, batch: list[dict]) -> dict:

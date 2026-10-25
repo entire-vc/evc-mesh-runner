@@ -263,6 +263,33 @@ addressee has already commented after it was asked, the wait is sent back at dec
 the start of that answer: the same question gets the same answer, so the agent waits on the
 event that changes it or asks something else. People are never asked here.
 
+Three kinds of decision wait to an agent file no request at all, each behind its own `[runner]`
+switch (all default on, `false` restores filing the request):
+
+- `decision_live_task_card_wait`: the question names exactly one other task (`#<8hex>` or its
+  uuid) that the addressee holds and is working on (todo, in progress or review), such as "pass
+  the handback from #x when ready". The addressee could only answer "not ready yet", so the wait
+  becomes a card wait on that task (its `blocks` edge included): it wakes when the task closes or
+  ships, or when the addressee comments on it. Nothing is posted to the addressee. A task held by
+  someone else, a closed or backlog task, or several named tasks file the request as before.
+- `decision_identical_no_reopen`: the same question again (case, whitespace, trailing punctuation
+  and trailing references to the asking task ignored) from the same asker and source to the same
+  agent is attached to the request that already carries it, open or closed within
+  `decision_reuse_hours`: no new card, no comment, no reopen, since each of those starts a new
+  session for the addressee. Only a changed question is asked on that request (and reopens it) as
+  above. A closed request attached this way hands the question back to the asker after the
+  re-check interval (`wait_first_recheck_hours`) unless a comment answers it first.
+- `decision_default_proceeds`: the question states the asker's own proposed default (`default:`,
+  `proposed:`, `if no objection`, `дефолт:`, `по умолчанию:`, `предлагаю`, `рекомендую`) and no
+  hard rule (`hard_ask_patterns`, `hard_ask_labels`) matches it. The runner posts the question on
+  the asking task, @-mentioning the addressee, which may object there, and the asker continues
+  with its default at once (counted like a `↻ NEXT`). Hard questions and questions to people are
+  asked as before.
+
+Each is logged in `runner.log` and recorded as an attempt event (`decision_to_card_wait`,
+`decision_attached`, `decision_default_proceeds`); the first and the last are also written to
+`events.jsonl`.
+
 New decision requests can opt into no-Git metadata admission for explicit resolved
 recipient UUIDs with `[runner] decision_request_metadata_only_recipients = [...]`
 (default `[]`, OFF). Existing and ambiguous requests are never relabelled. This
@@ -309,6 +336,9 @@ state_dir = "~/.local/state/mesh-runner"
 # comment_wake_always_from = []           # author names that always wake, with comment_wake = "addressed"
 # decision_wake = "any"                   # "answer": a decision wait with a request card wakes on an answer only, not on the addressee's progress notes
 # decision_reuse_hours = 24               # a new question from the same source to the same agent reuses its request card (0 = file a new one)
+# decision_live_task_card_wait = true     # a question about the addressee's own live task waits on that task, no request
+# decision_identical_no_reopen = true     # the same question again is attached to its request: no comment, no reopen
+# decision_default_proceeds = true        # a non-hard question carrying the asker's default proceeds; the addressee may object
 # review_unstartable_retry_minutes = 15   # a review no reviewer could start is tried again
 
 [chat]                                    # optional: Agent Chat (interactive sessions only, never headless)
@@ -515,9 +545,39 @@ hard or soft verdict and the rule that decided it. It only reads.
 
 ## Mesh extension
 
-`mesh-extension.json` declares the runner as an external plugin. Configuration
-from the Mesh extensions page arrives with the extension install protocol; until
-then the runner reads `runner.toml`.
+`mesh-extension.json` declares the runner as an external plugin. With `[extension] enabled = true`
+the runner serves the endpoints Mesh needs for the install handshake:
+
+- `GET /healthz`
+- `POST /mesh/install` — body `extension_id`, `version`, `workspace_id`, `signing_secret`, `events`,
+  `events_path`. The secret is stored in `state_dir/extension-signing-secret.json` (mode 600) and never
+  logged. A repeated install with the same secret is idempotent; a different secret is refused (409)
+  until that file is removed or `allow_rekey = true`.
+- `POST /mesh/events` — `task.assigned`, `task.updated`, `comment.created` wake the poll loop instead
+  of waiting for `poll_seconds`; other events are acknowledged and ignored.
+
+Every request must carry `X-Mesh-Timestamp` and `X-Mesh-Signature` (hex HMAC-SHA256 of
+`"{timestamp}.{body}"`); a wrong signature or a timestamp more than `tolerance_seconds` (300) off is
+refused with 401. The install signature is made with the secret that arrives in the same body, so it does not
+authorise the installer by itself. Create the workspace secret `EXT_AGENT_RUNNER_SIGNING_SECRET` in
+Mesh first (the handshake reuses an existing one) and give the same value to the runner with
+`signing_secret_file` / `signing_secret_env`: an install with any other secret, or for another
+`workspace_id`, is refused (403). `trust_first_install = true` drops the pre-shared secret and lets the
+first install win; use it only on a private link nothing else can reach.
+
+```toml
+[extension]
+enabled = true
+workspace_id = "00000000-0000-0000-0000-000000000000"   # the workspace this runner serves
+signing_secret_file = "~/.config/mesh-runner/extension-signing.secret"   # mode 600; same value as in Mesh
+host = "127.0.0.1"
+port = 8787
+# authenticate to Mesh as the extension actor instead of basic auth + agent key
+token_file = "~/.config/mesh-runner/extension.token"   # mode 600; or token_env = "NAME"
+rotate_days = 30                                       # POST /ext/me/token/rotate; 0 = never
+```
+
+`runner_url` in the Mesh extension settings must reach `host:port`.
 
 ## License
 

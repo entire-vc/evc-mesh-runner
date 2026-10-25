@@ -118,6 +118,9 @@ class ChatService:
         agent, thread = turn["agent_id"], turn["thread_id"]
         adm = self.pool.admit(agent, thread)
         if not adm.ok:
+            # handed back, not started: without this line a turn refused on every claim fails as
+            # runner_lost with nothing in the log
+            log.warning("chat turn %s not admitted: %s", turn["turn_id"][:8], adm.reason or "pool full")
             self.hold_until = time.monotonic() + 5.0
             try:
                 self.client.release(turn["turn_id"], turn["claim_token"], adm.reason or "pool full")
@@ -149,6 +152,8 @@ class ChatService:
                 turn, external_cancel=lambda: tid in self.cancel, on_started=on_started,
                 on_end=lambda: [k.stop() for k in keeper])
             self.outcomes.append((tid, out.state))
+            if out.state in ("failed", "dropped", "released"):
+                log.warning("chat turn %s %s: %s", tid[:8], out.state, out.detail or "-")
             stuck = out.detail == "delivery_stuck"
             if out.state in ("failed", "dropped", "released"):
                 # a session that did not finish its turn cleanly is not trusted warm

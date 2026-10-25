@@ -58,6 +58,27 @@ class Service(unittest.TestCase):
         svc.step(1)
         self.assertEqual(before, [p for _, p in self.mesh.requests if p.startswith("/claim")])
 
+    def test_pool_refusal_is_logged_with_its_reason(self):
+        pool = ChatPool(max_per_agent=1, max_host=0, idle_minutes=10, clock=lambda: self.t[0])
+        svc = ChatService(self.client, ["agent-1"], pool, lambda a: Echo(), lambda a, t: None,
+                          lambda a, t: True, spawn=lambda fn: fn())
+        self.mesh.queue_turn("x")
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            svc.step(1)
+        self.assertTrue(any("not admitted: host_limit" in m for m in logs.output), logs.output)
+
+    def test_unfinished_turn_is_logged_with_its_outcome(self):
+        class Broken:
+            def run(self, turn, cancelled):
+                yield {"type": "error", "code": "cli_not_started", "message": "x", "retryable": False}
+        svc = ChatService(self.client, ["agent-1"], self.pool, lambda a: Broken(), lambda a, t: None,
+                          lambda a, t: True, spawn=lambda fn: fn())
+        self.mesh.queue_turn("x")
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            svc.step(1)
+        self.assertEqual([s for _, s in svc.outcomes], ["failed"])
+        self.assertTrue(any(" failed: cli_not_started" in m for m in logs.output), logs.output)
+
     def test_delete_during_a_running_turn_stops_the_turn_first(self):
         self.svc.delivery_for = lambda a: Hold()
         self.svc.spawn = lambda fn: threading.Thread(target=fn, daemon=True).start()

@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -75,6 +76,15 @@ class Checkpoint(unittest.TestCase):
         paths, _ = self.pool.restore('attempt')
         self.assertEqual((Path(paths[0]) / ' lead.txt').read_text(), 'leading space')
 
+    def _oldest(self, key, source, metadata):
+        """A snapshot in the pre-exclusion format: full tree and history, no `excludes` in the manifest."""
+        old = Checkpoints(self.root / 'cp-old', exclude_names=(), slim=False).create(key, source, metadata)
+        manifest = old / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        data.pop('excludes', None)
+        manifest.write_text(json.dumps(data, sort_keys=True))
+        return old
+
     def _dirty_source(self):
         p = self.source
         (p / 'README').write_bytes(b'staged\0binary')
@@ -146,7 +156,7 @@ class Checkpoint(unittest.TestCase):
     def test_old_format_snapshot_with_caches_still_restores(self):
         p = self._dirty_source()
         cp = Checkpoints(self.root / 'cp')
-        old = Checkpoints(self.root / 'cp-old', exclude_names=()).create('k3', p, {})  # the pre-change format
+        old = self._oldest('k3', p, {})  # the pre-change format
         self.assertNotIn('excludes', cp.read(old))
         self.assertTrue((old / 'tree' / 'node_modules' / 'dep' / 'blob').is_file())
         target = self._restore_elsewhere(cp, old)
@@ -156,7 +166,7 @@ class Checkpoint(unittest.TestCase):
     def test_compact_rewrites_old_snapshot_in_place_and_restores(self):
         p = self._dirty_source()
         cp = Checkpoints(self.root / 'cp')
-        old = Checkpoints(self.root / 'cp-old', exclude_names=()).create('k4', p, {'repo': 'app'})
+        old = self._oldest('k4', p, {'repo': 'app'})
         cp.root.rmdir() if not any(cp.root.iterdir()) else None
         cpo = Checkpoints(self.root / 'cp-old')
         self.assertTrue(cpo.is_old_format(old))
@@ -174,7 +184,7 @@ class Checkpoint(unittest.TestCase):
     def test_compact_failure_leaves_old_snapshot_untouched(self):
         p = self._dirty_source()
         cpo = Checkpoints(self.root / 'cp-old')
-        old = Checkpoints(self.root / 'cp-old', exclude_names=()).create('k5', p, {})
+        old = self._oldest('k5', p, {})
         with patch.object(Checkpoints, '_verify', side_effect=WorkspaceError('boom')):
             with self.assertRaises(WorkspaceError):
                 cpo.compact(old)
@@ -185,7 +195,7 @@ class Checkpoint(unittest.TestCase):
     def test_compact_failed_swap_puts_the_old_snapshot_back(self):
         p = self._dirty_source()
         cpo = Checkpoints(self.root / 'cp-old')
-        old = Checkpoints(self.root / 'cp-old', exclude_names=()).create('k6', p, {})
+        old = self._oldest('k6', p, {})
         real, calls = os.rename, []
 
         def flaky(a, b):
@@ -203,7 +213,7 @@ class Checkpoint(unittest.TestCase):
     def test_crash_between_swap_renames_is_recovered_by_read_and_restore(self):
         p = self._dirty_source()
         cpo = Checkpoints(self.root / 'cp-old')
-        old = Checkpoints(self.root / 'cp-old', exclude_names=()).create('k7', p, {})
+        old = self._oldest('k7', p, {})
         os.rename(old, old.parent / '.retired-k7')        # the state a crash leaves
         self.assertEqual(cpo.read(old)['version'], 1)
         self.assertTrue(old.is_dir())
@@ -213,7 +223,7 @@ class Checkpoint(unittest.TestCase):
     def test_compact_reports_submodule_snapshots_as_skipped(self):
         p = self._dirty_source()
         cpo = Checkpoints(self.root / 'cp-old')
-        old = Checkpoints(self.root / 'cp-old', exclude_names=()).create('k8', p, {})
+        old = self._oldest('k8', p, {})
         data = cpo.read(old)
         data['submodules'] = [{'path': 'x'}]
         with patch.object(Checkpoints, 'read', return_value=data):

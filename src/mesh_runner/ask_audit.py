@@ -22,7 +22,8 @@ def open_gates(cfg, client_for=None) -> list[dict]:
     """One row per task with an open human gate among the tasks of the configured agents
     (each task once, however many agents list it). ``client_for(agent)`` returns a Mesh
     client; the default is the agent's own."""
-    client_for = client_for or (lambda ag: MeshClient(cfg.mesh_url, ag.key, basic_auth=cfg.mesh_basic_auth))
+    client_for = client_for or (lambda ag: MeshClient(cfg.mesh_url, ag.key, basic_auth=cfg.mesh_basic_auth,
+                                                  bearer=cfg.extension_token))
     seen: dict[str, dict] = {}
     errors: list[str] = []
     for ag in cfg.agents:
