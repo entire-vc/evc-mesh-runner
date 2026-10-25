@@ -123,10 +123,27 @@ def say(prompt):
             time.sleep(1.5)
             sys.stdout.write("\x1b[2J\x1b[H› Ask Codex to do anything\r\n"); sys.stdout.flush()
             return
+        turn = "turn-%d" % (len(said) + 1)
+
+        def quoted_title():
+            # Codex titles the thread in a side task of its own thread and turn: its one input message
+            # quotes our prompt, and it notifies within seconds, while our turn is still running
+            if os.environ.get("FAKE_TITLE") != "quoted":
+                return
+            subprocess.run([*notify, json.dumps({"type": "agent-turn-complete", "thread-id": "title-thread",
+                            "turn-id": "title-turn", "input-messages": [
+                                "Generate a concise, single-line task title. Do not answer the request.\n\n"
+                                "User prompt:\n" + prompt],
+                            "last-assistant-message": '{"title":"Fix the lint"}'})])
+            time.sleep(2.0)
+        if not rollout:
+            quoted_title()
         if rollout:
             time.sleep(1.0)
+            note({"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn}})
             note({"type": "response_item", "payload": {"type": "message", "role": "user"}})
             note({"type": "event_msg", "payload": {"type": "token_count"}})
+            quoted_title()
             if os.environ["FAKE_ROLLOUT"] == "empty":      # the task ends with no model record and no notify
                 note({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": None,
                       "error": {"message": "stream disconnected", "codex_error_info": "other"}}})
@@ -144,12 +161,13 @@ def say(prompt):
                 sys.stdout.write("\x1b[2J\x1b[H› Ask Codex to do anything\r\n"); sys.stdout.flush()
                 return
             time.sleep(1.0)
-        if os.environ.get("FAKE_TITLE"):        # a side task in its own thread notifies first
+        if os.environ.get("FAKE_TITLE") == "1":  # a side task in its own thread notifies first
             subprocess.run([*notify, json.dumps({"type": "agent-turn-complete", "thread-id": "title-thread",
                             "input-messages": ["Generate a concise title"], "last-assistant-message": "{}"})])
         said.append(prompt)                      # Codex lists every user message of the thread
-        subprocess.run([*notify, json.dumps({"type": "agent-turn-complete", "thread-id": sid,
-                        "input-messages": list(said), "last-assistant-message": reply})])
+        subprocess.run([*notify, json.dumps({"type": "agent-turn-complete", "thread-id": sid, "turn-id": turn,
+                        "input-messages": [] if os.environ.get("FAKE_BARE") else list(said),
+                        "last-assistant-message": reply})])
         sys.stdout.write("\x1b[2J\x1b[H› Ask Codex to do anything\r\n"); sys.stdout.flush()
     print("done:", reply); sys.stdout.flush()
 
@@ -387,6 +405,79 @@ class DriverTurns(unittest.TestCase):
         self.assertIn("Fix the lint", texts[0])
         thread = [e["thread_id"] for e in self.events(out) if e.get("type") == "thread.started"][0]
         self.assertNotEqual(thread, "title-thread")
+
+    def assert_title_task_is_not_the_turn(self, out, thread=None):
+        evs = self.events(out)
+        texts = [e["item"]["text"] for e in evs if e.get("type") == "item.completed"]
+        self.assertEqual(len(texts), 1, out.getvalue()[-400:])
+        self.assertNotIn('"title"', texts[0])                     # never the side task's title as the reply
+        self.assertIn("WAIT 2h: fake [Fix the lint", texts[0])
+        threads = [e["thread_id"] for e in evs if e.get("type") == "thread.started"]
+        self.assertNotIn("title-thread", threads)
+        if thread:
+            self.assertEqual(threads, [thread])
+
+    def test_codex_title_task_quoting_the_prompt_does_not_end_a_new_sessions_turn(self):
+        d, out = self.driver("codex", FAKE_TITLE="quoted")
+        self.assertEqual(d.run("Fix the lint"), 0)
+        self.assert_title_task_is_not_the_turn(out)
+        self.assertNotEqual(d.meta.get("session_id"), "title-thread")   # the next turn resumes our thread
+
+    def test_codex_title_task_quoting_the_prompt_does_not_end_a_resumed_turn(self):
+        d, out = self.driver("codex", sid=self.THREAD, mode="resume", FAKE_ROLLOUT="full", FAKE_TITLE="quoted",
+                             CODEX_HOME=str(self.root / "codexhome"))
+        self.assertEqual(d.run("Fix the lint"), 0)
+        self.assert_title_task_is_not_the_turn(out, thread=self.THREAD)
+        self.assertEqual(d.meta.get("session_id"), self.THREAD)
+
+    def test_codex_notify_of_another_turn_or_thread_is_not_ours(self):
+        d, _ = self.driver("codex", sid=self.THREAD, mode="resume")
+        d.prompt = "Fix the lint\nand report."
+        mine = {"type": "agent-turn-complete", "thread-id": self.THREAD, "turn-id": "t-1",
+                "input-messages": ["earlier", "Fix the lint\rand report."]}
+        self.assertTrue(d.ours(mine))
+        # the title side task quotes our prompt after its own instructions
+        self.assertFalse(d.ours({**mine, "thread-id": "title-thread", "turn-id": "t-9",
+                                 "input-messages": ["Generate a title.\n\nUser prompt:\nFix the lint\nand report."]}))
+        d.turn_id = "t-1"                                        # the rollout named the turn our prompt started
+        self.assertTrue(d.ours(mine))
+        self.assertFalse(d.ours({**mine, "turn-id": "t-2"}))
+        self.assertTrue(d.ours({k: v for k, v in mine.items() if k != "turn-id"}))
+
+    def test_codex_notify_must_carry_the_whole_prompt_not_only_its_opening(self):
+        d, _ = self.driver("codex", sid=self.THREAD, mode="resume")
+        opening = "[fleet] shared preamble of every runner prompt. " * 8          # > 200 characters
+        d.prompt = opening + "Task A: fix the lint\nand report."
+        ev = {"type": "agent-turn-complete", "thread-id": self.THREAD, "turn-id": "t-1"}
+        self.assertFalse(d.ours({**ev, "input-messages": [opening + "Task B: something else"]}))
+        self.assertFalse(d.ours({**ev, "input-messages": [opening]}))                 # cut short
+        self.assertTrue(d.ours({**ev, "input-messages": ["earlier", d.prompt]}))
+        # whitespace as the TUI records a paste (CR for the line break, re-wrapped spaces) still matches
+        self.assertTrue(d.ours({**ev, "input-messages": [d.prompt.replace("\n", "\r").replace(". ", ".  ")]}))
+
+    def test_codex_notify_without_input_messages_ends_the_turn_it_names(self):
+        d, out = self.driver("codex", sid=self.THREAD, mode="resume", FAKE_ROLLOUT="full", FAKE_BARE="1",
+                             CODEX_HOME=str(self.root / "codexhome"))
+        d.t["beat"] = 0.1
+        self.assertEqual(d.run("Fix the lint"), 0)
+        self.assertEqual(d.turn_id, "turn-1")                    # read from the rollout's task_started
+        texts = [e["item"]["text"] for e in self.events(out) if e.get("type") == "item.completed"]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("WAIT 2h: fake [Fix the lint", texts[0])
+
+    def test_codex_notify_without_input_messages_needs_our_turn_id(self):
+        d, _ = self.driver("codex", sid=self.THREAD, mode="resume")
+        d.prompt = "Fix the lint"
+        bare = {"type": "agent-turn-complete", "thread-id": self.THREAD, "last-assistant-message": '{"title":"x"}'}
+        # our thread alone is no evidence of our prompt: not before the rollout named our turn
+        self.assertFalse(d.ours(bare))
+        self.assertFalse(d.ours({**bare, "turn-id": "t-1"}))
+        self.assertFalse(d.ours({**bare, "input-messages": []}))
+        d.turn_id = "t-1"
+        self.assertFalse(d.ours(bare))                           # names no turn: still not ours
+        self.assertFalse(d.ours({**bare, "turn-id": "title-turn"}))
+        self.assertTrue(d.ours({**bare, "turn-id": "t-1"}))
+        self.assertTrue(d.ours({**bare, "thread-id": "", "turn-id": "t-1", "input-messages": [" "]}))
 
     THREAD = "11111111-2222-3333-4444-555555555555"
 

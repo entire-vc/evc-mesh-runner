@@ -51,6 +51,15 @@ _ABSOLUTE = re.compile(
 _NEXT = re.compile(r"^\s*↻\s*NEXT(?:\s*:\s*(?P<note>.*))?\s*$")
 _BLOCKING = re.compile(r"^\s*❓\s+(?:\*\*)?Blocking\s+@(?P<handle>[\w.\-]+)(?:\*\*)?\s*:?\s*(?P<note>.*)$")
 
+# A time wait whose reason names an answer, a verdict, a person or a card is a poll for an event:
+# the event has its own wait kind and wakes the session when it happens.
+_EVENT_REASON = re.compile(
+    r"verdict|answer|decision|\bapprov|вердикт|ответ|решени|павел|\bpavel\b|@[\w.\-]+|#[0-9a-f]{8}\b",
+    re.IGNORECASE)
+
+# A scheduled check of a channel outside Mesh: time is the condition by declaration.
+_POLL_REASON = re.compile(r"poll\s*:", re.IGNORECASE)
+
 MIN_WAIT = dt.timedelta(minutes=5)
 MAX_WAIT = dt.timedelta(hours=24)
 MAX_ABSOLUTE = dt.timedelta(days=400)
@@ -87,6 +96,22 @@ def _explicit_wait_problem(line: str) -> str:
                 "`until=merged after=<sha>:opened`")
     return ("invalid explicit VCS wait: expected `until=change|success after=<full-sha>:<pipeline-id>:<status>` "
             "or `until=merged after=<full-sha>:opened`")
+
+
+def _event_reason_hint(reason: str) -> str:
+    """Send-back text when a time wait's reason is an event (a verdict, an answer, a person, a
+    card), else ''. Time is the condition only for a measurement window, a dated start, or a
+    `poll:` check of a channel the runner cannot watch (a Telegram inbox, mail, an outside site):
+    a person answering there leaves no Mesh event to wait on, so a timer is the only wake."""
+    if _POLL_REASON.match(reason or "") or not _EVENT_REASON.search(reason or ""):
+        return ""
+    return ("a time wait must name time as the condition, but its reason waits for an event "
+            "(a verdict, an answer, a decision, a person or a card). Wait on the event itself: "
+            "`⏳ WAIT card:#<8hex>` for another task, `⏳ WAIT decision:@<agent>: <question>` for an "
+            "agent's answer, `⏳ WAIT mr:<group>/<project>!<iid>` / `⏳ WAIT pipeline:<group>/<project>#<id>` "
+            "for review or CI, `❓ Blocking @<person>: <question>` for a person. If the answer comes "
+            "through a channel the runner cannot watch (Telegram, mail, an outside site), keep the time "
+            "wait and start its reason with `poll:` (`⏳ WAIT 6h: poll: Telegram inbox for the reply`)")
 
 
 def declaration_lines(text: str) -> list[str]:
@@ -134,6 +159,8 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
     if m := _DECISION.match(line):
         return Outcome("decision", handle=m["handle"], note=note(m), line=line)
     if m := _DURATION.match(line):
+        if hint := _event_reason_hint(note(m)):
+            return Outcome("unparsed", note=hint, line=line)
         unit = m["unit"].lower()
         delta = dt.timedelta(hours=int(m["n"])) if unit in {"h", "ч"} else dt.timedelta(minutes=int(m["n"]))
         delta = min(max(delta, MIN_WAIT), MAX_WAIT)
@@ -142,6 +169,8 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         until = _parse_when(m["when"])
         if until is None or until > now + MAX_ABSOLUTE:
             return Outcome("unparsed", note="time target out of range", line=line)
+        if hint := _event_reason_hint(note(m)):
+            return Outcome("unparsed", note=hint, line=line)
         return Outcome("time", until=max(until, now + MIN_WAIT), note=note(m), line=line)
     if m := _NEXT.match(line):
         return Outcome("next", note=(m["note"] or "").strip(), line=line)

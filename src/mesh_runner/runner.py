@@ -59,7 +59,7 @@ from .wake import (GitLab, red_merge_statuses, wait_generation, changed_since, c
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign)
-from .workspace import DIRTY_HOLD_NOTE, InventoryError, WorkspaceError, WorkspacePool
+from .workspace import DIRTY_HOLD_NOTE, InventoryError, WorkspaceError, WorkspacePool, git
 from .workspace_scope import (RECEIPT_KEY, metadata_instructions, metadata_only, metadata_receipt,
                               read_only, recorded_scope)
 
@@ -795,6 +795,7 @@ class AgentRunner:
             # can finish after another task has changed the lane's active profile.
             self.store.mark(self.agent.name, a.task_id, "auth_launch",
                             json.dumps({"attempt": a.id, "turn": a.turns + 1, "profile": profile}))
+        self.store.mark(self.agent.name, a.task_id, "turn_work", self._work_digest(a))
         proc = adapter.spawn(Launch(argv, self.agent.profile_dir, env, prompt_text), log_path)
         self.procs[a.id] = proc
         delivery = (a.wait or {}).get("ci_delivery") or {}
@@ -1221,6 +1222,10 @@ class AgentRunner:
         if met and met[0]:
             self.store.mark(self.agent.name, a.task_id, "met_wake", "")
         if outcome.kind == "next":
+            before = self.store.mark(self.agent.name, a.task_id, "turn_work")
+            after = self._work_digest(a)
+            if before and before[0] and after and before[0] != after:      # unknown is never free
+                self.store.event(a.id, "next_work")     # the turn changed HEAD or the diff
             # NEXT has no event to observe after a cap.
             self.store.mark(self.agent.name, a.task_id, "cap_observation", "")
             if self._over_budget(a, task):
@@ -1603,6 +1608,10 @@ class AgentRunner:
                 return ""
             if recipient.get("kind") != "user":
                 return self._invalid_ask(a, task, outcome.handle, "unsupported recipient kind")
+            # before the lead redirect: a soft-classified login question is the registry's too
+            told = self._login_ask_refusal(a, task, outcome)
+            if told:
+                return told
             if outcome.kind == "decision" and (outcome.note or "").strip():
                 redirect = self._person_ask_redirect(task, outcome, recipient)
                 if redirect and self._ask_to_lead(a, task, outcome, wait, recipient.get("id"), redirect[0],
@@ -1660,6 +1669,32 @@ class AgentRunner:
             return ""
         self.store.mark(self.agent.name, a.task_id, "ask_not_raised", reason)
         return prompts.ask_not_raised_prompt(task, outcome.handle, (refusal or {}).get("body") or "")
+
+    def _login_ask_refusal(self, a: Attempt, task: dict, outcome: Outcome) -> str:
+        """A question to a person about logging in that the account registry already answers
+        (live session, a command, SSO) goes back to the lane once with the registry's facts, on
+        any harness: the Claude add_comment hook covers only Claude lanes. The check is the
+        configured command; a failure of it, or the same question declared again, lets the
+        question through, so a person is never lost behind it."""
+        argv, note = self.cfg.login_ask_check, (outcome.note or "").strip()
+        if not argv or outcome.kind != "decision" or not note:
+            return ""
+        asked = hashlib.sha1(note.encode()).hexdigest()[:12]
+        prev = self.store.mark(self.agent.name, a.task_id, "login_ask_refused")
+        if prev and prev[0] == asked:
+            return ""
+        try:
+            res = subprocess.run([*argv, "--task", a.task8], input=note, capture_output=True, text=True,
+                                 timeout=30)
+        except (OSError, ValueError, subprocess.SubprocessError) as e:   # ValueError: undecodable output
+            log.warning("%s: #%s login-ask check: %s", self.agent.name, a.task8, e)
+            return ""
+        if res.returncode != 10 or not res.stdout.strip():
+            return ""
+        self.store.mark(self.agent.name, a.task_id, "login_ask_refused", asked)
+        log.info("%s: #%s login ask to @%s answered by the registry; told the agent", self.agent.name,
+                 a.task8, outcome.handle)
+        return prompts.login_ask_refused_prompt(task, outcome.handle, res.stdout)
 
     def _person_ask_redirect(self, task: dict, outcome: Outcome, recipient: dict) -> tuple[str, bool] | None:
         """(why, soft) when a question to this person goes to the project lead instead of
@@ -2057,6 +2092,20 @@ class AgentRunner:
         return (used.get("next", 0) > self.cfg.daily_next_budget
                 or idle > self.cfg.daily_wait_budget
                 or used.get("step", 0) > self.cfg.daily_step_budget)
+
+    def _work_digest(self, a: Attempt) -> str:
+        """HEAD and uncommitted diff of the attempt's leased worktrees ('' = none or unreadable).
+        Equal digests at turn start and end mean the turn left no work behind."""
+        parts = []
+        for path in sorted(a.workspaces or []):
+            try:
+                head = git(Path(path), "rev-parse", "HEAD", timeout=20)
+                diff = git(Path(path), "diff", "HEAD", timeout=20) + "\0" + \
+                    git(Path(path), "status", "--porcelain", "-uall", timeout=20)   # untracked files too
+            except (WorkspaceError, OSError, subprocess.SubprocessError):
+                return ""
+            parts.append(f"{path}:{head}:{hashlib.sha1(diff.encode(errors='surrogateescape')).hexdigest()}")
+        return hashlib.sha1("\n".join(parts).encode()).hexdigest() if parts else ""
 
     def _over_budget(self, a: Attempt, task: dict, idle_exempt: bool = False) -> bool:
         """Per task and UTC day: N NEXT, S steps, M idle waits since verified CI progress.
@@ -2561,6 +2610,8 @@ class AgentRunner:
         own = self.agent.workspace_wait_release_minutes
         threshold = self.cfg.workspace_wait_release_minutes if own is None else own
         started = parse_time(a.wait.get("started")) or parse_time(a.updated_at)
+        if not requested and self._umbrella_waits(a):
+            requested = True                # an umbrella sleeps on its children: no lease, no delay
         if not requested and (threshold <= 0 or not started or now() - started < dt.timedelta(minutes=threshold)):
             return
         if not requested and not self._wait_frees_workspace(a.wait, threshold):
@@ -2581,6 +2632,24 @@ class AgentRunner:
                                "wait": a.wait}, writer_stopped=True)
         if self.pool._checkpoint_rows(a.id):
             self.store.event(a.id, "workspace_suspended", "verified durable snapshot; leases returned")
+
+    def _umbrella_waits(self, a: Attempt) -> bool:
+        """A parent task with open children waiting on something other than CI: it only resumes
+        when a child changes or someone writes (see ``_family_hold``), so it keeps no worktree
+        lease meanwhile. Unreadable children are uncertainty: the lease stays."""
+        if a.mode != "work" or not a.wait.get("kind") or not a.workspaces:
+            return False
+        if not self._wait_frees_workspace(a.wait, 0):      # CI waits and unknown deadlines keep the tree
+            return False
+        if self.pool.leased_to(a.id) == []:
+            return False                    # nothing left to give back
+        try:
+            task = self._task(a.task_id)
+            if not int(task.get("subtask_count") or 0):
+                return False
+            return any(self.cats.category(k) in OPEN_CHILD for k in self.mesh.subtasks(a.task_id))
+        except MeshError:
+            return False
 
     @staticmethod
     def _wait_frees_workspace(wait: dict, threshold_minutes: float) -> bool:

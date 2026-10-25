@@ -68,6 +68,7 @@ SKIP_CLEARS_PER_TICK = 10               # clears take at most this share of a pa
 SKIP_CLEAR_TRIES = 3                    # a clear that fails this often is given up (logged)
 STATE_FIELDS = ("kind", "ref", "reason")
 BACKLOG_BLOCKER = "blocked by a card in backlog: "
+EDGE_DENIED_MARK = "edge_denied"        # store mark prefix: an edge this lane's key may not remove / add (HTTP 403)
 UNSCHEDULE_MARK = "unschedule"          # store mark: a start_after this lane set and could not clear yet
 UNSCHEDULE_TRIES = 3                    # PATCHes per clear when Mesh answers 409 (re-read in between)
 UNSCHEDULE_PER_PASS = 10                # pending clears retried per tick
@@ -245,6 +246,7 @@ class Effects:
         self._close_blocked: dict[str, dict] = {}   # request id -> gate-refused close, when there is no store
         self._unschedule_due: dict[str, tuple[dt.datetime, dt.timedelta]] = {}   # task -> (next try, step)
         self._orphan_checked: dict[str, dt.datetime] = {}
+        self._edges_denied: set[tuple[str, str]] = set()     # memory of 403 edge operations when there is no store
 
     def _put(self, task_id: str, state: dict) -> None:
         """PUT a runtime state. A Mesh that does not know a reason code refuses the
@@ -477,11 +479,18 @@ class Effects:
         if wait.get("scheduled") or wait.get("scheduled_maybe"):
             self._end_schedule(a, wait)
         if wait.get("edge"):
-            try:
-                self.mesh.delete_dependency(a.task_id, wait["edge"])
-                wait.pop("edge", None)
-            except MeshError as e:
-                log.warning("%s: edge #%s: %s", self.lane, a.task8, e)
+            if self._edge_denied(a.task_id, "del:" + wait["edge"]):
+                wait.pop("edge", None)         # a denial is permanent for this key: not asked again
+            else:
+                try:
+                    self.mesh.delete_dependency(a.task_id, wait["edge"])
+                    wait.pop("edge", None)
+                except MeshError as e:
+                    if e.status == 403:
+                        self._deny_edge(a.task_id, "del:" + wait["edge"])
+                        wait.pop("edge", None)
+                    log.warning("%s: edge #%s: %s%s", self.lane, a.task8, e,
+                                "; not removable by this lane, not retried" if e.status == 403 else "")
         if close_request and wait.get("kind") in ("decision", "blocking"):
             active = self._decision(a.task_id)
             if active:
@@ -632,7 +641,28 @@ class Effects:
             log.warning("%s: orphan unschedule #%s: %s", self.lane, task_id[:8], outcome)
         return False
 
+    def _edge_denied(self, task_id: str, what: str) -> bool:
+        key = f"{EDGE_DENIED_MARK}:{what}"
+        if (task_id, key) in self._edges_denied:
+            return True
+        if self.store is None:
+            return False
+        if self.store.mark(self.lane, task_id, key):
+            self._edges_denied.add((task_id, key))
+            return True
+        return False
+
+    def _deny_edge(self, task_id: str, what: str) -> None:
+        """Remember that Mesh answered 403 for this edge operation: the same key is refused the
+        same way on every later tick, so asking again only fills the log."""
+        key = f"{EDGE_DENIED_MARK}:{what}"
+        self._edges_denied.add((task_id, key))
+        if self.store is not None:
+            self.store.mark(self.lane, task_id, key, "403")
+
     def _add_edge(self, a: Attempt, wait: dict) -> None:
+        if self._edge_denied(a.task_id, "add:" + str(wait.get("target"))):
+            return
         try:
             target = self.mesh.task_by_short(wait["target"])
             target_id = target.get("id")
@@ -643,7 +673,10 @@ class Effects:
             if edge_id:
                 wait["edge"] = edge_id
         except MeshError as e:
-            if e.status != 409:            # an edge that already exists is fine
+            if e.status == 403:            # a card of a workspace this key cannot see: asked once
+                self._deny_edge(a.task_id, "add:" + str(wait.get("target")))
+                log.warning("%s: edge #%s → #%s: %s; not retried", self.lane, a.task8, wait.get("target"), e)
+            elif e.status != 409:          # an edge that already exists is fine
                 log.warning("%s: edge #%s → #%s: %s", self.lane, a.task8, wait.get("target"), e)
 
     def _resolve_agent(self, handle: str, me: dict) -> dict | None:
@@ -1100,6 +1133,8 @@ class Effects:
         note = (wait.get("note") or "").strip()
         key = self._decision_key(a.task_id, addressee["id"], wait)
         active = self._decision(a.task_id)
+        if not active and not wait.get("request") and self._mirror(a, addressee, wait, me):
+            return
         if not active and wait.get("request"):
             # Upgrade an existing parked wait without filing a second request.
             active = {"key": key, "recipient": addressee["id"], "lane": self.lane, "state": "open",
@@ -1171,6 +1206,61 @@ class Effects:
                 active["reported"] = True
                 self._save_decision(a.task_id, active)
             log.warning("%s: decision request #%s: HTTP %s", self.lane, a.task8, e.status)
+
+    @staticmethod
+    def _card_refs(note: str, own: str) -> set[str]:
+        """Short ids of the cards a question names, the asking task's own excluded."""
+        return set(re.findall(r"(?<![\w-])#([0-9a-f]{8})\b", (note or "").casefold())) - {own[:8].casefold()}
+
+    def _counter_request(self, a: Attempt, addressee: dict, wait: dict, me: dict) -> tuple[str, dict] | None:
+        """An open request ``addressee`` put to this lane that asks the same thing: the same question
+        (``normalized_question``) or the same target card. (source task id, its record) or None."""
+        if self.store is None:
+            return None
+        note = wait.get("note") or ""
+        question = normalized_question(note, a.task_id)
+        refs = self._card_refs(note, a.task_id)
+        for source, value in sorted(self.store.marked(DECISION_OWNER, DECISION_MARK).items()):
+            try:
+                record = json.loads(value)
+            except ValueError:
+                continue
+            if (source == a.task_id or record.get("state") != "open" or record.get("recipient") != me.get("id")
+                    or str(record.get("lane") or "").casefold() != str(addressee.get("name") or "").casefold()
+                    or not (record.get("request") or {}).get("id")):
+                continue
+            theirs = record.get("question") or ""
+            if (question and normalized_question(theirs, source) == question) or (
+                    refs & self._card_refs(theirs, source)):
+                return source, record
+        return None
+
+    def _mirror(self, a: Attempt, addressee: dict, wait: dict, me: dict) -> bool:
+        """The addressee already asked this lane the same thing: no request is filed. Both waits
+        move to a ``card:`` target (the card both questions name, else the addressee's request,
+        which this lane answers on its own session; the addressee's wait moves there too). True when this wait was converted."""
+        found = self._counter_request(a, addressee, wait, me)
+        if not found:
+            return False
+        source, record = found
+        shared = sorted(self._card_refs(wait.get("note") or "", a.task_id)
+                        & self._card_refs(record.get("question") or "", source))
+        target = shared[0] if shared else record["request"]["id"][:8]
+        wait.update(kind="card", target=target, mirror=source[:8])
+        wait.pop("handle", None)
+        self._add_edge(a, wait)
+        for other in self.store.waiting_on_task(source):
+            w = dict(other.wait or {})
+            if other.task_id == source and w.get("kind") == "decision" and not w.get("mirror"):
+                w.update(kind="card", target=target, mirror=a.task8)
+                w.pop("handle", None)
+                self._add_edge(other, w)
+                self.store.update(other, wait=w)
+        if self.store is not None:
+            self.store.event(a.id, "decision_mirror", f"#{source[:8]} -> card:#{target}")
+        log.info("%s: #%s decision to %s mirrors #%s: both wait on card:#%s, no request filed", self.lane,
+                 a.task8, addressee.get("name"), source[:8], target)
+        return True
 
     def _reuse_decision(self, a: Attempt, task: dict, wait: dict, addressee: dict, key: str,
                         reuse: dict, ask: bool = False) -> bool:

@@ -54,6 +54,19 @@ class AnswerMode(Fixture):
         self.assertFalse(r.store.get(a.id).wait.get("met"))
         self.assertEqual(mesh.category(mesh.tasks[a.wait["request"]["id"]]), "todo")   # still open
 
+    def test_the_default_mode_wakes_when_the_request_is_closed_without_a_comment(self):
+        for n, cat in enumerate(("done", "cancelled"), 1):
+            with self.subTest(cat):
+                r, mesh, source, a = self.parked(mode="any", n=n)
+                mesh.tasks[a.wait["request"]["id"]]["status_category"] = cat
+                self.assertEqual(self.state(r, a), "ready")
+                self.assertIn(f"is {cat}", r.store.get(a.id).wake_text)
+
+    def test_the_default_mode_ignores_a_comment_on_the_request_card(self):
+        r, mesh, source, a = self.parked(mode="any")
+        self.say(mesh, a.wait["request"]["id"], "fyi, unrelated", author="agent-reviewer")
+        self.assertEqual(self.state(r, a), "waiting")
+
     def test_the_default_mode_wakes_on_the_same_note(self):
         r, mesh, source, a = self.parked(mode="any")
         self.say(mesh, source["id"], self.NOTE)

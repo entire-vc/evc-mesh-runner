@@ -365,7 +365,7 @@ def answers_on_source(c: dict, wait: dict, agent_name: str, always_from=()) -> b
 
 
 def request_answer(mesh: MeshClient, cats: StatusCategories, wait: dict, agent_id: str,
-                   since: dt.datetime) -> tuple[str, bool]:
+                   since: dt.datetime, closure_only: bool = False) -> tuple[str, bool]:
     """``decision_wake = "answer"``: the wake event for the request card of a decision wait, and
     whether it is the answer itself. A comment on it from a person or from the addressee, or a card
     closed since the wait began (done: answered; cancelled: no answer, but the asker must know).
@@ -376,7 +376,7 @@ def request_answer(mesh: MeshClient, cats: StatusCategories, wait: dict, agent_i
     try:
         card = mesh.task(rid)
         card = card.get("task", card)
-        comments = foreign_comments(mesh.comments(rid), agent_id, since)
+        comments = [] if closure_only else foreign_comments(mesh.comments(rid), agent_id, since)
         closed = cats.category(card) if cats is not None else ""
     except Exception as e:                    # noqa: BLE001 - a read that fails is not an answer
         log.debug("decision request %s: %s", rid[:8], e)
@@ -585,7 +585,7 @@ def manual_pipeline_text(target: str, sha: str, pid: int, row: dict | None, merg
     else:
         head = (f"action required: pipeline {target} on {sha[:8]} is blocked on manual jobs; the success "
                 "predicate is not met and this pipeline will not reach success by itself. ")
-    return (head + "Do not run jobs or bypass project gates automatically, and do not wait on this "
+    return (head + "Do not run jobs or skip a project gate automatically, and do not wait on this "
             "pipeline again while it is manual. " + manual_next_step("pipeline", target, sha, row, merge_gate))
 
 
@@ -625,8 +625,8 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
             return (f"action required: pipeline {target} on {sha[:8]} finished: {status}; "
                     "the success predicate is not met. The owner must inspect the outcome and take "
                     "the next authorized step or wait on a new concrete action, rather than wait "
-                    "on this finished event again. Do not retry pipelines, run jobs or bypass "
-                    "project gates automatically.")
+                    "on this finished event again. Do not retry pipelines, run jobs or skip "
+                    "a project gate automatically.")
     if allow_action_required and kind == "mr" and contract["predicate"] == "success" \
             and status in PIPELINE_DONE - {"success"}:
         # An MR head moves, so every head gets its own notice; a manual head
@@ -637,7 +637,7 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
         if status == "manual":
             return (f"action required: MR {target} head {sha[:8]} pipeline {pid} is blocked on "
                     "manual jobs; the success predicate is not met before review and the pipeline "
-                    "will not reach success by itself. Do not run jobs or bypass project gates "
+                    "will not reach success by itself. Do not run jobs or skip a project gate "
                     "automatically, and do not wait for its success again. "
                     + manual_next_step("mr", target, sha, None, merge_gate))
         return (f"action required: MR {target} head {sha[:8]} pipeline {pid} finished: {status}; "
@@ -855,6 +855,13 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
         return f"{who} commented: {(c.get('body') or '')[:300]}"
     if answer_mode:
         event, answered = request_answer(mesh, cats, wait, agent_id, since)
+        if event:
+            wait["met"] = answered
+            return event
+    elif kind == "decision" and wait.get("request") and not wait.get("attached_closed"):
+        # A request closed with no comment on the waiting card is no answer, but nothing will ever
+        # resume the wait: the asker gets it back to read the thread and decide (any mode).
+        event, answered = request_answer(mesh, cats, wait, agent_id, since, closure_only=True)
         if event:
             wait["met"] = answered
             return event

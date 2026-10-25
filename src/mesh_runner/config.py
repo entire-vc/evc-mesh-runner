@@ -364,6 +364,10 @@ class RunnerConfig:
     # A `WAIT decision:@x` whose addressee cannot answer (not run by this runner, paused, not resolvable,
     # a configured test or service user) goes to the project lead instead of waiting for ever.
     unanswerable_ask_to_lead: bool = True
+    # argv (no shell) that reads a question on stdin: exit 10 = the account registry already answers it
+    # (a login ask about a live session), stdout = the reason shown to the lane; anything else lets the
+    # question through. Runs on the final text of every lane, Codex included. () = off.
+    login_ask_check: tuple = ()
     hard_ask_patterns: tuple = asks.DEFAULT_HARD_PATTERNS     # keyword fragments of a hard question
     hard_ask_labels: tuple = asks.DEFAULT_HARD_LABELS         # task labels that make a question hard
     # slugs of Mesh users that are test or service accounts: nobody answers them (the roster
@@ -665,6 +669,7 @@ def load(path: str | Path) -> RunnerConfig:
         requeue_on_cap=r.get("requeue_on_cap", False) is True,
         soft_person_asks_to_lead=r.get("soft_person_asks_to_lead", False) is True,
         unanswerable_ask_to_lead=r.get("unanswerable_ask_to_lead", True) is not False,
+        login_ask_check=tuple(_string_list(r.get("login_ask_check"), "login_ask_check", ())),
         hard_ask_patterns=_ask_patterns(r.get("hard_ask_patterns")),
         hard_ask_labels=_string_list(r.get("hard_ask_labels"), "hard_ask_labels", asks.DEFAULT_HARD_LABELS),
         unanswerable_users=tuple(s.casefold() for s in _string_list(r.get("unanswerable_users"),

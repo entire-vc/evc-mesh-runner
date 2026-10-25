@@ -44,7 +44,7 @@ class WakeText(unittest.TestCase):
         self.assertTrue(text.startswith(f'action required: pipeline {PIPELINE} on {SHA[:8]} '
                                         'is blocked on manual jobs'))
         self.assertIn('will not reach success by itself', text)
-        self.assertIn('Do not run jobs or bypass project gates automatically', text)
+        self.assertIn('Do not run jobs or skip a project gate automatically', text)
         self.assertIn(f'obtain the review verdict on head {SHA}', text)
         self.assertIn(f'`⏳ WAIT merge:g/app!56 after={SHA}`', text)
         self.assertNotIn('until=success on this pipeline', text)
@@ -55,10 +55,16 @@ class WakeText(unittest.TestCase):
         text = notice(gitlab(), merge_gate=False)
         self.assertIn('blocked on manual jobs', text)
         self.assertIn('arrange the required review or authorized manual action', text)
-        self.assertIn('Do not run jobs or bypass project gates automatically', text)
+        self.assertIn('Do not run jobs or skip a project gate automatically', text)
         self.assertNotIn('WAIT merge:', text)
         self.assertNotIn('until=success', text)
         self.assertIn(f'`⏳ WAIT mr:g/app!56 until=merged after={SHA}:opened`', text)
+
+    def test_finished_non_success_notice_uses_the_reworded_hint(self):
+        text = notice(gitlab(status='failed'), merge_gate=False)
+        self.assertIn('finished: failed', text)
+        self.assertIn('Do not retry pipelines, run jobs or skip a project gate automatically', text)
+        self.assertNotIn('bypass', text)
 
     def test_notice_through_the_shared_evaluator_carries_the_flag(self):
         wait = {'ci_change': contract()}
@@ -131,7 +137,7 @@ class SendBack(Bench):
         self.assertEqual(a.state, 'ready')
         self.assertIn(f'pipeline {PIPELINE} is blocked on manual jobs (pipeline 14845, {SHA[:8]})', a.wake_text)
         self.assertIn('cannot complete on its own and was sent back', a.wake_text)
-        self.assertIn('Do not run jobs or bypass project gates automatically', a.wake_text)
+        self.assertIn('Do not run jobs or skip a project gate automatically', a.wake_text)
         self.assertNotIn('until=success', a.wake_text)
         if merge_gate:
             self.assertIn(f'`⏳ WAIT merge:g/app!56 after={SHA}`', a.wake_text)
