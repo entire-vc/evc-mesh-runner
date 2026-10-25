@@ -56,5 +56,42 @@ class OutcomeGrammar(unittest.TestCase):
         self.assertEqual(self.p("⏳ WAIT forever").kind, "unparsed")
 
 
+class TimeWaitReason(unittest.TestCase):
+    def p(self, text):
+        return parse_outcome(text, NOW)
+
+    def test_event_reasons_are_sent_back_with_the_wait_kind_to_use(self):
+        for line in ("⏳ WAIT 2h: waiting for the reviewer verdict",
+                     "⏳ WAIT 6h: ждём ответ Павла",
+                     "⏳ WAIT 2h: @bill should answer",
+                     "⏳ WAIT 2h: after #abcdef12 closes",
+                     "⏳ WAIT 2026-10-20T06:00Z: decision from the lead",
+                     "⏳ WAIT 1h — решение по карточке"):
+            o = self.p(line)
+            self.assertEqual(o.kind, "unparsed", line)
+            self.assertIn("⏳ WAIT card:#<8hex>", o.note)
+            self.assertIn("decision:@<agent>", o.note)
+
+    def test_time_as_the_condition_still_parses(self):
+        for line in ("⏳ WAIT 2h: soak window", "⏳ WAIT 2h", "⏳ WAIT 2026-10-20T06:00Z: measurement window ends",
+                     "⏳ WAIT 24h: traffic needs a full day"):
+            self.assertEqual(self.p(line).kind, "time", line)
+
+    def test_poll_of_an_outside_channel_is_a_time_wait(self):
+        # the reply comes in a chat outside Mesh; the reason named
+        # the answer, the line was refused and the card was given up.
+        for line in ("⏳ WAIT 2026-10-26T12:20Z: poll: Telegram inbox; on reply, copy it verbatim",
+                     "⏳ WAIT 6h: POLL: mail from the registrar, answer expected",
+                     "⏳ WAIT 2h: poll : @alice reply in Telegram"):
+            o = self.p(line)
+            self.assertEqual(o.kind, "time", line)
+            self.assertTrue(o.note.lower().startswith("poll"), o.note)
+
+    def test_poll_further_in_the_reason_does_not_exempt(self):
+        o = self.p("⏳ WAIT 2h: answer from @alice, then poll: CI")
+        self.assertEqual(o.kind, "unparsed")
+        self.assertIn("poll:", o.note)
+
+
 if __name__ == "__main__":
     unittest.main()

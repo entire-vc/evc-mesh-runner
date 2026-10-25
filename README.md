@@ -579,6 +579,27 @@ rotate_days = 30                                       # POST /ext/me/token/rota
 
 `runner_url` in the Mesh extension settings must reach `host:port`.
 
+## Accounts
+
+The publisher of this extension holds no accounts and receives none of yours. The runner uses, on
+the operator's machine: a Mesh agent key for each agent it serves (or the extension actor token,
+`token_file` / `token_env`); the operator's own Claude Code / Codex logins for the sessions it
+starts; and, optionally, the operator's GitLab token for merge and pipeline checks. All of them are
+read from files or environment variables the operator provides and are never logged.
+
+## Network
+
+The runner talks only to the Mesh instance in its config, the git remotes of the repositories the
+operator lists (it fetches them) and, if configured, the operator's GitLab. The harnesses it launches (Claude Code, Codex) reach their own providers under their own
+configuration. With `[extension] enabled = true` it listens on `host:port` (`runner_url`) for
+`/healthz`, `/mesh/install` and `/mesh/events`, signed requests only.
+
+## Telemetry
+
+Nothing is sent to the publisher or to any third party. The runner writes local state only:
+`runner.sqlite`, `status.json`, the event and turn logs under `state_dir`, and, if `metrics_file` is
+set, a Prometheus textfile for the operator's own collector.
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).

@@ -302,7 +302,15 @@ class Store:
             "SELECT e.detail, COUNT(*) FROM events e JOIN attempts a ON a.id = e.attempt "
             "WHERE a.agent=? AND a.task_id=? AND e.kind='outcome' AND e.at>=? GROUP BY e.detail",
             (agent, task_id, midnight))
-        return {k: n for k, n in rows}
+        used = {k: n for k, n in rows}
+        # a NEXT after which the leased worktree changed (commit, diff) did work: it is not spent budget
+        worked = self.db.execute(
+            "SELECT COUNT(*) FROM events e JOIN attempts a ON a.id = e.attempt "
+            "WHERE a.agent=? AND a.task_id=? AND e.kind='next_work' AND e.at>=?",
+            (agent, task_id, midnight)).fetchone()[0]
+        if "next" in used:
+            used["next"] = max(0, used["next"] - worked)
+        return used
 
     def outcome(self, a: Attempt, kind: str, ci_progress: str = "") -> None:
         """A CI receipt resets idle waits only with its first settled step.

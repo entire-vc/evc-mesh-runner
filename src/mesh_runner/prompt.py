@@ -150,5 +150,14 @@ Mesh raises the human gate from that line and checks that the question was not a
 """
 
 
+def login_ask_refused_prompt(task: dict, handle: str, registry: str) -> str:
+    """The turn ended on a login question to a person that the account registry answers."""
+    return (f"[runner] Task #{task['id'][:8]}: your question to @{handle} was not raised: the account "
+            f"registry already knows this login.\n\n{registry.strip()[:2500]}\n\n"
+            "Do the step yourself as described, or hand it to the lane the registry names. If the page "
+            "really shows a login form, ask again with a line `session-dead: <what you saw, where>`. "
+            "End the turn with the outcome contract.\n")
+
+
 def load_preamble(path: str | None) -> str:
     return Path(path).expanduser().read_text() if path else ""

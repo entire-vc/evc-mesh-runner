@@ -254,6 +254,62 @@ class PersonAsk(AskBench):
         self.assertEqual(sum("Decided by lead" in b for b in self.bodies()), 1)
 
 
+class LoginAskCheck(AskBench):
+    def fake_run(self, rc, out="registry: session LIVE"):
+        return mock.patch("mesh_runner.runner.subprocess.run",
+                          return_value=SimpleNamespace(returncode=rc, stdout=out, stderr=""))
+
+    def test_a_login_ask_the_registry_answers_goes_back_to_the_lane_once(self):
+        self.setup_route("person", "Sign in to GitHub in Chrome Profile 1, the session expired")
+        self.cfg.login_ask_check = ("check",)
+        with self.fake_run(10) as run:
+            told = self.route()
+        self.assertIn("registry already knows this login", told)
+        self.assertIn("session LIVE", told)
+        self.assertEqual(self.blocking_comments(), [])
+        self.assertEqual(run.call_args.kwargs["input"], self.note)
+        with self.fake_run(10):                      # the same question declared again passes
+            self.assertNotIn("registry already knows", self.route())
+        self.assertEqual(len(self.blocking_comments()), 1)
+
+    def test_a_question_the_registry_does_not_answer_is_raised(self):
+        self.setup_route("person", "Sign in to my personal Gmail owner@example.com")
+        self.cfg.login_ask_check = ("check",)
+        with self.fake_run(0, ""):
+            self.assertNotIn("registry already knows", self.route())
+        self.assertEqual(len(self.blocking_comments()), 1)
+
+    def test_a_broken_check_never_loses_the_question(self):
+        self.setup_route("person", "Sign in to GitHub")
+        self.cfg.login_ask_check = ("check",)
+        with mock.patch("mesh_runner.runner.subprocess.run", side_effect=OSError("gone")):
+            self.assertNotIn("registry already knows", self.route())
+        self.assertEqual(len(self.blocking_comments()), 1)
+
+    def test_undecodable_check_output_never_loses_the_question(self):
+        self.setup_route("person", "Sign in to GitHub")
+        self.cfg.login_ask_check = ("check",)
+        err = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        with mock.patch("mesh_runner.runner.subprocess.run", side_effect=err):
+            self.assertNotIn("registry already knows", self.route())
+        self.assertEqual(len(self.blocking_comments()), 1)
+
+    def test_the_registry_answers_before_a_soft_question_goes_to_the_lead(self):
+        self.setup_route("person", "Please sign in to GitHub, which profile is better, A or B?")
+        self.cfg.login_ask_check = ("check",)
+        self.cfg.soft_person_asks_to_lead = True
+        with self.fake_run(10):
+            told = self.route()
+        self.assertIn("registry already knows", told)
+        self.assertEqual(self.mesh.created, [])
+
+    def test_off_by_default(self):
+        self.setup_route("person", "Sign in to GitHub")
+        with self.fake_run(10) as run:
+            self.assertNotIn("registry already knows", self.route())
+        run.assert_not_called()
+
+
 class Classifier(unittest.TestCase):
     def test_hard_keywords_in_both_languages(self):
         for text in ("Нужно оплатить домен", "рассылка клиентам", "Удалить таблицу?", "send the invoice",

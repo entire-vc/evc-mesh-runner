@@ -162,6 +162,7 @@ class Driver:
         self.rollout = ""
         self.replied = False           # Codex: a model record was seen since the prompt was accepted
         self.turn_end: dict | None = None   # Codex: the task_complete of our turn, read from the rollout
+        self.turn_id = ""              # Codex: the turn our prompt started, from the rollout's task_started
 
     # ------------------------------------------------------------------ helpers
     def emit(self, event: dict) -> None:
@@ -325,6 +326,10 @@ class Driver:
             if self.codex_reply(line):
                 replied = True
                 continue
+            started = self.codex_task_start(line)
+            if started is not None:
+                self.turn_id = self.turn_id or started    # the first task after our prompt is our turn
+                continue
             ended = self.codex_task_end(line)
             if ended is not None:
                 ended["output"] = replied or self.replied
@@ -363,6 +368,21 @@ class Driver:
         if kind == "message":
             return item.get("role") == "assistant"
         return kind in CODEX_MODEL_ITEMS
+
+    @staticmethod
+    def codex_task_start(line: bytes) -> str | None:
+        """The rollout's ``task_started``: the id of the turn it opens ('' when it names none). None for
+        any other line."""
+        if b'"task_started"' not in line:
+            return None
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        item = rec.get("payload") if rec.get("type") == "event_msg" else None
+        if not isinstance(item, dict) or item.get("type") != "task_started":
+            return None
+        return str(item.get("turn_id") or "")
 
     @staticmethod
     def codex_task_end(line: bytes) -> dict | None:
@@ -638,14 +658,30 @@ class Driver:
         # a side task's message) is not ours even if it occurs inside our text
         return bool(said) and bool(mine) and mine[:200] in said
 
+    def opens_with_ours(self, text: str) -> bool:
+        """The message IS our prompt: it starts with the whole of it (whitespace aside). A message that
+        only quotes it, or shares its opening and then goes on differently, does not count. Codex
+        lists each user message in full (a 17.5k-character prompt came back at its full length), so
+        no shorter prefix is compared."""
+        mine, said = _said(self.prompt), _said(text)
+        return bool(said) and bool(mine) and said.startswith(mine)
+
     def ours(self, ev: dict) -> bool:
-        """Codex also notifies for its own side tasks (a title for the thread, in another
-        thread): the turn's event names our prompt; without input messages, our thread."""
+        """Codex also notifies for its own side tasks, e.g. the title it generates for a new thread,
+        which runs in a thread and turn of its own and whose single input message quotes our prompt
+        after its own instructions. A notify is ours when it names the turn our prompt started (once
+        the rollout told us that turn's id) and its last input message is our prompt itself, not a
+        quote of it. A notify without input messages carries no evidence of our prompt: it is ours
+        only when it names our turn's id, its thread alone is not enough. Until that id is known such
+        a notify waits (done() looks at it again on every poll), and the rollout's task_complete
+        still ends the turn."""
+        turn = str(ev.get("turn-id") or "")
+        if self.turn_id and turn and turn != self.turn_id:
+            return False
         said = [str(x) for x in ev.get("input-messages") or [] if str(x).strip()]
         if said:                                  # every user message of the thread so far
-            return self.said_ours(said[-1])
-        thread = self.meta.get("session_id") or self.sid
-        return bool(thread) and ev.get("thread-id") == thread
+            return self.opens_with_ours(said[-1])
+        return bool(self.turn_id) and turn == self.turn_id
 
     def accepted(self, base: int, busy_before: bool) -> bool:
         """The harness took our prompt: Claude's UserPromptSubmit naming it (its prompt_id
@@ -747,7 +783,7 @@ class Driver:
     def turn(self, prompt: str) -> dict:
         self.prompt, self.prompt_id = prompt, ""
         self.prompt_taken = False
-        self.turn_end, self.replied = None, False
+        self.turn_end, self.replied, self.turn_id = None, False, ""
         # a prompt pasted while background agents run only gets a "still waiting" turn: wait for
         # them (and the turn Claude Code starts by itself when one finishes) before anything else
         self.wait_background()
