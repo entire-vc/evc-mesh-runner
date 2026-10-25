@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesh-runner"
+version = "0.1.0"
+description = "Run Claude Code and Codex agents on Mesh tasks: parallel sessions per agent, isolated worktrees, resumable waits."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+mesh-runner = "mesh_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
