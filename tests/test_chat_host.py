@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from fake_chat_mesh import FakeChatMesh
 from mesh_runner import config
 from mesh_runner.chat_delivery import window_key
-from mesh_runner.chat_host import ChatRefused, make_plan, session_id_for
+from mesh_runner.chat_host import ChatHost, ChatRefused, make_plan, session_id_for
 from mesh_runner.chat_protocol import ChatClient
 from mesh_runner.interactive import write_meta
 
@@ -107,3 +107,34 @@ class Cfg(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeTmux:
+    def __init__(self, windows):
+        self.windows, self.killed = windows, []
+
+    def all_windows(self):
+        return list(self.windows)
+
+    def kill_window(self, session, window):
+        self.killed.append((session, window))
+
+
+class HostWindows(unittest.TestCase):
+    """The tmux server is shared with the other runners of the host: only this runner's windows count."""
+
+    def host(self, windows):
+        h = ChatHost.__new__(ChatHost)
+        h.runners = {"e2e-chat-claude": None}
+        h.tmux = FakeTmux(windows)
+        return h
+
+    def test_other_runners_card_windows_do_not_fill_the_host_cap(self):
+        h = self.host([("mr-Khan", "card-1"), ("mr-Bill", "card-2"), ("mr-Bill", "chat-x"),
+                       ("mr-e2e-chat-claude", "card-3"), ("mr-e2e-chat-claude", "chat-y")])
+        self.assertEqual(h._card_sessions(), 1)
+
+    def test_orphan_sweep_leaves_other_runners_chats_alone(self):
+        h = self.host([("mr-Bill", "chat-x"), ("mr-e2e-chat-claude", "chat-y")])
+        h._stop_orphans()
+        self.assertEqual(h.tmux.killed, [("mr-e2e-chat-claude", "chat-y")])

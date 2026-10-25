@@ -195,6 +195,9 @@ class DecisionRequestReuse(Bench):
                                                    mesh.comments(source['id']), r.me), '')
 
     def test_verbatim_repeat_without_an_answer_is_reused_not_sent_back(self):
+        # the reopen path; with decision_identical_no_reopen (default) the same question is attached
+        # to the closed request instead: test_decision_waste
+        self.cfg.decision_identical_no_reopen = False
         r, mesh, source, attempt, wait = self.setup_question()
         request = wait['request']['id']
         mesh.add_comment(source['id'], 'Decision: someone else decided', author='bystander')

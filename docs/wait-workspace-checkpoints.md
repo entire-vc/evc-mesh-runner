@@ -94,7 +94,9 @@ A snapshot stores only what the repository cannot give back:
 - `commits.bundle` carries `base_sha..HEAD` (plus the staged-index stash), with `base_sha` as its
   prerequisite (`bundle.mode = incremental`), or no bundle at all when HEAD is already in the base
   (`bundle.mode = none`). `base_sha` is pinned by `refs/runner-checkpoint-bases/<id>`; a restore into
-  a clone that lacks it fetches that ref from the capture source.
+  a clone that lacks it fetches that ref from the capture source. The manifest records the object
+  store the base lives in (`objects`): for a pool slot that is the base clone's, which outlives the
+  slot, so verification does not need the slot.
 - Capture replays the result into scratch before publishing. If the compact form does not reproduce
   the state (clean/smudge filters, `skip-worktree`, a missing base) the full form is kept and the
   manifest says `slim_failed`. Submodule repositories always use the full form.
@@ -104,7 +106,17 @@ Measured on the reference workspace: 135 MB and 48 s before, 1 MB and 4 s after.
 Snapshots written by an earlier runner (except those of repositories with submodules, which keep
 the full form and are skipped by the migration) are migrated by the gc pass (`compact_checkpoints`, one at a
 time, each replay-verified before an atomic swap of the directory; an old one is untouched on any
-failure).
+failure). The capture slot is usually gone by then: the replay borrows the base clone's object store
+(the manifest's `objects`, or the pool repository's base clone for a manifest written before it was
+recorded). A slim snapshot is never a candidate; every manifest now records `excludes`, empty when
+nothing was left out, so a repository that tracks a cache-named directory is migrated once, not on
+every pass.
+
+A failed migration is remembered in the store (`checkpoint_compact_failures`: snapshot, reason,
+time), so a restart does not reset it: the snapshot is retried after 6 h, the first failure for a
+reason is logged as a warning and repeats at debug level. A snapshot whose base is absent from the
+base clone, and one whose rewrite saved nothing, are never retried. The entry is dropped with its
+snapshot.
 
 `runner.checkpoint_budget_gb` (default 4) is the budget for all snapshots together. The gc pass
 measures them, publishes `mesh_runner_checkpoint_bytes` and `status.json` `checkpoints.bytes`, and

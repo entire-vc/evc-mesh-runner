@@ -392,6 +392,25 @@ def request_answer(mesh: MeshClient, cats: StatusCategories, wait: dict, agent_i
     return "", False
 
 
+def _watched_comment(mesh: MeshClient, target: dict, wait: dict, since: dt.datetime) -> str:
+    """A card wait made from a question to the target's own holder (``watch_comments_by``) also
+    ends when that holder comments on the target: its handback or verdict is the answer."""
+    watch = wait.get("watch_comments_by") or {}
+    rid, tid = str(watch.get("id") or ""), str(target.get("id") or "")
+    if not rid or not tid:
+        return ""
+    name = str(watch.get("name") or "").casefold()
+    for c in reversed(mesh.comments(tid)):
+        at = parse_time(c.get("created_at"))
+        if at is None or at <= since:
+            break
+        author = c.get("author_id") or (c.get("author") or {}).get("id")
+        who = str(c.get("author_name") or (c.get("author") or {}).get("name") or "")
+        if author == rid or (name and who.casefold() == name):
+            return f"{who or watch.get('name') or 'the holder'} commented on #{tid[:8]}: {(c.get('body') or '')[:300]}"
+    return ""
+
+
 HUMAN_ASK_RECHECK = dt.timedelta(hours=24)
 
 
@@ -867,6 +886,15 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
                     "and no human gate or agent request stands behind it; the question may be gone. "
                     "Continue the work, or ask again with `❓ Blocking @person` if an answer is still needed")
         return ""
+    if kind == "decision" and wait.get("attached_closed"):
+        # the same question again, attached to its closed request without reopening it: only a
+        # comment answers it, so after the re-check interval the asker gets it back, once per wait
+        if now - started >= interval:
+            wait["recheck_due"] = True
+            return (f"re-check: decision wait @{wait.get('handle') or ''} repeats the question of request "
+                    f"#{wait['attached_closed']}, which is closed and was not reopened, so nobody was asked again. "
+                    "Continue with what the thread holds, or ask a materially different question")
+        return ""
     if kind == "time":
         until = parse_time(wait.get("until"))
         if until and now >= until:
@@ -912,7 +940,7 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
             elif satisfied(cats, target):
                 event = f"task #{wait['target']} has shipped (still {cat})"
             else:
-                event = ""
+                event = _watched_comment(mesh, target, wait, since)
         elif kind in ("pipeline", "mr"):
             if gitlab is None:
                 if typed_wait(wait):

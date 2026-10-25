@@ -71,12 +71,14 @@ class Checkout:
 
 class MeshClient:
     def __init__(self, base_url: str, agent_key: str, timeout: int = DEFAULT_TIMEOUT, opener=None,
-                 basic_auth: str = ""):
+                 basic_auth: str = "", bearer=None):
         self.base = base_url.rstrip("/") + "/api/v1"
         self._key = agent_key
         # a self-hosted Mesh behind an HTTP basic-auth gate: "user:pass" in Authorization,
         # the agent key stays in X-Agent-Key, so the two never collide
         self._basic = ("Basic " + base64.b64encode(basic_auth.encode()).decode()) if basic_auth else ""
+        # an extension actor token (``ext_...``): a callable, so a rotated token is read at once
+        self._bearer = bearer
         self.timeout = timeout
         self._open = opener or urllib.request.urlopen
 
@@ -116,8 +118,12 @@ class MeshClient:
         # Reserve cleanup time inside the caller's shared diagnostic budget.
         if timeout <= .1:
             raise MeshError(0, "diagnostic deadline")
+        try:
+            bearer = self._bearer() if self._bearer else ""
+        except (OSError, RuntimeError):
+            raise MeshError(0, "diagnostic credential unavailable") from None
         payload = json.dumps({"base": self.base[:-7], "key": self._key,
-                              "basic": self._basic, "path": path,
+                              "basic": self._basic, "bearer": bearer, "path": path,
                               "timeout": min(timeout - .1, self.timeout)}).encode()
         try:
             child = subprocess.Popen([sys.executable, "-m", "mesh_runner.diagnostic_get"],
@@ -167,8 +173,10 @@ class MeshClient:
             url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, method=method, headers={
-            "X-Agent-Key": self._key, "Accept": "application/json",
-            **({"Authorization": self._basic} if self._basic else {}),
+            "Accept": "application/json",
+            **({"X-Agent-Key": self._key} if not self._bearer else {}),
+            **({"Authorization": "Bearer " + self._bearer()} if self._bearer
+               else {"Authorization": self._basic} if self._basic else {}),
             **({"Content-Type": "application/json"} if data is not None else {}),
         })
         try:

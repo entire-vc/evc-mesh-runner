@@ -16,7 +16,10 @@ Safety rules:
   freed only after its uncommitted state is committed onto a never-pushed ref
   under ``refs/mesh-runner/archive/``;
 - a returned slot is detached at the remote branch tip, so it pins nothing;
-- two open attempts never share a slot; slots belong to one agent's pool.
+- two open attempts never share a slot; slots belong to one agent's pool;
+- a slot is used only while its ``.git`` file leads to its own admin dir under the base clone's
+  ``worktrees/`` (checked before any git command runs in it); new slots get an owner-prefixed admin
+  id, so pools sharing one base clone never hand each other an admin id.
 """
 from __future__ import annotations
 
@@ -47,6 +50,9 @@ _COMMON_DIRS: dict[str, str] = {}
 # this durable marker until an operator explicitly inspects the slot.
 POOL_EVICTION_HOLD_NOTE = "pool eviction requires operator inspection"
 POOL_INDEX_FLAGS_HOLD_NOTE = "index flags require operator inspection"
+# The slot's link to its git admin dir (<common>/worktrees/<id>) is missing or points at an admin dir
+# that belongs to another worktree: git in this slot would read and write someone else's HEAD and index.
+POOL_ADMIN_HOLD_NOTE = "worktree admin link requires operator inspection"
 DIRTY_HOLD_NOTE = "uncommitted changes"        # the hold reason archive_and_free can resolve
 ARCHIVE_REF_PREFIX = "refs/mesh-runner/archive"  # outside refs/heads and refs/tags: no default push or fetch rule names it
 
@@ -207,8 +213,13 @@ class WorkspacePool:
     def unsafe_reason(self, path: Path, repo: RepoSpec) -> str:
         """Why the slot may NOT be returned; empty when it is safe."""
         try:
-            if not (path / ".git").exists():
+            dotgit = path / ".git"
+            if not dotgit.exists() and not dotgit.is_symlink():
                 return "missing"
+            # Before any git command in the slot: with a foreign admin dir git would succeed
+            # through another worktree's HEAD and index.
+            if why := self._admin_reason(path, repo):
+                return f"{POOL_ADMIN_HOLD_NOTE}: {why}"
             if self.index_flags_reason(path):
                 return "index flags may hide tracked changes"
             # Untracked scratch (evidence, logs) is archived on return, not a reason to keep
@@ -229,6 +240,106 @@ class WorkspacePool:
             if tag == "S" or tag.islower():  # skip-worktree or assume-unchanged
                 return f"tracked path has {tag} index flag"
         return ""
+
+    def _common_dir(self, repo: RepoSpec, *, timeout: float = 600) -> str:
+        """Canonical git common dir of the repository's base clone. Read-only; runs in the base, never a slot.
+        Resolved on every call rather than taken from base_lock's key cache: an integrity check must not
+        trust a value remembered for another purpose."""
+        base = os.path.realpath(repo.base)
+        common = git(Path(base), "rev-parse", "--git-common-dir", timeout=timeout, env=self.env)
+        return os.path.realpath(os.path.join(base, common))
+
+    def _admin_check(self, path: Path, repo: RepoSpec, *, timeout: float = 600) -> tuple[str, str]:
+        """(reason, admin dir): reason is '' when the slot's .git file names an admin dir directly under
+        ``<common dir of repo.base>/worktrees`` whose ``commondir`` is that common dir and whose ``gitdir``
+        back-pointer is this slot. Admin ids are derived from directory names and so may be reused by any
+        other ``git worktree add`` on the same clone once an admin dir disappears: a slot left pointing at a
+        reused id would share another worktree's HEAD and index while every git command still succeeds.
+
+        Reads files only, plus one read-only git call in the base clone; never runs git in the slot.
+        Paths are compared after realpath, so /var vs /private/var style aliases do not matter. Raises
+        WorkspaceError only when the base clone's common dir cannot be resolved."""
+        dotgit = path / ".git"
+        if dotgit.is_symlink():
+            return "slot .git is a symlink", ""
+        if not dotgit.is_file():
+            return "slot .git is not a regular file", ""
+        try:
+            lines = dotgit.read_text().splitlines()
+        except (OSError, UnicodeError) as e:
+            return f"slot .git is unreadable: {e}", ""
+        if len(lines) != 1 or not lines[0].startswith("gitdir: ") or not lines[0][8:].strip():
+            return "slot .git is not a single gitdir line", ""
+        # Relative gitdir paths (worktree.useRelativePaths) are relative to the file's directory, as git reads them.
+        admin = os.path.realpath(os.path.join(path, lines[0][8:].strip()))
+        common = self._common_dir(repo, timeout=timeout)
+        listing = os.path.realpath(os.path.join(common, "worktrees"))
+        if os.path.dirname(admin) != listing:
+            return f"admin dir {admin} is not under {listing}", admin
+        if not os.path.isdir(admin):
+            return f"admin dir {admin} is missing", admin
+        try:
+            commondir = Path(admin, "commondir").read_text().strip()
+            back = Path(admin, "gitdir").read_text().strip()
+        except (OSError, UnicodeError) as e:
+            return f"admin dir {admin} is unreadable: {e}", admin
+        if not commondir or os.path.realpath(os.path.join(admin, commondir)) != common:
+            return f"admin dir {admin} does not belong to {common}", admin
+        if not back or os.path.realpath(os.path.join(admin, back)) != os.path.realpath(dotgit):
+            return f"admin dir {admin} belongs to another worktree ({back or 'no gitdir'})", admin
+        return "", admin
+
+    def _admin_reason(self, path: Path, repo: RepoSpec, *, timeout: float = 600) -> str | None:
+        """Why git must not be run in this slot because of its admin link; None when the link is sound."""
+        return self._admin_check(path, repo, timeout=timeout)[0] or None
+
+    def _warn_admin(self, path: Path, repo: RepoSpec) -> None:
+        """One WARNING for a slot held for its admin link, with the timestamps that help find who removed
+        or replaced the admin dir: the admin dir itself and the ``worktrees`` listing that contained it."""
+        def mtime(p: str) -> str:
+            try:
+                return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.stat(p).st_mtime))
+            except OSError:
+                return "absent"
+        try:
+            why, admin = self._admin_check(path, repo, timeout=30)
+            listing = os.path.join(self._common_dir(repo, timeout=30), "worktrees")
+        except WorkspaceError as e:
+            why, admin, listing = f"cannot verify: {e}", "", ""
+        log.warning("%s: worktree %s held (%s): %s; admin dir %s (mtime %s); admin listing %s (mtime %s)",
+                    self.owner, path, POOL_ADMIN_HOLD_NOTE, why or "link sound again",
+                    admin or "unknown", mtime(admin) if admin else "n/a",
+                    listing or "unknown", mtime(listing) if listing else "n/a")
+
+    def audit_admin(self) -> list[str]:
+        """Periodic pass: hold every free slot whose admin link fails ``_admin_reason``, before a lease
+        would hand it out. Reads files only (plus one read-only git call per base clone). The rule is the one
+        unsafe_reason applies: any present ``.git`` (a symlink too, even dangling) is checked; a slot whose
+        ``.git`` is absent is left to lease(), which holds it as missing. Returns the newly held paths."""
+        held = []
+        for name, repo in self.repos.items():
+            if not self._rows(name, "free"):
+                continue
+            with base_lock(repo.base):
+                for row in self._rows(name, "free"):
+                    path = Path(row["path"])
+                    if not os.path.lexists(path / ".git"):
+                        continue
+                    try:
+                        why = self._admin_reason(path, repo, timeout=30)
+                    except WorkspaceError as e:
+                        log.warning("%s: worktree admin audit of %s skipped: %s", self.owner, name, e)
+                        break
+                    if not why:
+                        continue
+                    claim = self.store.db.execute(
+                        "UPDATE slots SET state='held', note=?, updated_at=? "
+                        "WHERE path=? AND state='free' AND attempt='' AND updated_at=?",
+                        (POOL_ADMIN_HOLD_NOTE, iso(), str(path), row["updated_at"]))
+                    if claim.rowcount == 1:
+                        self._warn_admin(path, repo)
+                        held.append(str(path))
+        return held
 
     def _save_detached_commits(self, path: Path, repo: RepoSpec, attempt_id: str) -> str:
         """Keep commits of a detached HEAD that the remote lacks. Returns the ref or ''."""
@@ -262,6 +373,7 @@ class WorkspacePool:
 
     def _lease(self, attempt_id: str, repo_name: str, repo: RepoSpec) -> Path:
         self._check_disk()
+        self._clean_staging(repo)
         self._fetch(repo)
         self._check_disk()
         start = f"{repo.remote}/{repo.branch}"
@@ -270,6 +382,8 @@ class WorkspacePool:
             reason = self.unsafe_reason(path, repo)
             if reason:
                 self._set(path, repo_name, "held", note=f"found while free: {reason}")
+                if reason.startswith(POOL_ADMIN_HOLD_NOTE):
+                    self._warn_admin(path, repo)
                 continue
             git(path, "checkout", "--quiet", "--detach", start, env=self.env)
             self._set(path, repo_name, "leased", attempt_id)
@@ -278,10 +392,57 @@ class WorkspacePool:
             raise WorkspaceError(f"no free worktree for {repo_name} (max {repo.max_slots}; see `mesh-runner slots`)")
         self._check_disk()
         path = self._new_path(repo)
-        git(repo.base, "worktree", "add", "--quiet", "--detach", str(path), start, env=self.env)
+        # git names the admin dir after the basename it is given, and slot-N names repeat across the pools
+        # sharing one base clone. Adding under an owner-prefixed name and moving it into place keeps an
+        # owner-unique admin id while the directory stays slot-N.
+        staging = self._staging_path(path)
+        git(repo.base, "worktree", "add", "--quiet", "--detach", str(staging), start, env=self.env)
+        git(repo.base, "worktree", "move", str(staging), str(path), env=self.env)
+        if why := self._admin_reason(path, repo):
+            self._set(path, repo_name, "held", note=f"{POOL_ADMIN_HOLD_NOTE}: {why}")
+            self._warn_admin(path, repo)
+            raise WorkspaceError(f"new worktree {path}: {why}")
         self._configure(path)
         self._set(path, repo_name, "leased", attempt_id)
         return path
+
+    def _owner_tag(self) -> str:
+        """The owner as a git-safe admin id prefix."""
+        return re.sub(r"[^A-Za-z0-9._-]", "-", self.owner).strip(".-") or "pool"
+
+    def _staging_path(self, path: Path) -> Path:
+        """Where a new slot is added before it is moved to ``path``: same parent, owner-prefixed name."""
+        staging = path.with_name(f"{self._owner_tag()}-{path.name}")
+        n = 0
+        while os.path.lexists(staging):            # a leftover that could not be removed: never reuse it
+            n += 1
+            staging = path.with_name(f"{self._owner_tag()}-{path.name}.{n}")
+        return staging
+
+    def _clean_staging(self, repo: RepoSpec) -> None:
+        """Remove staging worktrees left by a crash between ``worktree add`` and ``worktree move``.
+
+        A staging worktree never had a slot row (the row is written after the move), so nothing was ever
+        leased in it: it is a fresh detached checkout. It is removed only when its admin link is sound and
+        git agrees it is clean (no --force); anything else is kept for the operator."""
+        parent = self.root / repo.name
+        if not parent.is_dir():
+            return
+        pattern = re.compile(rf"{re.escape(self._owner_tag())}-slot-[1-9][0-9]*(\.[1-9][0-9]*)?")
+        known = {Path(r["path"]).name for r in self._rows(repo.name)}
+        for leftover in sorted(parent.iterdir()):
+            if (not pattern.fullmatch(leftover.name) or leftover.name in known
+                    or leftover.is_symlink() or not leftover.is_dir()):
+                continue
+            try:
+                if why := self._admin_reason(leftover, repo):
+                    raise WorkspaceError(why)
+                git(repo.base, "worktree", "remove", str(leftover), env=self.env)
+            except WorkspaceError as e:
+                log.warning("%s: leftover staging worktree %s kept for operator inspection: %s",
+                            self.owner, leftover, e)
+                continue
+            log.info("%s: removed leftover staging worktree %s", self.owner, leftover)
 
     def release(self, attempt_id: str) -> list[tuple[str, str]]:
         """Return the attempt's slots. Unsafe slots are held, never wiped.
@@ -315,7 +476,7 @@ class WorkspacePool:
         """
         if not writer_stopped:
             raise WorkspaceError("checkpoint: writer stop not established")
-        from .checkpoint import Checkpoints, _clear_tree
+        from .checkpoint import _clear_tree, base_objects_dir
         checkpoints = self._checkpoints()
         result = []
         for row in self._checkpoint_rows(attempt_id):
@@ -328,6 +489,9 @@ class WorkspacePool:
             repo_name = slot["pool"].split("/", 1)[1]
             repo, path = self.repos[repo_name], Path(slot["path"])
             with base_lock(repo.base):
+                # Snapshot, reset and clear below all run git in the slot: never through a foreign admin dir.
+                if why := self._admin_reason(path, repo):
+                    raise WorkspaceError(f"checkpoint: {path}: {POOL_ADMIN_HOLD_NOTE}: {why}; lease retained")
                 journal = next((r for r in self._checkpoint_rows(attempt_id) if r["repo"] == repo_name), None)
                 if journal and journal["phase"] in ("restored", "active"):
                     # A later WAIT needs a new generation; old snapshots remain recoverable.
@@ -346,7 +510,8 @@ class WorkspacePool:
                 else:
                     cp = Path(journal["checkpoint"])
                     try:
-                        checkpoints.compact(cp)     # old-format snapshot: shed regenerable caches, verified swap
+                        # old-format snapshot: shed regenerable caches, verified swap
+                        checkpoints.compact(cp, base_objects=base_objects_dir(repo.base, self.env))
                     except (WorkspaceError, OSError) as e:
                         log.warning("checkpoint compact %s skipped: %s", cp.name, e)
                     checkpoints.verify(cp)
@@ -424,6 +589,10 @@ class WorkspacePool:
                     # Re-entry after persisting completion must not overwrite later edits.
                     manifest = checkpoints.read(Path(row["checkpoint"]))
                 else:
+                    # A target already owned (restart recovery) did not pass lease()'s admission checks.
+                    if why := self._admin_reason(target, repo):
+                        raise WorkspaceError(f"checkpoint: restore target {target}: {POOL_ADMIN_HOLD_NOTE}: "
+                                             f"{why}; lease retained")
                     manifest = checkpoints.restore(Path(row["checkpoint"]), target)
                     self.store.db.execute("UPDATE workspace_checkpoints SET phase='restored' "
                         "WHERE owner=? AND attempt=? AND repo=?", (self.owner, attempt_id, row["repo"]))
@@ -438,7 +607,8 @@ class WorkspacePool:
         rows = [dict(r) for r in self.store.db.execute(
             "SELECT * FROM slots WHERE state='held' AND pool LIKE ?", (f"{self.owner}/%",))]
         for slot in rows:
-            if slot["note"] in (POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE):
+            if slot["note"] in (POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE) \
+                    or POOL_ADMIN_HOLD_NOTE in slot["note"]:
                 continue
             if slot["attempt"] and slot["attempt"] in open_attempts:
                 continue

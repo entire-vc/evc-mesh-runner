@@ -17,6 +17,9 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # requeue_on_cap = false           # a capped task returns to todo and restarts on new input, not a clock
     # soft_person_asks_to_lead = false # a question to a person that no hard rule matches goes to the lead
     # unanswerable_ask_to_lead = true  # a question to an agent that cannot answer goes to the lead
+    # decision_live_task_card_wait = true  # a question about the addressee's own live task waits on that task
+    # decision_identical_no_reopen = true  # the same question again is attached to its request, never reopened
+    # decision_default_proceeds = true     # a question carrying the asker's default proceeds; the addressee may object
     # hard_ask_patterns = [...]        # replaces the keyword list (see asks.py); hard_ask_labels likewise
     # unanswerable_users = ["example"]    # test or service users nobody answers for
     # merge_command = ["merge-gate", "{iid}", "{project}", "--expected-sha", "{sha}"]   # enables `WAIT merge:`
@@ -260,6 +263,21 @@ class RunnerConfig:
     # reopened) instead of filing another; a verbatim repeat of a question the agent already
     # answered is sent back. 0 = every new question files a new request.
     decision_reuse_hours: float = 24.0
+    # A decision wait whose question names exactly one other task (#<8hex> or its uuid) that the
+    # addressee itself holds and is working on (todo, in_progress or review) files no request: the
+    # addressee could only answer "not ready yet". It becomes a card wait on that task, woken when
+    # the task closes or ships, or when the addressee comments on it. False: a request is filed.
+    decision_live_task_card_wait: bool = True
+    # The same question (case, whitespace, trailing punctuation and trailing references to the
+    # asking task ignored) from the same asker and source to the same agent is attached to the
+    # request it already has: no new card, no reopen, no repeat comment. A changed question is
+    # asked on that request as before. False: only a byte-identical question is attached.
+    decision_identical_no_reopen: bool = True
+    # A decision wait to an agent whose question states the asker's own proposed default
+    # ("default:", "proposed:", "if no objection", ...) and no hard rule (asks.py) matches files no
+    # request: the question is posted on the asking task for the addressee to object, and the asker
+    # continues with its default at once. False: a request is filed.
+    decision_default_proceeds: bool = True
     time_wait_reason_after_minutes: float = 60.0   # a longer time WAIT must say why and what it waits for
     # this many short (<= time_wait_reason_after_minutes) time WAITs in a row on one task are sent back
     # once per UTC day: polling on a timer burns the daily turn budget; wait on the event. 0 = off
@@ -323,6 +341,18 @@ class RunnerConfig:
     # (Claude Code resumes the main thread itself when one finishes); 0 = paste at once
     background_wait_minutes: float = 45.0
     mesh_basic_auth: str = field(default="", repr=False)   # "user:pass" for a Mesh behind HTTP basic auth
+    # Mesh extension: the service endpoint (/healthz, /mesh/install, /mesh/events) and the extension
+    # actor token that replaces basic auth + agent key. Off unless `[extension]` says so.
+    extension_enabled: bool = False
+    extension_host: str = "127.0.0.1"
+    extension_port: int = 8787
+    extension_workspace_id: str = ""            # the one workspace whose install is accepted
+    extension_secret: str = field(default="", repr=False)   # pre-shared install secret (file or env)
+    extension_trust_first_install: bool = False
+    extension_allow_rekey: bool = False
+    extension_tolerance_seconds: int = 300
+    extension_token: object = field(default=None, repr=False)   # ExtensionToken: file or env name, never a value
+    extension_rotate_days: float = 0.0          # self-rotate the token this often; 0 = never
     # A task that hits START CAP, TURN CAP or COMPACTION CAP goes back to todo with the same assignee
     # (or to a free peer of its pool) and restarts on new input, never on a clock. False: the task goes
     # to the lead, or waits for the next UTC day without one (RUNNER GAVE UP is not a cap and always
@@ -463,6 +493,29 @@ def load(path: str | Path) -> RunnerConfig:
         raise ConfigError("comment_wake_always_from must be a list of author names")
     gl = raw.get("gitlab") or {}
     chat = raw.get("chat") or {}
+    ext = raw.get("extension") or {}
+    ext_token = None
+    if ext.get("token_file") or ext.get("token_env"):
+        if r.get("basic_auth_file") or r.get("basic_auth_env"):
+            raise ConfigError("[extension] token replaces basic auth: set only one of them")
+        from .extension_service import ExtensionToken
+        ext_token = ExtensionToken(_path(ext.get("token_file")), str(ext.get("token_env") or ""))
+        if ext_token.file:
+            mode = ext_token.file.stat().st_mode & 0o077
+            if mode:
+                raise ConfigError(f"extension token: {ext_token.file} is readable by group/others; chmod 600")
+    ext_ws = str(ext.get("workspace_id") or "")
+    if ext.get("enabled", False) is True and not re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", ext_ws):
+        raise ConfigError("[extension] workspace_id (the workspace UUID this runner serves) is required")
+    ext_secret = ""
+    if ext.get("enabled", False) is True:
+        if ext.get("signing_secret_file") or ext.get("signing_secret_env"):
+            ext_secret = read_secret(ext.get("signing_secret_file"), ext.get("signing_secret_env"),
+                                     "extension signing secret")
+        elif ext.get("trust_first_install", False) is not True:
+            raise ConfigError("[extension] needs signing_secret_file/signing_secret_env "
+                              "(or trust_first_install = true on a private link)")
     agents = []
     for a in raw.get("agents") or []:
         harness = a.get("harness", "claude")
@@ -480,7 +533,8 @@ def load(path: str | Path) -> RunnerConfig:
         ident = a.get("identity")
         agents.append(AgentConfig(
             name=a["name"],
-            key=read_secret(a.get("key_file"), a.get("key_env"), f"agent {a['name']} key"),
+            key=("" if ext_token is not None and not (a.get("key_file") or a.get("key_env"))
+                 else read_secret(a.get("key_file"), a.get("key_env"), f"agent {a['name']} key")),
             harness=harness,
             profile_dir=_path(a["profile_dir"]),
             repos=repos,
@@ -539,6 +593,9 @@ def load(path: str | Path) -> RunnerConfig:
         comment_wake_always_from=[v.strip() for v in always_from],
         decision_wake=_decision_wake(r.get("decision_wake", "any"), "[runner]"),
         decision_reuse_hours=_idle_hours(r.get("decision_reuse_hours", 24.0), "decision_reuse_hours"),
+        decision_live_task_card_wait=r.get("decision_live_task_card_wait", True) is not False,
+        decision_identical_no_reopen=r.get("decision_identical_no_reopen", True) is not False,
+        decision_default_proceeds=r.get("decision_default_proceeds", True) is not False,
         max_compactions=int(r.get("max_compactions", 0)),
         max_failures=int(r.get("max_failures", 3)),
         failed_cooldown_hours=float(r.get("failed_cooldown_hours", 0.5)),
@@ -595,6 +652,16 @@ def load(path: str | Path) -> RunnerConfig:
         interactive_max_sessions=int(r.get("interactive_max_sessions", 20)),
         background_wait_minutes=_idle_hours(r.get("background_wait_minutes", 45.0), "background_wait_minutes"),
         mesh_basic_auth=_basic_auth(r),
+        extension_enabled=ext.get("enabled", False) is True,
+        extension_host=str(ext.get("host", "127.0.0.1")),
+        extension_port=_positive(ext.get("port", 8787), "[extension] port", integer=True),
+        extension_workspace_id=ext_ws,
+        extension_secret=ext_secret,
+        extension_trust_first_install=ext.get("trust_first_install", False) is True,
+        extension_allow_rekey=ext.get("allow_rekey", False) is True,
+        extension_tolerance_seconds=_positive(ext.get("tolerance_seconds", 300), "tolerance_seconds", integer=True),
+        extension_token=ext_token,
+        extension_rotate_days=float(ext.get("rotate_days", 0.0)),
         requeue_on_cap=r.get("requeue_on_cap", False) is True,
         soft_person_asks_to_lead=r.get("soft_person_asks_to_lead", False) is True,
         unanswerable_ask_to_lead=r.get("unanswerable_ask_to_lead", True) is not False,

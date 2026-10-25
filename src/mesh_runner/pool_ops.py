@@ -17,8 +17,9 @@ import subprocess
 import time
 from pathlib import Path
 
+from .checkpoint import CheckpointBaseMissing, base_objects_dir
 from .store import Store, iso
-from .workspace import (POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE,
+from .workspace import (POOL_ADMIN_HOLD_NOTE, POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE,
                         WorkspacePool, WorkspaceError, _COMMON_DIRS, base_lock, git)
 
 _SIZE_CACHE: dict[str, tuple[float, int | None]] = {}
@@ -91,7 +92,17 @@ def eviction_candidates(pool: WorkspacePool, *, idle_hours: float, keep: int, de
                 expected = pool.root / name / path.name
                 if not re.fullmatch(r"slot-[1-9][0-9]*", path.name) or path != expected:
                     continue
-                if path.resolve() != pool.root.resolve() / name / path.name or not (path / ".git").is_file() or (path / ".git").is_symlink():
+                if path.resolve() != pool.root.resolve() / name / path.name or not os.path.lexists(path / ".git"):
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkspaceError("pool inspection budget exhausted")
+                if pool._admin_reason(path, repo, timeout=min(3, remaining)):
+                    # Any present .git that is not a sound link to this slot's own admin dir (a symlink,
+                    # dangling or not, a directory, a foreign or reused admin dir): git in this slot would
+                    # act on another worktree, and `worktree remove` must never run on it. Apply
+                    # quarantines it, dry-run does not offer it.
+                    candidates.append({**row, "_blocked_reason": POOL_ADMIN_HOLD_NOTE})
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -168,7 +179,9 @@ def evict(pool: WorkspacePool, *, idle_hours: float, keep: int, limit: int, appl
             if row not in eviction_candidates(pool, idle_hours=idle_hours, keep=keep, deadline=deadline):
                 continue
             if row.get("_blocked_reason"):
-                pool._set(path, name, "held", note=POOL_INDEX_FLAGS_HOLD_NOTE)
+                pool._set(path, name, "held", note=row["_blocked_reason"])
+                if row["_blocked_reason"] == POOL_ADMIN_HOLD_NOTE:
+                    pool._warn_admin(path, repo)
                 continue
             if time.monotonic() >= deadline:
                 break
@@ -285,8 +298,10 @@ def _slot_skip_reason(pool: WorkspacePool, repo, path: Path, deadline: float) ->
         if remaining <= 0:
             raise WorkspaceError("ignored cleanup budget exhausted")
         return git(path, *args, timeout=min(30, remaining), env=pool.env, **kwargs)
-    if not (path / ".git").is_file() or (path / ".git").is_symlink():
+    if not os.path.lexists(path / ".git"):
         return "no worktree .git file"
+    if pool._admin_reason(path, repo, timeout=_budget(deadline, 30)):
+        return "admin link"      # a symlinked or foreign link: git here would act on another worktree
     if (path / ".gitmodules").exists() or Path(run("rev-parse", "--path-format=absolute",
                                                    "--git-path", "modules")).exists():
         return "submodule metadata"
@@ -552,10 +567,26 @@ def checkpoint_bytes(pool_root: Path, deadline: float | None = None) -> int:
 _COMPACTABLE_PHASES = ("verified", "released", "restored", "active")
 
 
-# A snapshot whose compaction failed (typically its bundle base is gone) fails the same way on every
-# pass; without a pause it is retried each time under the base lock and eats the pass budget.
+# A snapshot whose compaction failed fails the same way on every pass; without a pause it is retried
+# each time under the base lock and eats the pass budget. The memory lives in the store, so a restart
+# does not reset it. A final entry (base absent from the base clone, or a rewrite that saved nothing)
+# is never retried; an entry disappears with its snapshot.
 _COMPACT_RETRY_AFTER = 6 * 3600
-_compact_failed: dict[str, float] = {}
+_COMPACT_FAILURES = ("CREATE TABLE IF NOT EXISTS checkpoint_compact_failures ("
+                     "checkpoint TEXT PRIMARY KEY, reason TEXT NOT NULL, failed_at REAL NOT NULL, "
+                     "final INTEGER NOT NULL DEFAULT 0)")
+# Scratch directories and generated keys differ on every attempt; a repeat is the same reason without them.
+_SCRATCH_NAME = re.compile(r"(\.(?:compact-src|verify|preflight|pending)-|compact-)[A-Za-z0-9_]+")
+
+
+def _compact_reason(error: Exception) -> str:
+    return _SCRATCH_NAME.sub(r"\1*", str(error))[:300]
+
+
+def _remember_compact(db, path: Path, reason: str, *, final: bool) -> None:
+    db.execute("INSERT INTO checkpoint_compact_failures VALUES (?,?,?,?) ON CONFLICT(checkpoint) DO UPDATE "
+               "SET reason=excluded.reason, failed_at=excluded.failed_at, final=excluded.final",
+               (str(path), reason, time.time(), int(final)))
 
 
 def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: float | None = None) -> dict:
@@ -568,14 +599,21 @@ def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: f
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='workspace_checkpoints'").fetchone():
         return result
     checkpoints = pool._checkpoints()
-    for row in [dict(r) for r in db.execute("SELECT * FROM workspace_checkpoints WHERE owner=?", (pool.owner,))]:
+    db.execute(_COMPACT_FAILURES)
+    rows = [dict(r) for r in db.execute("SELECT * FROM workspace_checkpoints WHERE owner=?", (pool.owner,))]
+    for row in rows:
+        path = row["checkpoint"]
+        if not Path(path).is_dir():
+            db.execute("DELETE FROM checkpoint_compact_failures WHERE checkpoint=?", (path,))
+    for row in rows:
         if time.monotonic() >= deadline:
             break
         path = Path(row["checkpoint"])
         if row["phase"] not in _COMPACTABLE_PHASES or row["repo"] not in pool.repos or not path.is_dir():
             continue
-        failed_at = _compact_failed.get(str(path))
-        if failed_at is not None and time.monotonic() - failed_at < _COMPACT_RETRY_AFTER:
+        memo = db.execute("SELECT reason, failed_at, final FROM checkpoint_compact_failures WHERE checkpoint=?",
+                          (str(path),)).fetchone()
+        if memo is not None and (memo["final"] or time.time() - memo["failed_at"] < _COMPACT_RETRY_AFTER):
             continue
         try:
             if not checkpoints.is_old_format(path):
@@ -587,8 +625,9 @@ def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: f
         result["candidates"].append(entry)
         if not apply:
             continue
+        repo = pool.repos[row["repo"]]                 # this pool's own repo config: its own base clone
         try:
-            with _bounded_base_lock(pool.repos[row["repo"]].base, deadline) as locked:
+            with _bounded_base_lock(repo.base, deadline) as locked:
                 if not locked:
                     result["errors"] += 1
                     continue
@@ -596,14 +635,22 @@ def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: f
                                  (pool.owner, row["attempt"], row["repo"])).fetchone()
                 if now is None or now["phase"] not in _COMPACTABLE_PHASES:
                     continue                        # a restore moved the row while we waited for the lock
-                done = checkpoints.compact(path)
+                done = checkpoints.compact(path, base_objects=base_objects_dir(Path(repo.base),
+                                                                               getattr(pool, "env", None)))
         except (WorkspaceError, OSError) as e:
-            log.warning("checkpoint compact %s: %s", path.name, e)
+            reason = _compact_reason(e)
+            final = isinstance(e, CheckpointBaseMissing)
+            repeat = memo is not None and memo["reason"] == reason
+            log.log(logging.DEBUG if repeat else logging.WARNING, "checkpoint compact %s: %s%s", path.name, e,
+                    "; not retried" if final else f"; retry in {_COMPACT_RETRY_AFTER // 3600}h")
             entry["error"] = str(e)
             result["errors"] += 1
-            _compact_failed[str(path)] = time.monotonic()
+            _remember_compact(db, path, reason, final=final)
             continue
-        _compact_failed.pop(str(path), None)
+        db.execute("DELETE FROM checkpoint_compact_failures WHERE checkpoint=?", (str(path),))
+        if done.get("compacted") and done["after"] >= done["before"]:
+            # Rewritten without saving anything: a further pass would do the same work again.
+            _remember_compact(db, path, "compaction saved nothing", final=True)
         if done.get("skipped"):
             entry["skipped"] = done["skipped"]
             result["skipped"] = result.get("skipped", 0) + 1

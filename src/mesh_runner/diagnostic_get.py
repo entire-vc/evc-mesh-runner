@@ -18,6 +18,9 @@ def main():
             raise ValueError()
         client = MeshClient(request['base'], request['key'])
         client._basic = request['basic']
+        if request.get('bearer'):
+            token = request['bearer']
+            client._bearer = lambda: token
         body = client._bounded_get_request(path, request['timeout'])
         status = 200
     except MeshError as error:

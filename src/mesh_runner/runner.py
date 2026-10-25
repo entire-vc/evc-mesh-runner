@@ -78,6 +78,12 @@ WAITING_FOR_INPUT = "waiting for new input after "      # hold reason of a cappe
 # what a time WAIT's reason may name that the runner can watch instead of a clock
 TIME_WAIT_EVENT = re.compile(r"\b(?:pipeline|mr|card):\S+|(?:[\w.\-]+/[\w.\-/]+)?![0-9]+\b"
                              r"|#[0-9a-f]{8}\b|\bpipeline\s*#?[0-9]+\b", re.IGNORECASE)
+# a task named in a decision question: a full uuid, or #<8hex>
+TASK_REF = re.compile(r"(?<![\w-])(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![\w-])"
+                      r"|#(?P<short>[0-9a-f]{8})(?![\w-])", re.IGNORECASE)
+# a question that carries the asker's own proposed default (decision_default_proceeds)
+DEFAULT_MARKER = re.compile(r"(?<!\w)(?:default\s*:|дефолт\s*:|по\s+умолчанию\s*:|proposed\s*:|предлагаю"
+                            r"|рекомендую|if\s+no\s+objections?)", re.IGNORECASE)
 DEAD_SLOT_RECHECK = 3600            # seconds between looks at the same held slot
 DEAD_SLOT_PER_TICK = 3              # held slots examined per maintenance pass
 FINISHED_ATTEMPT = ("completed", "failed", "aborted")
@@ -317,7 +323,8 @@ class AgentRunner:
     def __init__(self, cfg: RunnerConfig, agent: AgentConfig, store: Store, mesh: MeshClient | None = None,
                  adapter: Adapter | None = None, gitlab: GitLab | None = None):
         self.cfg, self.agent, self.store = cfg, agent, store
-        self.mesh = mesh or MeshClient(cfg.mesh_url, agent.key, basic_auth=cfg.mesh_basic_auth)
+        self.mesh = mesh or MeshClient(cfg.mesh_url, agent.key, basic_auth=cfg.mesh_basic_auth,
+                                       bearer=cfg.extension_token)
         # the runner decides how turns run (launch_mode); an agent may override it
         self.launch_mode = agent.launch_mode or cfg.launch_mode
         self._tmux = interactive.Tmux(cfg.tmux_binary)
@@ -373,7 +380,8 @@ class AgentRunner:
         self.effects = Effects(self.mesh, self.cats, agent.name, enabled=cfg.mesh_effects, store=store,
                                decision_metadata_recipients=tuple(cfg.decision_request_metadata_only_recipients),
                                answer_marker=(agent.decision_wake or cfg.decision_wake) == "answer",
-                               decision_reuse_hours=cfg.decision_reuse_hours)
+                               decision_reuse_hours=cfg.decision_reuse_hours,
+                               identical_no_reopen=cfg.decision_identical_no_reopen)
         self.procs: dict[str, subprocess.Popen] = {}
         self.me: dict = {}
         self._last_beat: dict[str, float] = {}
@@ -1173,6 +1181,17 @@ class AgentRunner:
             log.info("%s: #%s decision wait to @%s sent back: the same question was already answered",
                      self.agent.name, a.task8, outcome.handle)
             return
+        proceed = self._default_proceeds(a, task, outcome)
+        if proceed:
+            # the asker stated its own default: it continues now, the addressee may object. Counted
+            # like a NEXT, so a session that keeps doing this still reaches the NEXT budget.
+            self.store.outcome(a, "next")
+            self.store.mark(self.agent.name, a.task_id, "cap_observation", "")
+            if self._over_budget(a, task):
+                return
+            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, proceed))
+            return
+        outcome = self._live_task_card_wait(a, task, outcome)
         # the wait is accepted from here on: only now may it retire a delivery receipt
         self._forget_spent_ci_delivery(a, outcome)
         recheck = self.store.mark(self.agent.name, a.task_id, "recheck_wake")
@@ -1217,7 +1236,7 @@ class AgentRunner:
                 "note": outcome.note}
         if queue_contract:
             wait.update(kind="queue", until="", queue_request=queue_wait.new_request(a.task_id, queue_contract))
-        for key in ("ci_change", "mr_state"):
+        for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from"):
             if outcome.extra.get(key):
                 wait[key] = outcome.extra[key]
         if outcome.kind == "merge":
@@ -1328,6 +1347,118 @@ class AgentRunner:
         self.emit("wait", a, wait=wait["kind"], target=wait.get("target") or wait.get("handle") or wait.get("until"))
         log.info("%s: #%s waits: %s %s", self.agent.name, a.task8, wait["kind"],
                  wait.get("target") or wait.get("handle") or wait.get("until"))
+
+    def _already_posted(self, a, body: str) -> bool:
+        """Whether this agent already left exactly ``body`` on the task. An unreadable thread is
+        False: posting once more is the lesser harm than dropping the note."""
+        try:
+            return any(c.get("author_id") == self.agent_id and (c.get("body") or "").strip() == body.strip()
+                       for c in self.mesh.comments(a.task_id))
+        except MeshError:
+            return False
+
+    def _ask_agent(self, task: dict, outcome: Outcome) -> dict | None:
+        """The workspace agent a ``decision:@handle`` wait addresses, when that is unambiguously
+        another agent (not a person, not the asker) and the task is under no human gate; else None.
+        An unreadable roster is None: the usual routing decides."""
+        if outcome.kind != "decision" or not outcome.handle or task.get("human_gate"):
+            return None
+        try:
+            matches = self._recipient_matches(outcome.handle)
+            addressee = self.effects._resolve_agent(outcome.handle, self.me)
+        except MeshError:
+            return None
+        only = next(iter(matches.values())) if len(matches) == 1 else {}
+        if (not addressee or only.get("kind") != "agent" or only.get("id") != addressee.get("id")
+                or addressee.get("id") in (None, self.agent_id)):
+            return None
+        return addressee
+
+    def _default_proceeds(self, a: Attempt, task: dict, outcome: Outcome) -> str:
+        """Wake text when a ``decision:@agent`` question carries the asker's own proposed default
+        (``DEFAULT_MARKER``) and no hard rule (asks.py) matches it: nothing needs to block on it.
+        The question is posted on this task, @-mentioning the addressee, which may object there;
+        no request is filed. '' = route the question as usual (hard, to a person, no marker, an
+        unreadable roster, or the comment could not be posted)."""
+        if not self.cfg.decision_default_proceeds or not DEFAULT_MARKER.search(outcome.note or ""):
+            return ""
+        verdict = asks.classify(outcome.note, task.get("labels"), self.cfg.hard_ask_patterns,
+                                self.cfg.hard_ask_labels)
+        if verdict.hard:
+            return ""
+        addressee = self._ask_agent(task, outcome)
+        if not addressee:
+            return ""
+        name = str(addressee.get("name") or outcome.handle)
+        note = outcome.note.strip()
+        asked = hashlib.sha1(f"{name.casefold()}\n{note}".encode()).hexdigest()[:12]
+        posted = ((self.store.mark(self.agent.name, a.task_id, "default_posted") or ("",))[0] or "").split(",")
+        body = f"[runner] Proceeding with the proposed default; @{name}, reply on this task to object:\n> {note}"
+        if asked not in posted and self._already_posted(a, body):
+            # Posted before a crash that lost the mark: record it, do not post it twice.
+            posted.append(asked)
+            self.store.mark(self.agent.name, a.task_id, "default_posted", ",".join(posted).strip(","))
+        if asked not in posted:
+            try:
+                # "[runner]": a runner note, so it files no mention request and wakes no wait
+                self.mesh.add_comment(a.task_id, body)
+            except MeshError as e:
+                log.warning("%s: #%s default ask to @%s: post: %s; asking as usual", self.agent.name, a.task8,
+                            name, e)
+                return ""
+            self.store.mark(self.agent.name, a.task_id, "default_posted", ",".join([*posted, asked]).strip(","))
+        self.store.event(a.id, "decision_default_proceeds", f"@{name}: {note[:300]}")
+        self.emit("decision_default_proceeds", a, handle=name)
+        log.info("%s: #%s decision wait to @%s carries a proposed default: no request, proceeding",
+                 self.agent.name, a.task8, name)
+        return (f"your question to @{name} states your own proposed default, so nothing has to wait for it: "
+                f"no request was filed, and the question was posted on this task for @{name} to object. "
+                "Proceed with your stated default now and end the turn with your real next outcome "
+                f"(the event you then wait on, ↻ NEXT, or the review/done status). An objection from @{name} "
+                "reaches you as an ordinary comment.")
+
+    def _live_task_card_wait(self, a: Attempt, task: dict, outcome: Outcome) -> Outcome:
+        """A ``decision:@agent`` question about a task that agent itself holds and is working on
+        (``#<8hex>`` or its uuid in the question; todo, in_progress or review) becomes a card wait on
+        that task. Such a question ("pass the handback from #x when ready", "tell me when #x's verdict
+        is in") can only be answered "not ready", and a request card starts a fresh session for the
+        addressee just to say so. The card wait wakes when the task closes or ships, or when the
+        addressee comments on it; nothing is posted to the addressee. Exactly one other task must be
+        named; anything else (none, several, someone else's, a closed one, unreadable) is unchanged."""
+        if not self.cfg.decision_live_task_card_wait:
+            return outcome
+        refs = []
+        for m in TASK_REF.finditer(outcome.note or ""):
+            ref = (m.group("uuid") or m.group("short")).casefold()
+            if ref[:8] != a.task8 and ref[:8] not in (r[:8] for r in refs):
+                refs.append(ref)
+        if len(refs) != 1:
+            return outcome
+        addressee = self._ask_agent(task, outcome)
+        if not addressee:
+            return outcome
+        ref = refs[0]
+        try:
+            target = self.mesh.task(ref) if len(ref) > 8 else self.mesh.task_by_short(ref)
+            target = target.get("task", target) if isinstance(target, dict) else {}
+            holder = target.get("assignee_id") or (target.get("assignee") or {}).get("id")
+            live = target.get("id") and self.cats.category(target) in ("todo", "in_progress", "review")
+        except MeshError as e:
+            log.info("%s: #%s decision wait names #%s, unreadable (%s): asked as usual", self.agent.name,
+                     a.task8, ref[:8], e.status)
+            return outcome
+        if not live or holder != addressee["id"] or target["id"] == a.task_id:
+            return outcome
+        name = str(addressee.get("name") or outcome.handle)
+        target8 = str(target["id"])[:8]
+        self.store.event(a.id, "decision_to_card_wait", f"@{name} #{target8}")
+        self.emit("decision_to_card_wait", a, handle=name, target=target8)
+        log.info("%s: #%s decision wait to @%s converted to card wait on #%s (its live task): no request filed",
+                 self.agent.name, a.task8, name, target8)
+        return Outcome("card", target8, note=f"asked @{name}, waits on its live task #{target8}: {outcome.note}",
+                       line=outcome.line,
+                       extra={"watch_comments_by": {"id": addressee["id"], "name": name},
+                              "converted_from": f"decision:@{name}"})
 
     def _time_wait_told(self, a: Attempt, task: dict, outcome: Outcome) -> str:
         """A time WAIT longer than ``time_wait_reason_after_minutes`` that gives no reason, or
@@ -4568,6 +4699,10 @@ class AgentRunner:
         self._last_recheck = time.monotonic()
         open_ids = {a.id for a in self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))}
         try:
+            self.pool.audit_admin()             # holds and logs free slots whose admin link went bad
+        except Exception as e:
+            log.warning("%s: worktree admin audit: %s", self.agent.name, e)
+        try:
             for path in self.pool.recheck_held(open_ids):
                 log.info("%s: worktree %s is clean again, returned to the pool", self.agent.name, path)
         except Exception as e:
@@ -4802,6 +4937,17 @@ class Runner:
         self.checkpoint_bytes: int | None = None     # None until the first measurement
         self._started = time.time()
         self._latest_lock = threading.Lock()
+        self._wake_gen = 0                 # bumped by a Mesh event: agent loops poll now, not at poll_seconds
+
+    def wake(self) -> None:
+        self._wake_gen += 1
+
+    def _sleep(self, stop: threading.Event, seconds: float, gen: int) -> None:
+        """Wait out the poll interval; a stop or a Mesh event (``wake``) ends it early."""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and self._wake_gen == gen:
+            if stop.wait(min(0.5, max(0.0, end - time.monotonic()))):
+                return
 
     def tick(self) -> list[dict]:
         out = []
@@ -4947,8 +5093,9 @@ class Runner:
         try:
             while not stop.is_set():
                 started = time.monotonic()
+                gen = self._wake_gen
                 self._tick_agent(ar)
-                stop.wait(max(1.0, self.cfg.poll_seconds - (time.monotonic() - started)))
+                self._sleep(stop, max(1.0, self.cfg.poll_seconds - (time.monotonic() - started)), gen)
         except BaseException as e:       # a dead loop must show at once, not as a stale healthy row
             log.critical("%s: agent loop died: %r", ar.agent.name, e)
             with self._latest_lock:
@@ -5012,6 +5159,32 @@ class Runner:
         threading.Thread(target=host.loop, args=(stop,), name="chat", daemon=True).start()
         log.info("chat serving %s", ", ".join(sorted(ids.values())))
 
+    def _start_extension(self, stop: threading.Event):
+        """The Mesh extension endpoint and the extension token's self-rotation (`[extension]`)."""
+        cfg = self.cfg
+        service = None
+        if cfg.extension_enabled:
+            from .extension_service import ExtensionService
+            service = ExtensionService(cfg.state_dir, self.wake, cfg.extension_workspace_id,
+                                       expected_secret=cfg.extension_secret,
+                                       trust_first_install=cfg.extension_trust_first_install, allow_rekey=cfg.extension_allow_rekey,
+                                       tolerance=cfg.extension_tolerance_seconds)
+            service.serve(cfg.extension_host, cfg.extension_port)
+            log.info("extension endpoint on %s:%s", cfg.extension_host, cfg.extension_port)
+        token = cfg.extension_token
+        if token is not None and token.file and cfg.extension_rotate_days > 0 and self.agents:
+            client = self.agents[0].mesh
+
+            def rotate_loop() -> None:
+                while not stop.wait(cfg.extension_rotate_days * 86400):
+                    try:
+                        token.rotate(client)
+                        log.info("extension token rotated")
+                    except (MeshError, RuntimeError, OSError) as e:
+                        log.warning("extension token rotation failed: %s", type(e).__name__)
+            threading.Thread(target=rotate_loop, name="extension-token", daemon=True).start()
+        return service
+
     def run_forever(self, stop: threading.Event | None = None) -> None:
         stop = stop or threading.Event()
         self._started = time.time()
@@ -5021,6 +5194,7 @@ class Runner:
             t.start()
         self._start_announce(stop)
         self._start_chat(stop)
+        service = self._start_extension(stop)
         try:
             while not stop.is_set():
                 self._prune_ignored_if_due()
@@ -5030,6 +5204,8 @@ class Runner:
             # let every agent finish its tick: a thread cut between spawn and the
             # store update would leave a session the next start does not know about
             stop.set()
+            if service:
+                service.shutdown()
             deadline = time.monotonic() + STOP_GRACE_SECONDS
             for t in threads:
                 t.join(timeout=max(0.1, deadline - time.monotonic()))

@@ -122,9 +122,15 @@ class ChatHost:
     def _name(self, agent_id: str) -> str:
         return self.by_id[agent_id]
 
+    def _own_windows(self) -> list[tuple[str, str]]:
+        """Windows of this runner's agents only: the tmux server is shared with other runners on
+        the host, whose card and chat windows are neither counted nor stopped here."""
+        own = {interactive.session_name(name) for name in self.runners}
+        return [(s, w) for s, w in self.tmux.all_windows() if s in own]
+
     def _card_sessions(self) -> int:
         try:
-            return sum(1 for _, w in self.tmux.all_windows() if not w.startswith(interactive.CHAT_PREFIX))
+            return sum(1 for _, w in self._own_windows() if not w.startswith(interactive.CHAT_PREFIX))
         except Exception:
             return 0
 
@@ -150,7 +156,7 @@ class ChatHost:
         """Chat windows that outlived a runner restart are not in the pool: stop them (the
         session stays resumable from its metadata), so the limits and idle rules hold."""
         try:
-            for session, window in self.tmux.all_windows():
+            for session, window in self._own_windows():
                 if window.startswith(interactive.CHAT_PREFIX):
                     self.tmux.kill_window(session, window)
         except Exception as e:

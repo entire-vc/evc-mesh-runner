@@ -56,7 +56,7 @@ class CompactRetryPause(unittest.TestCase):
         db.execute('CREATE TABLE workspace_checkpoints (owner, attempt, repo, phase, checkpoint)')
         db.execute("INSERT INTO workspace_checkpoints VALUES ('o', 1, 'r', 'verified', ?)", (str(path),))
         cps = SimpleNamespace(is_old_format=lambda p: True,
-                              compact=lambda p: (_ for _ in ()).throw(pool_ops.WorkspaceError('bundle base unavailable')))
+                              compact=lambda p, **kw: (_ for _ in ()).throw(pool_ops.WorkspaceError('bundle base unavailable')))
         return SimpleNamespace(owner='o', store=SimpleNamespace(db=db), repos={'r': SimpleNamespace(base='b')},
                                _checkpoints=lambda: cps)
 
@@ -64,7 +64,6 @@ class CompactRetryPause(unittest.TestCase):
         import contextlib
         import tempfile
         from pathlib import Path
-        pool_ops._compact_failed.clear()
         with tempfile.TemporaryDirectory() as tmp:
             pool = self._pool(Path(tmp))
             locks = []
@@ -76,11 +75,11 @@ class CompactRetryPause(unittest.TestCase):
             with patch.object(pool_ops, '_bounded_base_lock', lock):
                 first = pool_ops.compact_checkpoints(pool, apply=True)
                 second = pool_ops.compact_checkpoints(pool, apply=True)
-                pool_ops._compact_failed[str(tmp)] -= pool_ops._COMPACT_RETRY_AFTER + 1
+                pool.store.db.execute("UPDATE checkpoint_compact_failures SET failed_at = failed_at - ?",
+                                      (pool_ops._COMPACT_RETRY_AFTER + 1,))
                 third = pool_ops.compact_checkpoints(pool, apply=True)
         self.assertEqual((first['errors'], second['errors'], third['errors']), (1, 0, 1))
         self.assertEqual(len(locks), 2)
-        pool_ops._compact_failed.clear()
 
 
 if __name__ == '__main__':
