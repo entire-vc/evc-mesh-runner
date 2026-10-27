@@ -36,11 +36,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .store import Store, iso
+from .store import OPEN, Store, iso
 
 log = logging.getLogger("mesh_runner")
 
-_BASE_LOCKS: dict[str, threading.RLock] = {}
+_BASE_LOCKS: dict[str, "TimedLock"] = {}
 _BASE_LOCKS_GUARD = threading.Lock()
 
 
@@ -57,7 +57,7 @@ DIRTY_HOLD_NOTE = "uncommitted changes"        # the hold reason archive_and_fre
 ARCHIVE_REF_PREFIX = "refs/mesh-runner/archive"  # outside refs/heads and refs/tags: no default push or fetch rule names it
 
 
-def base_lock(base: Path, *, timeout: float = 600) -> threading.RLock:
+def base_lock(base: Path, *, timeout: float = 600) -> "TimedLock":
     """One lock per repository for this process. Agents tick in parallel threads and
     two of them may pool the same repository — through one clone, or through two
     linked worktrees of it: git takes no retry on its config and ref locks, so
@@ -75,7 +75,7 @@ def base_lock(base: Path, *, timeout: float = 600) -> threading.RLock:
         except WorkspaceError:
             key = path
     with _BASE_LOCKS_GUARD:
-        return _BASE_LOCKS.setdefault(key, threading.RLock())
+        return _BASE_LOCKS.setdefault(key, TimedLock(f"base:{os.path.basename(key)}"))
 
 
 SCHEMA = """
@@ -96,6 +96,54 @@ class WorkspaceError(Exception):
 
 class InventoryError(WorkspaceError):
     """The attempt's repository inventory cannot be proven; only a config/journal change heals it."""
+
+
+class BranchInUse(WorkspaceError):
+    """A checkpoint's branch is checked out in another worktree of the same base repository.
+
+    ``live`` is True when a runner slot leased by a live attempt holds it: the restore must wait for
+    that attempt (``holder_attempt``) to end or release the slot. It is not a failure of the restore.
+    When False the holder is a stale slot that could not be cleared (uncommitted changes)."""
+
+    def __init__(self, message: str, *, branch: str, holder_attempt: str = "", holder_path: str = "",
+                 live: bool = True):
+        super().__init__(message)
+        self.branch, self.holder_attempt, self.holder_path, self.live = branch, holder_attempt, holder_path, live
+
+
+class TimedLock:
+    """A reentrant lock whose `with` form gives up instead of waiting forever. A slot stuck in
+    filesystem IO (an unanswered access prompt, a hung mount) holds the lock for every other
+    lane sharing the repository; a bounded wait turns that into a WorkspaceError for the one
+    waiter, with the holder named, instead of a frozen tick."""
+
+    def __init__(self, name: str, timeout: float = 900.0):
+        self._lock = threading.RLock()
+        self._name = name
+        self._timeout = float(os.environ.get('MESH_RUNNER_LOCK_TIMEOUT', timeout))
+        self._holder = ''
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        ok = self._lock.acquire(blocking, timeout)
+        if ok:
+            self._holder = threading.current_thread().name
+        return ok
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def _is_owned(self) -> bool:
+        return self._lock._is_owned()
+
+    def __enter__(self):
+        if not self._lock.acquire(timeout=self._timeout):
+            raise WorkspaceError(f"lock {self._name} not acquired in {self._timeout:.0f}s; "
+                                 f"last holder: {self._holder or 'unknown'}")
+        self._holder = threading.current_thread().name
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._lock.release()
 
 
 @dataclass(frozen=True)
@@ -552,6 +600,95 @@ class WorkspacePool:
             "SELECT * FROM workspace_checkpoints WHERE owner=? AND attempt=? ORDER BY repo",
             (self.owner, attempt_id))]
 
+    # -- branch ownership ----------------------------------------------------------------
+    def _worktree_branches(self, repo: RepoSpec) -> list[tuple[Path, str]]:
+        """(path, full branch ref) of every worktree of the base repository that has a branch checked out."""
+        out = git(repo.base, "worktree", "list", "--porcelain", env=self.env)   # fails closed: ownership unknown
+        found, path = [], None
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                path = Path(line[len("worktree "):])
+            elif line.startswith("branch ") and path is not None:
+                found.append((path, line[len("branch "):].strip()))
+        return found
+
+    def _attempt_live(self, attempt_id: str, state: str) -> bool:
+        """The attempt holding a slot is still alive. An attempt the store does not know, holding a
+        leased slot, counts as live: a checkout is never taken from an owner that cannot be disproved."""
+        a = self.store.get(attempt_id) if attempt_id else None
+        if a is not None:
+            return a.state in OPEN
+        return state == "leased"
+
+    def attempt_holds_slot(self, attempt_id: str, path: str = "") -> bool:
+        """The live attempt still has a leased or held slot (at ``path`` when given)."""
+        q, args = "SELECT state FROM slots WHERE attempt=? AND state IN ('leased','held')", [attempt_id]
+        if path:
+            q, args = q + " AND path=?", args + [path]
+        row = self.store.db.execute(q, args).fetchone()
+        return bool(row) and self._attempt_live(attempt_id, row["state"])
+
+    def _settle_branch(self, attempt_id: str, repo: RepoSpec, branch: str, target: Path | None) -> None:
+        """Make ``branch`` free to check out for ``attempt_id`` or raise why it is not.
+
+        Held by a slot of a live attempt: BranchInUse (wait, no failure). Held by a runner slot nobody
+        lives in: detached when clean, kept held (BranchInUse, not live) when it carries uncommitted
+        changes. Held by anything else: logged, git decides as before. Caller holds the base lock."""
+        name = branch[len("refs/heads/"):]
+        slots = {os.path.realpath(r["path"]): dict(r) for r in self.store.db.execute("SELECT * FROM slots")}
+        skip = os.path.realpath(target) if target else None
+        for path, ref in self._worktree_branches(repo):
+            real = os.path.realpath(path)
+            if ref != branch or real == skip:
+                continue
+            row = slots.get(real)
+            if row is None:
+                log.warning("%s: branch %s is checked out in %s, which is not a runner slot; "
+                            "restore for attempt %s goes on and git may refuse", self.owner, name, path,
+                            attempt_id[:8])
+                continue
+            if row["attempt"] == attempt_id and row["state"] == "leased":
+                continue                                  # the attempt's own lease: not a conflict
+            slot_name = Path(row["path"]).name
+            holder = self.store.get(row["attempt"]) if row["attempt"] else None
+            who = holder.task8 if holder else (row["attempt"][:8] or "unknown")
+            if row["state"] in ("leased", "held") and self._attempt_live(row["attempt"], row["state"]):
+                raise BranchInUse(f"branch {name} in use by #{who} ({slot_name})", branch=name,
+                                  holder_attempt=row["attempt"], holder_path=row["path"])
+            holder_repo = self.repos.get(row["pool"].split("/", 1)[1], repo)
+            reason = self.unsafe_reason(Path(row["path"]), holder_repo)
+            if reason:
+                if row["state"] != "held":
+                    self._set(Path(row["path"]), holder_repo.name, "held", row["attempt"],
+                              f"branch {name} checked out: {reason}")
+                log.warning("%s: branch %s is checked out in stale slot %s (%s); slot held for inspection",
+                            self.owner, name, row["path"], reason)
+                raise BranchInUse(f"branch {name} checked out in {slot_name} ({reason}); slot held",
+                                  branch=name, holder_path=row["path"], live=False)
+            git(Path(row["path"]), "checkout", "--quiet", "--detach", env=self.env)
+            log.info("%s: detached stale slot %s (state %s) to free branch %s for attempt %s",
+                     self.owner, row["path"], row["state"], name, attempt_id[:8])
+
+    def _settle_row(self, attempt_id: str, row: dict, checkpoints) -> None:
+        """Settle the branch one journal row will restore. Caller holds the base lock."""
+        if row["phase"] not in ("released", "restoring"):
+            return
+        try:
+            branch = checkpoints.read(Path(row["checkpoint"])).get("branch")
+        except WorkspaceError:
+            return                                        # restore itself reports an unreadable snapshot
+        if isinstance(branch, str) and branch.startswith("refs/heads/"):
+            self._settle_branch(attempt_id, self.repos[row["repo"]], branch,
+                                Path(row["target"]) if row["target"] else None)
+
+    def _settle_branches(self, attempt_id: str, rows: list[dict], checkpoints) -> None:
+        """Before any lease or replay of any repository: every branch to restore must be free, so a
+        multi-repo restore does not stop half way. restore() settles each row again under the lock it
+        leases and replays with: nothing can take the branch between that check and the checkout."""
+        for row in rows:
+            with base_lock(self.repos[row["repo"]].base):
+                self._settle_row(attempt_id, row, checkpoints)
+
     def restore(self, attempt_id: str, *, expected_repos: set[str] | None = None) -> tuple[list[str], list[dict]]:
         """Fresh leases; failed replay retains its lease and cannot admit a writer."""
         checkpoints = self._checkpoints()
@@ -562,11 +699,13 @@ class WorkspacePool:
                   if r["attempt"] == attempt_id and r["state"] == "leased"}
         if leased - known or (expected_repos is not None and known != expected_repos):
             raise WorkspaceError("checkpoint: incomplete repository inventory; leases retained")
+        self._settle_branches(attempt_id, rows, checkpoints)
         for row in rows:
             if row["phase"] not in ("released", "restoring", "restored"):
                 raise WorkspaceError("checkpoint: suspension incomplete; lease retained")
             repo = self.repos[row["repo"]]
             with base_lock(repo.base):
+                self._settle_row(attempt_id, row, checkpoints)      # same lock as the lease and the checkout
                 # Restart recovery may already own a target lease, bypassing lease()'s
                 # admission guard. Check before changing the journal or replaying bytes.
                 # A completed restore is read-only and remains safe to re-enter.
@@ -760,6 +899,12 @@ class WorkspacePool:
     def leased_to(self, attempt_id: str) -> list[str]:
         return [r[0] for r in self.store.db.execute(
             "SELECT path FROM slots WHERE attempt=? AND state IN ('leased','held')", (attempt_id,))]
+
+    def leased_path(self, attempt_id: str) -> Path | None:
+        """The slot ``attempt_id`` holds in the leased state (a held one is no longer its to use)."""
+        row = self.store.db.execute(
+            "SELECT path FROM slots WHERE attempt=? AND state='leased' ORDER BY path", (attempt_id,)).fetchone()
+        return Path(row[0]) if row else None
 
     def rows(self) -> list[dict]:
         return [dict(r) for r in self.store.db.execute(

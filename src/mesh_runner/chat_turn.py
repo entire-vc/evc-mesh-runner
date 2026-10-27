@@ -65,6 +65,7 @@ class ChatTurnRunner:
             on_end: Callable[[], None] | None = None) -> TurnOutcome:
         """``external_cancel``: the claim loop saw a ``cancel_turn`` command for this turn."""
         tid, tok = turn["turn_id"], turn["claim_token"]
+        t_run = self.clock()
         try:
             started = self._start(turn)
         except ChatError as e:
@@ -76,19 +77,30 @@ class ChatTurnRunner:
             except ChatError:
                 pass
             return TurnOutcome("released", "start not accepted")
+        t_started = self.clock()
         try:
-            return self._run_started(turn, started, external_cancel, on_started)
+            return self._run_started(turn, started, external_cancel, on_started, t_run, t_started)
         finally:
             if on_end:
                 on_end()
 
-    def _run_started(self, turn, started, external_cancel, on_started) -> TurnOutcome:
+    def _run_started(self, turn, started, external_cancel, on_started, t_run=None, t_started=None) -> TurnOutcome:
         tid, tok = turn["turn_id"], turn["claim_token"]
         state = {"cancel": bool(started.get("cancel_requested")), "dropped": False, "terminal": "", "broken": ""}
         seq = int(started.get("last_seq") or 0)
         # renew at a third of the lease; a silent turn also learns about Stop from the lease answer
         lease_every = max(1.0, min(5.0, float(turn.get("lease_seconds") or 60) / 3))
+        first: list[int] = []
+
+        def note_first() -> None:
+            # where a cold turn's seconds go: Mesh start call vs. session until the first event (an error counts)
+            if t_run is not None and not first:
+                first.append(1)
+                log.info("chat turn %s timing: start_call=%.1f first_event=%.1f", tid[:8],
+                         t_started - t_run, self.clock() - t_started)
+
         if state["cancel"]:
+            note_first()                                # cancelled at start: the line still exists, first_event ~0
             return self._send_cancelled(tid, tok, seq + 1)
         if on_started:
             try:
@@ -101,13 +113,16 @@ class ChatTurnRunner:
         def produce() -> None:
             try:
                 for ev in self.delivery.run(turn, lambda: state["cancel"] or state["dropped"] or external_cancel()):
+                    note_first()
                     feed.put(ev)
             except Exception as e:                      # never leave a turn without a terminal event
                 # a refusal with a stable code (e.g. headless_forbidden) keeps it; messages stay user-safe
                 code = getattr(e, "code", "") or "delivery_failed"
+                note_first()
                 feed.put({"type": "error", "code": code, "retryable": False,
                           "message": (str(e) if hasattr(e, "code") else type(e).__name__)[:120]})
             finally:
+                note_first()                            # a delivery that ended with no event at all still gets its line
                 feed.put(None)
         worker = threading.Thread(target=produce, daemon=True, name=f"chat-turn-{tid[:8]}")
         worker.start()

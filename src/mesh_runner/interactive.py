@@ -163,6 +163,19 @@ class Tmux:
                 out.append((s, w))
         return out
 
+    def windows_strict(self) -> list[tuple[str, str]] | None:
+        """``all_windows`` that tells a failed listing (None) from an empty one: tmux answered, or says there is
+        no server (so no windows). A failed ``list-windows`` must not read as "no window is alive"."""
+        res = self.run("list-windows", "-a", "-F", "#{session_name}\t#{window_name}")
+        if res.returncode != 0:
+            # only "there is no server" is an empty list; a socket that exists but cannot be used (permission,
+            # refused) is an unreadable one
+            gone = "no server running" in res.stderr or (
+                "error connecting to" in res.stderr and "No such file or directory" in res.stderr)
+            return [] if gone else None
+        return [(s, w) for line in res.stdout.splitlines()
+                for s, _, w in [line.partition("\t")] if s.startswith(SESSION_PREFIX) and w]
+
     def kill_window(self, session: str, window: str) -> None:
         self.run("kill-window", "-t", f"={session}:={window}")
 
@@ -238,9 +251,24 @@ class InteractiveAdapter(Adapter):
         head, tail = self._split(argv)
         return head + self.base.with_read_only(tail)
 
+    def with_slot_confined(self, argv: list[str]) -> list[str]:
+        head, tail = self._split(argv)
+        return head + self.base.with_slot_confined(tail)
+
     def with_effort(self, argv: list[str], effort: str) -> list[str]:
         head, tail = self._split(argv)
         return head + self.base.with_effort(tail, effort)
+
+    def without_local_memory(self, env: dict) -> dict:
+        return self.base.without_local_memory(env)
+
+    def with_instructions(self, argv: list[str], text: str) -> list[str]:
+        head, tail = self._split(argv)
+        return head + self.base.with_instructions(tail, text)
+
+    def with_mcp(self, argv: list[str], name: str, command: list[str], env: dict) -> list[str]:
+        head, tail = self._split(argv)
+        return head + self.base.with_mcp(tail, name, command, env)
 
     def prepare_resume(self, session_id: str, cwd: Path, env: dict) -> str:
         return self.base.prepare_resume(session_id, cwd, env)

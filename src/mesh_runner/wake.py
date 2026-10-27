@@ -16,6 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from .mesh import MeshClient, MeshError
+from .outcome import declaration_lines
 from .selection import CLOSED, StatusCategories, _read_elsewhere, parse_time, satisfied
 
 log = logging.getLogger("mesh_runner")
@@ -281,6 +282,23 @@ def foreign_comments(comments: list[dict], agent_id: str, since: dt.datetime) ->
         if is_foreign(c, agent_id):
             out.append(c)
     return out[::-1]
+
+
+def own_next_after(comments: list[dict], agent_id: str, since: dt.datetime) -> dict | None:
+    """The agent's own newest declaring comment after ``since`` when it ends in ``↻ NEXT``: a later
+    word than the wait it sits on. None when the newest declaration is a WAIT or an ask."""
+    for c in reversed(comments):
+        at = parse_time(c.get("created_at"))
+        if at is None or at <= since:
+            break
+        author = c.get("author_id") or (c.get("author") or {}).get("id")
+        body = c.get("body") or ""
+        if author != agent_id or body.startswith("[runner"):
+            continue
+        lines = declaration_lines(body)
+        if lines:
+            return c if re.match(r"^\s*↻\s*NEXT", lines[-1]) else None
+    return None
 
 
 def foreign_comment(comments: list[dict], agent_id: str, since: dt.datetime) -> dict | None:
@@ -838,6 +856,12 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
         return str(wait["settled"])          # the awaited result was final when the wait began
     since = parse_time(wait.get("since")) or now
     kind = wait.get("kind")
+    if kind in ("time", "card", "decision", "pipeline", "mr") and (c := own_next_after(comments, agent_id, since)):
+        # (a blocking ask is left out on purpose: a person's gate is lifted by the person, not by a NEXT)
+        # the agent's newest word after the wait was declared is "continue now": the old WAIT line
+        # (and its until) no longer stands
+        wait["met"] = True
+        return f"you declared ↻ NEXT after this wait ({(c.get('created_at') or '')[:16]}): the wait is superseded"
     foreign = foreign_comments(comments, agent_id, since)
     if comment_wake == "addressed":
         foreign = [x for x in foreign if wakes_on_comment(x, wait, agent_name, comment_wake_always_from)]

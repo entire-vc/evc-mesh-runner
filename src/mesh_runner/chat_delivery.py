@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -29,9 +30,23 @@ def window_key(thread_id: str) -> str:
     return CHAT_PREFIX + "".join(c for c in thread_id if c.isalnum())[:12]
 
 
+def _no_reply(why: str) -> dict:
+    """A turn that ended without any text: the user would get an empty answer marked done."""
+    msg = "the agent ended the turn without a reply" + (f" ({why})" if why else "")
+    return {"type": "error", "code": "empty_reply", "retryable": False, "message": msg[:200]}
+
+
+def _tool_status(cid, name) -> Iterator[dict]:
+    """One tool call as a started/finished pair: a short label, never the input or the output."""
+    label = ("Using " + str(name or "a tool"))[:LABEL_MAX]
+    for status in ("started", "finished"):
+        yield {"type": "tool_status", "tool_call_id": str(cid), "label": label, "status": status}
+
+
 def translate(lines: Iterable[dict], harness: str) -> Iterator[dict]:
-    """Driver output events → protocol events (no ``seq``). Always ends with final or error."""
-    sid, ended, calls = "", False, 0
+    """Driver output events → protocol events (no ``seq``). Always ends with final or error;
+    a turn that delivered no text ends with an ``empty_reply`` error."""
+    sid, ended, calls, texted = "", False, 0, False
     for ev in lines:
         t = ev.get("type")
         if t == "system" and ev.get("subtype") == "init" and ev.get("session_id"):
@@ -45,16 +60,18 @@ def translate(lines: Iterable[dict], harness: str) -> Iterator[dict]:
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text" and b.get("text"):
+                    texted = True
                     yield {"type": "text_delta", "text": b["text"]}
                 elif b.get("type") == "tool_use":
                     calls += 1
-                    cid = str(b.get("id") or f"t{calls}")
-                    label = ("Using " + str(b.get("name") or "a tool"))[:LABEL_MAX]
-                    yield {"type": "tool_status", "tool_call_id": cid, "label": label, "status": "started"}
-                    yield {"type": "tool_status", "tool_call_id": cid, "label": label, "status": "finished"}
+                    yield from _tool_status(b.get("id") or f"t{calls}", b.get("name"))
+        elif t == "item.completed" and (ev.get("item") or {}).get("type") == "tool_call":
+            calls += 1
+            yield from _tool_status(ev["item"].get("id") or f"t{calls}", ev["item"].get("name"))
         elif t == "item.completed" and (ev.get("item") or {}).get("type") == "agent_message":
             text = ev["item"].get("text") or ""
             if text:
+                texted = True
                 yield {"type": "text_delta", "text": text}
         elif t == "result":
             u = ev.get("usage") or {}
@@ -65,6 +82,8 @@ def translate(lines: Iterable[dict], harness: str) -> Iterator[dict]:
             if ev.get("is_error"):
                 yield {"type": "error", "code": "harness_error", "retryable": False,
                        "message": str(ev.get("result") or "turn failed")[:200]}
+            elif not texted:
+                yield _no_reply("")
             else:
                 yield {"type": "final", "stop_reason": "end_turn"}
             return
@@ -73,7 +92,7 @@ def translate(lines: Iterable[dict], harness: str) -> Iterator[dict]:
             yield {"type": "usage", "tokens_in": int(u.get("input_tokens") or 0),
                    "tokens_out": int(u.get("output_tokens") or 0)}
             ended = True
-            yield {"type": "final", "stop_reason": "end_turn"}
+            yield {"type": "final", "stop_reason": "end_turn"} if texted else _no_reply(str(ev.get("no_reply") or ""))
             return
         elif t == "turn.failed":
             ended = True
@@ -109,7 +128,12 @@ class DriverDelivery:
         self.poll, self.term_wait = poll, term_wait
 
     def run(self, turn: dict, cancelled: Callable[[], bool]) -> Iterator[dict]:
-        argv, cwd, env, prompt, *rest = self.plan(turn)
+        t_plan = time.monotonic()
+        try:
+            argv, cwd, env, prompt, *rest = self.plan(turn)
+        finally:                                          # a slow or failing plan is the one worth seeing
+            logging.getLogger(__name__).info("chat turn %s plan=%.1f", str(turn.get("turn_id"))[:8],
+                                             time.monotonic() - t_plan)
         harness = rest[0] if rest else self.harness       # a plan may name the harness it routed to
         # one directory per chat: deleting the chat removes whatever a crash left in it
         logs = self.log_dir / window_key(str(turn.get("thread_id") or "none"))
@@ -130,13 +154,19 @@ class DriverDelivery:
             except OSError:
                 pass
 
-    @staticmethod
-    def _log_timing(errlog: Path) -> None:
-        """The driver's ``timing:`` line (seconds per phase) goes to the runner log; nothing else of its stderr."""
+    # the driver's report lines that carry no session text: per-phase seconds, how the session was
+    # started, why a turn ended without a reply. Other ``interactive:`` lines can quote the pane.
+    _DRIVER_REPORT = re.compile(r"timing: |interactive: (reuse$|start$|restart: |codex ended the turn with no "
+                                r"final message |\w+ exited during start-up, starting again )")
+
+    @classmethod
+    def _log_driver(cls, errlog: Path) -> None:
+        """The driver's report lines go to the runner log; nothing else of its stderr, which may carry
+        harness output or the screen."""
         try:
             for line in errlog.read_text(errors="replace").splitlines():
-                if line.startswith("timing: "):
-                    log.info("chat turn %s", line[:200])
+                if cls._DRIVER_REPORT.match(line):
+                    log.info("chat turn %s", line[:300])
         except OSError:
             pass
 
@@ -149,26 +179,65 @@ class DriverDelivery:
             proc.stdin.close()
         except BrokenPipeError:
             pass
-        interrupted = False
-        while proc.poll() is None:
-            if cancelled() and not interrupted:
-                interrupted = True
-                os.killpg(proc.pid, signal.SIGTERM)       # the driver presses Escape; the window stays
-                deadline = time.monotonic() + self.term_wait
-                while proc.poll() is None and time.monotonic() < deadline:
-                    time.sleep(self.poll)
-                if proc.poll() is None:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                break
-            time.sleep(self.poll)
-        proc.wait()
-        self._log_timing(errlog)
-        events = read_log(log)
-        if interrupted:
+        state = {"interrupted": False}
+
+        def interrupt() -> None:
+            state["interrupted"] = True
+            os.killpg(proc.pid, signal.SIGTERM)           # the driver presses Escape; the window stays
+            deadline = time.monotonic() + self.term_wait
+            while proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(self.poll)
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+
+        def follow() -> Iterator[dict]:
+            """The driver's events as it writes them (it streams reply blocks during the turn)."""
+            rest = b""
+            with open(log, "rb") as fh:
+                while True:
+                    running = proc.poll() is None
+                    if running and not state["interrupted"] and cancelled():
+                        interrupt()
+                        running = False
+                    chunk = fh.read()
+                    if chunk:
+                        *lines, rest = (rest + chunk).split(b"\n")
+                        for raw in lines:
+                            try:
+                                yield json.loads(raw)
+                            except ValueError:
+                                continue
+                    elif not running:
+                        break
+                    else:
+                        time.sleep(self.poll)
+            if rest.strip():
+                try:
+                    yield json.loads(rest)
+                except ValueError:
+                    pass
+
+        def finish() -> None:
+            # the turn is reported over only once the driver has exited: until then it still owns
+            # the window (its meta, busy marker), and the next turn of the chat must not take it
+            while proc.poll() is None:
+                if not state["interrupted"] and cancelled():
+                    interrupt()
+                time.sleep(self.poll)
+            proc.wait()
+            self._log_driver(errlog)
+
+        events = follow()
+        try:
             for ev in translate(events, harness):
                 if ev["type"] in ("final", "error"):
-                    break
+                    if state["interrupted"]:
+                        break
+                    finish()
+                    yield ev
+                    return
                 yield ev
-            yield {"type": "final", "stop_reason": "cancelled"}
-            return
-        yield from translate(events, harness)
+        finally:
+            events.close()
+        finish()
+        yield {"type": "final", "stop_reason": "cancelled"}

@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -151,7 +152,9 @@ class BlockingPathTests(unittest.TestCase):
         nodes = [node(n) for n in range(2,10)]
         mesh = Reads(nodes, {t['id']:[edge(nodes[i+1])] for i,t in enumerate(nodes[:-1])}, clock)
         with mock.patch('mesh_runner.blocking_path.time.monotonic', side_effect=lambda:clock[0]):
-            result = self.resolver(mesh).resolve(self.a, Budget())
+            budget = Budget()
+            budget.deadline = 13.0          # 3 s from the fake clock start
+            result = self.resolver(mesh).resolve(self.a, budget)
         self.assertIn('UNKNOWN', result)
         self.assertEqual(len(mesh.calls), 4)
         timeouts = [v for _,v in mesh.calls]
@@ -272,6 +275,55 @@ class BlockingPathTests(unittest.TestCase):
         self.assertIn('node cut',self.resolver(mesh).resolve(self.a,budget))
         self.assertEqual(budget.nodes,8)
         self.assertLessEqual(len(mesh.calls),12)
+
+    def test_each_waiting_card_gets_its_own_budget_and_names_the_addressee(self):
+        # Live shape: 2-node chain, GETs slow enough that one shared 3 s budget
+        # serves one card and starves the next (UNKNOWN (deadline)).
+        clock = [0.0]
+        waits = []
+        for n in (10, 12):
+            waits.append((node(n), node(n + 1, assignee_name='Bill')))
+        mesh = Reads([t for pair in waits for t in pair],
+                     {m['id']: [edge(e)] for m, e in waits})
+        attempts = []
+        for i, (mid, _) in enumerate(waits):
+            att = self.store.create('lane', task(20 + i)['id'], 'codex')
+            self.store.update(att, state='waiting', wait={'kind': 'card', 'target': mid['id'][:8]})
+            attempts.append(att)
+        fx = Effects(mesh, None, 'lane', store=self.store)
+        real = time.monotonic
+        orig = mesh.bounded_get
+
+        def slow(path, *, timeout):
+            clock[0] += 1.0          # 4 GETs x 1 s per card: over the old 3 s
+            return orig(path, timeout=timeout)
+        mesh.bounded_get = slow
+        with mock.patch('mesh_runner.blocking_path.time.monotonic', lambda: real() + clock[0]):
+            fx.publish(attempts)
+        for att in attempts:
+            reason = mesh.runtime[att.task_id]['reason']
+            self.assertNotIn('UNKNOWN', reason)
+            self.assertIn('addressee=Bill', reason)
+
+    def test_tick_cap_bounds_the_budget_of_a_card_started_near_the_deadline(self):
+        mesh = Reads([self.b])
+        self.store.update(self.a, state='waiting', wait={'kind': 'card', 'target': self.b['id'][:8]})
+        fx = Effects(mesh, None, 'lane', store=self.store)
+        seen = []
+        fx._blocking_path.resolve = lambda att, budget: seen.append(budget.deadline) or 'r'
+        with mock.patch('mesh_runner.effects.DIAGNOSTIC_TICK_SECONDS', 2.0):
+            start = time.monotonic()
+            fx.publish([self.a])
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(seen[0], start + 2.0 + 0.5)   # tick cap, not the 8 s card budget
+
+    def test_gated_end_of_chain_addressee_stays_unknown(self):
+        end = node(3, assignee_name='Bill')
+        end.update(human_gate=True, human_gate_info={'owner_agent_id': 'asker'})
+        mesh = Reads([self.b, end], {self.b['id']: [edge(end)]})
+        reason = self.resolver(mesh).resolve(self.a, Budget())
+        self.assertIn('addressee=unknown', reason)
+        self.assertNotIn('Bill', reason)
 
     def test_only_card_waits_get_diagnostics_no_normal_get_fallback(self):
         mesh = Reads([self.b])

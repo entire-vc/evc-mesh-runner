@@ -20,6 +20,10 @@ from .chat_turn import ChatTurnRunner, Delivery
 
 log = logging.getLogger("mesh_runner")
 
+# a turn waits this long for its session token; a slower Mesh answer (the 30 s timeout of 26.10, ec202e35) lands later
+TOKEN_FIRST_WAIT = 2.0
+ORDERS_EVERY = 20.0          # seconds between order fetches while claims come back idle
+
 
 class ChatService:
     def __init__(self, client: ChatClient, agents: list[str], pool: ChatPool,
@@ -37,6 +41,7 @@ class ChatService:
         self.running_on: dict[str, tuple[str, str]] = {}      # turn id -> (agent, thread)
         self.lock = threading.Lock()
         self.outcomes: list[tuple[str, str]] = []
+        self._next_orders = 0.0                  # idle rounds fetch orders no more often than ORDERS_EVERY
         self.hold_until = 0.0                    # no claiming until then (a pool refusal must not spin)
 
     def free_slots(self) -> int:
@@ -51,12 +56,19 @@ class ChatService:
             for cmd in self.client.commands(self.agents):
                 self._command(cmd)
             return 0
+        t0 = time.monotonic()
         res = self.client.claim(self.agents, timeout=timeout, max_turns=min(5, free))
+        if res:   # an idle long-poll is not logged; a turn that returned after ~5 s woke on the poll tick, not the hint
+            log.info("chat claim: returned in %.1fs, %d turn(s), %d command(s)", time.monotonic() - t0,
+                     len(res.get("turns") or []), len(res.get("commands") or []))
         if not res:
             # an idle claim carries no orders (a chat switched off in the project answers 204 for good):
-            # stop/delete orders of deleted chats are fetched here, or their transcripts stay on disk
-            for cmd in self.client.commands(self.agents):
-                self._command(cmd)
+            # stop/delete orders of deleted chats are fetched here, or their transcripts stay on disk.
+            # The poll is short, so the fetch is paced separately instead of riding every round.
+            if time.monotonic() >= self._next_orders:
+                self._next_orders = time.monotonic() + ORDERS_EVERY
+                for cmd in self.client.commands(self.agents):
+                    self._command(cmd)
             return 0
         for cmd in res.get("commands") or []:
             self._command(cmd)
@@ -145,15 +157,17 @@ class ChatService:
             if path is not None:
                 k = TokenKeeper(self.client, turn, path, int(started.get("execution_epoch") or
                                                             turn.get("execution_epoch") or 0))
-                k.start()
+                k.start(first_wait=TOKEN_FIRST_WAIT)
                 keeper.append(k)
+        t0 = time.monotonic()
         try:
             out = ChatTurnRunner(self.client, self.delivery_for(agent)).run(
                 turn, external_cancel=lambda: tid in self.cancel, on_started=on_started,
                 on_end=lambda: [k.stop() for k in keeper])
             self.outcomes.append((tid, out.state))
-            if out.state in ("failed", "dropped", "released"):
-                log.warning("chat turn %s %s: %s", tid[:8], out.state, out.detail or "-")
+            # every turn's end is in the log: a Stop or an empty reply is otherwise invisible here
+            log.log(logging.WARNING if out.state in ("failed", "dropped", "released") else logging.INFO,
+                    "chat turn %s %s: %s (%.1fs)", tid[:8], out.state, out.detail or "-", time.monotonic() - t0)
             stuck = out.detail == "delivery_stuck"
             if out.state in ("failed", "dropped", "released"):
                 # a session that did not finish its turn cleanly is not trusted warm
@@ -172,9 +186,14 @@ class ChatService:
             self.cancel.discard(tid)
 
     def reap_idle(self) -> list[str]:
-        """Stop sessions idle past the limit (the process count falls to zero)."""
+        """Stop sessions idle past the limit (the process count falls to zero).
+
+        The pool is shared by every served agent's service: this one stops only its own agents'
+        sessions, the others' are left to their service (their windows are not known here)."""
         stopped = []
         for s in self.pool.expired():
+            if s.agent not in self.agents:
+                continue
             self.pool.release(s.agent, s.thread)
             self.stop_session(s.agent, s.thread)
             stopped.append(s.thread)

@@ -1094,6 +1094,26 @@ class AdapterAndConfig(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load(path)
 
+    def test_load_gate_knobs_default_on_and_can_be_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "k"
+            key.write_text("x")
+            key.chmod(0o600)
+            base = (f'[runner]\nmesh_url = "http://m"\nstate_dir = "{tmp}"\n{{runner}}'
+                    f'[[agents]]\nname = "a"\nkey_file = "{key}"\nprofile_dir = "{tmp}"\n')
+            path = Path(tmp) / "r.toml"
+            path.write_text(base.format(runner=""))
+            cfg = load(path)
+            self.assertEqual((cfg.load_hold_per_cpu, cfg.load_release_per_cpu), (4.0, 0.0))
+            path.write_text(base.format(runner="load_hold_per_cpu = 2.5\nload_release_per_cpu = 1.5\n"))
+            cfg = load(path)
+            self.assertEqual((cfg.load_hold_per_cpu, cfg.load_release_per_cpu), (2.5, 1.5))
+            path.write_text(base.format(runner="load_hold_per_cpu = 0\n"))
+            self.assertEqual(load(path).load_hold_per_cpu, 0.0)
+            path.write_text(base.format(runner="load_hold_per_cpu = -1\n"))
+            with self.assertRaises(ConfigError):
+                load(path)
+
 
 if __name__ == "__main__":
     unittest.main()

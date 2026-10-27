@@ -147,11 +147,28 @@ def _task_via_others(mesh: MeshClient, task_id: str) -> dict | None:
     return _read_elsewhere(f"t:{task_id}", mesh, lambda r: r.mesh.task(task_id))
 
 
-def satisfied(cats: StatusCategories, blocker: dict) -> bool:
-    """A blocker no longer blocks when it is closed, or when what it delivers has
-    shipped (Mesh's is_shipped: merged and deployed) while its card still waits
-    for acceptance or a closing comment. Dependants wait for the condition, not for
-    the bookkeeping."""
+# Edge conditions whose False verdict is authoritative (see satisfied).
+TYPED_CONDITIONS = frozenset({"shipped", "deployed", "accepted"})
+
+
+def satisfied(cats: StatusCategories, blocker: dict, edge: dict | None = None) -> bool:
+    """A blocker no longer blocks when its edge condition holds.
+
+    ``edge`` is the dependency row. Mesh computes ``condition_satisfied`` per edge, but its
+    meaning differs by server version: an older server derives it from evidence only and
+    leaves the blocker's status out (a task_done edge to a done blocker reads False there),
+    a newer one returns the full verdict. So the boolean is read in the one way that is
+    right on both: True always releases; False is the answer only for the conditions whose
+    point is to differ from "closed" (shipped, deployed, accepted: a cancelled blocker of an
+    ``accepted`` edge keeps blocking). Any other condition, or no field, falls back to the
+    older rule: the blocker is closed, or what it delivers has shipped (Mesh's is_shipped:
+    merged and deployed) while its card still waits for acceptance or a closing comment.
+    Dependants wait for the condition, not for the bookkeeping."""
+    verdict = edge.get("condition_satisfied") if isinstance(edge, dict) else None
+    if verdict is True:
+        return True
+    if verdict is False and str(edge.get("condition") or "").strip().lower() in TYPED_CONDITIONS:
+        return False
     return blocker.get("is_shipped") is True or cats.category(blocker) in CLOSED
 
 
@@ -180,7 +197,7 @@ def blocking_tasks(mesh: MeshClient, cats: StatusCategories, task_id: str) -> li
             if blocker is None:
                 raise
         blocker = blocker.get("task", blocker) if isinstance(blocker, dict) else {}
-        if not satisfied(cats, blocker):
+        if not satisfied(cats, blocker, dep):
             blockers.append(dict(blocker, id=bid))
     return blockers
 

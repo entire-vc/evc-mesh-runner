@@ -15,7 +15,7 @@ from fakes import AGENT_ID, FAKE_AGENT, HarnessGate, FakeAdapter, FakeProfileAda
 from test_workspace import make_repo
 
 from mesh_runner.config import AgentConfig, RunnerConfig
-from mesh_runner.runner import AgentRunner, AlreadyRunning, Runner, public_harness_error
+from mesh_runner.runner import AgentRunner, AlreadyRunning, Runner, public_harness_error, startup_error_excerpt
 from mesh_runner.store import Store
 from mesh_runner.workspace import RepoSpec
 
@@ -36,7 +36,8 @@ class Bench(unittest.TestCase):
                                  repos=[RepoSpec("app", base, max_slots=4)],
                                  env={"FAKE_REPLIES": str(self.replies), "FAKE_CALLS": str(self.calls)})
         self.cfg = RunnerConfig(mesh_url="http://mesh", state_dir=root / "state", agents=[self.agent],
-                                wake_poll_seconds=0, heartbeat_seconds=0)
+                                wake_poll_seconds=0, heartbeat_seconds=0,
+                                load_hold_per_cpu=0)       # the host's real load must not hold a test's starts
         self.adapter = FakeAdapter(script)
 
     def tearDown(self):
@@ -194,6 +195,40 @@ class Loop(Bench):
         bodies = " ".join(c["body"] for c in mesh.comment_log.get(t["id"], []))
         self.assertIn("4 failed turns: harness error [sha256:", bodies)
         self.assertNotIn("arbitrary-secret-without-label", bodies + a.note)
+
+    def startup_failure(self, r, a, stderr):
+        """One more turn of attempt ``a`` whose stream never began: no session id, only stderr."""
+        path = self.root / f"{a.id}.jsonl"
+        path.write_text("")
+        path.with_suffix(".stderr").write_text(stderr)
+        r.store.update(a, state="running", turns=a.turns + 1, log_path=str(path), session_id="pre-assigned")
+        r.settle(r.store.get(a.id))
+        return r.store.get(a.id)
+
+    def test_session_less_failures_stop_after_two_turns_with_error_excerpt(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.refresh_me()
+        a = r.store.create(self.agent.name, t["id"], "claude")
+        err = "prompt could not be pasted into the window token=abc123secretvalue"
+        a = self.startup_failure(r, a, err)
+        self.assertEqual((a.state, a.turns), ("ready", 1))        # first failure: one retry
+        a = self.startup_failure(r, a, err)
+        self.assertEqual((a.state, a.turns), ("failed", 2))       # second: handed up, no 3rd/4th turn
+        bodies = " ".join(c["body"] for c in mesh.comment_log.get(t["id"], []))
+        self.assertIn("did not start a session in 2 turns", bodies)
+        self.assertIn("prompt could not be pasted", bodies)
+        self.assertNotIn("abc123secretvalue", bodies + a.note)
+
+    def test_startup_error_excerpt_masks_compound_credential_labels(self):
+        for leak, value in (("api_key=short1", "short1"), ("OPENAI_API_KEY: abc", "abc"),
+                            ("client_secret=xyz", "xyz"), ("db_password=pw1", "pw1"), ("AUTH_TOKEN=t0k", "t0k")):
+            with self.subTest(leak=leak):
+                out = startup_error_excerpt(f"boom {leak} tail")
+                self.assertNotIn(value, out)
+                self.assertIn("[redacted]", out)
+        self.assertEqual(len(startup_error_excerpt("x " * 400)), 300)
 
     def test_public_harness_error_only_exposes_fixed_categories(self):
         for reason, category in (("Usage limit reached Bearer superprivate", "provider limit or overload"),
@@ -2383,6 +2418,24 @@ class Hardening(Bench):
         self.settle_all(r)
         self.assertEqual(len(calls(self.calls)), 1)
 
+    def test_load_gate_holds_new_sessions(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.loadgate.t.hold_per_cpu = 4.0
+        r.loadgate._read = lambda: (80.0, 10)                      # 8 per CPU
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            r.tick()
+        self.assertEqual(calls(self.calls), [])
+        self.assertIn("host load: HOLD", "\n".join(logs.output))
+        self.assertEqual(r.status()["load_hold"][:10], "load5 80.0")
+        r.loadgate._read, r.loadgate._at = (lambda: (20.0, 10)), None   # 2 per CPU
+        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2h: soak window"})
+        r.tick()
+        self.settle_all(r)
+        self.assertEqual(len(calls(self.calls)), 1)
+        self.assertNotIn("load_hold", r.status())
+
     def test_env_command_output_reaches_the_session_and_its_failure_stops_the_start(self):
         t1, t2 = task(1), task(2)
         mesh = FakeMesh([t1], max_concurrent=1)
@@ -2414,6 +2467,19 @@ class Hardening(Bench):
         self.agent.env_command = [sys.executable, "-c", "print('X=1')"]
         r._fresh_env()
         self.assertEqual(r.adapter.profile, "base")                       # routed back: configured profile
+
+    def test_route_env_names_the_routing_without_writing_the_shared_adapter(self):
+        # chat takes its harness/profile from _route_env; only a card turn applies it to the shared adapter
+        mesh = FakeMesh([], max_concurrent=1)
+        r = self.runner(mesh)
+        r.adapter = FakeProfileAdapter(r.adapter.script, "base")
+        env, harness, profile = r._route_env({"MESH_RUNNER_PROFILE": "other-account", "X": "1"})
+        self.assertEqual((env, profile), ({"X": "1"}, "other-account"))
+        self.assertEqual(harness, r.agent.harness)
+        self.assertEqual(r.adapter.profile, "base")                       # nothing was written
+        r._apply_env({"MESH_RUNNER_PROFILE": "other-account"})
+        self.assertEqual(r.adapter.profile, "other-account")              # a card turn does apply it
+        self.assertEqual(r._route_env({"X": "1"})[2], "base")             # not sticky: no value = configured
 
     def test_model_label_picks_the_model_for_every_turn(self):
         t1, t2 = task(1, labels=["model:opus"]), task(2)

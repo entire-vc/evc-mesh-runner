@@ -9,6 +9,7 @@ first event (``thread.started``); the runner stores it as the session id.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -54,6 +55,23 @@ class CodexAdapter(Adapter):
 
     def with_read_only(self, argv: list[str]) -> list[str]:
         """Codex's own read-only sandbox; a root option, so it goes before any subcommand."""
+        return self._sandboxed(argv, "read-only")
+
+    def with_slot_confined(self, argv: list[str]) -> list[str]:
+        """Codex's workspace-write sandbox: writes reach the session's cwd (the slot) and temp dirs only."""
+        out, j = [], 0
+        while j < len(argv):                   # no extra writable directory may survive: the slot is the whole boundary
+            if argv[j] in ("--add-dir", "--writable-root"):
+                j += 2
+            elif argv[j].startswith(("--add-dir=", "--writable-root=")):
+                j += 1
+            else:
+                out.append(argv[j])
+                j += 1
+        out = [out[0], "-c", "sandbox_workspace_write.writable_roots=[]", *out[1:]]   # and none from the profile
+        return self._sandboxed(out, "workspace-write")
+
+    def _sandboxed(self, argv: list[str], mode: str) -> list[str]:
         out, j = [], 0
         while j < len(argv):                   # drop a configured sandbox, then name ours
             if argv[j] in ("--sandbox", "-s"):
@@ -69,7 +87,23 @@ class CodexAdapter(Adapter):
             j += 1
         # headless: before ``exec``; the interactive TUI has no subcommand (or ``resume``)
         i = next((k for k, a in enumerate(out) if a in ("exec", "resume")), len(out))
-        return out[:i] + ["--sandbox", "read-only"] + out[i:]
+        return out[:i] + ["--sandbox", mode] + out[i:]
+
+    def with_instructions(self, argv: list[str], text: str) -> list[str]:
+        """A root ``-c developer_instructions`` override (a JSON string is a valid TOML value)."""
+        return [argv[0], "-c", "developer_instructions=" + json.dumps(text), *argv[1:]]
+
+    def with_mcp(self, argv: list[str], name: str, command: list[str], env: dict) -> list[str]:
+        """Root ``-c`` overrides of ``mcp_servers.<name>``: command, args and the whole env table are
+        replaced, so the profile's entry under that name loses its agent key. JSON strings and
+        arrays are valid TOML values."""
+        table = "{" + ", ".join(f"{k} = {json.dumps(str(v))}" for k, v in env.items()) + "}"
+        prefix = f"mcp_servers.{name}."
+        return [argv[0],
+                "-c", prefix + "command=" + json.dumps(command[0]),
+                "-c", prefix + "args=" + json.dumps(list(command[1:])),
+                "-c", prefix + "env=" + table,
+                *argv[1:]]
 
     def profile_model(self) -> str:
         """The model the profile pins (``~/.codex/<profile>.config.toml``): Codex does

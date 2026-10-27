@@ -15,6 +15,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # turn_cap_continue_on_progress = false  # at max_turns a progressing attempt restarts fresh on the same agent
     # turn_cap_progress_min = 3        # step/next outcomes among the last 10 that count as progress
     # requeue_on_cap = false           # a capped task returns to todo and restarts on new input, not a clock
+    # cap_wake_next_day = false        # a capped task of an agent without a lead restarts on the next UTC day
     # soft_person_asks_to_lead = false # a question to a person that no hard rule matches goes to the lead
     # unanswerable_ask_to_lead = true  # a question to an agent that cannot answer goes to the lead
     # decision_live_task_card_wait = true  # a question about the addressee's own live task waits on that task
@@ -210,6 +211,7 @@ class RunnerConfig:
     mention_requests: bool = False     # an @-address on someone else's task becomes a request card
     max_compactions: int = 0           # context compactions in one attempt; past it -> lead (0 = off)
     max_failures: int = 3
+    max_startup_failures: int = 2      # failed turns that never created a session before the task goes up
     failed_cooldown_hours: float = 0.5   # a failed task is retried this soon even without a new comment
     max_turns: int = 30
     # At max_turns an attempt that still made progress (>= turn_cap_progress_min of its last 10 turn
@@ -296,7 +298,11 @@ class RunnerConfig:
     chat_max_per_agent: int = 3             # max_chat_sessions per agent
     chat_host_cap: int = 6                  # live sessions on this host, chats and cards together
     chat_idle_minutes: float = 10.0
-    chat_workspace: str = "none"            # none | read; write is refused
+    chat_workspace: str = "none"            # none | read | write (a slot of the card pool)
+    # Mesh MCP of a chat session: stdio command (binary + args) run with the chat's session token
+    # (MESH_CHAT_TOKEN_FILE), never the agent key; empty = the session gets no Mesh MCP from the runner
+    chat_mcp_command: tuple = ()
+    chat_mcp_url: str = ""                  # MESH_API_URL for it; empty = [runner] mesh_url
     metrics_file: Path | None = None   # Prometheus textfile (node_exporter textfile collector)
     mesh_effects: bool = True          # runtime state, schedules, edges, decision requests
     decision_request_metadata_only_recipients: list[str] = field(default_factory=list)  # resolved agent UUIDs; new requests only
@@ -331,6 +337,10 @@ class RunnerConfig:
     memory_release_free_pct: float = 0.0
     memory_hold_swap_mb: float = 0.0
     memory_release_swap_mb: float = 0.0
+    # host load gate: no new or resumed sessions while the 5-minute load average per CPU is over
+    # this (0 = off); released below load_release_per_cpu (0 = three quarters of the hold value)
+    load_hold_per_cpu: float = 4.0
+    load_release_per_cpu: float = 0.0
     tmux_binary: str = "tmux"               # standing chat sessions and interactive turns
     # how turns run: "interactive" (the harness's interactive program in tmux, fed by a driver;
     # what a subscription covers) or "headless" (claude -p / codex exec, billed per token)
@@ -358,6 +368,10 @@ class RunnerConfig:
     # to the lead, or waits for the next UTC day without one (RUNNER GAVE UP is not a cap and always
     # goes to the lead).
     requeue_on_cap: bool = False
+    # A capped task of an agent with no lead (the top of the chain) has nobody to hand it to and no input
+    # that would wake it: it restarts in the first tick of the next UTC day after its cap (the restart is
+    # a start, so daily_start_cap still bounds the loop). False: it waits for new input only.
+    cap_wake_next_day: bool = False
     # A question to a person that no hard rule (asks.py) matches is put to the project lead as an agent
     # decision request instead of raising a human gate. False: every such question raises the gate.
     soft_person_asks_to_lead: bool = False
@@ -459,8 +473,8 @@ def _exclude_names(value) -> tuple:
 
 
 def _chat_workspace(value) -> str:
-    if value not in ("none", "read"):
-        raise ConfigError('[chat] chat_workspace must be "none" or "read" (write is not available)')
+    if value not in ("none", "read", "write"):
+        raise ConfigError('[chat] chat_workspace must be "none", "read" or "write"')
     return value
 
 
@@ -602,6 +616,7 @@ def load(path: str | Path) -> RunnerConfig:
         decision_default_proceeds=r.get("decision_default_proceeds", True) is not False,
         max_compactions=int(r.get("max_compactions", 0)),
         max_failures=int(r.get("max_failures", 3)),
+        max_startup_failures=int(r.get("max_startup_failures", 2)),
         failed_cooldown_hours=float(r.get("failed_cooldown_hours", 0.5)),
         max_turns=int(r.get("max_turns", 30)),
         turn_cap_continue_on_progress=r.get("turn_cap_continue_on_progress", False) is True,
@@ -667,6 +682,7 @@ def load(path: str | Path) -> RunnerConfig:
         extension_token=ext_token,
         extension_rotate_days=float(ext.get("rotate_days", 0.0)),
         requeue_on_cap=r.get("requeue_on_cap", False) is True,
+        cap_wake_next_day=r.get("cap_wake_next_day", False) is True,
         soft_person_asks_to_lead=r.get("soft_person_asks_to_lead", False) is True,
         unanswerable_ask_to_lead=r.get("unanswerable_ask_to_lead", True) is not False,
         login_ask_check=tuple(_string_list(r.get("login_ask_check"), "login_ask_check", ())),
@@ -683,6 +699,8 @@ def load(path: str | Path) -> RunnerConfig:
         memory_release_free_pct=float(r.get("memory_release_free_pct", 0)),
         memory_hold_swap_mb=float(r.get("memory_hold_swap_mb", 0)),
         memory_release_swap_mb=float(r.get("memory_release_swap_mb", 0)),
+        load_hold_per_cpu=_idle_hours(r.get("load_hold_per_cpu", 4.0), "load_hold_per_cpu"),
+        load_release_per_cpu=_idle_hours(r.get("load_release_per_cpu", 0.0), "load_release_per_cpu"),
         announce_controllers=r.get("announce_controllers", False) is True,
         chat_enabled=chat.get("enabled", False) is True,
         chat_agents=tuple(_string_list(chat.get("agents"), "[chat] agents", ())),
@@ -692,6 +710,8 @@ def load(path: str | Path) -> RunnerConfig:
         chat_host_cap=_positive(chat.get("host_cap", 6), "[chat] host_cap", integer=True),
         chat_idle_minutes=_positive(chat.get("session_idle_minutes", 10.0), "session_idle_minutes"),
         chat_workspace=_chat_workspace(chat.get("chat_workspace", "none")),
+        chat_mcp_command=_string_list(chat.get("mcp_command"), "[chat] mcp_command", ()),
+        chat_mcp_url=str(chat.get("mcp_url") or ""),
         gitlab_url=gl.get("base_url", ""),
         gitlab_token=read_secret(gl.get("token_file"), gl.get("token_env"), "gitlab token")
         if gl.get("base_url") else "",

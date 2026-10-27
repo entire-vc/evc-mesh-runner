@@ -29,12 +29,39 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .workspace import WorkspaceError, git
+from .workspace import TimedLock, WorkspaceError, git
+
+def _run(args, *, timeout=600, input=None, capture_output=False, check=False, **kwargs):
+    """subprocess.run with a deadline that also holds when the child is stuck in uninterruptible IO.
+
+    subprocess.run kills the child on timeout and then waits for it to exit; a process blocked in
+    the kernel never does, so the caller (and the lock it holds) would stay pinned. Here the kill is
+    followed by a short bounded wait and the child is abandoned."""
+    if capture_output:
+        kwargs['stdout'] = kwargs['stderr'] = subprocess.PIPE
+    if input is not None:
+        kwargs['stdin'] = subprocess.PIPE
+    proc = subprocess.Popen(args, **kwargs)
+    try:
+        out, err = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass                    # unkillable (uninterruptible IO): leave it, free the caller
+        name = args[0] if isinstance(args, (list, tuple)) and args else args
+        raise WorkspaceError(f"{name} timed out after {timeout:.0f}s") from e
+    result = subprocess.CompletedProcess(args, proc.returncode, out, err)
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, args, out, err)
+    return result
+
 
 # Agent threads can checkpoint different repositories on the same filesystem.
 # Serialize admission through publication/cleanup, including scratch replay,
 # so they do not all spend the same observed free-space budget.
-_IO_LOCK = threading.RLock()
+_IO_LOCK = TimedLock("checkpoint-io")
 
 # Directories a build regenerates; a checkpoint copying them moves gigabytes from a freed slot
 # into the snapshot. Matched by basename at any depth, and only when nothing under them is tracked.
@@ -42,7 +69,7 @@ DEFAULT_EXCLUDE_NAMES = ('.gocache', 'node_modules', 'target', '.venv', '__pycac
 
 
 def _du(path: Path) -> int:
-    r = subprocess.run(['du', '-sk', str(path)], capture_output=True, text=True)
+    r = _run(['du', '-sk', str(path)], capture_output=True, text=True)
     return int(r.stdout.split()[0]) * 1024 if r.returncode == 0 and r.stdout else 0
 
 
@@ -106,7 +133,7 @@ def _modules_dir(path: Path) -> Path:
 
 
 def _gitdir(gd: Path, *args: str, check: bool = True) -> str:
-    r = subprocess.run(['git', '--git-dir', str(gd), '--work-tree', str(gd), *args], capture_output=True, text=True,
+    r = _run(['git', '--git-dir', str(gd), '--work-tree', str(gd), *args], capture_output=True, text=True,
                        errors='surrogateescape')
     if check and r.returncode:
         raise WorkspaceError(f'checkpoint: git {args[0]} failed in a submodule gitdir: {r.stderr.strip()[:120]}')
@@ -125,7 +152,7 @@ def _stash_create(repo: Path) -> str:
     except WorkspaceError:
         # read the NUL-separated list raw: git() strips its output, which would cut a
         # leading space from the first path
-        res = subprocess.run(['git', '-C', str(repo), 'diff', '--name-only', '-z', '--diff-filter=A'],
+        res = _run(['git', '-C', str(repo), 'diff', '--name-only', '-z', '--diff-filter=A'],
                              capture_output=True, text=True, errors='surrogateescape',
                              env=dict(os.environ, GIT_TERMINAL_PROMPT='0'), timeout=600)
         added = [n for n in res.stdout.split('\0') if n] if res.returncode == 0 else []
@@ -149,7 +176,7 @@ def _safe_rel(name: str) -> bool:
 
 def _submodule_names(source: Path) -> dict:
     """gitlink path -> submodule name, from the worktree .gitmodules (never from config values)."""
-    r = subprocess.run(['git', '-C', str(source), 'config', '-f', '.gitmodules', '-z',
+    r = _run(['git', '-C', str(source), 'config', '-f', '.gitmodules', '-z',
                         '--get-regexp', '^submodule\\..*\\.path$'], capture_output=True)
     if r.returncode not in (0, 1):
         raise WorkspaceError('checkpoint: configured submodule metadata unsupported')
@@ -173,12 +200,12 @@ def submodule_plan(source: Path) -> list:
     when every gitlink maps to a `.gitmodules` name and its gitdir lives in this worktree's own
     modules directory. Never follow a symlink or claim an unverifiable state was checkpointed.
     """
-    result = subprocess.run(['git', '-C', str(source), 'ls-files', '--stage', '-z'],
+    result = _run(['git', '-C', str(source), 'ls-files', '--stage', '-z'],
                             capture_output=True)
     if result.returncode:
         raise WorkspaceError('checkpoint: cannot inspect gitlinks')
     records = [record for record in result.stdout.split(b'\0') if record.startswith(b'160000 ')]
-    head = subprocess.run(['git', '-C', str(source), 'ls-tree', '-r', '-z', 'HEAD'], capture_output=True)
+    head = _run(['git', '-C', str(source), 'ls-tree', '-r', '-z', 'HEAD'], capture_output=True)
     if head.returncode:
         raise WorkspaceError('checkpoint: cannot inspect HEAD gitlinks')
     head_links = {r.split(b'\t', 1)[1] for r in head.stdout.split(b'\0') if r.startswith(b'160000 ')}
@@ -187,7 +214,7 @@ def submodule_plan(source: Path) -> list:
         raise WorkspaceError('checkpoint: removed or replaced gitlink unsupported')
     if not records:
         return []
-    configured = subprocess.run(['git', '-C', str(source), 'config',
+    configured = _run(['git', '-C', str(source), 'config',
                                  '--name-only', '--get-regexp', '^submodule\\.'], capture_output=True)
     if configured.returncode not in (0, 1):
         raise WorkspaceError('checkpoint: cannot inspect submodule configuration')
@@ -257,7 +284,7 @@ def submodule_plan(source: Path) -> list:
                 raise WorkspaceError('checkpoint: populated submodule unsupported')
             if os.path.realpath(wt / text[len('gitdir: '):].strip()) != os.path.realpath(gd):
                 raise WorkspaceError('checkpoint: submodule gitdir outside own modules unsupported')
-            inner = subprocess.run(['git', '-C', str(wt), 'ls-files', '--stage', '-z'], capture_output=True)
+            inner = _run(['git', '-C', str(wt), 'ls-files', '--stage', '-z'], capture_output=True)
             if inner.returncode:
                 raise WorkspaceError('checkpoint: cannot inspect submodule')
             if any(r.startswith(b'160000 ') for r in inner.stdout.split(b'\0')):
@@ -290,7 +317,7 @@ def _submodule_state(path: Path, entry: dict, modules: Path) -> dict:
     wt = path / entry['path']
     if (wt / '.git').is_file():
         def raw(*args):
-            r = subprocess.run(['git', '-C', str(wt), *args], capture_output=True)
+            r = _run(['git', '-C', str(wt), *args], capture_output=True)
             if r.returncode:
                 raise WorkspaceError('checkpoint: cannot fingerprint submodule state')
             return hashlib.sha256(r.stdout).hexdigest()
@@ -383,7 +410,7 @@ def _stale_submodule_work(target: Path, entry: dict, gd: Path) -> str:
             files = [f for f in files if f != '.git']
         if '.git' in dirs or '.git' in files:
             return 'nested repository in the worktree'
-    status = subprocess.run(['git', '--no-optional-locks', '-C', str(wt), 'status', '--porcelain=v1', '-z',
+    status = _run(['git', '--no-optional-locks', '-C', str(wt), 'status', '--porcelain=v1', '-z',
                              '--untracked-files=all'], capture_output=True)
     if status.returncode or status.stdout:
         return 'uncommitted or untracked work'
@@ -394,7 +421,7 @@ def find_excludes(source: Path, names: tuple) -> list:
     """Outermost directories called one of `names` with no tracked file beneath them."""
     if not names:
         return []
-    r = subprocess.run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
+    r = _run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
     if r.returncode:
         raise WorkspaceError('checkpoint: cannot list tracked files')
     tracked = set()  # tracked directories, and gitlinks (a submodule's own files are not listed here)
@@ -424,7 +451,7 @@ def _copy(src: Path, dst: Path, excludes: frozenset = frozenset()) -> None:
     # APFS clones use no second full allocation. Portable fallback is budgeted below.
     if sys.platform == 'darwin':
         def copyfile(a, b):
-            r = subprocess.run(['cp', '-cp', str(a), str(b)], capture_output=True)
+            r = _run(['cp', '-cp', str(a), str(b)], capture_output=True)
             if r.returncode:
                 shutil.copy2(a, b)
             return b
@@ -450,7 +477,7 @@ def fingerprint(path: Path, submodules: list | None = None, excludes: tuple = ()
     # Untracked-but-not-ignored excluded dirs show up in `status`; leave them out of it too.
     spec = ['--', '.', *(f':(exclude,literal){e}' for e in excludes)] if excludes else []
     def raw(*args):
-        r = subprocess.run(['git', '-C', str(path), *args], capture_output=True)
+        r = _run(['git', '-C', str(path), *args], capture_output=True)
         if r.returncode:
             raise WorkspaceError('checkpoint: cannot fingerprint git state')
         return hashlib.sha256(r.stdout).hexdigest()
@@ -471,7 +498,7 @@ MAX_UNTRACKED_BYTES = 16 * 1024 * 1024    # an untracked file above this is not 
 
 def _status_entries(source: Path) -> list:
     """(XY, path, orig) for every changed/untracked path, as git sees it; ignored paths are absent."""
-    r = subprocess.run(['git', '-C', str(source), 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+    r = _run(['git', '-C', str(source), 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
                        capture_output=True)
     if r.returncode:
         raise WorkspaceError('checkpoint: cannot list changed files')
@@ -494,7 +521,7 @@ def _status_entries(source: Path) -> list:
 def find_ignored(source: Path, covered: list) -> list:
     """Git-ignored paths (outermost), minus what a named exclude already covers: logs, caches and
     build output that any clone regenerates. Tracked files are never listed here."""
-    r = subprocess.run(['git', '-C', str(source), 'ls-files', '-z', '--others', '--ignored', '--exclude-standard',
+    r = _run(['git', '-C', str(source), 'ls-files', '-z', '--others', '--ignored', '--exclude-standard',
                         '--directory'], capture_output=True)
     if r.returncode:
         raise WorkspaceError('checkpoint: cannot list ignored files')
@@ -535,7 +562,7 @@ def _delta_plan(source: Path, before: dict, excludes: list, ignored: list) -> di
                 files.add(name)
         else:
             deleted.add(name)
-    r = subprocess.run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
+    r = _run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
     if r.returncode:
         raise WorkspaceError('checkpoint: cannot list tracked files')
     tracked_dirs = set()
@@ -588,7 +615,7 @@ def _durable_objects(data: dict, fallback: Path | None = None) -> Path | None:
 
 
 def _has_commit(repo: Path, sha: str) -> bool:
-    return subprocess.run(['git', '-C', str(repo), 'cat-file', '-e', f'{sha}^{{commit}}'],
+    return _run(['git', '-C', str(repo), 'cat-file', '-e', f'{sha}^{{commit}}'],
                           capture_output=True).returncode == 0
 
 
@@ -743,7 +770,7 @@ class Checkpoints:
         """Write commits.bundle. Slim form: only what `base_sha` (pinned by a checkpoint ref) lacks, with
         base_sha as the bundle's prerequisite; None when the full-history form was written."""
         out = pending / 'commits.bundle'
-        known = base_sha and subprocess.run(['git', '-C', str(source), 'cat-file', '-e', f'{base_sha}^{{commit}}'],
+        known = base_sha and _run(['git', '-C', str(source), 'cat-file', '-e', f'{base_sha}^{{commit}}'],
                                             capture_output=True).returncode == 0
         if not known:
             git(source, 'bundle', 'create', str(out), *refs)
@@ -767,7 +794,7 @@ class Checkpoints:
             out.parent.mkdir(parents=True, exist_ok=True)
             if src.is_symlink():
                 os.symlink(os.readlink(src), out)
-            elif sys.platform == 'darwin' and subprocess.run(['cp', '-cp', str(src), str(out)],
+            elif sys.platform == 'darwin' and _run(['cp', '-cp', str(src), str(out)],
                                                              capture_output=True).returncode == 0:
                 continue
             else:
@@ -823,10 +850,10 @@ class Checkpoints:
         """`bundle verify` checks only the header; unpack into scratch storage to prove the pack."""
         with tempfile.TemporaryDirectory(prefix='.preflight-', dir=self.root) as scratch:
             probe = Path(scratch) / 'probe'
-            ok = subprocess.run(['git', 'init', '--bare', '--quiet', str(probe)], capture_output=True).returncode == 0
+            ok = _run(['git', 'init', '--bare', '--quiet', str(probe)], capture_output=True).returncode == 0
             if ok and reference is not None:
                 _alternate(probe / 'objects', reference)      # the bundle's prerequisite lives there
-            ok = ok and subprocess.run(
+            ok = ok and _run(
                 ['git', '--git-dir', str(probe), '-c', 'transfer.fsckObjects=true', 'fetch', '--quiet',
                  str(bundle), *refspecs], capture_output=True).returncode == 0
             if not ok:
@@ -863,7 +890,7 @@ class Checkpoints:
             self._ensure_base(checkpoint, target, bundle['base'], data['source'])
         refspecs = ['+refs/*:refs/runner-replay/*', *(['HEAD'] if not bundle or bundle['has_head'] else [])]
         if bundle and bundle['mode'] == 'none':
-            if subprocess.run(['git', '-C', str(target), 'cat-file', '-e', f"{data['fingerprint']['head']}^{{commit}}"],
+            if _run(['git', '-C', str(target), 'cat-file', '-e', f"{data['fingerprint']['head']}^{{commit}}"],
                               capture_output=True).returncode:
                 raise WorkspaceError('checkpoint: base commit missing in target; target untouched')
         elif prove:
@@ -915,12 +942,12 @@ class Checkpoints:
         """A slim bundle needs its base commit in the target. Pool slots share the base clone's objects;
         any other target gets it from the capture source, where a checkpoint ref pins it."""
         def have():
-            return subprocess.run(['git', '-C', str(target), 'cat-file', '-e', f'{base}^{{commit}}'],
+            return _run(['git', '-C', str(target), 'cat-file', '-e', f'{base}^{{commit}}'],
                                   capture_output=True).returncode == 0
         if have():
             return
         ref = f'refs/runner-checkpoint-bases/{checkpoint.name}'
-        subprocess.run(['git', '-C', str(target), 'fetch', '--quiet', '--no-recurse-submodules', source, ref],
+        _run(['git', '-C', str(target), 'fetch', '--quiet', '--no-recurse-submodules', source, ref],
                        capture_output=True)       # objects only: no ref is written into the target
         if not have():
             raise WorkspaceError('checkpoint: base commit missing in target; target untouched')
@@ -1083,7 +1110,7 @@ class Checkpoints:
         want = data['fingerprint']['submodules'][entry['path']]
         if not os.path.lexists(gd):
             gd.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(['git', 'init', '--bare', '--quiet', str(gd)], check=True, capture_output=True)
+            _run(['git', 'init', '--bare', '--quiet', str(gd)], check=True, capture_output=True)
             _gitdir(gd, 'fetch', '--quiet', str(src / 'commits.bundle'),
                     '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*',
                     '+refs/remotes/*:refs/remotes/*', '+refs/runner-checkpoints/*:refs/runner-checkpoints/*',

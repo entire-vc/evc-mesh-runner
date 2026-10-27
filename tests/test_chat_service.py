@@ -1,3 +1,4 @@
+import logging
 import tempfile
 import threading
 import time
@@ -46,6 +47,18 @@ class Service(unittest.TestCase):
         self.svc.step(1)
         self.assertEqual(self.mesh.acks["c1"]["result"], "not_found")
         self.assertEqual(self.deleted, [])
+
+    def test_claim_that_returns_a_turn_logs_its_wait_and_an_idle_claim_does_not(self):
+        with self.assertLogs("mesh_runner", level="INFO") as idle:
+            self.svc.step(1)
+            logging.getLogger("mesh_runner").info("sentinel")
+        self.assertEqual([r.getMessage() for r in idle.records], ["sentinel"])
+        self.mesh.queue_turn("x")
+        with self.assertLogs("mesh_runner", level="INFO") as got:
+            self.svc.step(1)
+        line = [r.getMessage() for r in got.records if r.getMessage().startswith("chat claim: returned in ")]
+        self.assertEqual(len(line), 1)
+        self.assertRegex(line[0], r"returned in \d+\.\ds, 1 turn\(s\), 0 command\(s\)")
 
     def test_pool_refusal_holds_claiming_instead_of_spinning(self):
         pool = ChatPool(max_per_agent=1, max_host=0, idle_minutes=10, clock=lambda: self.t[0])
@@ -114,6 +127,14 @@ class Service(unittest.TestCase):
         self.assertEqual(self.svc.reap_idle(), ["thread-1"])
         self.assertEqual(self.stopped, [("agent-1", "thread-1")])
 
+    def test_idle_reap_leaves_sessions_of_agents_served_by_another_service(self):
+        self.svc.pool.admit("other", "thread-9")
+        self.svc.pool.end_turn("other", "thread-9")
+        self.t[0] += 601
+        self.assertEqual(self.svc.reap_idle(), [])
+        self.assertEqual(self.stopped, [])
+        self.assertIn(("other", "thread-9"), self.svc.pool.slots)     # still held for its own service
+
     def test_second_chat_evicts_idle_session_of_first(self):
         self.mesh.queue_turn("a", thread="t1")
         self.svc.step(1)
@@ -139,6 +160,17 @@ class Service(unittest.TestCase):
         self.svc.step(1)
         self.assertEqual(self.deleted, [("agent-1", "t9")])
         self.assertEqual(self.mesh.acks["c1"]["result"], "done")
+
+    def test_idle_rounds_fetch_orders_at_most_every_orders_every(self):
+        calls = []
+        real = self.client.commands
+        self.client.commands = lambda agents: calls.append(1) or real(agents)
+        self.svc.step(1)
+        self.svc.step(1)
+        self.assertEqual(len(calls), 1)         # the second idle round rides on the first fetch
+        self.svc._next_orders = 0.0
+        self.svc.step(1)
+        self.assertEqual(len(calls), 2)
 
     def test_a_populated_claim_does_not_fetch_orders_again(self):
         calls = []
