@@ -81,6 +81,25 @@ class Adapter:
         metadata-only decision). The harness enforces it, not the prompt."""
         raise NotImplementedError
 
+    def with_slot_confined(self, argv: list[str]) -> list[str]:
+        """argv for a session that may write, but only inside its cwd: enforced by the harness."""
+        raise NotImplementedError
+
+    def without_local_memory(self, env: dict) -> dict:
+        """env for a session that must not keep the harness's own memory files (a chat: read-only and
+        shared by several people, so its memory is Mesh). A harness without such memory returns env."""
+        return env
+
+    def with_instructions(self, argv: list[str], text: str) -> list[str]:
+        """argv with ``text`` added to the session's standing instructions. A harness without
+        such a channel returns argv unchanged."""
+        return argv
+
+    def with_mcp(self, argv: list[str], name: str, command: list[str], env: dict) -> list[str]:
+        """argv whose MCP server ``name`` is the stdio ``command`` with ``env``, in place of
+        whatever the profile configures under that name. A harness without MCP returns argv."""
+        return argv
+
     @property
     def session_id_known_upfront(self) -> bool:
         """True when the runner chooses the session id before starting (Claude)."""

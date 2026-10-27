@@ -41,6 +41,32 @@ class Pool(unittest.TestCase):
         self.assertEqual(git(a, "config", "user.name"), "Agent")
         self.assertEqual(git(self.base, "config", "user.name"), "t")   # operator clone untouched
 
+    def test_chat_slot_is_leased_returned_and_refused_when_the_pool_is_empty(self):
+        from mesh_runner.chat_host import ChatRefused, lease_slot, return_slot
+        from types import SimpleNamespace as NS
+        ar = NS(pool=self.pool, agent=NS(repos=[RepoSpec("app", self.base, max_slots=2)]))
+        first = lease_slot(ar, "thread-one")
+        self.assertEqual(lease_slot(ar, "thread-one"), first)          # one slot per chat, reused by every turn
+        self.assertEqual(self.pool.leased_path("chat-threadone"), first)
+        lease_slot(ar, "thread-two")
+        with self.assertRaises(ChatRefused) as cm:                     # both slots busy: a third chat is refused
+            lease_slot(ar, "thread-three")
+        self.assertEqual(cm.exception.code, "chat_workspace_busy")
+        return_slot(ar, "thread-one")                                  # the slot goes back, clean
+        self.assertIsNone(self.pool.leased_path("chat-threadone"))
+        self.assertEqual(lease_slot(ar, "thread-three"), first)        # and is leased again
+
+    def test_chat_slot_with_uncommitted_work_stays_held(self):
+        from mesh_runner.chat_host import lease_slot, return_slot
+        from types import SimpleNamespace as NS
+        ar = NS(pool=self.pool, agent=NS(repos=[RepoSpec("app", self.base, max_slots=2)]))
+        path = lease_slot(ar, "thread-one")
+        (path / "README").write_text("unsaved\n")
+        return_slot(ar, "thread-one")
+        self.assertIsNone(self.pool.leased_path("chat-threadone"))
+        self.assertEqual((path / "README").read_text(), "unsaved\n")      # never wiped
+        self.assertEqual([r["state"] for r in self.pool.rows() if r["path"] == str(path)], ["held"])
+
     def test_max_slots(self):
         self.pool.lease("a1", "app")
         self.pool.lease("a2", "app")

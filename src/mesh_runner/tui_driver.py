@@ -22,13 +22,26 @@ import shlex
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 if __package__ in (None, ""):                         # run as a file by the runner
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from mesh_runner.adapters.base import STAMP_V2, precise_stamp  # noqa: E402
+
 from mesh_runner.interactive import (BACKGROUND_WAIT_MINUTES, CHAT_PREFIX, HOOK, Tmux, forget, pid_alive,  # noqa: E402
-                                     read_meta, session_name, write_meta, write_progress)
+                                     meta_path, read_meta, session_name, write_meta, write_progress)
+
+def read_own_meta(directory: Path, key: str) -> dict | None:
+    """The window's metadata under this runner's state root, or None when the file is absent or
+    unreadable (the window is then not provably this runner's)."""
+    try:
+        data = json.loads(meta_path(directory, key).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
 
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # markers of a parent Claude Code session: inherited, they make the child think it is a
@@ -44,6 +57,13 @@ AUTH_RE = re.compile(r"(not logged in|run /login|please log in|oauth token (has 
 # a finished one reads "✻ Sautéed for 24s")
 BUSY_RE = re.compile(r"(esc to interrupt|esc to cancel|working \(|ctrl\+b to run in background|…\s*\(\d+[ms])", re.I)
 CODEX_READY_RE = re.compile(r"(ask codex to do anything|\? for shortcuts)", re.I)
+# Codex still starting: it shows the composer (so CODEX_READY_RE matches) while "Resuming session…" is on
+# screen, and a prompt entered then is queued under "Waiting for startup · esc cancel" until start-up
+# ends. On a saturated host that took 30-130 s (26.10). Not BUSY_RE: accepted() reads a busy screen as
+# "the prompt started a turn", and a queued prompt has started nothing.
+CODEX_STARTUP_RE = re.compile(r"waiting for startup", re.I)
+CODEX_RESUMING_RE = re.compile(r"resuming session", re.I)
+STARTUP_TAIL_LINES = 8         # the markers count in the last lines only: older text may quote them
 TRUST_RE = re.compile(r"trust this folder|do you trust the files|one you trust", re.I)
 UPDATE_RE = re.compile(r"update available|update now|new version", re.I)
 # Codex exits with status 1 when its own account check times out during start-up
@@ -52,6 +72,9 @@ UPDATE_RE = re.compile(r"update available|update now|new version", re.I)
 BOOTSTRAP_RE = re.compile(r"^Error: .*failed during TUI bootstrap", re.I)
 PANE_DEAD_RE = re.compile(r"^Pane is dead\b")
 BOOTSTRAP_RETRIES = 2
+# the pane's pid may be a wrapper that starts a moment before Codex; a task this close to the process
+# start is not called stale
+PROCESS_START_SLACK = 5.0
 CURSOR_RE = re.compile(r"^\s*[❯›>]\s*(.*)$")
 SESSION_ARGS = ("--session-id", "--resume")
 # Claude Code lists the main thread and its background agents in rows under the prompt box
@@ -99,9 +122,14 @@ def background_agents(screen: str) -> list[str]:
 
 PASTE_WRAP_RE = re.compile(r"</?pasted_content[^>]*>")
 SCAN_CHUNK = 1 << 20
+ROLLOUT_TAIL = 1 << 16         # Codex: how much of the rollout's end says whether a task is open
+ROLLOUT_HEAD = 1 << 20         # Codex: how much of its start is searched for the prompt that opened it
 # Codex rollout response_item types written by the model (a "message" counts only with role assistant)
 CODEX_MODEL_ITEMS = ("agent_message", "reasoning", "function_call", "custom_tool_call", "local_shell_call",
                      "web_search_call")
+# Codex rollout response_item types that are a tool call, and the name of those that carry none
+CODEX_TOOL_ITEMS = {"function_call": "", "custom_tool_call": "", "local_shell_call": "shell",
+                    "web_search_call": "web_search"}
 
 
 def _squash(text: str) -> str:
@@ -112,6 +140,14 @@ def _said(text: str) -> str:
     """The prompt as the harness records it, comparable to ours: Claude Code wraps pasted
     text in <pasted_content id="…">…</pasted_content>; whitespace may differ."""
     return _squash(PASTE_WRAP_RE.sub("", text or ""))
+
+
+def load_average() -> str:
+    """The host's 1-minute load average with the CPU count, for an error message ("?" when unknown)."""
+    try:
+        return "%.1f on %d CPUs" % (os.getloadavg()[0], os.cpu_count() or 0)
+    except (OSError, AttributeError):
+        return "?"
 
 
 class DriverError(Exception):
@@ -135,12 +171,16 @@ class Driver:
         self.env = {k: v for k, v in dict(os.environ if env is None else env).items() if not SCRUB_ENV.match(k)}
         self.python = python or sys.executable
         self.clock, self.sleep = clock, sleep
-        self.t = {"ready": 90, "accept": 30, "poll": 1.0, "scan": 15, "interrupt": 6, "settle": 1.5,
+        self.t = {"ready": 180, "accept": 30, "poll": 1.0, "scan": 15, "interrupt": 6, "settle": 1.5,
+                  # Codex: how long a queued prompt may wait for the harness to finish starting
+                  "startup_wait": 300,
                   "idle": 30, "stop_wait": 45, "beat": 5,
                   "cap_wait": 300, "cap_poll": 5, "busy_wait": 1800, "paste": 5,
                   # before a prompt goes into a session whose background agents still run (0 = do not wait)
                   "background_wait": BACKGROUND_WAIT_MINUTES * 60, "background_poll": 2.0, "background_settle": 10,
                   **(timeouts or {})}
+        # a chat answers a person who waits: its first idle re-sample comes soon, not after a full settle
+        self.t.setdefault("first_settle", 0.3 if str(key).startswith("chat-") else self.t["settle"])
         self.session = session_name(agent)
         self.target = f"={self.session}:={key}"
         self.events = self.dir / f"{key}.events.jsonl"
@@ -163,6 +203,11 @@ class Driver:
         self.replied = False           # Codex: a model record was seen since the prompt was accepted
         self.turn_end: dict | None = None   # Codex: the task_complete of our turn, read from the rollout
         self.turn_id = ""              # Codex: the turn our prompt started, from the rollout's task_started
+        # Claude: transcript records written out while the turn runs (stream_claude), by uuid
+        self.streamed: set[str] = set()
+        self.live_from = 0             # first transcript byte stream_claude has not read
+        self.live_turn: list[dict] | None = None   # records from our prompt on, None until it is found
+        self.init_sent = False
 
     # ------------------------------------------------------------------ helpers
     def emit(self, event: dict) -> None:
@@ -199,6 +244,15 @@ class Driver:
 
     def busy(self) -> bool:
         return bool(BUSY_RE.search(self.screen()))
+
+    def starting(self, screen: str | None = None) -> bool:
+        """Codex has not finished starting: "Resuming session…" or "Waiting for startup" in the last
+        lines of the screen. Never true for Claude, whose readiness is the SessionStart hook."""
+        if self.harness != "codex":
+            return False
+        lines = [x for x in (self.screen() if screen is None else screen).splitlines() if x.strip()]
+        tail = "\n".join(lines[-STARTUP_TAIL_LINES:])
+        return bool(CODEX_STARTUP_RE.search(tail) or CODEX_RESUMING_RE.search(tail))
 
     def background(self, screen: str | None = None) -> list[str]:
         """Background agents the session shows as running (Claude Code only)."""
@@ -251,18 +305,70 @@ class Driver:
         text = [x for x in self.pane(40).splitlines() if x.strip()]
         return " | ".join(x.strip() for x in text[-lines:])[:400]
 
+    def rollout_open(self) -> bool:
+        """Codex: the rollout's last task event is a task_started with no task_complete after it, i.e. a
+        turn is running whatever the screen shows. Read backwards in ROLLOUT_TAIL blocks until a task
+        event turns up, so a long task whose start is far behind its output is still found."""
+        if not self.rollout:
+            return False
+        try:
+            with open(self.rollout, "rb") as fh:
+                pos = fh.seek(0, os.SEEK_END)
+                rest = b""
+                while pos > 0:
+                    step = min(ROLLOUT_TAIL, pos)
+                    pos -= step
+                    fh.seek(pos)
+                    lines = (fh.read(step) + rest).split(b"\n")
+                    rest = lines[0] if pos > 0 else b""     # the first line of a block may be cut
+                    for line in reversed(lines[1:] if pos > 0 else lines):
+                        if self.codex_task_end(line) is not None:
+                            return False
+                        if self.codex_task_start(line) is not None:
+                            return not self.task_predates_pane(line)
+        except OSError:
+            return False
+        return False
+
+    def pane_started(self) -> float:
+        """Epoch seconds at which the process in our pane started; 0 when it cannot be read (no pane,
+        dead pane, a platform without a precise start time)."""
+        res = self.tmux.run("display-message", "-p", "-t", self.target, "#{pane_pid}")
+        pid = res.stdout.split("\n")[0].strip() if res.returncode == 0 else ""
+        stamp = precise_stamp(int(pid)) if pid.isdigit() else ""
+        try:
+            return float(stamp[len(STAMP_V2):]) if stamp.startswith(STAMP_V2) else 0.0
+        except ValueError:
+            return 0.0
+
+    def task_predates_pane(self, line: bytes) -> bool:
+        """The open task_started was written before the Codex process in our pane started. A resumed
+        Codex never continues the task of an earlier process, so that task_started is the leftover of a
+        process that died mid-turn: nothing will ever end it, and counting it as a running turn kept every
+        later turn on the thread waiting busy_wait and failing ("the session stayed busy", measured 26.10).
+        A task younger than the process, or either time unknown, stays a running turn (fail-safe)."""
+        try:
+            at = datetime.fromisoformat(str(json.loads(line).get("timestamp"))).timestamp()
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            return False
+        started = self.pane_started()
+        return bool(started) and at < started - PROCESS_START_SLACK
+
     def wait_idle(self, seconds: float) -> bool:
-        """The session shows no running turn and its transcript stopped growing."""
+        """The session shows no running turn and its transcript stopped growing. Codex: the file it
+        appends to is the rollout (``transcript_size`` is 0 for it, which settles at once), and an
+        open task in it is a running turn even when the screen shows no spinner."""
         deadline = self.clock() + seconds
         last = None
         while self.clock() < deadline:
             self.check_cancel()
             self.beat()
-            size = self.transcript_size()
-            if not self.busy() and size == last:
+            size = self.progress_size() if self.harness == "codex" else self.transcript_size()
+            if not self.busy() and size == last and not (self.harness == "codex" and self.rollout_open()):
                 return True
+            first = last is None
             last = size
-            self.sleep(self.t["settle"])
+            self.sleep(min(self.t["first_settle"], self.t["settle"]) if first else self.t["settle"])
         return False
 
     # ------------------------------------------------------------------ progress
@@ -323,6 +429,9 @@ class Driver:
             return any(self.claude_reply(line) for line in lines)
         replied = False
         for line in lines:                                # in file order; the first task end closes our turn
+            tool = self.codex_tool(line)
+            if tool is not None:                          # streamed as it is seen: the chat shows it live
+                self.emit({"type": "item.completed", "item": {"type": "tool_call", **tool}})
             if self.codex_reply(line):
                 replied = True
                 continue
@@ -370,6 +479,22 @@ class Driver:
         return kind in CODEX_MODEL_ITEMS
 
     @staticmethod
+    def codex_tool(line: bytes) -> dict | None:
+        """A rollout line that is a tool call of the model: its call id and tool name, never its input.
+        None for any other line."""
+        if b'"response_item"' not in line or b'_call"' not in line:
+            return None
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        item = rec.get("payload") if rec.get("type") == "response_item" else None
+        if not isinstance(item, dict) or item.get("type") not in CODEX_TOOL_ITEMS:
+            return None
+        name = str(item.get("name") or CODEX_TOOL_ITEMS[item["type"]] or "a tool")
+        return {"id": str(item.get("call_id") or item.get("id") or ""), "name": name}
+
+    @staticmethod
     def codex_task_start(line: bytes) -> str | None:
         """The rollout's ``task_started``: the id of the turn it opens ('' when it names none). None for
         any other line."""
@@ -391,7 +516,7 @@ class Driver:
         ''). None for any other line. The caller reads only lines after our prompt was accepted, so an
         earlier task's end is never seen here."""
         if b'"task_complete"' not in line:
-            return None
+            return Driver.codex_turn_aborted(line)
         try:
             rec = json.loads(line)
         except ValueError:
@@ -403,6 +528,29 @@ class Driver:
         text = "%s: %s" % (str(err.get("codex_error_info") or "?")[:60], str(err.get("message") or "")[:200]) \
             if isinstance(err, dict) else ""
         return {"message": str(item.get("last_agent_message") or ""), "error": text}
+
+    @staticmethod
+    def codex_turn_aborted(line: bytes) -> dict | None:
+        """An interrupted Codex turn (Escape) writes no ``task_complete``: its only trace is a developer
+        message ``<turn_aborted>`` (or an ``event_msg`` of type ``turn_aborted`` in newer builds). It ends
+        the turn like a task end, else ``rollout_open`` stays true for good and the chat's next message
+        is held for a turn that never finishes."""
+        if b"turn_aborted" not in line:
+            return None
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        item = rec.get("payload")
+        if not isinstance(item, dict):
+            return None
+        if rec.get("type") == "event_msg" and item.get("type") == "turn_aborted":
+            return {"message": "", "error": "interrupted"}
+        if rec.get("type") == "response_item" and item.get("type") == "message" and item.get("role") == "developer":
+            text = "".join(str(c.get("text") or "") for c in item.get("content") or [] if isinstance(c, dict))
+            if text.lstrip().startswith("<turn_aborted>"):
+                return {"message": "", "error": "interrupted"}
+        return None
 
     def beat(self, phase: str = "", force: bool = False, moved: bool = False) -> None:
         """Tell the runner where the turn stands (interactive.PHASES). ``progress_at`` moves when the
@@ -467,24 +615,37 @@ class Driver:
             os.close(fd)
 
     def make_room(self) -> bool:
-        """At most max_sessions runner windows on this host: close the one idle longest.
-        False when the cap is reached and every window is running a turn."""
-        # chat windows are the chat pool's: neither counted against this cap nor closed from here
-        windows = [(se, w) for se, w in self.tmux.all_windows() if not w.startswith(CHAT_PREFIX)]
-        if self.max_sessions <= 0 or len(windows) < self.max_sessions:
+        """At most max_sessions runner windows on this host, chats included (card #face4a7a): close the
+        card window idle longest. A chat window counts against the cap but is never closed from here,
+        it is the chat pool's (idle minutes, per-agent and host limits).
+
+        The tmux server is shared by every runner instance on the host (the fleet runner, test runners),
+        and each keeps its window metadata under its own state root. A window is a candidate only when
+        its metadata exists and parses under THIS root: that proves the window is ours and tells whether
+        it is busy. A window without readable metadata is unknown (another runner's, possibly mid-turn)
+        and is never closed, it only counts against the cap. False when the cap is reached and no window
+        of ours is provably idle."""
+        listed = self.tmux.all_windows()
+        windows = [(se, w) for se, w in listed if not w.startswith(CHAT_PREFIX)]
+        if self.max_sessions <= 0 or len(listed) < self.max_sessions:
             return True
         root = self.dir.parent
         idle = []
         for session, window in windows:
             directory = root / session[len("mr-"):]
-            meta = read_meta(directory, window)
+            meta = read_own_meta(directory, window)
+            if meta is None:                             # not provably ours: unknown, never closed
+                continue
             if pid_alive(int(meta.get("busy_pid") or 0)) or window == self.key:
                 continue
             idle.append((float(meta.get("last_end") or 0), session, window, directory))
-        need = len(windows) - self.max_sessions + 1
+        need = len(listed) - self.max_sessions + 1
         if len(idle) < need:
             return False
-        for _, session, window, directory in sorted(idle)[:need]:
+        for last_end, session, window, directory in sorted(idle)[:need]:
+            print(f"INFO make_room: closed idle window agent={session[len('mr-'):]} window={window} "
+                  f"last_end={last_end:.0f} (host windows {len(listed)}, cap {self.max_sessions})",
+                  file=sys.stderr, flush=True)
             self.tmux.kill_window(session, window)
             forget(directory, window)
         return True
@@ -570,6 +731,10 @@ class Driver:
             menu = TRUST_RE.search(text) or (self.harness == "codex" and UPDATE_RE.search(text)
                                              and not CODEX_READY_RE.search(text))
             if self.harness == "codex" and CODEX_READY_RE.search(text) and not TRUST_RE.search(text):
+                if self.starting(text):                  # the composer shows at once on a resume, start-up
+                    last_screen = None                   # (30-130 s on a loaded host) is not done
+                    self.sleep(self.t["poll"])
+                    continue
                 if text == last_screen:                  # the marker shows before start-up is done:
                     return                               # ready when the screen also stopped changing
                 last_screen = text
@@ -644,8 +809,10 @@ class Driver:
         """The paste shows in the input box: a collapsed "[Pasted …" chip or the prompt's start."""
         head = _squash(prompt)[:24]
         deadline = self.clock() + self.t["paste"]
+        nap = 0.15                                       # the paste usually shows at once: look soon, then slower
         while True:
-            self.sleep(0.5)
+            self.sleep(nap)
+            nap = 0.5
             screen = self.screen()
             if re.search(r"\[Pasted (Content|text)", screen) or (head and head in _squash(screen)):
                 return True
@@ -738,6 +905,8 @@ class Driver:
         stop = self.clock() + self.t["interrupt"]
         while self.clock() < stop and self.done(base) is None:
             self.sleep(self.t["poll"])
+        if self.harness == "claude" and self.prompt_taken:
+            self.stream_claude()                         # what was written before Escape stays the reply
         raise Cancelled()
 
     def wait_background(self) -> bool:
@@ -805,6 +974,7 @@ class Driver:
         self.paste(prompt)
         deadline = self.clock() + self.t["accept"]
         retried = False
+        starting_since = None                            # Codex: since when its start-up marker is on screen
         while not self.accepted(base, busy_before):
             self.beat()
             if self.cancelled:
@@ -813,6 +983,19 @@ class Driver:
                 raise DriverError("interactive session exited: " + self.tail(), close=True)
             if self.busy():                              # queued behind running work: not refused
                 deadline = max(deadline, self.clock() + self.t["accept"])
+            if self.starting():
+                # Codex queues the prompt until start-up ends: the full accept time counts from then, but
+                # only for startup_wait. Stalled past it, the prompt is not taken (prompt_taken stays False,
+                # accepted() alone decides that) and the window is kept: a start-up that is merely slow
+                # (load) is not a broken session, and closing it would start the next attempt from zero.
+                now = self.clock()
+                starting_since = now if starting_since is None else starting_since
+                if now - starting_since > self.t["startup_wait"]:
+                    raise DriverError("%s start-up stalled for %.0fs, the prompt was not taken (host load average "
+                                      "%s): %s" % (self.harness, now - starting_since, load_average(), self.tail()))
+                deadline = max(deadline, now + self.t["accept"])
+            else:
+                starting_since = None
             if self.clock() > deadline:
                 if retried:
                     raise DriverError("the session did not take the prompt: " + self.tail(), close=True)
@@ -829,6 +1012,8 @@ class Driver:
         end_seen = None
         while True:
             self.beat()
+            if self.harness == "claude":
+                self.stream_claude()
             if self.cancelled:
                 self.interrupt(base)
             ev = self.done(base)
@@ -850,13 +1035,15 @@ class Driver:
                 end = self.turn_end
                 end_seen = end_seen if end_seen is not None else self.clock()
                 if not end["message"] or self.clock() - end_seen > self.t["settle"] * 2:
+                    why = ""
                     if not end["message"]:
-                        print("interactive: codex ended the turn with no final message (%s%s)" % (
-                            "after model output" if end["output"] else "no model output",
-                            "; " + end["error"] if end["error"] else ""), file=sys.stderr, flush=True)
-                    thread = self.meta.get("session_id") or self.sid or self.rollout_thread()
+                        why = "%s%s" % ("after model output" if end["output"] else "no model output",
+                                        "; " + end["error"] if end["error"] else "")
+                        print("interactive: codex ended the turn with no final message (%s)" % why,
+                              file=sys.stderr, flush=True)
+                    thread = self.rollout_thread() or self.meta.get("session_id") or self.sid
                     event = {"type": "agent-turn-complete", "thread-id": thread,
-                             "last-assistant-message": end["message"]}
+                             "last-assistant-message": end["message"], **({"no-reply": why} if why else {})}
                     return {"event": event, "offset": offset, "totals": totals}
             if self.window_state() != "alive":
                 raise DriverError("interactive session exited: " + self.tail(), close=True)
@@ -912,11 +1099,39 @@ class Driver:
             try:
                 with open(path, "rb") as fh:
                     meta = json.loads(fh.readline(SCAN_CHUNK))
-                if os.path.realpath(str((meta.get("payload") or {}).get("cwd") or "")) == os.path.realpath(str(self.cwd)):
-                    return path
+                if os.path.realpath(str((meta.get("payload") or {}).get("cwd") or "")) != os.path.realpath(str(self.cwd)):
+                    continue
             except (OSError, ValueError, AttributeError):
                 continue
+            said = self.rollout_user_texts(path)
+            if not self.prompt and not said:           # no prompt to tell the cards apart by
+                return path
+            if any(self.opens_with_ours(x) for x in said):
+                return path        # another card's session in the same cwd, blank or not, is never taken
         return ""
+
+    def rollout_user_texts(self, path: str) -> list[str]:
+        """The user prompts in the head of a rollout, at most ROLLOUT_HEAD bytes; the harness's own
+        context messages (environment, AGENTS.md) are not prompts."""
+        out = []
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(ROLLOUT_HEAD)
+        except OSError:
+            return out
+        for line in head.splitlines():
+            if b'"user"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            item = rec.get("payload") if rec.get("type") == "response_item" else None
+            if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user":
+                text = " ".join(str(b.get("text") or "") for b in item.get("content") or [] if isinstance(b, dict))
+                if text.strip() and not text.lstrip().startswith(("<environment_context>", "# AGENTS.md")):
+                    out.append(text)
+        return out
 
     def codex_totals(self) -> dict:
         if self.harness != "codex":
@@ -958,6 +1173,73 @@ class Driver:
                 return entries[i:]
         return entries
 
+    @staticmethod
+    def _claude_record(e: dict) -> dict | None:
+        """The output line of a transcript record, or None for a record the turn does not report."""
+        t = e.get("type")
+        if t in ("user", "assistant"):
+            return {"type": t, "message": e.get("message") or {}}
+        if t == "system" and e.get("subtype") == "compact_boundary":
+            return {"type": "system", "subtype": "compact_boundary"}
+        return None
+
+    def emit_init(self, sid: str, model: str) -> None:
+        if not self.init_sent:
+            self.init_sent = True
+            self.emit({"type": "system", "subtype": "init", "session_id": sid, "model": model,
+                       "launch_mode": "interactive"})
+
+    def stream_claude(self) -> None:
+        """Write out the turn's transcript records as Claude Code appends them, so a reader of the
+        output sees each reply block (text, tool use) when it is written, not only after Stop. Claude
+        Code writes a block once it is complete: a reply of one text block still arrives in one piece.
+        Records go out in transcript order from our prompt on, starting with the first assistant
+        record (the init line names its model); emit_claude writes the rest and skips these by uuid.
+        Only complete lines are read; never raises."""
+        path = self.meta.get("transcript")
+        if not path:
+            return
+        if not self.live_from:
+            self.live_from = self.turn_offset
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(self.live_from)
+                chunk = fh.read(SCAN_CHUNK)
+        except OSError:
+            return
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return
+        self.live_from += end + 1
+        for raw in chunk[:end].split(b"\n"):
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(e, dict):
+                continue
+            if self.live_turn is None:
+                if e.get("type") == "user" and self.said_ours(self._user_text(e)):
+                    self.live_turn = []
+                else:
+                    continue
+            self.live_turn.append(e)
+        if not self.live_turn:
+            return
+        first = next((e for e in self.live_turn if e.get("type") == "assistant"), None)
+        if first is None:
+            return
+        sid = str(first.get("sessionId") or self.meta.get("session_id") or self.sid or "")
+        self.emit_init(sid, str((first.get("message") or {}).get("model") or ""))
+        for e in self.live_turn:
+            uid = str(e.get("uuid") or "")
+            rec = self._claude_record(e)
+            if not uid or uid in self.streamed or rec is None:
+                continue
+            self.streamed.add(uid)
+            self.emit({**rec, "session_id": sid})
+        self.live_turn = []
+
     def emit_claude(self, done: dict) -> bool:
         ev, offset = done["event"], done["offset"]
         sid = ev.get("session_id") or self.sid
@@ -993,14 +1275,11 @@ class Driver:
                                      if isinstance(b, dict)).strip() or "API error"
         if failure:
             error = str(ev.get("error") or ev.get("message") or ev.get("reason") or "") or error or "turn failed"
-        self.emit({"type": "system", "subtype": "init", "session_id": sid, "model": model,
-                   "launch_mode": "interactive"})
+        self.emit_init(sid, model)
         for e in entries:
-            t = e.get("type")
-            if t in ("user", "assistant"):
-                self.emit({"type": t, "session_id": sid, "message": e.get("message") or {}})
-            elif t == "system" and e.get("subtype") == "compact_boundary":
-                self.emit({"type": "system", "subtype": "compact_boundary", "session_id": sid})
+            rec = self._claude_record(e)
+            if rec is not None and str(e.get("uuid") or "") not in self.streamed:
+                self.emit({**rec, "session_id": sid})
         total = {}
         for u in usage.values():
             for k, v in u.items():
@@ -1014,7 +1293,13 @@ class Driver:
 
     def emit_codex(self, done: dict) -> bool:
         ev, before = done["event"], done["totals"] or {}
-        thread = str(ev.get("thread-id") or self.meta.get("session_id") or self.sid)
+        # the notify can come before the watch read the rollout to the task's end: its tool calls go out first
+        while self.turn_end is None and self.rollout:
+            mark = self.scan_from
+            self.reply_started(self.progress_size())
+            if self.scan_from == mark:
+                break
+        thread = self.rollout_thread() or str(ev.get("thread-id") or self.meta.get("session_id") or self.sid)
         self.meta["session_id"] = thread
         after = self.codex_totals()
         usage = {k: max(0, int(after.get(k) or 0) - int(before.get(k) or 0))
@@ -1022,13 +1307,16 @@ class Driver:
         self.emit({"type": "thread.started", "thread_id": thread, "launch_mode": "interactive"})
         self.emit({"type": "item.completed", "item": {"type": "agent_message",
                                                       "text": ev.get("last-assistant-message") or ""}})
-        self.emit({"type": "turn.completed", "usage": usage})
+        # a turn without a final message says why (an API error, no model output); readers that do
+        # not know the field see the same empty turn as before
+        why = "" if ev.get("last-assistant-message") else str(ev.get("no-reply") or "no final message")
+        self.emit({"type": "turn.completed", "usage": usage, **({"no_reply": why[:300]} if why else {})})
         return True
 
     def emit_start(self) -> None:
         """Session id only, no result: the runner treats the turn as cut off."""
         sid = self.meta.get("session_id") or self.sid
-        if not sid:
+        if not sid or self.init_sent:
             return
         if self.harness == "codex":
             self.emit({"type": "thread.started", "thread_id": sid, "launch_mode": "interactive"})
@@ -1043,7 +1331,7 @@ class Driver:
             self.emit({"type": "turn.failed", "error": {"message": message}})
         else:
             sid = self.meta.get("session_id") or self.sid
-            self.emit({"type": "system", "subtype": "init", "session_id": sid, "launch_mode": "interactive"})
+            self.emit_init(sid, "")
             self.emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
                        "result": message, "session_id": sid, "usage": {}, "total_cost_usd": None})
 

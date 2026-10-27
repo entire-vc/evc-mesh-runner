@@ -16,6 +16,26 @@ def _comments_block(comments: list[dict], limit: int = 6) -> str:
     return "\n".join(rows) or "- (none)"
 
 
+# Work whose result is not a merge request: it is closed by its evidence. The label is
+# ``kind:<value>``; change, defect and no label keep the plain contract.
+DELIVERY_EVIDENCE = {
+    "research": "a report with its sources and a conclusion",
+    "content": "a link to the artifact and the criteria it meets",
+    "ops": "a verifiable receipt of the change, e.g. command output or a GET showing the new state",
+}
+
+
+def delivery_note(task: dict) -> str:
+    """One short paragraph for kind:research / kind:content / kind:ops cards, else ''."""
+    labels = [str(x).strip().lower() for x in task.get("labels") or []]
+    for kind, evidence in DELIVERY_EVIDENCE.items():
+        if f"kind:{kind}" in labels:
+            return (f"\nDelivery (kind:{kind}): this card is closed by its evidence: {evidence}. "
+                    "No MR, CI or deploy is invented for it. Put the evidence in the closing comment and move the "
+                    "card to done (to review when its acceptor is someone else).\n")
+    return ""
+
+
 def start_prompt(task: dict, agent_name: str, workspaces: list[str], comments: list[dict],
                  preamble: str = "", merge: bool = False) -> str:
     short = task["id"][:8]
@@ -34,7 +54,7 @@ Read the full task (description, dependencies, all comments) with your Mesh tool
 Latest comments:
 {_comments_block(comments)}
 
-{contract(merge)}""".strip() + "\n"
+{contract(merge)}{delivery_note(task)}""".strip() + "\n"
 
 
 REVIEW_PROTOCOL = """This task is in REVIEW and assigned to you. Decide it in this turn:
@@ -102,7 +122,7 @@ What changed: {event}
 Re-read the task's new comments, continue from where you stopped, and end the turn with the same
 outcome contract (a closing comment with ⏳ WAIT / ↻ NEXT / ❓ Blocking, or move the task on).
 
-{DECISION_WAIT_GUIDANCE}"""
+{DECISION_WAIT_GUIDANCE}{delivery_note(task)}"""
 
 
 def new_comments_block(comments: list[dict], limit: int = 8, size: int = 1500) -> str:
@@ -129,7 +149,7 @@ def no_outcome_prompt(task: dict, line: str = "", why: str = "", merge: bool = F
     else:
         head = f"[runner] Your last turn on task #{task['id'][:8]} ended without an outcome.\n"
     return head + f"""Post the closing comment now; its last line must be exactly one of these forms:
-{contract(merge)}"""
+{contract(merge)}{delivery_note(task)}"""
 
 
 def ask_not_raised_prompt(task: dict, handle: str, refusal: str = "") -> str:

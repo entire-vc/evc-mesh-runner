@@ -114,6 +114,28 @@ class StartCap(CapBench):
         mesh.add_comment(t["id"], "my own note")
         self.assertTrue(r.hold_reason(dict(mesh.tasks[t["id"]]), "work").startswith("waiting for new input"))
 
+    def test_a_queue_request_by_the_agents_own_key_is_input(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
+        mesh.add_comment(t["id"], "[fleet queue-request:{\"version\":1,\"observed_at\":1,\"targets\":[]}] idle")
+        self.assertEqual(r.hold_reason(dict(mesh.tasks[t["id"]]), "work"), "")
+
+    def test_a_queue_request_by_the_system_author_is_not_input(self):
+        from mesh_runner.wake import SYSTEM_AUTHOR
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
+        mesh.add_comment(t["id"], "[fleet queue-request:{\"version\":1,\"observed_at\":1,\"targets\":[]}] idle",
+                         author=SYSTEM_AUTHOR)
+        self.assertTrue(r.hold_reason(dict(mesh.tasks[t["id"]]), "work").startswith("waiting for new input"))
+
     def test_each_kind_of_input_counts(self):
         for label, change in (
                 ("merge request pipeline", lambda m, t: m.links.update({t["id"]: [{"url": "u", "status": "open",
@@ -429,6 +451,28 @@ class OtherCaps(CapBench):
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
         self.assertIn("routed to lead", r.store.get(a.id).note)
         self.assertFalse(r._cap_wait(t["id"]))
+
+    def test_cap_wake_next_day_restarts_a_leadless_agent_only_on_a_new_utc_day(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.cfg.cap_wake_next_day = True
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
+        cur = dict(mesh.tasks[t["id"]])
+        self.assertIn("waiting for new input", r.hold_reason(cur, "work"))
+        rec = json.loads(r.store.mark("builder", t["id"], CAP_WAIT)[0])
+        rec["at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+        r.store.mark("builder", t["id"], CAP_WAIT, json.dumps(rec))
+        with self.assertLogs("mesh_runner", "INFO") as lg:
+            self.assertEqual(r.hold_reason(cur, "work"), "")
+        self.assertTrue(any("cap wake" in m for m in lg.output))
+        self.agent.lead = "lead"                       # a lead takes the cap path, no clock
+        self.assertIn("waiting for new input", r.hold_reason(cur, "work"))
+        self.agent.lead = ""
+        self.cfg.cap_wake_next_day = False             # rollback flag
+        self.assertIn("waiting for new input", r.hold_reason(cur, "work"))
 
 
 class FlagOff(CapBench):

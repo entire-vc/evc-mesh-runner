@@ -38,10 +38,13 @@ import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 
 from .mesh import MeshClient, MeshError
 from .blocking_path import BlockingPath, Budget
+
+DIAGNOSTIC_TICK_SECONDS = 15.0
 from .selection import StatusCategories, parse_time
 from .store import OPEN, Attempt, Store, iso, now
 
@@ -342,11 +345,16 @@ class Effects:
         self.reconcile_decisions()
         self.retry_unschedules()
         current = now()
-        diagnostic_budget = Budget()
+        tick_deadline = time.monotonic() + DIAGNOSTIC_TICK_SECONDS
         for a in attempts:
             desired = runtime_state(a, self.lane)
             if desired is not None and a.state == "waiting" and a.wait.get("kind") == "card":
-                desired["reason"] = self._blocking_path.resolve(a, diagnostic_budget)
+                # A budget per card: one shared 3 s budget starved every card
+                # after the first uncached ones. The tick cap bounds the total.
+                if time.monotonic() < tick_deadline:
+                    budget = Budget()
+                    budget.deadline = min(budget.deadline, tick_deadline)
+                    desired["reason"] = self._blocking_path.resolve(a, budget)
             prev = self._published.get(a.task_id)
             if desired is None:
                 continue

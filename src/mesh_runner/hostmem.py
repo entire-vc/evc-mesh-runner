@@ -1,4 +1,4 @@
-"""Host memory gate: hold NEW sessions while the machine is short of memory.
+"""Host gates: hold NEW sessions while the machine is short of memory, or overloaded.
 
 Parallel sessions multiply memory use; on a small host the next start can push
 it into swap thrash, which slows every running session. The gate holds starts
@@ -9,10 +9,17 @@ taken imposes nothing: no readings at all = open (fail open).
 
 macOS: ``sysctl kern.memorystatus_level`` (free %), ``sysctl vm.swapusage``.
 Linux: ``/proc/meminfo`` (MemAvailable / MemTotal, SwapFree).
+
+The load gate (LoadGate) is the same idea for CPU: a host whose 5-minute load average per CPU is far
+above 1 (26.10: load ~300 on 10 CPUs from runaway renderers) starts every session so slowly that the
+drivers' start-up and accept waits run out, and each failed start only adds load. It holds starts and
+resumes while the load is over the hold threshold and releases below the release threshold. Memory
+and load log under their own strings ("host memory: ..." / "host load: ...").
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -129,5 +136,69 @@ class MemoryGate:
                 self.holding = decide(was, self.free, self.swap, self.t)
                 if self.holding != was:
                     log.warning("host memory: %s new sessions (%s)",
+                                "HOLD" if self.holding else "resume", self.describe())
+            return self.holding
+
+
+@dataclass
+class LoadThresholds:
+    hold_per_cpu: float = 0.0           # 5-minute load average per CPU; 0 = gate off
+    release_per_cpu: float = 0.0        # 0 = three quarters of the hold threshold
+
+
+def read_load() -> tuple[float | None, int]:
+    """(5-minute load average, CPU count); (None, n) when the load cannot be read."""
+    cpus = os.cpu_count() or 1
+    try:
+        return os.getloadavg()[1], cpus
+    except (OSError, AttributeError):
+        return None, cpus
+
+
+def decide_load(holding: bool, load: float | None, cpus: int, t: LoadThresholds) -> bool:
+    """Next state, True = hold new sessions. Pure. No reading = open (fail open)."""
+    if t.hold_per_cpu <= 0 or load is None:
+        return False
+    per_cpu = load / max(1, cpus)
+    if not holding:
+        return per_cpu > t.hold_per_cpu
+    release = t.release_per_cpu if 0 < t.release_per_cpu <= t.hold_per_cpu else 0.75 * t.hold_per_cpu
+    return per_cpu >= release
+
+
+class LoadGate:
+    """The CPU twin of MemoryGate: shared by every agent thread of one runner, reads the load at most
+    every `cache_seconds`, logs only on a state change."""
+
+    def __init__(self, t: LoadThresholds, reader=read_load, cache_seconds: float = 30.0, clock=time.monotonic):
+        self.t, self._read, self._cache, self._clock = t, reader, cache_seconds, clock
+        self._lock = threading.Lock()
+        self.holding = False
+        self.load: float | None = None
+        self.cpus = os.cpu_count() or 1
+        self._at: float | None = None
+
+    def describe(self) -> str:
+        if self.load is None:
+            return "load average ?"
+        return "load5 %.1f on %d CPUs = %.1f per CPU, hold above %g" % (
+            self.load, self.cpus, self.load / max(1, self.cpus), self.t.hold_per_cpu)
+
+    def check(self) -> bool:
+        """True = hold new sessions now."""
+        if self.t.hold_per_cpu <= 0:
+            return False
+        with self._lock:
+            now = self._clock()
+            if self._at is None or now - self._at >= self._cache:
+                self._at = now
+                try:
+                    self.load, self.cpus = self._read()
+                except Exception:
+                    self.load = None
+                was = self.holding
+                self.holding = decide_load(was, self.load, self.cpus, self.t)
+                if self.holding != was:
+                    log.warning("host load: %s new sessions (%s)",
                                 "HOLD" if self.holding else "resume", self.describe())
             return self.holding

@@ -58,6 +58,43 @@ class ChatTurn(unittest.TestCase):
         kinds = [p for _, p in mesh.requests if "/turns/" in p]
         self.assertTrue(kinds[0].endswith("/start"))
 
+    def test_first_event_logs_where_the_turn_seconds_went_once(self):
+        d = Scripted([{"type": "text_delta", "text": "a"}, {"type": "text_delta", "text": "b"},
+                      {"type": "final", "stop_reason": "end_turn"}])
+        mesh, client, runner = make(d)
+        turn = claim(mesh, client)
+        with self.assertLogs("mesh_runner", level="INFO") as cm:
+            runner.run(turn)
+        lines = [m for m in cm.output if "timing: start_call=" in m and "first_event=" in m]
+        self.assertEqual(len(lines), 1)
+
+    def test_a_delivery_that_raises_before_any_event_still_logs_its_timing(self):
+        class Boom:
+            def run(self, turn, cancelled):
+                raise RuntimeError("tmux gone")
+                yield
+        mesh, client, runner = make(Boom())
+        turn = claim(mesh, client)
+        with self.assertLogs("mesh_runner", level="INFO") as cm:
+            runner.run(turn)
+        self.assertEqual(len([m for m in cm.output if "timing: start_call=" in m]), 1)
+
+    def test_a_turn_cancelled_at_start_still_logs_its_timing(self):
+        d = Scripted([{"type": "final", "stop_reason": "end_turn"}])
+        mesh, client, runner = make(d)
+        turn = claim(mesh, client)
+        mesh.turns[turn["turn_id"]]["cancel_requested"] = True
+        with self.assertLogs("mesh_runner", level="INFO") as cm:
+            runner.run(turn)
+        self.assertEqual(len([m for m in cm.output if "timing: start_call=" in m]), 1)
+
+    def test_a_delivery_that_yields_nothing_still_logs_its_timing(self):
+        mesh, client, runner = make(Scripted([]))
+        turn = claim(mesh, client)
+        with self.assertLogs("mesh_runner", level="INFO") as cm:
+            runner.run(turn)
+        self.assertEqual(len([m for m in cm.output if "timing: start_call=" in m]), 1)
+
     def test_stale_claim_on_start_drops_without_touching_the_model(self):
         d = Scripted([{"type": "final", "stop_reason": "end_turn"}])
         mesh, client, runner = make(d)

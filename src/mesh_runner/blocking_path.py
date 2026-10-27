@@ -12,7 +12,7 @@ from .store import iso, now
 
 MARK = 'blocking_path_diagnostic_v1'
 CACHE_SECONDS = 300
-MAX_GETS, MAX_DEPTH, MAX_NODES, SECONDS = 12, 4, 8, 3.0
+MAX_GETS, MAX_DEPTH, MAX_NODES, SECONDS = 12, 4, 8, 8.0
 # Mesh's typed nonblocking edges; digest compatibility also recognizes the
 # legacy depends_on spelling as blocking. Unknown types never prove no blocker.
 BLOCKING_TYPES = ('blocks', 'depends_on')
@@ -21,10 +21,22 @@ UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 SHORT = re.compile(r'[0-9a-f]{8}')
 
 
-def _format_reason(task_id, paths, gates, checked_at):
+def _addressee(row):
+    # The assignee of an open, ungated end-of-chain card is who must move it
+    # (CI, MR, work). A gated end asks a person; neither owner nor assignee
+    # proves who, so that stays unknown.
+    name = row.get('assignee_name')
+    if not isinstance(name, str):
+        assignee = row.get('assignee')
+        name = assignee.get('name') if isinstance(assignee, dict) else None
+    return name if isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', name) else 'unknown'
+
+
+def _format_reason(task_id, paths, gates, checked_at, addressees=()):
     fields = [' -> '.join('#' + tid[:8] for tid in [task_id] + path) for path in paths]
     fields += ['#' + tid[:8] + ' human_gate=true gate_owner=' + owner for tid, owner in gates]
-    tail = '; addressee=unknown; observed_at=' + checked_at
+    names = sorted(set(addressees))
+    tail = '; addressee=' + (','.join(names) if names else 'unknown') + '; observed_at=' + checked_at
     reason = 'Blocking path diagnostic: ' + '; '.join(fields) + tail
     if len(reason) <= 800:
         return reason
@@ -86,7 +98,7 @@ class BlockingPath:
                 return record['reason']
         except (ValueError, TypeError, AttributeError, RecursionError):
             pass
-        paths, gates = [], []
+        paths, gates, addressees = [], [], []
         visited = set()
 
         def walk(value, ancestry):
@@ -155,6 +167,7 @@ class BlockingPath:
                 gates.append((tid, owner))
             if not children:
                 paths.append(path)
+                addressees.append('unknown' if gate else _addressee(row))
             for child in sorted(set(children)):
                 walk(child, path)
 
@@ -172,7 +185,7 @@ class BlockingPath:
             reason = ('Blocking path diagnostic UNKNOWN (' + failure
                       + '); addressee=unknown; observed_at=' + checked_at)
         else:
-            reason = _format_reason(attempt.task_id, paths, gates, checked_at)
+            reason = _format_reason(attempt.task_id, paths, gates, checked_at, addressees)
         record = {'target': target, 'checked_at': checked_at, 'reason': reason}
         if self.store:
             self.store.mark(self.lane, attempt.task_id, MARK, json.dumps(record))

@@ -9,6 +9,7 @@ the task's worktrees are added with --add-dir.
 """
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -93,6 +94,25 @@ class ClaudeAdapter(Adapter):
 
     def with_read_only(self, argv: list[str]) -> list[str]:
         return argv + ["--disallowedTools", *self.READ_ONLY_DENIED]
+
+    def with_slot_confined(self, argv: list[str]) -> list[str]:
+        """Not available: this harness has no sandbox here and its file tools are not path-bounded
+        in a session that skips permission prompts, so a write session cannot be confined to a directory."""
+        raise NotImplementedError("no sandbox: writes cannot be confined to the slot")
+
+    def without_local_memory(self, env: dict) -> dict:
+        """Auto-memory off: with it on, "remember this" goes to a memory file (denied in a read-only
+        chat, and shared by every chat of the agent) instead of the Mesh server's remember."""
+        return {**env, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+
+    def with_instructions(self, argv: list[str], text: str) -> list[str]:
+        return argv + ["--append-system-prompt", text]
+
+    def with_mcp(self, argv: list[str], name: str, command: list[str], env: dict) -> list[str]:
+        """Only this server: --strict-mcp-config drops the profile's .mcp.json (the agent's own Mesh
+        MCP, with the agent key). It also ends the variadic --mcp-config before any later flag."""
+        cfg = {"mcpServers": {name: {"command": command[0], "args": list(command[1:]), "env": dict(env)}}}
+        return argv + ["--mcp-config", json.dumps(cfg), "--strict-mcp-config"]
 
     def with_model(self, argv: list[str], model: str) -> list[str]:
         out, i = [], 0

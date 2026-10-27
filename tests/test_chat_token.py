@@ -1,6 +1,8 @@
 import os
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -82,6 +84,42 @@ class Token(unittest.TestCase):
         k.thread.join(5)
         self.assertEqual(k.error, "chat_cancel_requested")
         self.assertFalse(f.exists())
+
+
+    def test_slow_issue_does_not_hold_the_turn(self):
+        """A session-token call that hangs (the 30 s gap before `plan` of turn ec202e35) is waited
+        for first_wait only; the file lands when the call returns."""
+        self.client.start(self.turn["turn_id"], self.turn["claim_token"])
+        release, real = threading.Event(), self.client.session_token
+
+        def slow(*a, **kw):
+            release.wait(10)
+            return real(*a, **kw)
+        self.client.session_token = slow
+        path = self.dir / "chat" / "tok"
+        k = TokenKeeper(self.client, self.turn, path, 1, wait=lambda d: True)
+        t0 = time.monotonic()
+        k.start(first_wait=0.2)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertFalse(path.exists())
+        release.set()
+        k.thread.join(5)
+        self.assertTrue(path.exists())
+        k.stop()
+
+    def test_stop_does_not_wait_for_a_hung_issue_and_the_file_never_appears(self):
+        self.client.start(self.turn["turn_id"], self.turn["claim_token"])
+        release, real = threading.Event(), self.client.session_token
+        self.client.session_token = lambda *a, **kw: (release.wait(10), real(*a, **kw))[1]
+        path = self.dir / "chat" / "tok"
+        k = TokenKeeper(self.client, self.turn, path, 1, wait=lambda d: True)
+        k.start(first_wait=0.1)
+        t0 = time.monotonic()
+        k.stop()
+        self.assertLess(time.monotonic() - t0, 2.0)
+        release.set()
+        k.thread.join(5)
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

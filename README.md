@@ -348,7 +348,12 @@ state_dir = "~/.local/state/mesh-runner"
 # max_chat_sessions = 3                   # live chat sessions per agent
 # host_cap = 6                            # live sessions on this host, chats and cards together
 # session_idle_minutes = 10               # an idle chat session is stopped; the next message resumes it
-# chat_workspace = "none"                 # "none" | "read"; no repository checkout in a chat
+# chat_workspace = "none"                 # "none" | "read" | "write"; none/read: no repository checkout (read-only tools);
+                                          # write: a slot of the card worktree pool (first repo) for the life of the session
+# mcp_command = ["/usr/local/bin/evc-mesh-mcp", "--transport", "stdio"]   # Mesh MCP of a chat, run with the
+#                                         # thread's token (MESH_CHAT_TOKEN_FILE), never the agent key; it
+#                                         # replaces the profile's `evc-mesh` server in the session
+# mcp_url = ""                            # MESH_API_URL for it; empty = [runner] mesh_url
 
 [gitlab]                                  # optional: pipeline/mr waits
 base_url = "https://gitlab.example.com"
@@ -464,6 +469,21 @@ shell reads and deletes.
 Host memory gate (`[runner] memory_hold_free_pct = 15`, `memory_release_free_pct = 20`,
 `memory_hold_swap_mb`, `memory_release_swap_mb`): no new or resumed sessions while
 the host is short of memory; running turns are never touched. Off by default.
+
+Host load gate (`[runner] load_hold_per_cpu = 4.0`, `load_release_per_cpu`): the same hold
+for CPU. No new or resumed sessions while the 5-minute load average divided by the CPU count
+is over `load_hold_per_cpu`; released below `load_release_per_cpu` (0 = three quarters of the
+hold value). On by default at 4.0; `0` turns it off. An overloaded host starts a session so
+slowly that the driver's start-up waits run out, and every failed start adds load. The
+runner logs `host load: HOLD new sessions (...)` / `host load: resume new sessions (...)`
+(the memory gate logs `host memory: ...`) and reports `load_hold` in its status.
+
+Codex start-up: a resumed Codex shows its prompt box before it is done starting
+(`Resuming session…`), and a prompt entered then is queued under `Waiting for startup`.
+The driver does not call Codex ready while those lines are on screen (the `ready` wait is
+180 s), and while the queued prompt waits for start-up it extends the accept wait up to the
+driver's `startup_wait` (300 s). Past that the turn fails with `start-up stalled` and the
+window is kept, not closed.
 
 A `model:<name>` label on a task runs every turn of that task with
 `--model <name>` (Claude; a Codex agent takes its model from the profile). The label

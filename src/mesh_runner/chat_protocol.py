@@ -17,6 +17,7 @@ from typing import Any
 from .mesh import MeshClient, MeshError
 
 PROTOCOL = 1
+CLAIM_READ_SLACK = 3        # seconds past the server's own deadline before a silent claim is given up
 # the runner must stop working on a turn when Mesh answers with one of these (protocol §5.2)
 DROP_CODES = frozenset({"chat_stale_claim", "chat_lease_expired", "chat_turn_terminal",
                         "chat_not_claim_holder", "chat_turn_not_found"})
@@ -42,8 +43,10 @@ def _wrap(e: MeshError) -> ChatError:
     err = body.get("error") if isinstance(body.get("error"), dict) else body
     code = str(err.get("error_code") or "") if isinstance(err, dict) else ""
     ctx = err.get("context") if isinstance(err, dict) and isinstance(err.get("context"), dict) else {}
-    return ChatError(e.status, code or ("transport" if e.status == 0 else f"http_{e.status}"),
-                     str(err.get("message") or "")[:200] if isinstance(err, dict) else "", ctx)
+    msg = str(err.get("message") or "")[:200] if isinstance(err, dict) else ""
+    if e.status == 0 and not msg:
+        msg = str(e)[:200]      # which socket error it was (reset, timeout, TLS), not just "transport"
+    return ChatError(e.status, code or ("transport" if e.status == 0 else f"http_{e.status}"), msg, ctx)
 
 
 def load_runner_id(state_dir) -> str:
@@ -66,13 +69,16 @@ def load_runner_id(state_dir) -> str:
     return rid
 
 
-def load_runner_credential(state_dir, register) -> tuple[str, str]:
+def load_runner_credential(state_dir, register, agent: str = "") -> tuple[str, str]:
     """The registered runner of this machine: ``(runner_id, token)`` from ``chat-runner.json`` (0600),
     registered once through ``register()`` (POST /runner/chat/runners; the token is in that answer
     only). Mesh hands a runner its orders (stop_session, delete_transcript) only against this
-    credential, so without it a deleted chat's transcript would stay on disk."""
+    credential, so without it a deleted chat's transcript would stay on disk. The token is bound to the
+    key that registered it (Mesh answers 403 ``chat_runner_forbidden`` to another agent's key), so a
+    runner serving several agents keeps one file per agent: ``chat-runner-<agent>.json``."""
     import json
-    path = os.path.join(os.path.expanduser(str(state_dir)), "chat-runner.json")
+    name = "chat-runner-%s.json" % urllib.parse.quote(agent, safe="") if agent else "chat-runner.json"
+    path = os.path.join(os.path.expanduser(str(state_dir)), name)
     try:
         with open(path) as fh:
             cur = json.load(fh)
@@ -149,7 +155,7 @@ class ChatClient:
     def claim(self, agents: list[str], timeout: int = 30, max_turns: int = 1) -> dict | None:
         """Long-poll. ``None`` on 204/empty; otherwise ``{"turns": [...], "commands": [...]}``."""
         res = self._call("GET", "/claim", query={"agents": ",".join(agents), "timeout": int(timeout),
-                                                 "max": int(max_turns)}, long=timeout + 15)
+                                                 "max": int(max_turns)}, long=timeout + CLAIM_READ_SLACK)
         return res or None
 
     def active(self) -> list[dict]:
@@ -196,13 +202,13 @@ class ChatClient:
 
 
 def registered_client(base_url: str, credential: str, state_dir, runner_id: str, name: str,
-                      opener=None) -> "ChatClient":
+                      opener=None, agent: str = "") -> "ChatClient":
     """The chat client of this runner: registered (orders arrive) when Mesh allows it, otherwise the
     plain one (turns still flow; stop/delete orders do not) and a warning without the token."""
     import logging
     client = ChatClient(base_url, credential, runner_id=runner_id, opener=opener)
     try:
-        rid, token = load_runner_credential(state_dir, lambda: client.register_runner(name))
+        rid, token = load_runner_credential(state_dir, lambda: client.register_runner(name), agent)
     except (ChatError, OSError, KeyError, ValueError, TypeError) as e:
         logging.getLogger("mesh_runner").warning(
             "chat runner registration failed (stop/delete orders will not arrive): %s",

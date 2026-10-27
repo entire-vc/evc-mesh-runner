@@ -31,7 +31,7 @@ does not apply to headless turns; `turn_idle_minutes` does.
 
 | key | default | ends the turn when |
 |-----|---------|--------------------|
-| `turn_first_output_minutes` | 0 | the harness has not replied this long after the turn started (phases `launcher`, `ready`, `sent`). Keep it above start-up (about 2 minutes) and above `busy_wait` (30 minutes) if a previous cut-off turn may still occupy the session |
+| `turn_first_output_minutes` | 0 | the harness has not replied this long after the turn started (phases `launcher`, `ready`, `sent`). Keep it above start-up (about 2 minutes, up to 8 on a loaded host: Codex waits up to 3 minutes to be ready and 5 more for a queued prompt) and above `busy_wait` (30 minutes) if a previous cut-off turn may still occupy the session |
 | `turn_idle_minutes` | 0 | no progress this long while nothing is running on the screen (a dialog, a dead prompt, a lost hook). For a headless turn this is the quiet time of the log: set it above the longest silent tool call |
 | `turn_external_wait_minutes` | 0 | no progress this long while the harness runs a tool or background task. 0 leaves such a turn to `max_turn_minutes` |
 

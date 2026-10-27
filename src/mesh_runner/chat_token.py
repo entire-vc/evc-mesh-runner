@@ -3,6 +3,7 @@ renewed at ttl-60s while the turn streams, removed when the turn ends. The token
 never logged and never leaves this file."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -10,7 +11,10 @@ from pathlib import Path
 
 from .chat_protocol import ChatClient, ChatError
 
+log = logging.getLogger(__name__)
+
 RENEW_MARGIN = 60.0
+STOP_JOIN = 0.25
 
 
 def write_token(path: Path, token: str) -> None:
@@ -44,18 +48,29 @@ class TokenKeeper:
     def ttl_of(self, res: dict) -> float:
         return float(res.get("ttl_seconds") or self.ttl)
 
-    def start(self) -> None:
-        try:
-            delay = self.issue()
-        except ChatError as e:
-            self.error = e.error_code            # the turn runs without MCP rights; Mesh refused a token
-            return
-        except (KeyError, OSError, ValueError) as e:
-            self.error = type(e).__name__
-            self.remove()
-            return
+    def start(self, first_wait: float | None = None) -> None:
+        """Issue the first token and keep it renewed. ``first_wait``: how long the caller waits for
+        the first issue (None = until it ends). A slow Mesh answer must not hold the turn: the file
+        lands when the call returns, and the model reads it at its first tool call, seconds later."""
+        first = threading.Event()
 
-        def loop(delay=delay):
+        def run() -> None:
+            t0 = time.monotonic()
+            try:
+                delay = self.issue()
+            except ChatError as e:
+                self.error = e.error_code            # the turn runs without MCP rights; Mesh refused a token
+                return
+            except (KeyError, OSError, ValueError) as e:
+                self.error = type(e).__name__
+                self.remove()
+                return
+            finally:
+                took = time.monotonic() - t0
+                if took > 1.0:                       # where a turn's missing seconds went
+                    log.info("chat turn %s: session-token issue took %.1fs",
+                             str(self.turn.get("turn_id"))[:8], took)
+                first.set()
             while not self._wait(delay):
                 try:
                     delay = self.issue()
@@ -67,8 +82,9 @@ class TokenKeeper:
                     self.error = type(e).__name__
                     self.remove()
                     return
-        self.thread = threading.Thread(target=loop, daemon=True, name="chat-token")
+        self.thread = threading.Thread(target=run, daemon=True, name="chat-token")
         self.thread.start()
+        first.wait(first_wait)
 
     def remove(self) -> None:
         with self._lock:
@@ -80,6 +96,6 @@ class TokenKeeper:
 
     def stop(self) -> None:
         self.stop_event.set()
-        if self.thread:
-            self.thread.join(timeout=5)
+        if self.thread:                              # a request in flight cannot revive the file (stop_event, under the lock): the turn's end waits for it only briefly
+            self.thread.join(timeout=STOP_JOIN)
         self.remove()                                # a renewal still in flight sees stop_event under the lock
