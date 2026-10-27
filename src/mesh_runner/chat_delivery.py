@@ -234,6 +234,12 @@ class DriverDelivery:
                     if state["interrupted"]:
                         break
                     finish()
+                    if ev["type"] == "error":        # Mesh keeps only the code: the reason stays in this log
+                        # only the start-up line is quoted: other driver errors can carry the screen
+                        msg = str(ev.get("message") or "")
+                        logging.getLogger(__name__).warning(
+                            "chat turn failed: %s: %s", ev.get("code"),
+                            msg[:300] if re.match(r"\w+ exited during start-up \d+ times: ", msg) else "(text withheld: may carry the screen)")
                     yield ev
                     return
                 yield ev

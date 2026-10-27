@@ -164,8 +164,10 @@ class ClaudeAdapter(Adapter):
                 # the hand-off, instead of retrying/reporting an error named "success".
                 subtype = str(ev.get("subtype") or "")
                 reason = str(ev.get("result") or "")
-                r.auth_failed = r.is_error and any(is_auth_banner(str(part))
-                    for part in [reason, *(errs if isinstance(errs, list) else [])])
+                hook_auth = (ev.get("runner_error") == {
+                    "source": "claude.StopFailure", "code": "authentication_failed"})
+                r.auth_failed = r.is_error and (hook_auth or any(is_auth_banner(str(part))
+                    for part in [reason, *(errs if isinstance(errs, list) else [])]))
                 output = (ev.get("usage") or {}).get("output_tokens", 0)
                 r.auth_only = r.auth_failed and not had_work and not (isinstance(output, (int, float)) and output > 0)
                 parts = [x for x in (reason, errors) if x]

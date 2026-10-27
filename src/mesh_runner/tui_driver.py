@@ -72,6 +72,10 @@ UPDATE_RE = re.compile(r"update available|update now|new version", re.I)
 BOOTSTRAP_RE = re.compile(r"^Error: .*failed during TUI bootstrap", re.I)
 PANE_DEAD_RE = re.compile(r"^Pane is dead\b")
 BOOTSTRAP_RETRIES = 2
+# seconds between a start-up exit and the next start, doubled per retry: the account check that timed out
+# is a host-load symptom (26.10: three starts in a row died inside 62 s), and an immediate restart meets the
+# same load
+BOOTSTRAP_BACKOFF = 15.0
 # the pane's pid may be a wrapper that starts a moment before Codex; a task this close to the process
 # start is not called stale
 PROCESS_START_SLACK = 5.0
@@ -173,7 +177,7 @@ class Driver:
         self.clock, self.sleep = clock, sleep
         self.t = {"ready": 180, "accept": 30, "poll": 1.0, "scan": 15, "interrupt": 6, "settle": 1.5,
                   # Codex: how long a queued prompt may wait for the harness to finish starting
-                  "startup_wait": 300,
+                  "startup_wait": 300, "bootstrap_backoff": BOOTSTRAP_BACKOFF,
                   "idle": 30, "stop_wait": 45, "beat": 5,
                   "cap_wait": 300, "cap_poll": 5, "busy_wait": 1800, "paste": 5,
                   # before a prompt goes into a session whose background agents still run (0 = do not wait)
@@ -1285,9 +1289,14 @@ class Driver:
             for k, v in u.items():
                 if isinstance(v, (int, float)):
                     total[k] = total.get(k, 0) + v
+        # Preserve the CLI hook's typed failure, independently of transcript prose.
+        # A task or assistant quoting the same words must never quarantine a profile.
+        runner_error = ({"source": "claude.StopFailure", "code": "authentication_failed"}
+                        if failure and ev.get("error") == "authentication_failed" else None)
         self.emit({"type": "result", "subtype": "error_during_execution" if error else "success",
                    "is_error": bool(error), "result": error or ev.get("last_assistant_message") or "",
-                   "session_id": sid, "usage": total, "total_cost_usd": None})
+                   "session_id": sid, "usage": total, "total_cost_usd": None,
+                   **({"runner_error": runner_error} if runner_error else {})})
         self.meta["session_id"] = sid
         return not error
 
@@ -1369,8 +1378,10 @@ class Driver:
                     if start == BOOTSTRAP_RETRIES:
                         raise DriverError(f"{self.harness} exited during start-up {start + 1} times: {line[:300]}",
                                           close=True) from None
+                    pause = float(self.t["bootstrap_backoff"]) * (2 ** start)
                     print(f"interactive: {self.harness} exited during start-up, starting again "
-                          f"({start + 1}/{BOOTSTRAP_RETRIES})", file=sys.stderr, flush=True)
+                          f"({start + 1}/{BOOTSTRAP_RETRIES}) in {pause:.0f}s: {line[:200]}", file=sys.stderr, flush=True)
+                    self.sleep(pause)
             ok = self.emit_claude(done) if self.harness == "claude" else self.emit_codex(done)
             marks["emit"] = self.clock()
             self.print_timing(marks)

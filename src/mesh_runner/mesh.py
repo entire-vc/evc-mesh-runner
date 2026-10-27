@@ -253,8 +253,16 @@ class MeshClient:
     def statuses(self, project_id: str) -> list[dict]:
         return _items(self.request("GET", f"/projects/{project_id}/statuses"))
 
-    def move(self, task_id: str, status_id: str) -> dict:
-        return self.request("POST", f"/tasks/{task_id}/move", {"status_id": status_id})
+    def move(self, task_id: str, status_id: str, expected_version: int | None = None,
+             expected_status_id: str | None = None) -> dict:
+        """Move a task. With ``expected_*`` the server writes only if the card is still as read
+        (atomic; otherwise 409 cas_conflict and no write)."""
+        body = {"status_id": status_id}
+        if expected_version is not None:
+            body["expected_version"] = int(expected_version)
+        if expected_status_id:
+            body["expected_status_id"] = expected_status_id
+        return self.request("POST", f"/tasks/{task_id}/move", body)
 
     def session_report(self, task_id: str, tokens_in: int, tokens_out: int, model: str, cost: float) -> None:
         """Spend of one turn on the agent's Mesh record (POST /agents/me/sessions/report)."""

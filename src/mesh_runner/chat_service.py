@@ -43,21 +43,26 @@ class ChatService:
         self.outcomes: list[tuple[str, str]] = []
         self._next_orders = 0.0                  # idle rounds fetch orders no more often than ORDERS_EVERY
         self.hold_until = 0.0                    # no claiming until then (a pool refusal must not spin)
+        self.claim_s: float | None = None        # how long the last round's claim took (None: no claim sent)
 
     def free_slots(self) -> int:
         with self.lock:
             return max(0, self.pool.max_per_agent * len(self.agents) - len(self.running))
 
-    def step(self, timeout: int = 30) -> int:
-        """One claim round. Returns the number of turns started."""
+    def step(self, timeout: int = 30, claim_agents: list[str] | None = None) -> int:
+        """One claim round; an optional filter affects claims only, never commands or workers."""
+        eligible = self.agents if claim_agents is None else [a for a in self.agents if a in claim_agents]
         free = self.free_slots()
-        if free <= 0 or time.monotonic() < self.hold_until:
+        self.claim_s = None
+        if not eligible or free <= 0 or time.monotonic() < self.hold_until:
             # commands (Stop, delete) must not wait for a free slot
-            for cmd in self.client.commands(self.agents):
-                self._command(cmd)
+            self._fetch_orders()
             return 0
         t0 = time.monotonic()
-        res = self.client.claim(self.agents, timeout=timeout, max_turns=min(5, free))
+        try:
+            res = self.client.claim(eligible, timeout=timeout, max_turns=min(5, free))
+        finally:
+            self.claim_s = time.monotonic() - t0
         if res:   # an idle long-poll is not logged; a turn that returned after ~5 s woke on the poll tick, not the hint
             log.info("chat claim: returned in %.1fs, %d turn(s), %d command(s)", time.monotonic() - t0,
                      len(res.get("turns") or []), len(res.get("commands") or []))
@@ -67,8 +72,7 @@ class ChatService:
             # The poll is short, so the fetch is paced separately instead of riding every round.
             if time.monotonic() >= self._next_orders:
                 self._next_orders = time.monotonic() + ORDERS_EVERY
-                for cmd in self.client.commands(self.agents):
-                    self._command(cmd)
+                self._fetch_orders()
             return 0
         for cmd in res.get("commands") or []:
             self._command(cmd)
@@ -78,6 +82,21 @@ class ChatService:
         return started
 
     # ------------------------------------------------------------------ commands
+    def _fetch_orders(self) -> None:
+        """A failed order fetch is logged as such and retried on a later round: reported through the
+        claim loop it read as a 33 s claim outage and backed the next claim off."""
+        t0 = time.monotonic()
+        try:
+            cmds = self.client.commands(self.agents)
+        except ChatError as e:
+            if not e.transient:
+                raise
+            log.warning("chat commands: %s after %.1fs%s", e.error_code, time.monotonic() - t0,
+                        f" ({e})" if e.status == 0 else "")
+            return
+        for cmd in cmds:
+            self._command(cmd)
+
     def _command(self, cmd: dict) -> None:
         kind, cid = cmd.get("kind"), cmd.get("command_id")
         try:

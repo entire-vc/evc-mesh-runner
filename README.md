@@ -428,6 +428,13 @@ Optional hooks per agent:
   holds only that task for 10 minutes. An observed update of the refused task permits a fresh gate decision; a
   successful local turn release also rechecks a capacity refusal. Neither event
   authorizes a start. Successful admission resets the backoff.
+  Chat starts use a separate `transport` phase (10-second hook timeout), with
+  empty task/attempt and mode `chat`. It must check only transport, without
+  reserving capacity or reading a task. Any refusal leaves a standing pane
+  unchanged and Mesh turns queued before claim; it does not spend task failure
+  budgets. Active turns, commands, idle reap and lease renewal continue. Deploy
+  support for this phase in the operator hook first; older hooks may allow an
+  unknown phase. This phase does not reconfigure or restart live chats.
   `HOLD_REASON_CODE=human|profile|capacity|review|unknown` selects a fixed public
   diagnostic; emit exactly one code. Unknown or duplicate codes stay generic.
   Legacy plain text remains supported; recognized routing text containing `=`
@@ -574,7 +581,8 @@ the runner serves the endpoints Mesh needs for the install handshake:
   logged. A repeated install with the same secret is idempotent; a different secret is refused (409)
   until that file is removed or `allow_rekey = true`.
 - `POST /mesh/events` — `task.assigned`, `task.updated`, `comment.created` wake the poll loop instead
-  of waiting for `poll_seconds`; other events are acknowledged and ignored.
+  of waiting for `poll_seconds`; other events are acknowledged and ignored. The event type is read from
+  the `X-Mesh-Event` header (an `event`/`type` field in the body is accepted as a fallback).
 
 Every request must carry `X-Mesh-Timestamp` and `X-Mesh-Signature` (hex HMAC-SHA256 of
 `"{timestamp}.{body}"`); a wrong signature or a timestamp more than `tolerance_seconds` (300) off is

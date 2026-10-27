@@ -53,6 +53,22 @@ class Driver(unittest.TestCase):
         evs = list(self.delivery(script).run({"turn_id": "turn-12345678"}, lambda: False))
         self.assertEqual(evs[-1], {"type": "final", "stop_reason": "end_turn"})
 
+    def test_failed_turn_logs_its_reason(self):
+        failed = {"type": "turn.failed", "error": {"message": "codex exited during start-up 3 times: Error: bootstrap"}}
+        d = self.delivery("import sys\nsys.stdin.read()\nprint(%r)" % json.dumps(failed))
+        d.harness = "codex"
+        with self.assertLogs("mesh_runner.chat_delivery", level="WARNING") as cm:
+            evs = list(d.run({"turn_id": "turn-12345678"}, lambda: False))
+        self.assertEqual(evs[-1]["code"], "harness_error")
+        self.assertIn("exited during start-up 3 times: Error: bootstrap", cm.output[0])
+
+    def test_failed_turn_log_does_not_quote_other_driver_errors(self):
+        failed = {"type": "turn.failed", "error": {"message": "prompt not taken; screen: SECRET-SCREEN"}}
+        d = self.delivery("import sys\nsys.stdin.read()\nprint(%r)" % json.dumps(failed))
+        with self.assertLogs("mesh_runner.chat_delivery", level="WARNING") as cm:
+            list(d.run({"turn_id": "turn-12345678"}, lambda: False))
+        self.assertNotIn("SECRET-SCREEN", cm.output[0])
+
     def test_answer_text_does_not_stay_on_disk_after_the_turn(self):
         d = self.delivery("import sys\nsys.stdin.read()\nprint('secret answer')")
         list(d.run({"turn_id": "turn-12345678"}, lambda: False))

@@ -357,12 +357,20 @@ class Store:
         return int(self.db.execute("SELECT COUNT(DISTINCT detail) FROM events WHERE attempt=? AND kind='auth_only_turn'",
                                    (attempt_id,)).fetchone()[0])
 
+    def outage_lanes(self, since: "dt.datetime") -> int:
+        """Agents with a provider-outage turn since ``since``."""
+        return int(self.db.execute(
+            "SELECT COUNT(DISTINCT attempts.agent) FROM events JOIN attempts ON attempts.id=events.attempt "
+            "WHERE events.kind='provider_outage' AND events.at>=?", (iso(since),)).fetchone()[0])
+
     def starts_today(self, agent: str, task_id: str) -> int:
         """Attempts this agent began on this task since UTC midnight that ran at least
-        one turn (a start the gate held before it ran is not a start)."""
+        one turn that was not a provider outage (a start the gate held before it ran is not a start)."""
         midnight = iso(now().replace(hour=0, minute=0, second=0, microsecond=0))
         row = self.db.execute("SELECT COUNT(*) FROM attempts WHERE agent=? AND task_id=? AND created_at>=? "
-                              "AND turns>0 AND mode='work'", (agent, task_id, midnight)).fetchone()
+                              "AND mode='work' AND turns > (SELECT COUNT(DISTINCT detail) FROM events "
+                              "WHERE attempt=attempts.id AND kind='provider_outage')",
+                              (agent, task_id, midnight)).fetchone()   # outage-only turns are not a start
         return int(row[0]) if row else 0
 
     def last_work_end(self, agent: str, task_id: str) -> "dt.datetime | None":

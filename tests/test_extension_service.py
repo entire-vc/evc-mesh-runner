@@ -119,6 +119,24 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(self.svc.events(headers(body), body)[0], 202)
             self.assertEqual(len(self.wakes), woke, kind)
 
+    def test_event_kind_from_x_mesh_event_header(self):
+        # Mesh puts the event type in the X-Mesh-Event header; the body carries only the payload
+        self.install()
+        body = json.dumps({"task_id": "t1", "project_id": "p1", "changes": {"status": "todo"}}).encode()
+        for kind, status, woke in (("task.assigned", "wake", 1), ("comment.created", "wake", 1),
+                                   ("task.deleted", "ignored", 0)):
+            self.wakes.clear()
+            hdr = dict(headers(body), **{"X-Mesh-Event": kind})
+            self.assertEqual(self.svc.events(hdr, body), (202, {"status": status}), kind)
+            self.assertEqual(len(self.wakes), woke, kind)
+
+    def test_header_kind_wins_over_body(self):
+        self.install()
+        body = json.dumps({"event": "task.assigned"}).encode()
+        hdr = dict(headers(body), **{"X-Mesh-Event": "project.created"})
+        self.assertEqual(self.svc.events(hdr, body), (202, {"status": "ignored"}))
+        self.assertEqual(self.wakes, [])
+
     def test_secret_never_logged(self):
         with self.assertLogs("mesh_runner", level="DEBUG") as cm:
             self.install()
@@ -163,6 +181,17 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(self.call("POST", "/mesh/events", ev, headers(ev, ts=now))[0], 202)
         self.assertEqual(len(self.wakes), 1)
         self.assertEqual(self.call("POST", "/nope", b"{}")[0], 404)
+
+    def test_event_header_over_http_any_case(self):
+        # the real handler passes self.headers (case-insensitive), not a dict
+        import time
+        body = install_body()
+        now = int(time.time())
+        self.assertEqual(self.call("POST", "/mesh/install", body, headers(body, ts=now))[0], 200)
+        ev = json.dumps({"task_id": "t1", "changes": {}}).encode()
+        self.assertEqual(self.call("POST", "/mesh/events", ev, dict(headers(ev, ts=now), **{"x-mesh-event": "task.updated"})),
+                         (202, {"status": "wake"}))
+        self.assertEqual(len(self.wakes), 1)
 
 
 class TokenTest(unittest.TestCase):

@@ -197,8 +197,8 @@ class StartCap(CapBench):
                 self.started(r, t)
                 real_move, real_patch = mesh.move, mesh.patch_task
                 if label == "move":
-                    mesh.move = lambda tid, sid: (_ for _ in ()).throw(MeshError(503, "down")) \
-                        if mesh.tasks[tid]["assignee_id"] == AGENT_ID else real_move(tid, sid)
+                    mesh.move = lambda tid, sid, **kw: (_ for _ in ()).throw(MeshError(503, "down")) \
+                        if mesh.tasks[tid]["assignee_id"] == AGENT_ID else real_move(tid, sid, **kw)
                 else:
                     mesh.patch_task = lambda tid, f: (_ for _ in ()).throw(MeshError(503, "down"))
                 r._start_cap(dict(mesh.tasks[t["id"]]), 2)
