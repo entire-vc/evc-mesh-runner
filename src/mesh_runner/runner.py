@@ -101,6 +101,12 @@ ENUMERATED_VERDICTS = re.compile(r"\b(?:SHIP|DO-NOT-SHIP)\b\s*(?:/|\||,|\bor\b)\
 OPEN_CHILD = {"todo", "in_progress", "review", "backlog"}
 ENV_PASSTHROUGH = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TERM", "TZ", "SSH_AUTH_SOCK")
 QUOTA_HINT = re.compile(r"rate.?limit|usage limit|quota|overloaded|429|too many requests", re.I)
+# A provider-side outage, not a fault of the task: the CLI's typed auth failure, a 403 with no tokens,
+# codex failing to reach its account service at TUI bootstrap. It passes without anyone's action.
+PROVIDER_OUTAGE_HINT = re.compile(
+    r"authentication_failed|API Error: 403|Request not allowed|workspace routing discovery failed"
+    r"|account/read failed during TUI bootstrap", re.I)
+OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY = "_runtime", "_provider_outage", "pause_until"
 POLICY_REFUSAL_HINT = re.compile(r"flagged for possible cybersecurity risk", re.I)
 # Codex says "No saved session found with ID …" when it cannot resume a thread
 NO_SESSION_HINT = re.compile(r"no conversation found|no saved session found|session .*not found|thread .*not found", re.I)
@@ -987,6 +993,49 @@ class AgentRunner:
             self.store.event(a.id, "auth_only_turn", str(a.turns))
         return profile
 
+    def _outage_paused(self) -> bool:
+        """Every start waits while several lanes fail on the provider at once."""
+        mark = self.store.mark(OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY)
+        until = parse_time(mark[0]) if mark and mark[0] else None
+        return until is not None and now() < until
+
+    def _provider_outage(self, a: Attempt, task: dict, public_error: str) -> None:
+        """A provider outage is neither a failed turn nor a start: back off and retry the same
+        attempt, give up only after the outage has lasted ``provider_outage_giveup_minutes``."""
+        name, tid = self.agent.name, a.task_id
+        # not a product turn: the turn budget ignores it, like an authentication-only turn
+        self.store.event(a.id, "auth_only_turn", str(a.turns))
+        self.store.event(a.id, "provider_outage", str(a.turns))
+        since = self.store.mark(name, tid, "outage_since")
+        began = parse_time(since[0]) if since and since[0] else None
+        if began is None:
+            began = now()
+            self.store.mark(name, tid, "outage_since", iso(began))
+            self.store.mark(name, tid, "outage_n", "0")
+        n = int((self.store.mark(name, tid, "outage_n") or ("0",))[0] or 0) + 1
+        self.store.mark(name, tid, "outage_n", str(n))
+        lasted = (now() - began).total_seconds() / 60
+        limit = self.cfg.provider_outage_giveup_minutes
+        if limit and lasted >= limit:
+            self.store.mark(name, tid, "outage_since", "")
+            log.warning("%s: #%s provider outage lasted %d min", name, a.task8, lasted)
+            self._give_up(a, task, f"the provider has failed for {int(lasted)} min: {public_error}")
+            return
+        delay = min(self.cfg.provider_outage_backoff_cap_seconds,
+                    self.cfg.provider_outage_backoff_seconds * 2 ** (n - 1))
+        lanes = self.cfg.provider_outage_lanes
+        if lanes and self.store.outage_lanes(now() - dt.timedelta(minutes=15)) >= lanes:
+            until = now() + dt.timedelta(seconds=delay)
+            mark = self.store.mark(OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY)
+            held = parse_time(mark[0]) if mark and mark[0] else None
+            if held is None or held <= now():
+                log.warning("%s: provider outage on %d+ lanes; starts paused %d s", name, lanes, delay)
+            if held is None or until > held:        # a later lane's shorter backoff never shortens the pause
+                self.store.mark(OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY, iso(until))
+        self.store.update(a, state="ready", pid=0, stamp="", note="provider outage, retrying")
+        self._resume_hold[a.id] = time.monotonic() + delay
+        log.info("%s: #%s provider outage (%d in a row); retry in %d s", name, a.task8, n, delay)
+
     def _authentication_failed(self, a: Attempt, profile: str) -> None:
         self._auth_hold_attempt(a, profile)
         log.warning("%s: #%s authentication held; profile %s; repair authentication then use clear-auth-hold",
@@ -1171,7 +1220,12 @@ class AgentRunner:
         if auth_profile is not None:
             self._authentication_failed(a, auth_profile)
             return
-        if a.turns - self.store.auth_turns(a.id) >= self.cfg.max_turns and not self._cap_at_resume(a):
+        stream_never_began = (not result.finished and not result.is_error and not result.final_text
+                              and not result.session_id and bool(stderr.strip()))
+        outage_turn = (result.is_error or stream_never_began) and bool(PROVIDER_OUTAGE_HINT.search(
+            f"{result.error_details or result.error} {result.final_text} {stderr[-500:]}"))
+        if (a.turns - self.store.auth_turns(a.id) >= self.cfg.max_turns and not outage_turn
+                and not self._cap_at_resume(a)):
             self._give_up(a, task, f"stopped after {a.turns} turns on this task")
             return
         no_session = NO_SESSION_HINT.search(f"{stderr} {result.error_details or result.error}")
@@ -1189,9 +1243,16 @@ class AgentRunner:
             # the harness died before its stream began (bad flag, untrusted dir, missing
             # binary): a harness error with its own words, not a silent "no outcome"
             result.is_error, result.error = True, stderr.strip()[-300:]
+        if not result.is_error and (self.store.mark(self.agent.name, a.task_id, "outage_since") or ("",))[0]:
+            self.store.mark(self.agent.name, a.task_id, "outage_since", "")   # the provider answered: the outage is over
         if result.is_error:
             text = f"{result.error_details or result.error} {result.final_text} {stderr[-500:]}"
             public_error = public_harness_error(text)
+            if PROVIDER_OUTAGE_HINT.search(text):
+                self._provider_outage(a, task, public_error)
+                return
+            if self.store.mark(self.agent.name, a.task_id, "outage_since"):
+                self.store.mark(self.agent.name, a.task_id, "outage_since", "")
             if QUOTA_HINT.search(text):
                 if self._switch_on_limit(a):
                     # another account/profile is in place: retry this task on it at once
@@ -2266,11 +2327,8 @@ class AgentRunner:
         tid = task["id"]
         try:
             if self.cats.category(task) != "todo":
-                todo = next((s["id"] for s in self.mesh.statuses(task["project_id"])
-                             if s.get("category") == "todo"), None)
-                if not todo:
+                if not self._guarded_todo(tid, task, self.agent_id, tid[:8]):
                     return False
-                self.mesh.move(tid, todo)
             if task.get("start_after"):
                 self.mesh.patch_task(tid, {"start_after": None})
         except MeshError as e:
@@ -2498,7 +2556,7 @@ class AgentRunner:
                                          f"({e.status}); released until someone writes here.")
                 return
             self._handed(a.task_id)
-            self._to_todo(a, task, always=True)
+            self._to_todo(a, task, always=True, expect_assignee=lead["id"])
             self._comment(a.task_id, f"{banner}: {why}. Handed to {lead.get('name')} to decide how to unblock it.")
             self._finish(a, "completed", f"routed to lead {lead.get('name')}: {why}")
             return
@@ -2510,16 +2568,55 @@ class AgentRunner:
                                  + (" until tomorrow (UTC) or until someone writes here." if short == "turn budget"
                                     else " until someone writes here."))
 
-    def _to_todo(self, a: Attempt, task: dict | None, always: bool = False) -> None:
-        if not task or (not always and self.cats.category(task) != "in_progress"):
+    def _to_todo(self, a: Attempt, task: dict | None, always: bool = False, expect_assignee: str = "") -> None:
+        """Back to todo only a card this attempt still holds in the stage the runner put it in.
+        ``always`` no longer skips that check: a hand-up must not undo a stage or owner someone
+        else set while the old attempt was ending."""
+        if not task:
             return
+        if not always and self.cats.category(task) != "in_progress":
+            return
+        self._guarded_todo(a.task_id, task, expect_assignee or self.agent_id, a.task8)
+
+    def _guarded_todo(self, tid: str, snapshot: dict, assignee: str, label: str) -> bool:
+        """Move to todo after re-reading the card now. The snapshot is from the start of the attempt;
+        a person or another agent may have changed stage/owner since. Skipped (False) unless the fresh
+        card is still in the stage the snapshot had or the project's default working stage, in an
+        in_progress category, assigned to ``assignee``. The move itself carries
+        expected_version/expected_status_id, so the server refuses (409) if the card changed after
+        this read."""
         try:
-            todo = next((s["id"] for s in self.mesh.statuses(task["project_id"])
-                         if s.get("category") == "todo"), None)
-            if todo:
-                self.mesh.move(a.task_id, todo)
+            fresh = self.mesh.task(tid)
+            if (fresh.get("assignee_id") or (fresh.get("assignee") or {}).get("id")) != assignee:
+                log.info("%s: #%s todo skipped: owner changed", self.agent.name, label)
+                return False
+            if self.cats.category(fresh) == "todo":
+                return True                          # already where we wanted it
+            if self.cats.category(fresh) != "in_progress":
+                log.info("%s: #%s todo skipped: stage moved on (%s)", self.agent.name, label,
+                         self.cats.category(fresh))
+                return False
+            statuses = self.mesh.statuses(snapshot["project_id"])
+            working = next((s["id"] for s in statuses if s.get("category") == "in_progress"), None)
+            if fresh.get("status_id") not in {snapshot.get("status_id"), working}:
+                log.info("%s: #%s todo skipped: business stage changed", self.agent.name, label)
+                return False
+            todo = next((s["id"] for s in statuses if s.get("category") == "todo"), None)
+            if not todo:
+                return False
+            version = fresh.get("version")
+            if version is None or not fresh.get("status_id"):
+                log.info("%s: #%s todo skipped: no version/stage to condition the move on", self.agent.name, label)
+                return False                         # fail closed: never an unconditional move
+            # atomic on the server: a change after the read above is a 409, not an overwrite
+            self.mesh.move(tid, todo, expected_version=version, expected_status_id=fresh["status_id"])
+            return True
         except MeshError as e:
-            log.warning("%s: route #%s: move: %s", self.agent.name, a.task8, e)
+            if e.status == 409:
+                log.info("%s: #%s todo skipped: card changed since read (cas_conflict)", self.agent.name, label)
+            else:
+                log.warning("%s: route #%s: move: %s", self.agent.name, label, e)
+            return False
 
     # ------------------------------------------------------------------ phases
     def heartbeat(self) -> None:
@@ -3383,7 +3480,7 @@ class AgentRunner:
         return ""
 
     def resume_ready(self, room: int) -> int:
-        if self.paused() or time.monotonic() < self._starts_paused_until:
+        if self.paused() or time.monotonic() < self._starts_paused_until or self._outage_paused():
             return room                       # a limit error: do not burn resumes either
         if self.host_hold():
             return room
@@ -4459,9 +4556,10 @@ class AgentRunner:
               gate: dict | None = None) -> tuple[str, dict]:
         """One phase of the operator's start gate: `reserve` (before a session starts or
         resumes), `admit` (the Mesh checkout is held: the writer is known), `renew`
-        (heartbeat of a running turn). ('', merged outputs) = go; (reason, gate) = hold."""
+        (heartbeat of a running turn), `transport` (chat-only, no reservation). ('', merged outputs) = go; (reason, gate) = hold."""
         gate = dict(gate or {})
-        self._gate_task_only = False
+        if phase != "transport":
+            self._gate_task_only = False
         if not self.agent.start_gate_command:
             return "", gate
         if phase == "reserve" and self._agent_gate_hold:
@@ -4469,13 +4567,14 @@ class AgentRunner:
             if source in self._gate_hold and time.monotonic() < until:
                 return reason, gate
         rc, out, err = self._run_hook(self.agent.start_gate_command,
-                                      self._hook_env(task_id, mode, phase, attempt, gate), timeout=120)
+                                      self._hook_env(task_id, mode, phase, attempt, gate), timeout=10 if phase == "transport" else 120)
         if rc == 0:
             gate.update(self._kv(out))
             if phase == "admit":
                 self._clear_agent_gate_hold()
             return "", gate
-        self._gate_task_only = rc == GATE_HOLD_TASK
+        if phase != "transport":
+            self._gate_task_only = rc == GATE_HOLD_TASK
         if rc in (GATE_HOLD, GATE_HOLD_TASK):
             reason = gate_hold_reason(out)
             gate.update(self._kv(out))
@@ -4734,7 +4833,7 @@ class AgentRunner:
         self._pool_hold = ""                   # only what this tick measured
         if room <= 0:
             return room
-        if self.paused() or time.monotonic() < self._starts_paused_until:
+        if self.paused() or time.monotonic() < self._starts_paused_until or self._outage_paused():
             self._break_review_streaks()
             return room
         if self.host_hold():
@@ -5118,6 +5217,10 @@ class AgentRunner:
                 return env, None              # the chat runs the configured harness: no routing compare now
             return env, env_digest({**env, "MESH_RUNNER_PROFILE": str(getattr(self.adapter, "profile", ""))})
         try:
+            reason, _ = self._gate("transport", "", "chat")
+            if reason:
+                self._chat_hold = "transport: " + reason
+                return                              # leave any existing pane and retry budget untouched
             outcome = self.chat.check(env_of)
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             self._chat_error = f"chat session check failed: {type(e).__name__}: {str(e)[:160]}"

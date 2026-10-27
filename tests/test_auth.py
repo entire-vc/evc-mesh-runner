@@ -15,6 +15,7 @@ from mesh_runner.cli import main
 from mesh_runner.store import Store
 from mesh_runner.workspace import WorkspaceError
 from mesh_runner.runner import AgentRunner
+from mesh_runner.tui_driver import Driver
 from fakes import HarnessGate, FakeMesh, calls, task, write_replies
 from test_runner import Bench
 
@@ -75,7 +76,77 @@ class Banner(unittest.TestCase):
                          auth.profile_id({"HOME": "/h"}, Path("/b")))
 
 
+class StopFailureAuth(unittest.TestCase):
+    def test_only_exact_hook_error_has_auth_provenance(self):
+        cases = [
+            ({"hook_event_name": "StopFailure", "error": "authentication_failed"}, True),
+            ({"hook_event_name": "StopFailure", "error": "rate_limit_error"}, False),
+            ({"hook_event_name": "StopFailure", "message": "authentication_failed"}, False),
+            ({"hook_event_name": "StopFailure", "reason": "authentication_failed"}, False),
+            ({"hook_event_name": "StopFailure", "error": "quoted authentication_failed"}, False),
+            ({"hook_event_name": "Stop", "error": "authentication_failed"}, False),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            transcript = root / "transcript.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "uuid": "a", "message": {
+                "content": [{"type": "text", "text": "authentication_failed"}], "usage": {}}}) + "\n")
+            for event, expected in cases:
+                with self.subTest(event=event):
+                    out = io.StringIO()
+                    driver = Driver(harness="claude", agent="test", state=root, tmux=object(), max_sessions=1,
+                                    cwd=root, session_id="s", mode="resume", key="test", argv=["claude"],
+                                    out=out, env={})
+                    driver.slice_turn = lambda entries: entries
+                    driver.emit_claude({"event": {**event, "transcript_path": str(transcript)}, "offset": 0})
+                    path = root / "turn.jsonl"
+                    path.write_text(out.getvalue())
+                    terminal = json.loads(out.getvalue().splitlines()[-1])
+                    self.assertEqual("runner_error" in terminal, expected)
+                    self.assertEqual(ClaudeAdapter().parse(path).auth_failed, expected)
+
+    def test_plain_text_or_untrusted_provenance_does_not_hold_auth(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "turn.jsonl"
+            for marker in (None, "authentication_failed", {"source": "assistant", "code": "authentication_failed"},
+                           {"source": "claude.StopFailure", "code": "rate_limit_error"}):
+                for is_error in (False, True):
+                    event = {"type": "result", "is_error": is_error, "result": "authentication_failed"}
+                    if marker is not None:
+                        event["runner_error"] = marker
+                    path.write_text(json.dumps(event) + "\n")
+                    self.assertFalse(ClaudeAdapter().parse(path).auth_failed)
+            path.write_text(json.dumps({"type": "result", "is_error": False, "result": "authentication_failed",
+                "runner_error": {"source": "claude.StopFailure", "code": "authentication_failed"}}) + "\n")
+            self.assertFalse(ClaudeAdapter().parse(path).auth_failed)
+
+
 class AuthLoop(Bench):
+    def test_typed_stop_failure_at_failure_cap_holds_without_handoff_or_budget_spend(self):
+        t = task(31)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.refresh_me()
+        a = r.store.create(self.agent.name, t["id"], "claude")
+        profile = auth.profile_id(r._fresh_env(), self.agent.profile_dir)
+        path = self.root / "typed-auth.jsonl"
+        path.write_text(json.dumps({"type": "result", "session_id": "s", "subtype": "error_during_execution",
+            "is_error": True, "result": "authentication_failed", "usage": {},
+            "runner_error": {"source": "claude.StopFailure", "code": "authentication_failed"}}) + "\n")
+        r.store.mark(self.agent.name, t["id"], "auth_launch",
+                     json.dumps({"attempt": a.id, "turn": 4, "profile": profile}))
+        r.store.update(a, state="running", turns=4, no_outcome=3, log_path=str(path))
+        before = dict(mesh.tasks[t["id"]])
+        r._hand_up = lambda *args, **kwargs: self.fail("auth failure must not hand up product work")
+        r._switch_on_limit = lambda *args, **kwargs: self.fail("auth failure must not switch accounts")
+        r.settle(r.store.get(a.id))
+        held = r.store.get(a.id)
+        self.assertEqual((held.state, held.no_outcome, held.turns), ("ready", 3, 4))
+        self.assertEqual(r.store.auth_turns(a.id), 1)
+        self.assertTrue(auth.held(r.store, profile))
+        self.assertEqual(mesh.tasks[t["id"]], before)
+        self.assertEqual(mesh.comment_log, {})
+
     def settle_auth_after_task_change(self, change):
         t = task(30)
         mesh = FakeMesh([t], max_concurrent=1)

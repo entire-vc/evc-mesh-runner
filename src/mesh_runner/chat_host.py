@@ -322,6 +322,18 @@ class ChatHost:
                 except Exception as e:
                     log.warning("chat orphan slots (%s): %s", ar.agent.name, type(e).__name__)
 
+    def _claim_agents(self) -> list[str]:
+        """Hold new turns before claim; active workers, commands and idle reap continue."""
+        eligible = []
+        for agent_id, name in self.by_id.items():
+            try:
+                reason, _ = self.runners[name]._gate("transport", "", "chat")
+            except Exception:                        # a broken admission hook must not claim a turn
+                continue
+            if not reason:
+                eligible.append(agent_id)
+        return eligible
+
     def loop(self, stop: threading.Event) -> None:
         backoff, reaped = 1.0, 0.0
         try:
@@ -330,13 +342,19 @@ class ChatHost:
             log.warning("chat recover: %s", getattr(e, "error_code", type(e).__name__))
         while not stop.is_set():
             t0 = time.monotonic()
+            eligible, gate_s = [], 0.0
             try:
-                self.service.step(STEP_TIMEOUT)
+                eligible = self._claim_agents()
+                gate_s = time.monotonic() - t0
+                self.service.step(STEP_TIMEOUT, claim_agents=eligible)
                 backoff = 1.0
             except ChatError as e:
-                # the time before the failure tells a stalled connection from a read timeout
-                log.warning("chat claim (%s): %s after %.1fs%s", ", ".join(self.by_id.values()), e.error_code,
-                            time.monotonic() - t0, f" ({e})" if e.status == 0 else "")
+                # the time before the failure tells a stalled connection from a read timeout; gate and
+                # claim apart say which of them it was
+                claim_s = getattr(self.service, "claim_s", None)
+                log.warning("chat claim (%s): %s after %.1fs (gate %.1fs, claim %s)%s",
+                            ", ".join(self.by_id.values()), e.error_code, time.monotonic() - t0, gate_s,
+                            "-" if claim_s is None else f"{claim_s:.1f}s", f" ({e})" if e.status == 0 else "")
                 stop.wait(backoff)
                 backoff = min(30.0, backoff * 2)
             except Exception as e:
@@ -349,5 +367,5 @@ class ChatHost:
                     self.service.reap_idle()
                 except Exception as e:
                     log.warning("chat reap: %s", type(e).__name__)
-            if self.service.free_slots() <= 0 or time.monotonic() < self.service.hold_until:
+            if not eligible or self.service.free_slots() <= 0 or time.monotonic() < self.service.hold_until:
                 stop.wait(1.0)

@@ -151,6 +151,7 @@ class FakeMesh:
         if tid not in self.tasks:
             raise MeshError(404, "not found")
         out = dict(self.tasks[tid])
+        out.setdefault("version", 1)
         if getattr(self, "shows_runtime", False):     # a Mesh that returns the card's runtime state
             out["runtime_state"] = dict(self.runtime[tid], source="explicit") if tid in self.runtime else None
         return out
@@ -188,7 +189,11 @@ class FakeMesh:
     def statuses(self, pid):
         return list(STATUSES)
 
-    def move(self, tid, status_id):
+    def move(self, tid, status_id, expected_version=None, expected_status_id=None):
+        cur = self.tasks[tid]
+        if (expected_version is not None and cur.get("version", 1) != expected_version) or \
+                (expected_status_id and cur["status_id"] != expected_status_id):
+            raise MeshError(409, "cas_conflict")
         self.tasks[tid]["status_id"] = status_id
         return dict(self.tasks[tid])
 

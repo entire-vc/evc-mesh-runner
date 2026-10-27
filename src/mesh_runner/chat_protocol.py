@@ -7,8 +7,10 @@ to the caller and never logged or placed in an error.
 """
 from __future__ import annotations
 
+import http.client
 import os
 import threading
+import time
 import urllib.parse
 import uuid
 import urllib.request
@@ -18,9 +20,51 @@ from .mesh import MeshClient, MeshError
 
 PROTOCOL = 1
 CLAIM_READ_SLACK = 3        # seconds past the server's own deadline before a silent claim is given up
+COMMANDS_TIMEOUT = 4        # an order fetch rides the claim loop: a silent one must not hold it for the default 30 s
 # the runner must stop working on a turn when Mesh answers with one of these (protocol §5.2)
 DROP_CODES = frozenset({"chat_stale_claim", "chat_lease_expired", "chat_turn_terminal",
                         "chat_not_claim_holder", "chat_turn_not_found"})
+
+
+_PHASES = threading.local()      # per thread: when each stage of the current request finished
+
+
+class _TimedHTTPS(http.client.HTTPSConnection):
+    """Marks connect (TCP+TLS), send and first byte, so a silent read timeout says which stage stalled."""
+
+    def _mark(self, stage: str) -> None:
+        ph = getattr(_PHASES, "d", None)
+        if ph is not None:
+            ph[stage] = time.monotonic() - ph["t0"]
+
+    def connect(self):
+        super().connect()
+        self._mark("connect")
+
+    def send(self, data):
+        super().send(data)
+        self._mark("sent")
+
+    def getresponse(self):
+        resp = super().getresponse()
+        self._mark("headers")
+        return resp
+
+
+class _TimedHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_TimedHTTPS, req)
+
+
+def _timed_open(req, timeout=None):
+    _PHASES.d = {"t0": time.monotonic()}
+    return urllib.request.build_opener(_TimedHandler()).open(req, timeout=timeout)
+
+
+def _phase_note() -> str:
+    ph = getattr(_PHASES, "d", None) or {}
+    done = ", ".join(f"{k}={v:.2f}s" for k, v in ph.items() if k != "t0")
+    return f" [phases: {done or 'none reached'}]"
 
 
 class ChatError(Exception):
@@ -111,7 +155,10 @@ class ChatClient:
             raise ValueError("the runner credential is sent only over https")
         self._credential = credential
         self._local = threading.local()                  # per-thread extra headers: calls run concurrently
-        real = opener or urllib.request.urlopen
+        self._injected = opener is not None
+        self._conn_factory = http.client.HTTPSConnection     # tests swap it for a plain-HTTP double
+        self._claim_conn = None
+        real = opener or _timed_open
 
         def open_with_headers(req, timeout=None):
             req.add_header("X-Agent-Key", self._credential)
@@ -133,7 +180,7 @@ class ChatClient:
         return f"ChatClient({self._mesh.base!r})"
 
     def _call(self, method: str, path: str, body: Any = None, query: dict | None = None,
-              headers: dict | None = None, long: float = 0.0) -> Any:
+              headers: dict | None = None, long: float = 0.0, timeout: float | None = None) -> Any:
         client = self._mesh
         if long:
             client = self._poll
@@ -141,9 +188,12 @@ class ChatClient:
         self._local.headers = dict(headers or {})
         try:
             # a long-poll GET is repeated by the loop in the service, not by the transport retry
-            return client._request(method, path, body, query)
+            return client._request(method, path, body, query, timeout=timeout)
         except MeshError as e:
-            raise _wrap(e) from None
+            err = _wrap(e)
+            if e.status == 0 and not getattr(self, "_injected", False):
+                err.args = ((err.args[0] if err.args else "")[:240] + _phase_note(),)
+            raise err from None
         finally:
             self._local.headers = {}
 
@@ -154,9 +204,73 @@ class ChatClient:
     # -- claim ---------------------------------------------------------------------
     def claim(self, agents: list[str], timeout: int = 30, max_turns: int = 1) -> dict | None:
         """Long-poll. ``None`` on 204/empty; otherwise ``{"turns": [...], "commands": [...]}``."""
-        res = self._call("GET", "/claim", query={"agents": ",".join(agents), "timeout": int(timeout),
-                                                 "max": int(max_turns)}, long=timeout + CLAIM_READ_SLACK)
-        return res or None
+        query = {"agents": ",".join(agents), "timeout": int(timeout), "max": int(max_turns)}
+        if self._injected:
+            return self._call("GET", "/claim", query=query, long=timeout + CLAIM_READ_SLACK) or None
+        # One kept-alive connection for the claim loop: a new TCP/TLS flow every ~3 s through the
+        # provider's NAT silently lost ~1% of the polls (request sent, no answer, never seen by Mesh).
+        # A poll that got no answer is repeated once on a fresh connection; only a second silence is an error.
+        last: MeshError | None = None
+        took: list[str] = []
+        for _ in range(2):
+            t0 = time.monotonic()
+            try:
+                return self._claim_once(query, timeout + CLAIM_READ_SLACK) or None
+            except MeshError as e:
+                if e.status != 0 or getattr(e, "answered", False):      # an answer, however odd, is not silence
+                    raise _wrap(e) from None
+                last = e
+                took.append(f"{time.monotonic() - t0:.1f}s")
+        err = _wrap(last)
+        err.args = ((err.args[0] if err.args else "")[:240] + f" [claim attempts: {', '.join(took)}]",)
+        raise err from None
+
+    def _claim_once(self, query: dict, read_timeout: float) -> Any:
+        import json
+        host = urllib.parse.urlsplit(self._mesh.base)
+        path = host.path + "/claim?" + urllib.parse.urlencode(query)
+        headers = {"Accept": "application/json", "X-Agent-Key": self._credential,
+                   "X-Chat-Runner-Id": self._runner_id, "X-Chat-Protocol": str(PROTOCOL)}
+        if self._runner_token:
+            headers["X-Runner-Token"] = self._runner_token
+        conn = getattr(self, "_claim_conn", None)
+        try:
+            if conn is None:
+                conn = self._claim_conn = self._conn_factory(host.netloc, timeout=read_timeout)
+            conn.timeout = read_timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(read_timeout)
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            if resp.will_close:
+                conn.close()
+        except (OSError, http.client.HTTPException) as e:
+            self._drop_claim_conn()
+            raise MeshError(0, f"{type(e).__name__}: {str(e)[:200]}") from None
+        if resp.status >= 400:
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                body = raw.decode(errors="replace")[:500]
+            msg = body.get("message") if isinstance(body, dict) else str(body)[:200]
+            raise MeshError(resp.status, msg or resp.reason, body, endpoint="GET /claim")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            err = MeshError(0, "response is not JSON")
+            err.answered = True
+            raise err from None
+
+    def _drop_claim_conn(self) -> None:
+        conn, self._claim_conn = getattr(self, "_claim_conn", None), None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def active(self) -> list[dict]:
         res = self._call("GET", "/turns/active") or {}
@@ -166,7 +280,7 @@ class ChatClient:
         query = {"agents": ",".join(agents)}
         if self._runner_token:
             query["runner_id"] = self._runner_id
-        res = self._call("GET", "/commands", query=query) or {}
+        res = self._call("GET", "/commands", query=query, timeout=COMMANDS_TIMEOUT) or {}
         return list(res.get("commands") or [])
 
     # -- one turn ------------------------------------------------------------------

@@ -174,7 +174,8 @@ class ExtensionService:
             event = json.loads(body)
         except ValueError:
             return 400, {"error": "invalid json"}
-        kind = event.get("event") or event.get("type") if isinstance(event, dict) else None
+        # Mesh sends the event type in the X-Mesh-Event header; a type in the body is only a fallback
+        kind = headers.get("X-Mesh-Event") or (event.get("event") or event.get("type") if isinstance(event, dict) else None)
         if kind in WAKE_EVENTS:
             self.wake()
             return 202, {"status": "wake"}

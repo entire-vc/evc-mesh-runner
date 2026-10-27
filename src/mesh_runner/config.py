@@ -211,6 +211,10 @@ class RunnerConfig:
     mention_requests: bool = False     # an @-address on someone else's task becomes a request card
     max_compactions: int = 0           # context compactions in one attempt; past it -> lead (0 = off)
     max_failures: int = 3
+    provider_outage_giveup_minutes: int = 360   # continuous provider outage before a task goes up (0 = never)
+    provider_outage_backoff_seconds: int = 120  # first retry delay; doubles per failed turn
+    provider_outage_backoff_cap_seconds: int = 7200
+    provider_outage_lanes: int = 3     # lanes failing within 15 min that pause every start (0 = off)
     max_startup_failures: int = 2      # failed turns that never created a session before the task goes up
     failed_cooldown_hours: float = 0.5   # a failed task is retried this soon even without a new comment
     max_turns: int = 30
@@ -616,6 +620,10 @@ def load(path: str | Path) -> RunnerConfig:
         decision_default_proceeds=r.get("decision_default_proceeds", True) is not False,
         max_compactions=int(r.get("max_compactions", 0)),
         max_failures=int(r.get("max_failures", 3)),
+        provider_outage_giveup_minutes=int(r.get("provider_outage_giveup_minutes", 360)),
+        provider_outage_backoff_seconds=int(r.get("provider_outage_backoff_seconds", 120)),
+        provider_outage_backoff_cap_seconds=int(r.get("provider_outage_backoff_cap_seconds", 7200)),
+        provider_outage_lanes=int(r.get("provider_outage_lanes", 3)),
         max_startup_failures=int(r.get("max_startup_failures", 2)),
         failed_cooldown_hours=float(r.get("failed_cooldown_hours", 0.5)),
         max_turns=int(r.get("max_turns", 30)),

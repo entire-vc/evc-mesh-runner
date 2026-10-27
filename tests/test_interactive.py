@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from mesh_runner import interactive
@@ -277,7 +278,8 @@ class DriverTurns(unittest.TestCase):
         subprocess.run([TMUX, "-L", self.sock, "kill-server"], capture_output=True)
         self.tmp.cleanup()
 
-    def driver(self, kind, key="att-1", sid="", mode="start", **env):
+    def driver(self, kind, key="att-1", sid="", mode="start", kw=None, **env):
+        kw = kw or {}
         argv = [str(self.fake)]
         if kind == "claude":
             argv += ["--resume" if mode == "resume" else "--session-id", sid]
@@ -288,7 +290,8 @@ class DriverTurns(unittest.TestCase):
                    session_id=sid, mode=mode, key=key, argv=argv, out=out,
                    env={"PATH": os.environ.get("PATH", ""), "FAKE_KIND": kind, "FAKE_ROOT": str(self.root),
                         "HOME": os.environ.get("HOME", ""), **env},
-                   timeouts={"ready": 15, "accept": 8, "poll": 0.1, "scan": 2, "interrupt": 2})
+                   timeouts={"ready": 15, "accept": 8, "poll": 0.1, "scan": 2, "interrupt": 2,
+                             "bootstrap_backoff": 0.0}, **kw)
         return d, out
 
     def events(self, out):
@@ -374,6 +377,23 @@ class DriverTurns(unittest.TestCase):
         self.assertEqual(last["type"], "turn.failed")
         self.assertIn("TUI bootstrap", last["error"]["message"])
         self.assertEqual(self.tmux.windows(interactive.session_name("builder")), {})
+
+    def test_start_up_exit_is_logged_with_its_error_line_and_waits_between_starts(self):
+        naps = []
+
+        def nap(x):
+            naps.append(x)
+            time.sleep(min(x, 0.05))
+
+        d, out = self.driver("codex", FAKE_BOOTSTRAP_FAIL="9", kw={"sleep": nap})
+        d.t["bootstrap_backoff"] = 7.0
+        err = io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            self.assertEqual(d.run("Fix the lint"), 1)
+        self.assertEqual([n for n in naps if n >= 7.0], [7.0, 14.0])          # doubled, none after the last start
+        lines = [x for x in err.getvalue().splitlines() if "starting again" in x]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("TUI bootstrap" in x for x in lines), lines)
 
     def test_a_prompt_quoting_the_start_up_error_is_never_sent_twice(self):
         # the phrase is the prompt's last line and the process exits non-zero, but only after
