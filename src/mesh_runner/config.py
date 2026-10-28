@@ -30,6 +30,21 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # merge_max_runs = 30              # deprecated, ignored: a queued run always ends in a wake or another poll
     # merge_queue_hours = 24           # a wait that stays queued this long wakes the agent too
 
+    [catalog]                     # optional: apply the runtime catalog and report on it (off by default)
+    enabled = false
+    manifest = "~/runtime/accounts.json"   # what this host can execute: controllers, accounts, modes, pools
+    # interval_seconds = 120
+    # observations = "~/runtime/quota-observations.json"    # quota-observations/v1; absent = pools unknown
+    # harness_limits = "~/runtime/harness-limits.json"      # harness-limits/v1: usage limits lanes printed
+    # thresholds = "~/runtime/thresholds.json"
+
+      [[catalog.workspace]]
+      id = "<workspace uuid>"
+      reporter_key_file = "~/.config/mesh-runner/reporter.key"   # an agent with the reporter grant here
+      # home = "..."              # state.json, pools.json, desired-etag.json (default state_dir/catalog/<id>)
+      # catalog_dir = "..."       # applied.json, desired.json (default: home)
+      # manifest = "..."          # this workspace's own manifest (default [catalog] manifest)
+
     [gitlab]                      # optional: enables pipeline/mr waits
     base_url = "https://gitlab.example.com"
     token_file = "~/.config/mesh-runner/gitlab.token"
@@ -198,6 +213,61 @@ class AgentConfig:
 
 
 @dataclass
+class CatalogWorkspace:
+    workspace_id: str
+    reporter_key: str = field(repr=False)
+    home: Path = Path()
+    catalog_dir: Path = Path()
+    manifest: Path | None = None
+
+
+@dataclass
+class CatalogConfig:
+    """`[catalog]`: the runner is the catalog controller of these workspaces (catalog.py)."""
+    enabled: bool = False
+    controller_ref: str = "mesh-runner"
+    interval_seconds: float = 120.0
+    manifest: Path | None = None
+    observations: Path | None = None
+    harness_limits: Path | None = None
+    thresholds: Path | None = None
+    workspaces: tuple = ()
+
+
+def _catalog(raw, state_dir: Path) -> CatalogConfig:
+    from . import RUNNER_NAME
+    c = raw or {}
+    if not isinstance(c, dict):
+        raise ConfigError("[catalog] must be a table")
+    if c.get("enabled", False) is not True:
+        return CatalogConfig()
+    if c.get("controller_ref", RUNNER_NAME) != RUNNER_NAME:
+        raise ConfigError(f"[catalog] reports under the runner's own name {RUNNER_NAME!r}; controller_ref cannot differ")
+    if not c.get("manifest"):
+        raise ConfigError("[catalog] manifest (the host manifest path) is required")
+    spaces, seen = [], set()
+    for w in c.get("workspace") or []:
+        ws = str(w.get("id") or "")
+        if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", ws) or ws in seen:
+            raise ConfigError(f"[[catalog.workspace]] id must be a unique workspace UUID, got {ws!r}")
+        seen.add(ws)
+        home = _path(w.get("home")) or state_dir / "catalog" / ws
+        spaces.append(CatalogWorkspace(
+            workspace_id=ws,
+            reporter_key=read_secret(w.get("reporter_key_file"), w.get("reporter_key_env"),
+                                     f"catalog workspace {ws[:8]} reporter key"),
+            home=home, catalog_dir=_path(w.get("catalog_dir")) or home, manifest=_path(w.get("manifest"))))
+    if not spaces:
+        raise ConfigError("[catalog] enabled needs at least one [[catalog.workspace]]")
+    return CatalogConfig(
+        enabled=True, controller_ref=RUNNER_NAME,
+        interval_seconds=_positive(c.get("interval_seconds", 120), "[catalog] interval_seconds"),
+        manifest=_path(c["manifest"]), observations=_path(c.get("observations")),
+        harness_limits=_path(c.get("harness_limits")), thresholds=_path(c.get("thresholds")),
+        workspaces=tuple(spaces))
+
+
+@dataclass
 class RunnerConfig:
     mesh_url: str
     state_dir: Path
@@ -251,10 +321,12 @@ class RunnerConfig:
     checkpoint_exclude_names: tuple = (".gocache", "node_modules", "target", ".venv", "__pycache__", "var")
     queue_wait_freshness_v1: bool = False  # machine refill WAIT only; shared state_dir protocol files
     max_wait_hours: float = 6.0
-    # Which comments by other agents end a pipeline/MR/time/decision wait early. "all": every
-    # foreign comment. "addressed": only an @-mention of the waiting agent, a person's comment,
+    # Which comments by other agents end a pipeline/MR/time/decision/card/merge wait early. "all":
+    # every foreign comment. "addressed": only an @-mention of the waiting agent, a person's comment,
     # the addressee (or an explicit answer) of a decision wait, or an author listed in
-    # comment_wake_always_from; the rest is read when the wait ends for its own reason.
+    # comment_wake_always_from (unless the comment opens with an FYI marker, which asks nothing);
+    # the rest is read when the wait ends for its own reason (the awaited card closing, the MR
+    # merging or closing, the pipeline finishing, the deadline).
     comment_wake: str = "all"
     comment_wake_always_from: list[str] = field(default_factory=list)
     # What ends a decision wait that has a request card for its addressee. "any": every comment the
@@ -354,6 +426,7 @@ class RunnerConfig:
     # an interactive turn's prompt waits this long while the session's background agents run
     # (Claude Code resumes the main thread itself when one finishes); 0 = paste at once
     background_wait_minutes: float = 45.0
+    catalog: CatalogConfig = field(default_factory=CatalogConfig)
     mesh_basic_auth: str = field(default="", repr=False)   # "user:pass" for a Mesh behind HTTP basic auth
     # Mesh extension: the service endpoint (/healthz, /mesh/install, /mesh/events) and the extension
     # actor token that replaces basic auth + agent key. Off unless `[extension]` says so.
@@ -679,6 +752,7 @@ def load(path: str | Path) -> RunnerConfig:
         interactive_max_sessions=int(r.get("interactive_max_sessions", 20)),
         background_wait_minutes=_idle_hours(r.get("background_wait_minutes", 45.0), "background_wait_minutes"),
         mesh_basic_auth=_basic_auth(r),
+        catalog=_catalog(raw.get("catalog"), _path(r.get("state_dir") or _default_state_dir())),
         extension_enabled=ext.get("enabled", False) is True,
         extension_host=str(ext.get("host", "127.0.0.1")),
         extension_port=_positive(ext.get("port", 8787), "[extension] port", integer=True),

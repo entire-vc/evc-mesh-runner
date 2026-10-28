@@ -462,6 +462,43 @@ class Gate(MergeBench):
         self.assertIn("commented: hold on", a.wake_text)
         self.assertEqual(self.runs(), [])
 
+    def foreign_agent_comment(self, r, t, body, author_type="agent"):
+        c = r.mesh.add_comment(t["id"], body, author="agent-lead", at=fresh() + dt.timedelta(seconds=5))
+        c["author_type"] = author_type
+
+    def test_addressed_mode_holds_a_foreign_agent_comment_on_a_merge_wait(self):
+        self.cfg.comment_wake = "addressed"
+        r, a, t, gl = self.waiting()
+        self.foreign_agent_comment(r, t, "Combined handback (FYI, same grant).")
+        a = self.check(r, a)
+        self.assertEqual(a.state, "waiting")          # the held note ends nothing; the gate goes on running
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_addressed_mode_still_wakes_a_merge_wait_on_a_mention_or_a_person(self):
+        self.cfg.comment_wake = "addressed"
+        r, a, t, gl = self.waiting()
+        self.foreign_agent_comment(r, t, "@builder hold on, do not merge")
+        a = self.check(r, a)
+        self.assertEqual(a.state, "ready")
+        self.assertIn("commented: @builder hold on", a.wake_text)
+        self.assertEqual(self.runs(), [])
+
+    def test_addressed_mode_wakes_a_merge_wait_on_a_persons_comment(self):
+        self.cfg.comment_wake = "addressed"
+        r, a, t, gl = self.waiting()
+        self.foreign_agent_comment(r, t, "hold on", author_type="user")
+        a = self.check(r, a)
+        self.assertEqual(a.state, "ready")
+
+    def test_addressed_mode_wakes_a_merge_wait_when_the_mr_merges_despite_a_held_comment(self):
+        self.cfg.comment_wake = "addressed"
+        r, a, t, gl = self.waiting()
+        self.foreign_agent_comment(r, t, "Combined handback (FYI, same grant).")
+        gl.mr_rows[TARGET] = mr_row(state="merged")
+        a = self.check(r, a)
+        self.assertEqual(a.state, "ready")
+        self.assertIn("merged at", a.wake_text)
+
     def test_env_failure_does_not_run_the_gate(self):
         self.agent.env_command = [sys.executable, "-c", "import sys; sys.exit(3)"]
         r, a, t, gl = self.waiting()

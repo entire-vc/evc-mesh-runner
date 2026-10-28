@@ -56,6 +56,12 @@ AUTH_RE = re.compile(r"(not logged in|run /login|please log in|oauth token (has 
 # a running turn: the interrupt hint, a running tool, or an active spinner ("✽ Forging… (1m 2s · …)";
 # a finished one reads "✻ Sautéed for 24s")
 BUSY_RE = re.compile(r"(esc to interrupt|esc to cancel|working \(|ctrl\+b to run in background|…\s*\(\d+[ms])", re.I)
+# A usage-limit notice Claude Code leaves on screen ("⏺ Usage limit reached · continuing automatically at 12pm ·
+# esc to cancel", "⎿ You've hit your weekly limit · resets 12pm"). It is not a running turn although it carries
+# "esc to cancel", and it stays on screen after the stated time (28.10: 35 failed turns on an idle pane).
+LIMIT_NOTICE_RE = re.compile(r"(usage limit reached|continuing automatically at|"
+                             r"hit your [\w -]{0,30}limit\b.*\bresets?\b)", re.I)
+LIMIT_NOTICE_LINES = 10        # the notice counts in the last non-empty lines only
 CODEX_READY_RE = re.compile(r"(ask codex to do anything|\? for shortcuts)", re.I)
 # Codex still starting: it shows the composer (so CODEX_READY_RE matches) while "Resuming session…" is on
 # screen, and a prompt entered then is queued under "Waiting for startup · esc cancel" until start-up
@@ -154,6 +160,23 @@ def load_average() -> str:
         return "?"
 
 
+def is_busy(text: str) -> bool:
+    """A running turn on the screen. A usage-limit notice is not one, whatever hint it carries."""
+    return bool(BUSY_RE.search("\n".join(x for x in text.splitlines() if not LIMIT_NOTICE_RE.search(x))))
+
+
+def limit_notice(text: str) -> str:
+    """The usage-limit notice among the last lines of an idle screen, or ''. A screen with a running turn
+    has none: the notice is then older than the work the session went on with."""
+    if is_busy(text):
+        return ""
+    lines = [x.strip() for x in text.splitlines() if x.strip()][-LIMIT_NOTICE_LINES:]
+    for line in reversed(lines):
+        if LIMIT_NOTICE_RE.search(line):
+            return line[:300]
+    return ""
+
+
 class DriverError(Exception):
     def __init__(self, message: str, close: bool = False):
         super().__init__(message)
@@ -247,7 +270,7 @@ class Driver:
         return res.stdout if res.returncode == 0 else ""
 
     def busy(self) -> bool:
-        return bool(BUSY_RE.search(self.screen()))
+        return is_busy(self.screen())
 
     def starting(self, screen: str | None = None) -> bool:
         """Codex has not finished starting: "Resuming session…" or "Waiting for startup" in the last
@@ -937,7 +960,7 @@ class Driver:
                 self.check_cancel()
                 self.beat()
                 screen, size = self.screen(), self.transcript_size()
-                if self.background(screen) or BUSY_RE.search(screen) or size != last:
+                if self.background(screen) or is_busy(screen) or size != last:
                     quiet_since = None
                 elif quiet_since is None:
                     quiet_since = self.clock()
@@ -960,6 +983,11 @@ class Driver:
         # a prompt pasted while background agents run only gets a "still waiting" turn: wait for
         # them (and the turn Claude Code starts by itself when one finishes) before anything else
         self.wait_background()
+        # a limit notice still on the idle screen: the provider limit, and a pane that cannot be reused
+        # (its screen keeps the notice after the stated time, so every later turn would meet it again)
+        notice = limit_notice(self.screen())
+        if notice:
+            raise DriverError("usage limit reached: " + notice, close=True)
         base = len(self.read_events())
         offset = self.turn_offset = self.transcript_size()
         totals = self.codex_totals()
@@ -1054,7 +1082,7 @@ class Driver:
             if self.clock() >= scan_at:
                 scan_at = self.clock() + self.t["scan"]
                 text = self.screen()
-                hit = "" if BUSY_RE.search(text) else self.banner(text)
+                hit = "" if is_busy(text) else self.banner(text)
                 if hit and hit == banner_seen:          # the same banner on an idle screen twice
                     raise DriverError(hit, close=True)
                 banner_seen = hit

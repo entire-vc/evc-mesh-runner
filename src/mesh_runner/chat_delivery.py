@@ -8,6 +8,7 @@ short label (never input or output).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -116,6 +117,21 @@ def read_log(path: Path) -> list[dict]:
     except OSError:
         pass
     return out
+
+
+# the fixed lead-in of the driver's own errors; whatever follows the colon can be the screen
+_DRIVER_LEADIN = re.compile(
+    r"(interactive session [a-z ]+|the session [a-z ]+|prompt could not be [a-z ]+|driver failed"
+    r"|host session cap reached|\w+ start-up stalled)(?=:|$| \(| for )")
+
+
+def _withheld(msg: str) -> str:
+    """What a failed turn's log may say about text that can carry the screen: the driver's fixed
+    lead-in and a fingerprint, so the cause is classifiable and the turn log can be matched."""
+    m = _DRIVER_LEADIN.match(msg)
+    kind = m.group(1) if m else "unclassified"
+    return "(text withheld: may carry the screen; kind=%s sha256=%s)" % (
+        kind, hashlib.sha256(msg.encode()).hexdigest()[:12])
 
 
 class DriverDelivery:
@@ -239,7 +255,7 @@ class DriverDelivery:
                         msg = str(ev.get("message") or "")
                         logging.getLogger(__name__).warning(
                             "chat turn failed: %s: %s", ev.get("code"),
-                            msg[:300] if re.match(r"\w+ exited during start-up \d+ times: ", msg) else "(text withheld: may carry the screen)")
+                            msg[:300] if re.match(r"\w+ exited during start-up \d+ times: ", msg) else _withheld(msg))
                     yield ev
                     return
                 yield ev

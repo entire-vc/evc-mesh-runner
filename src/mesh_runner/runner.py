@@ -55,7 +55,7 @@ from .mesh import Checkout, MeshClient, MeshError
 from .outcome import DECISION_WAIT_GUIDANCE, Outcome, declaration_lines, parse_line
 from .selection import StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
-from .wake import (GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments,
+from .wake import (GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign)
@@ -2138,6 +2138,11 @@ class AgentRunner:
         The answer is kept for ``wake_poll_seconds`` so a long queue does not read every capped
         task on every tick."""
         tid = task["id"]
+        from . import cap_rearm
+        grant = cap_rearm.pending(self.store, self.agent.name, tid)
+        if grant:
+            self._cap_wake_reasons[tid] = "operator rearm " + grant["id"]
+            return True
         got = self._input_checked.get(tid)
         mono = time.monotonic()
         if got and got[0] == rec.get("at") and mono - got[1] < self.cfg.wake_poll_seconds:
@@ -3303,7 +3308,11 @@ class AgentRunner:
         if (n := own_next_after(comments, self.agent_id, since)):
             wait["met"] = True                 # the agent's newest word is "continue now"
             return f"you declared ↻ NEXT after this wait ({(n.get('created_at') or '')[:16]}): the wait is superseded"
-        c = foreign_comment(comments, self.agent_id, since)
+        foreign = foreign_comments(comments, self.agent_id, since)
+        if foreign and self.cfg.comment_wake == "addressed":
+            foreign = [x for x in foreign
+                       if wakes_on_comment(x, wait, self.agent.name, self.cfg.comment_wake_always_from)]
+        c = foreign[-1] if foreign else None
         if c:
             who = c.get("author_name") or (c.get("author") or {}).get("name") or "someone"
             return f"{who} commented: {(c.get('body') or '')[:300]}"
@@ -4567,7 +4576,7 @@ class AgentRunner:
             if source in self._gate_hold and time.monotonic() < until:
                 return reason, gate
         rc, out, err = self._run_hook(self.agent.start_gate_command,
-                                      self._hook_env(task_id, mode, phase, attempt, gate), timeout=10 if phase == "transport" else 120)
+                                      self._hook_env(task_id, mode, phase, attempt, gate), timeout=15 if phase == "transport" else 120)
         if rc == 0:
             gate.update(self._kv(out))
             if phase == "admit":
@@ -4898,8 +4907,10 @@ class AgentRunner:
     def _start_one(self, task: dict) -> bool:
         backoff = time.monotonic() + self.cfg.abort_backoff_minutes * 60
         mode = task.get("_mode", "work")
+        from . import cap_rearm
         if self.hold_reason(task, mode):
             return False
+        rearm = cap_rearm.pending(self.store, self.agent.name, task["id"]) if mode == "work" else None
         cap = self.cfg.daily_start_cap
         # review feeds have their own refeed rule (_review_hold); the cap is for work starts
         # a decision request is reopened per question of its requester: its starts are answers, not a loop
@@ -4934,7 +4945,7 @@ class AgentRunner:
             return False
         self._clear_hold_log(task["id"][:8], "start")
         try:
-            a = self.store.create(self.agent.name, task["id"], self.agent.harness, task.get("title", ""), mode=mode)
+            a = self.store.create(self.agent.name, task["id"], self.agent.harness, task.get("title", ""), mode=mode, cap_rearm=rearm["id"] if rearm else None)
         except sqlite3.IntegrityError:
             self._turn_end(task["id"], mode, None, gate, "not-started")
             return False
@@ -5568,6 +5579,16 @@ class Runner:
         threading.Thread(target=announce_loop, name="controller-announce", daemon=True, args=(
             {ar.agent.name: ar.mesh for ar in self.agents}, load_runner_id(self.cfg.state_dir), stop)).start()
 
+    def _start_catalog(self, stop: threading.Event) -> None:
+        """Apply the runtime catalog of each `[[catalog.workspace]]` and report on it (`[catalog] enabled`)."""
+        if not self.cfg.catalog.enabled:
+            return
+        from .catalog import build_controllers, catalog_loop
+        controllers = build_controllers(self.cfg)
+        threading.Thread(target=catalog_loop, name="catalog", daemon=True,
+                         args=(controllers, stop, self.cfg.catalog.interval_seconds)).start()
+        log.info("catalog controller %s for %d workspace(s)", self.cfg.catalog.controller_ref, len(controllers))
+
     def _start_chat(self, stop: threading.Event) -> None:
         """Agent Chat for the configured agents, in a thread of its own (off unless `[chat] enabled`)."""
         cfg = self.cfg
@@ -5643,6 +5664,7 @@ class Runner:
         for t in threads:
             t.start()
         self._start_announce(stop)
+        self._start_catalog(stop)
         self._start_chat(stop)
         service = self._start_extension(stop)
         try:
