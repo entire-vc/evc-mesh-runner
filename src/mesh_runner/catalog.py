@@ -610,9 +610,11 @@ class ControllerClient:
                     or set(obs) - {"state", "verified", "observed_at", "threshold_ref", "evidence_kind"}):
                 raise CatalogError("invalid pool observation")
         # Exactly the server's report fields (it rejects unknown ones): the controller is named by the
-        # URL path, and the version the server expects is matched against desired.controller.version.
+        # URL path. version is the host's own build, shown on the Runner screen; a server older than
+        # that field answers 400 to it, and the report then goes again without it.
         body = {"schema_version": 2, "revision": revision, "digest": digest, "status": status,
-                "capabilities": sorted(capabilities), "emergency_paused": emergency_paused, "pools": pools}
+                "capabilities": sorted(capabilities), "emergency_paused": emergency_paused, "pools": pools,
+                "version": __version__}
         if profiles:
             body["profiles"] = profiles
         url = self.base + quote(controller_ref, safe="") + "/report"
@@ -622,6 +624,10 @@ class ControllerClient:
                 self._sleep(delay)
             attempts += 1
             code, _tag, value = self._exchange("POST", url, body)
+            if code == 400 and "version" in body:
+                del body["version"]
+                attempts += 1
+                code, _tag, value = self._exchange("POST", url, body)
             if code is None:
                 result = ReportResult("transport", None, attempts=attempts)
             elif code == 200:

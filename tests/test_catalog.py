@@ -15,8 +15,7 @@ WS = "11111111-2222-3333-4444-555555555555"
 NOW = 1_800_000_000.0
 D1, D2 = "a" * 64, "b" * 64
 CRED = "cred:claude-accounts/alpha"
-# domain.RuntimeReport in evc-mesh. The controller is named by the URL path and the runner version
-# travels in desired.controller.version; neither is a report field.
+# domain.RuntimeReport in evc-mesh before it gained version. The controller is named by the URL path.
 REPORT_FIELDS = {"schema_version", "revision", "digest", "status", "capabilities", "emergency_paused", "pools",
                  "profiles"}
 
@@ -66,6 +65,8 @@ class _Resp(io.BytesIO):
 class FakeMesh:
     """The two controller endpoints of the Mesh runtime API."""
 
+    fields = REPORT_FIELDS
+
     def __init__(self, body):
         self.body = body
         self.reports = []
@@ -86,7 +87,7 @@ class FakeMesh:
         assert req.full_url.endswith(f"/runtime/controllers/{RUNNER_NAME}/report")
         report = json.loads(req.data)
         # the server decodes the report with unknown fields disallowed: any other key is a 400
-        if set(report) - REPORT_FIELDS:
+        if set(report) - self.fields:
             return _Resp(400, {"error": "invalid runtime request"})
         self.reports.append(report)
         return _Resp(200, {"recorded": True, "launch_authorized": False})
@@ -188,6 +189,21 @@ class CatalogPassTest(unittest.TestCase):
         body["controller"]["version"] = "9.9.9"
         st = self.controller(FakeMesh(body)).tick(NOW)
         self.assertEqual(st["version_mismatch"], {"catalog": "9.9.9", "host": __version__})
+
+    def test_report_carries_the_host_version(self):
+        class Current(FakeMesh):
+            fields = REPORT_FIELDS | {"version"}
+        mesh = Current(desired())
+        st = self.controller(mesh).tick(NOW)
+        self.assertTrue(st["recorded"])
+        self.assertEqual([r["version"] for r in mesh.reports], [__version__])
+
+    def test_server_without_version_field_still_records_the_report(self):
+        mesh = FakeMesh(desired())
+        st = self.controller(mesh).tick(NOW)
+        self.assertTrue(st["recorded"])
+        self.assertEqual(len(mesh.reports), 1)
+        self.assertNotIn("version", mesh.reports[0])
 
     def test_forbidden_report_is_an_error(self):
         class Denied(FakeMesh):
