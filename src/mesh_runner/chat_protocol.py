@@ -20,6 +20,7 @@ from .mesh import MeshClient, MeshError
 
 PROTOCOL = 1
 CLAIM_READ_SLACK = 3        # seconds past the server's own deadline before a silent claim is given up
+CLAIM_RETRY_BUDGET = 1.5    # seconds the repeat of a silent claim may add: it asks the server for 1 s
 COMMANDS_TIMEOUT = 4        # an order fetch rides the claim loop: a silent one must not hold it for the default 30 s
 # the runner must stop working on a turn when Mesh answers with one of these (protocol §5.2)
 DROP_CODES = frozenset({"chat_stale_claim", "chat_lease_expired", "chat_turn_terminal",
@@ -210,17 +211,23 @@ class ChatClient:
         # One kept-alive connection for the claim loop: a new TCP/TLS flow every ~3 s through the
         # provider's NAT silently lost ~1% of the polls (request sent, no answer, never seen by Mesh).
         # A poll that got no answer is repeated once on a fresh connection; only a second silence is an error.
+        # The repeat asks for the server's shortest wait and gets only what is left of the budget,
+        # so two silences cost timeout + CLAIM_READ_SLACK + CLAIM_RETRY_BUDGET, not two full reads.
         last: MeshError | None = None
         took: list[str] = []
+        deadline = time.monotonic() + timeout + CLAIM_READ_SLACK + CLAIM_RETRY_BUDGET
+        read = float(timeout + CLAIM_READ_SLACK)
         for _ in range(2):
             t0 = time.monotonic()
             try:
-                return self._claim_once(query, timeout + CLAIM_READ_SLACK) or None
+                return self._claim_once(query, read) or None
             except MeshError as e:
                 if e.status != 0 or getattr(e, "answered", False):      # an answer, however odd, is not silence
                     raise _wrap(e) from None
                 last = e
                 took.append(f"{time.monotonic() - t0:.1f}s")
+                query = {**query, "timeout": 1}
+                read = max(deadline - time.monotonic(), 0.5)
         err = _wrap(last)
         err.args = ((err.args[0] if err.args else "")[:240] + f" [claim attempts: {', '.join(took)}]",)
         raise err from None
