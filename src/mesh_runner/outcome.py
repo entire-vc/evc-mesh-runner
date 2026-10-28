@@ -10,6 +10,7 @@ the attempt started and takes the last declaration line in it:
     ⏳ WAIT card:#<8hex>                                   another task closes
     ⏳ WAIT decision:@<agent>                              another agent answers
     ⏳ WAIT 30m   (or 2h, 2026-10-20, 2026-10-20T06:00Z)  time passes
+    ⏳ WAIT pipeline:<proj>#<id> until=success|change     a changed/successful pipeline (``after=`` optional)
     ↻ NEXT[: note]                                         continue right away
     ❓ Blocking @<person>: <question>                      a person must decide (Mesh raises the gate)
 
@@ -35,6 +36,14 @@ _CI_CHANGE = re.compile(
     r"\s+until=(?P<predicate>change|success)\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64}):"
     r"(?P<pipeline>[1-9]\d{0,11}):(?P<status>created|waiting_for_resource|preparing|pending|running|success|failed|canceled|cancelled|skipped|manual|scheduled)"
     + _EXPLANATION)
+# ``until=`` without ``after=``: the baseline is the state at the moment the wait is declared. The
+# parser cannot read GitLab, so it only marks the wait (``extra["ci_default"]`` / ``["mr_default"]``)
+# and the runner fills the baseline in (or falls back to the plain wait when it cannot read it).
+_CI_DEFAULT = re.compile(
+    _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
+    r"\s+until=(?P<predicate>change|success)" + _EXPLANATION)
+_MR_MERGED_DEFAULT = re.compile(
+    _WAIT_HEAD + r"mr:(?P<project>[\w.\-/]+)!(?P<id>[1-9]\d{0,11})\s+until=merged" + _EXPLANATION)
 _MR_STATE = re.compile(
     _WAIT_HEAD + r"mr:(?P<project>[\w.\-/]+)!(?P<id>[1-9]\d{0,11})"
     r"\s+until=merged\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64}):opened" + _EXPLANATION)
@@ -63,6 +72,8 @@ _POLL_REASON = re.compile(r"poll\s*:", re.IGNORECASE)
 MIN_WAIT = dt.timedelta(minutes=5)
 MAX_WAIT = dt.timedelta(hours=24)
 MAX_ABSOLUTE = dt.timedelta(days=400)
+# An absolute WAIT whose moment is already here (or within this much) means "continue now".
+PAST_GRACE = dt.timedelta(minutes=1)
 
 
 @dataclass(frozen=True)
@@ -143,6 +154,15 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", note=note(m), line=line,
                        extra={"ci_change": {"predicate": m["predicate"], "sha": m["sha"],
                                             "pipeline": int(m["pipeline"]), "status": m["status"]}})
+    if m := _MR_MERGED_DEFAULT.match(line):
+        return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line,
+                       extra={"mr_default": {"predicate": "merged"}})
+    if m := _CI_DEFAULT.match(line):
+        kind = "mr" if m["sep"] == "!" else "pipeline"
+        if m["kind"] == "mr" and kind != "mr":
+            return Outcome("unparsed", note="CI baseline does not match target", line=line)
+        return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", note=note(m), line=line,
+                       extra={"ci_default": {"predicate": m["predicate"]}})
     # Explicit fields are a contract, including when malformed; never seed a
     # legacy already-terminal wait from an invalid typed declaration.
     if re.match(_WAIT_HEAD + r"(?:mr|pipeline):[^\s]+\s+(?:until|after)\b", line):
@@ -160,7 +180,7 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         return Outcome("decision", handle=m["handle"], note=note(m), line=line)
     if m := _DURATION.match(line):
         if hint := _event_reason_hint(note(m)):
-            return Outcome("unparsed", note=hint, line=line)
+            return Outcome("unparsed", note=hint, line=line, extra={"event_reason": True})
         unit = m["unit"].lower()
         delta = dt.timedelta(hours=int(m["n"])) if unit in {"h", "ч"} else dt.timedelta(minutes=int(m["n"]))
         delta = min(max(delta, MIN_WAIT), MAX_WAIT)
@@ -169,8 +189,13 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         until = _parse_when(m["when"])
         if until is None or until > now + MAX_ABSOLUTE:
             return Outcome("unparsed", note="time target out of range", line=line)
+        if until <= now + PAST_GRACE:
+            # the moment is already here: nothing to wait for, continue now
+            return Outcome("next", note=note(m), line=line, extra={"hint": (
+                f"your `⏳ WAIT {m['when']}` named a moment that had already passed, so the runner continued "
+                "you at once; declare a future moment, a duration, or the event itself")})
         if hint := _event_reason_hint(note(m)):
-            return Outcome("unparsed", note=hint, line=line)
+            return Outcome("unparsed", note=hint, line=line, extra={"event_reason": True})
         return Outcome("time", until=max(until, now + MIN_WAIT), note=note(m), line=line)
     if m := _NEXT.match(line):
         return Outcome("next", note=(m["note"] or "").strip(), line=line)

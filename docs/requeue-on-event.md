@@ -6,11 +6,12 @@ starts again when something new reaches it, or on another agent that is free.
 ## Caps (`requeue_on_cap`)
 
 START CAP (`daily_start_cap` starts of one task by one agent per UTC day), TURN CAP
-(`daily_next_budget`, `daily_wait_budget`, `daily_step_budget`) and COMPACTION CAP
+(`daily_next_budget`, `daily_wait_budget`, `daily_step_budget`), LOOP (`loop_streak_limit`
+consecutive turns without progress; see the README) and COMPACTION CAP
 (`max_compactions`) no longer hand the task to the lead or keep it until tomorrow:
 
 1. The task moves to the project's `todo` status, the assignee stays, `start_after` is cleared
-   and no backoff is set. The attempt note is `cap: requeued (<start cap|turn budget|compaction cap>)`
+   and no backoff is set. The attempt note is `cap: requeued (<start cap|turn budget|loop|compaction cap>)`
    (a START CAP has no attempt, so the runner writes a closed row of its own for the audit) and
    an event `cap` goes to `events.jsonl`. One comment per cap event says where the task is and
    what restarts it.
@@ -35,8 +36,10 @@ START CAP (`daily_start_cap` starts of one task by one agent per UTC day), TURN 
    *Pool* is, in order: the same non-empty `pool` name in the agent block; or, when neither agent
    sets one, the same set of `[[agents.repos]]` names and the same `lead` (same product, same
    team). A pinned task refuses the reassignment and stays.
-5. `RUNNER GAVE UP` (unreadable outcome, harness errors, turn limit) is mechanics, not work, and
-   still goes to the lead.
+5. `RUNNER GAVE UP` (harness errors, turn limit) is mechanics, not work, and still goes to the lead.
+   Turns without a readable outcome use the same wait: the second in a row puts the task back in todo
+   with the same lane (`🔁 NO OUTCOME`, no peer reassignment) until its inputs change; the
+   `no_outcome_route_after`-th in a row (default 3, reset by any readable outcome) goes to the lead.
 
 With the flag off the code path is the previous one.
 

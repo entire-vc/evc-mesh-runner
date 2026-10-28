@@ -45,7 +45,18 @@ The agent ends each turn with a comment on the task whose last line is one of:
 ```
 
 or moves the task to its review/done status. No outcome → the runner asks once
-in the same session, then releases the task until someone writes on it.
+in the same session (`max_no_outcome`). A second turn in a row without a readable
+outcome puts the task back in todo with the same lane until new input arrives (a comment,
+a change to a linked merge request or pipeline, a closed dependency: the `requeue_on_cap`
+inputs; no timer; without `requeue_on_cap` it is handed up as before). The
+`no_outcome_route_after`-th turn in a row without a readable outcome on the task (default 3,
+any lane; a readable outcome resets the count) hands it to the lead. A task that was handed up
+for this reason is only ever kept by the lead that receives it, never handed further up.
+
+A time wait whose reason names an event (a verdict, an answer, a person, a card) is answered
+once, in the same session, with the forms that wait on the event itself; that answer does not
+count as a missing outcome. The same form repeated afterwards is an ordinary miss. An absolute
+`⏳ WAIT <moment>` whose moment has already passed (or is within a minute) means `↻ NEXT`.
 
 Observable waits are polled without starting the agent while their target is healthy
 and unchanged; time waits wake at their deadline. Age re-checks apply to unreadable
@@ -80,6 +91,12 @@ satisfy `success`. `pipeline:group/project#14845` supports the same fields for
 retries of that exact pipeline (the baseline ID must match). Missing/malformed CI
 observations remain UNKNOWN and do not acknowledge a result. Ordinary WAIT syntax
 keeps its existing behavior, including an immediate wake on an already failed CI.
+
+`after=` may be left out: `⏳ WAIT pipeline:group/project#14845 until=success` (also
+`until=change`, and `mr:group/project!56` with `until=success|change|merged`) takes the
+CI/MR state read at the moment the wait is declared as its baseline. A target that is
+already final (a pipeline in any terminal status, a merge request merged or closed), or that
+cannot be read, leaves the plain wait; only a non-final target keeps a typed baseline.
 
 An ordinary typed `pipeline:... until=success after=...` wait also gives one
 action-required notice when that exact pipeline and SHA have finished with
@@ -534,7 +551,7 @@ the runner writes on tasks it holds but does not run are kept in its database an
 cleared after a restart too, once a task is done, cancelled, in backlog or another
 agent's; a state someone else wrote since is left alone.
 
-Hand-offs (`daily_start_cap`, the turn budget, `max_compactions`, a runner give-up) go
+Hand-offs (`daily_start_cap`, the turn budget, a detected loop, `max_compactions`, a runner give-up) go
 to the agent's `lead`, that lead's `lead` while it is an agent of this runner, then the
 project's lead (`[project_leads]`). A lead that itself started the task
 `daily_start_cap` times today is passed over. A task this agent already handed up
@@ -545,12 +562,61 @@ agent of the same runner when one can; otherwise the task shows `blocker card is
 readable by this agent` (reason code `dependencies_unreadable`). Each new reason a
 task is held for is logged once (`<agent>: #<task> held: <reason>`).
 
+### Loops are caught by repetition, not by a count
+
+`loop_streak_limit` (6, `0` = off) is the loop guard. The runner keeps, per task and agent, a streak
+of consecutive turns that made no progress (a store mark, so it survives attempts and restarts). At
+the limit the task is handed up like any other cap (`requeue_on_cap` or the lead chain) under the
+banner `🔁 LOOP`, whose text lists the last turns (NEXT, which wait was sent back and declared again).
+A loop is never held to the next UTC day by this path.
+
+A turn extends the streak when nothing moved and it is one of:
+
+- a `↻ NEXT` after which the leased worktrees have the same HEAD and diff as at the turn start and
+  the agent wrote nothing new on the card;
+- a wait that the runner sent back (the time, dead, stale, unattended, card and repeated-decision
+  bounces) and the agent declared again unchanged;
+- a wait the agent already declared in the current window but not just before it (alternating
+  between waits A and B);
+- the same wait as the previous one, accepted, declared again in a turn the agent started itself
+  with `↻ NEXT`.
+
+An accepted wait declared again right after itself, after a wake that was not the agent's own NEXT,
+leaves the streak as it is: a runner re-check of a standing wait (a person's answer, a decision, a
+slow pipeline, a scheduled time) that the agent correctly keeps is not an agent loop, and the cost of
+waking it is the wake policy's concern. It neither extends nor resets the streak.
+
+Any of these resets it:
+
+- a comment of the agent's own that is news. The text (declaration lines and `[runner]` notes
+  removed) is reduced to its gist: lowercase, URL query strings, dates, times, hex ids and shas
+  (7+ hex characters) and numbers removed, punctuation and whitespace collapsed. The gist must be at
+  least 40 characters and not seen among the agent's comments in the window. "still waiting for
+  pipeline 21234 (checked 14:05)" an hour later is the same comment, and so is a short status line;
+- a change in the worktrees (HEAD or diff; an unreadable digest counts as a change);
+- a change of the card's status;
+- a wake by a met event (a pipeline finished, a card closed);
+- a wait the agent has not declared in the current window (the first wait is new).
+
+The window is the turns since the last change in the worktrees, the card's status or a met event.
+A new wait or a new comment resets the count but joins the window, so alternating between two waits
+or two comments is a repeat, while a succession of new waits (A, B, C, ...) never is. A task that
+keeps waking and waiting with real progress is never stopped by this guard, however many turns it
+takes.
+
+Not seen by the streak: an agent that writes a genuinely different comment (40+ characters of
+new gist) on every turn, and work that leaves no trace in the worktree, a comment or the card
+status (a task without a worktree has only the last two). The per-day counters
+`daily_next_budget` (6), `daily_wait_budget` (8) and `daily_step_budget` (24) remain in the code and
+the config as a backstop and a rollback; they count turns whether or not the task progresses, so a
+fleet that relies on the streak sets them high.
+
 ### Caps without a clock, questions without a wait
 
 Three switches in `[runner]` change what happens when work stalls on a cap or a question.
 Everything here restarts on an event, never on a timer. Details: `docs/requeue-on-event.md`.
 
-- `requeue_on_cap = false`: when true, a task that hit START CAP, TURN CAP or COMPACTION CAP goes
+- `requeue_on_cap = false`: when true, a task that hit START CAP, TURN CAP, LOOP or COMPACTION CAP goes
   back to `todo` with the same assignee (no `start_after`, no backoff) and starts again only when
   its inputs change (a comment by someone else, a linked merge request's state, pipeline status or
   head commit, a closed dependency, a new assignee). A free peer of the agent's pool (`pool` in the
@@ -806,7 +872,7 @@ This feature alone does not prove any host's pool is below a size target.
 Preview an explicit, scoped permission after repairing infrastructure:
 
 ```
-mesh-runner rearm-cap --config runner.toml --agent Riker-VC --task <full-task-uuid> --reason "transport repaired and verified"
+mesh-runner rearm-cap --config runner.toml --agent my-agent --task <full-task-uuid> --reason "transport repaired and verified"
 ```
 
 Add `--apply` to record the permission; `--dry-run` is the default. Only a current

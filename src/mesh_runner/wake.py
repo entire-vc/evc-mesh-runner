@@ -31,14 +31,56 @@ NO_PIPELINE_GRACE = dt.timedelta(minutes=15)    # a push takes a moment to get i
 
 
 @dataclass
+class GitHub:
+    """Reads a GitHub pull request as the merge-request dict the wait evaluators already
+    understand (``state`` opened/merged/closed, ``sha``, ``merge_commit_sha``, ``labels``,
+    ``target_branch``), so ``mr:`` / ``merge:`` waits on a GitHub target need no second code path."""
+    token: str = ""
+    api_url: str = "https://api.github.com"
+    orgs: tuple = ()
+
+    def __repr__(self) -> str:
+        return f"GitHub({self.api_url!r})"
+
+    def owns(self, target: str) -> bool:
+        """True for ``org/repo!N`` whose org (or full org/repo) is configured as GitHub-hosted."""
+        project = target.rsplit("!", 1)[0]
+        return any(project == o or project.startswith(o.rstrip("/") + "/") for o in self.orgs)
+
+    def get(self, path: str) -> dict:
+        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(f"{self.api_url.rstrip('/')}/{path}", headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def get_mr(self, target: str) -> dict:
+        project, number = target.rsplit("!", 1)
+        pr = self.get(f"repos/{project}/pulls/{number}")
+        state = "merged" if pr.get("merged") or pr.get("merged_at") else \
+            ("closed" if pr.get("state") == "closed" else "opened")
+        head = pr.get("head") or {}
+        return {"state": state, "sha": head.get("sha") or "", "merged_at": pr.get("merged_at"),
+                "closed_at": pr.get("closed_at"), "updated_at": pr.get("updated_at"),
+                "merge_commit_sha": pr.get("merge_commit_sha") if state == "merged" else None,
+                "target_branch": (pr.get("base") or {}).get("ref"),
+                "labels": [l.get("name") for l in pr.get("labels") or [] if isinstance(l, dict)],
+                "head_pipeline": None, "web_url": pr.get("html_url")}
+
+
+@dataclass
 class GitLab:
     base_url: str
     token: str
+    github: "GitHub | None" = None
 
     def __repr__(self) -> str:
         return f"GitLab({self.base_url!r})"
 
     def get(self, path: str) -> dict:
+        if not self.base_url:                  # GitHub-only configuration: no GitLab to read
+            raise ValueError("no [gitlab] base_url configured")
         req = urllib.request.Request(f"{self.base_url.rstrip('/')}/api/v4/{path}",
                                      headers={"PRIVATE-TOKEN": self.token})
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -94,6 +136,8 @@ class GitLab:
         return f"{head.get('id')}:{head.get('status')}"
 
     def get_mr(self, target: str) -> dict:
+        if self.github is not None and self.github.owns(target):
+            return self.github.get_mr(target)
         project, iid = target.rsplit("!", 1)
         return self.get(f"projects/{self.project(project)}/merge_requests/{iid}")
 

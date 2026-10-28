@@ -396,6 +396,21 @@ class Store:
                               (agent, task_id, midnight)).fetchone()   # outage-only turns are not a start
         return int(row[0]) if row else 0
 
+    def events_since_readable(self, task_id: str, kind: str) -> int:
+        """Events of ``kind`` on any attempt of this task (any agent) after its latest
+        ``readable_outcome`` event: a run of misses is counted only while it is unbroken."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.task_id=? AND e.kind=? "
+            "AND e.rowid > COALESCE((SELECT MAX(x.rowid) FROM events x JOIN attempts b ON b.id=x.attempt "
+            "WHERE b.task_id=? AND x.kind='readable_outcome'), 0)", (task_id, kind, task_id)).fetchone()
+        return int(row[0]) if row else 0
+
+    def events_on_task(self, task_id: str, kind: str) -> int:
+        """Events of ``kind`` on any attempt of this task, whatever readable outcomes came since."""
+        row = self.db.execute("SELECT COUNT(*) FROM events e JOIN attempts a ON a.id=e.attempt "
+                              "WHERE a.task_id=? AND e.kind=?", (task_id, kind)).fetchone()
+        return int(row[0]) if row else 0
+
     def last_work_end(self, agent: str, task_id: str) -> "dt.datetime | None":
         """When this agent's latest session on this task that ran a turn last changed."""
         row = self.db.execute("SELECT MAX(updated_at) FROM attempts WHERE agent=? AND task_id=? "

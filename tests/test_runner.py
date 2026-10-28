@@ -368,8 +368,7 @@ class Loop(Bench):
         mesh.add_comment(t["id"], "try again with the new spec", author="lead")
         r.tick()                                   # a new comment from someone else re-opens it
         self.assertEqual(len(r.store.by_state("builder", ("running", "starting"))), 1)
-        self.assertEqual(self.finish_turn(r).state, "ready")
-        r.tick()
+        # the third turn in a row without a readable outcome (no lead above: released again)
         self.assertEqual(self.finish_turn(r).state, "failed")
 
     def test_checkout_refused_aborts_without_spawning(self):

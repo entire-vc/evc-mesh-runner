@@ -251,12 +251,18 @@ class ManualAction(Bench):
         self.assertFalse(a.wait.get("met"))
 
     def test_missing_after_is_not_an_exact_typed_contract(self):
-        for suffix in ("", " after=:5:failed", " after=abc:5:failed"):
+        for suffix in (" after=:5:failed", " after=abc:5:failed"):
             with self.subTest(suffix=suffix):
                 parsed = parse_line(f"⏳ WAIT pipeline:{TARGET} until=success{suffix}",
                                     dt.datetime.now(dt.timezone.utc))
                 self.assertEqual(parsed.kind, "unparsed")
                 self.assertNotIn("ci_change", parsed.extra)
+
+    def test_missing_after_takes_the_state_at_declaration_as_baseline(self):
+        parsed = parse_line(f"⏳ WAIT pipeline:{TARGET} until=success", dt.datetime.now(dt.timezone.utc))
+        self.assertEqual(parsed.kind, "pipeline")
+        self.assertNotIn("ci_change", parsed.extra)          # the runner fills the baseline in
+        self.assertEqual(parsed.extra["ci_default"], {"predicate": "success"})
 
     def test_disk_preflight_refusal_preserves_pending_action(self):
         r, a, t, gl, wait = self.setup_wait()
