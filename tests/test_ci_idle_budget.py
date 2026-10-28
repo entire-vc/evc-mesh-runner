@@ -344,6 +344,7 @@ class CIIdleBudget(Bench):
                 self.assert_waiting(r, a)
 
     def test_default_24_step_and_6_next_caps_survive_ci_progress(self):
+        self.cfg.loop_streak_limit = 0         # the daily counters alone: the streak guard would stop 7 idle NEXTs first
         for kind, limit in (('step', 24), ('next', 6)):
             with self.subTest(kind=kind):
                 r, _, gl = self.setup_flow()

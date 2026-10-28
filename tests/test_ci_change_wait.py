@@ -474,4 +474,4 @@ class ExplicitWaitDiagnosisTests(unittest.TestCase):
         self.assertIn('until=merged', self.note(f'until=change after={self.SHA}:opened'))
 
     def test_other_malformation_gets_the_forms(self):
-        self.assertIn('expected', self.note('until=change'))
+        self.assertIn('expected', self.note('until=change after=nonsense'))

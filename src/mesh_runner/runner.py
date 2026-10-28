@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import dataclasses
 import datetime as dt
 import fcntl
 import hashlib
@@ -52,10 +53,10 @@ from .effects import (BACKLOG_BLOCKER, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SK
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
-from .outcome import DECISION_WAIT_GUIDANCE, Outcome, declaration_lines, parse_line
+from .outcome import DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
 from .selection import StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
-from .wake import (GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
+from .wake import (GitHub, GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign)
@@ -75,6 +76,16 @@ RELEASE_PENDING = "release_pending"     # store mark: the lease of a release who
 RELEASE_RETRY_SECONDS = (30, 120, 300)  # backoff between retries of a pending release; the last step repeats
 TURN_CAP_WINDOW = 10                # turn_cap_continue_on_progress: how many recent outcomes are looked at
 CAP_WAIT = "cap_wait"                # store mark: a capped task waiting for new input (requeue_on_cap)
+LOOP_COMMENT_MIN = 40               # loop guard: shortest gist (characters) of a comment that counts as news
+LOOP_WINDOW = 50                    # loop guard: signatures / comment gists remembered within one window
+LOOP_COMMENT_NOISE = (              # loop guard: what _comment_gist removes, in this order
+    (re.compile(r"(https?://[^\s?#]+)\?[^\s#]*"), r"\1"),
+    (re.compile(r"\b\d{4}-\d\d-\d\d(?:[t ]\d{1,2}:\d\d(?::\d\d(?:\.\d+)?)?(?:z|[+-]\d\d:?\d\d)?)?"), " "),
+    (re.compile(r"\b\d{1,2}:\d\d(?::\d\d)?(?:\s?[ap]m)?\b"), " "),
+    (re.compile(r"\b[0-9a-f]{7,64}\b"), " "),
+    (re.compile(r"\d+"), " "),
+)
+LOOP_STREAK = "loop_streak"          # store mark: the task's run of turns without progress (loop_streak_limit)
 CAP_REASSIGNED = "cap_reassigned"    # store mark: the UTC day a cap moved this task to this agent
 WAITING_FOR_INPUT = "waiting for new input after "      # hold reason of a capped task
 # what a time WAIT's reason may name that the runner can watch instead of a clock
@@ -1069,7 +1080,40 @@ class AgentRunner:
         return bool(self.cfg.merge_command) and self.gitlab is not None
 
     def _parse(self, line: str, at: dt.datetime, task8: str = "") -> Outcome:
-        return parse_line(line, at, task8, merge=self.merge_enabled)
+        out = parse_line(line, at, task8, merge=self.merge_enabled)
+        if out.extra.get("ci_default") or out.extra.get("mr_default"):
+            out = self._default_baseline(out)
+        return out
+
+    def _default_baseline(self, out: Outcome) -> Outcome:
+        """``until=`` without ``after=``: the baseline is the CI/MR state at the moment the wait is
+        declared. A target that is already final (a pipeline in any terminal status, a merge request
+        merged or closed), one that cannot be read, or no GitLab leaves the plain wait, which wakes on
+        the next check when the result is final; only a non-final target keeps a typed baseline."""
+        plain = dataclasses.replace(out, extra={})
+        if self.gitlab is None:
+            return plain
+        try:
+            if out.extra.get("mr_default"):
+                row = self.gitlab.get_mr(out.target)
+                sha = row.get("sha") if isinstance(row, dict) else None
+                if (isinstance(row, dict) and row.get("state") == "opened" and isinstance(sha, str)
+                        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)):
+                    return dataclasses.replace(out, extra={
+                        "mr_state": {"predicate": "merged", "sha": sha, "state": "opened"}})
+                return plain
+            predicate = out.extra["ci_default"]["predicate"]
+            row = self.gitlab.get_mr(out.target) if out.kind == "mr" else self.gitlab.get_pipeline(out.target)
+            if out.kind == "mr" and (not isinstance(row, dict) or row.get("state") != "opened"):
+                return plain                    # merged, closed or in transit: nothing a baseline could wait for
+            sha, pid, status = ci_observation(self.gitlab, out.kind, out.target, row=row)
+        except Exception as e:                  # noqa: BLE001 - unreadable: the plain wait stands
+            log.info("%s: default CI baseline for %s unreadable: %r", self.agent.name, out.target, e)
+            return plain
+        if status in PIPELINE_DONE:
+            return plain                        # already final: the plain wait wakes on the next check
+        return dataclasses.replace(out, extra={"ci_change": {
+            "predicate": predicate, "sha": sha, "pipeline": pid, "status": status}})
 
     def _read_outcome(self, a: Attempt, result: TurnResult, comments: list[dict]) -> tuple[Outcome | None, str]:
         """The agent's newest declaration written after the turn started (Mesh
@@ -1307,15 +1351,11 @@ class AgentRunner:
         comments = self._comments(a.task_id)
         outcome, at = self._read_outcome(a, result, comments)
         if outcome is None or outcome.kind == "unparsed":
-            line = outcome.line if outcome else ""
-            if a.no_outcome >= self.cfg.max_no_outcome:
-                self._give_up(a, task, "the session ended without a readable outcome twice"
-                                       + (f" (last: `{line.strip()[:160]}`)" if line else ""))
-            else:
-                self.store.update(a, state="ready", no_outcome=a.no_outcome + 1,
-                                  wake_text=prompts.no_outcome_prompt(task, line, outcome.note if outcome else "",
-                                                                         merge=self.merge_enabled))
+            self._no_outcome(a, task, outcome)
             return
+        self.store.event(a.id, "readable_outcome")
+        end_digest = self._work_digest(a) if self.cfg.loop_streak_limit > 0 else None
+        sent_back = lambda: self._loop_guard(a, task, outcome, comments, end_digest, bounced=True)
         queue_contract = None
         if self.cfg.queue_wait_freshness_v1 and a.mode == "work" and outcome.kind == "time":
             try:
@@ -1326,12 +1366,16 @@ class AgentRunner:
                 return  # retry settlement, without another turn or a stale source
         told = "" if queue_contract else self._time_wait_told(a, task, outcome)
         if told:
+            if sent_back():
+                return
             # sent back before anything is recorded: a rejected declaration spends no budget
             self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, told))
             log.info("%s: #%s time wait sent back: %s", self.agent.name, a.task8, told[:80])
             return
         dead, dead_again = self._canceled_pipeline_wait(a, outcome)
         if dead:
+            if sent_back():
+                return
             # Same budget as the other sent-back waits: a session that keeps re-declaring it
             # still reaches the wait budget.
             self.store.outcome(a, "wait")
@@ -1345,6 +1389,8 @@ class AgentRunner:
                                              "ci_change": outcome.extra["ci_change"]})
                  if not dead_again and outcome.kind in ("pipeline", "mr") and outcome.extra.get("ci_change") else "")
         if stale:
+            if sent_back():
+                return
             # This wait could never wake (measured 21.10: one card waited on another with
             # after=...:running, already delivered as failed). Send it back, but count it as an
             # idle wait: a session that keeps re-declaring it still reaches the wait budget.
@@ -1356,6 +1402,8 @@ class AgentRunner:
             return
         unattended = "" if dead_again else self._unattended_ci_wait(a, outcome)
         if unattended:
+            if sent_back():
+                return
             # Nobody will make this happen: a blocked manual stage, a finished red pipeline, or
             # the task's own MR that no review has passed. Same budget as the stale-baseline
             # bounce: a session that keeps re-declaring it still reaches the wait budget.
@@ -1368,6 +1416,8 @@ class AgentRunner:
             return
         idle_card = self._card_wait_told(a, outcome)
         if idle_card:
+            if sent_back():
+                return
             # same budget as the stale-baseline bounce: a session that keeps re-declaring it
             # still reaches the wait budget
             self.store.outcome(a, "wait")
@@ -1379,6 +1429,8 @@ class AgentRunner:
             return
         repeat = self._repeated_decision_told(a, task, outcome, comments)
         if repeat:
+            if sent_back():
+                return
             # the same budget as the other sent-back waits: asking the same question again and
             # again still reaches the wait budget
             self.store.outcome(a, "wait")
@@ -1390,6 +1442,8 @@ class AgentRunner:
             return
         proceed = self._default_proceeds(a, task, outcome)
         if proceed:
+            if sent_back():
+                return
             # the asker stated its own default: it continues now, the addressee may object. Counted
             # like a NEXT, so a session that keeps doing this still reaches the NEXT budget.
             self.store.outcome(a, "next")
@@ -1401,6 +1455,8 @@ class AgentRunner:
         outcome = self._live_task_card_wait(a, task, outcome)
         # the wait is accepted from here on: only now may it retire a delivery receipt
         self._forget_spent_ci_delivery(a, outcome)
+        if self._loop_guard(a, task, outcome, comments, end_digest):
+            return
         recheck = self.store.mark(self.agent.name, a.task_id, "recheck_wake")
         owner, _, count = str(recheck[0] if recheck else "").rpartition(":")
         # a mark left by another attempt (one that ended without an outcome) is not this turn's
@@ -1429,7 +1485,7 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "met_wake", "")
         if outcome.kind == "next":
             before = self.store.mark(self.agent.name, a.task_id, "turn_work")
-            after = self._work_digest(a)
+            after = end_digest if end_digest is not None else self._work_digest(a)
             if before and before[0] and after and before[0] != after:      # unknown is never free
                 self.store.event(a.id, "next_work")     # the turn changed HEAD or the diff
             # NEXT has no event to observe after a cap.
@@ -1437,7 +1493,8 @@ class AgentRunner:
             if self._over_budget(a, task):
                 return
             self.store.update(a, state="ready", no_outcome=0,
-                              wake_text=prompts.wake_prompt(task, "you asked to continue (↻ NEXT)"))
+                              wake_text=prompts.wake_prompt(task, "you asked to continue (↻ NEXT)")
+                              + ("\n" + outcome.extra["hint"] if outcome.extra.get("hint") else ""))
             return
         wait = {"kind": outcome.kind, "target": outcome.target, "handle": outcome.handle,
                 "line": outcome.line[:400],
@@ -1558,6 +1615,52 @@ class AgentRunner:
         self.emit("wait", a, wait=wait["kind"], target=wait.get("target") or wait.get("handle") or wait.get("until"))
         log.info("%s: #%s waits: %s %s", self.agent.name, a.task8, wait["kind"],
                  wait.get("target") or wait.get("handle") or wait.get("until"))
+
+    def _no_outcome(self, a: Attempt, task: dict, outcome: Outcome | None) -> None:
+        """The turn ended without a declaration the runner can read.
+
+        A time WAIT whose reason names an event is answered once with the forms to use; that is not a
+        miss. Misses are counted while unbroken by a readable outcome, across lanes. The first is
+        corrected in the same session (``max_no_outcome``). The second in a row sends the task back to
+        todo with the same lane until new input arrives (no timer). From the ``no_outcome_route_after``-th
+        in a row it goes to the lead, unless it already went up for this reason: the lead that receives
+        it never hands it further up."""
+        line = outcome.line if outcome else ""
+        prompt = prompts.no_outcome_prompt(task, line, outcome.note if outcome else "", merge=self.merge_enabled)
+        if (outcome and outcome.extra.get("event_reason")
+                and not self.store.events_since_readable(a.task_id, "event_reason_corrected")):
+            self.store.event(a.id, "event_reason_corrected", line.strip()[:200])
+            self.store.update(a, state="ready", wake_text=prompt)           # not counted as a miss
+            return
+        self.store.event(a.id, "no_outcome", line.strip()[:200])
+        misses = self.store.events_since_readable(a.task_id, "no_outcome")
+        routed = self.store.events_on_task(a.task_id, "no_outcome_routed") > 0   # survives readable outcomes
+        last = f" (last: `{line.strip()[:160]}`)" if line else ""
+        if not routed and misses >= self.cfg.no_outcome_route_after:
+            self._give_up_no_outcome(a, task, f"the session ended without a readable outcome {misses} turns in a row" + last)
+            return
+        if a.no_outcome < self.cfg.max_no_outcome:
+            self.store.update(a, state="ready", no_outcome=a.no_outcome + 1, wake_text=prompt)
+            return
+        why = f"{misses} turns in a row ended without a readable outcome" + last
+        if (self.cfg.requeue_on_cap and a.mode == "work"
+                and self._requeue_on_event(task, "no outcome", "🔁 NO OUTCOME", why, a, keep_lane=True)):
+            return
+        if not routed:
+            self._give_up_no_outcome(a, task, why)
+            return
+        # already handed up for this reason and nothing to wait on: the receiving lead keeps it in todo
+        self._to_todo(a, task)
+        self._finish(a, "failed", f"no readable outcome: {why}")
+        self._comment(a.task_id, f"NO OUTCOME: {why}; already handed up for this, so it stays here. "
+                                 "Back in todo until someone writes here.")
+
+    def _give_up_no_outcome(self, a: Attempt, task: dict, why: str) -> None:
+        self._give_up(a, task, why)
+        ended = self.store.get(a.id)
+        if ended and (ended.note or "").startswith("routed to lead"):
+            # only a card that really went up is marked; the lead that receives it never hands it on
+            self.store.event(a.id, "no_outcome_routed", why[:200])
 
     def _already_posted(self, a, body: str) -> bool:
         """Whether this agent already left exactly ``body`` on the task. An unreadable thread is
@@ -2286,7 +2389,7 @@ class AgentRunner:
         return bool(mark and mark[0])
 
     def _requeue_on_event(self, task: dict, kind: str, banner: str, why: str, a: Attempt | None = None,
-                          fp: dict | None = None) -> bool:
+                          fp: dict | None = None, keep_lane: bool = False) -> bool:
         """A cap put the task back in the queue (``requeue_on_cap``). Same assignee, status todo,
         no ``start_after``, no backoff: it starts again when its inputs change (see inputs.py), or
         at once on a free peer of its pool for a fresh start. False when it could not be done safely
@@ -2306,7 +2409,7 @@ class AgentRunner:
             log.warning("%s: #%s %s: could not move it to todo / clear start_after; using the hand-up path",
                         self.agent.name, tid[:8], kind)
             return False
-        peer = self._free_peer(task)
+        peer = None if keep_lane else self._free_peer(task)
         moved_to = ""
         if peer:
             try:
@@ -2417,6 +2520,152 @@ class AgentRunner:
         why = (f"{used.get('next', 0)} NEXT, {used.get('wait', 0)} waits and {used.get('step', 0)} "
                f"steps today on this task; {idle} idle waits since the last verified CI step")
         self._hand_up(a, task, "🔁 TURN CAP", why, "turn budget")
+        return True
+
+    def _own_turn_comments(self, a: Attempt, comments: list[dict]) -> list[str]:
+        """What the agent itself wrote on the card during this turn, one text per comment,
+        declaration lines and runner notes left out. Judged by Mesh's clock, like ``_read_outcome``."""
+        started = parse_time(a.turn_started_at)
+        if started is None:
+            return []
+        texts = []
+        for c in comments:
+            author = c.get("author_id") or (c.get("author") or {}).get("id")
+            body = c.get("body") or ""
+            at = parse_time(c.get("created_at"))
+            if author != self.agent_id or body.startswith("[runner") or at is None or at <= started:
+                continue
+            text = "\n".join(l for l in body.splitlines() if not DECLARATION.match(l)).strip()
+            if text:
+                texts.append(text)
+        return texts
+
+    @staticmethod
+    def _comment_gist(text: str) -> str:
+        """A comment with what changes between two status reports taken out: lowercase, no URL query
+        strings, dates, times, hex ids / shas (7+ hex characters) or numbers, punctuation and
+        whitespace collapsed. "still waiting for pipeline 21234 (checked 14:05)" and the same line
+        an hour later have the same gist."""
+        t = text.lower()
+        for pattern, repl in LOOP_COMMENT_NOISE:
+            t = pattern.sub(repl, t)
+        return re.sub(r"[\W_]+", " ", t).strip()
+
+    @staticmethod
+    def _loop_signature(outcome: Outcome) -> str:
+        """Which wait the agent declared. A time wait is told apart by its reason, not its clock
+        (every time wait ends at a different moment); a question by its text."""
+        parts = [outcome.kind, outcome.target or "", outcome.handle or ""]
+        if outcome.kind in ("time", "blocking", "decision"):
+            parts.append((outcome.note or "").strip())
+        for key in ("ci_change", "merge", "mr_state"):
+            if outcome.extra.get(key):
+                parts.append(json.dumps(outcome.extra[key], sort_keys=True, default=str))
+        return "|".join(parts)
+
+    def _loop_guard(self, a: Attempt, task: dict | None, outcome: Outcome, comments: list[dict],
+                    end_digest: str, bounced: bool = False) -> bool:
+        """Catch a loop by repetition without progress (``loop_streak_limit``); True = handed up.
+
+        Called once per settled turn with a readable outcome: with ``bounced`` where the runner is
+        about to send the declaration back, otherwise where it accepts it. The turn extends,
+        resets or leaves alone the task's streak (a store mark, so it survives attempts and
+        restarts).
+
+        Progress resets it: a comment of the agent's own that is news (at least ``LOOP_COMMENT_MIN``
+        characters once ``_comment_gist`` has taken the numbers, times and ids out, and a gist not
+        seen among its comments in this window), the worktree moved (HEAD or diff; unreadable counts
+        as moved), the card changed status, the wake was a met event (a pipeline finished, a card
+        closed), or the agent declared a wait it has not declared in this window (the first wait is
+        new). The worktree, status and met signals clear the window: what was declared and said
+        before is forgotten (the previous wait is kept apart, only to tell a standing wait kept
+        after a wake from a new one). A new wait or comment only resets the count and joins the window,
+        so alternating between waits A and B, or between two comments, is still a repeat.
+
+        No progress extends it: a NEXT; a wait the runner sent back and the agent declared again;
+        a wait declared again that is not the previous one but is in the window (ping-pong); the
+        same wait declared again, and accepted, in a turn the agent started itself with NEXT.
+
+        Neutral (the streak stays as it is): an accepted wait declared again after a wake that was
+        not the agent's own NEXT, a runner re-check above all. A standing wait that is checked
+        and kept is not an agent loop; how often it is woken is the wake policy's concern."""
+        limit = self.cfg.loop_streak_limit
+        if limit <= 0:
+            return False
+        agent, tid = self.agent.name, a.task_id
+        got = self.store.mark(agent, tid, LOOP_STREAK)
+        try:
+            state = json.loads(got[0]) if got and got[0] else {}
+        except ValueError:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        gists = [self._comment_gist(t) for t in self._own_turn_comments(a, comments)]
+        seen_gists = list(state.get("cmts") or [])
+        news = False
+        for g in dict.fromkeys(gists):                  # a comment is news once per window
+            hashed = hashlib.sha1(g.encode()).hexdigest()[:16]
+            if len(g) >= LOOP_COMMENT_MIN and hashed not in seen_gists:
+                news = True
+            if g:
+                seen_gists.append(hashed)
+        before = (self.store.mark(agent, tid, "turn_work") or ("",))[0]
+        if not a.workspaces:
+            moved = False                       # no worktree: this signal does not exist
+        else:
+            moved = not before or not end_digest or before != end_digest    # unreadable: cannot show it idle
+        status = str((task or {}).get("status_id") or "")
+        met = self.store.mark(agent, tid, "met_wake")
+        met_at = met[1] if met and met[0] == a.id else ""
+        previous = state.get("sig", "")
+        signature = previous if outcome.kind == "next" else self._loop_signature(outcome)
+        own_next = state.get("last") == "next"          # this turn began with the agent's own NEXT
+        window = list(state.get("seen") or [])
+        fresh = ""                                       # progress that starts a new window
+        if moved:
+            fresh = "worktree changed"
+        elif status and state.get("st") and status != state["st"]:
+            fresh = "status changed"
+        elif met_at and met_at != state.get("met", ""):
+            fresh = "woken by a met event"
+        if fresh:
+            window = []                                  # progress clears the window completely
+            seen_gists = [hashlib.sha1(g.encode()).hexdigest()[:16] for g in dict.fromkeys(gists) if g]
+        streak = list(state.get("log") or [])
+        is_wait = outcome.kind != "next"
+        same_as_previous = is_wait and signature == previous
+        in_window = is_wait and signature in window
+        what = outcome.kind + (f":{outcome.target or '@' + outcome.handle}" if is_wait
+                               and (outcome.target or outcome.handle) else "")
+        if fresh or news:
+            streak = []
+        elif not is_wait:
+            streak.append("NEXT, nothing changed, no new comment")
+        elif not (same_as_previous or in_window):
+            streak = []                          # a wait not declared in this window is a move
+        elif bounced:
+            streak.append(f"{what} sent back by the runner and declared again")
+        elif in_window and own_next and same_as_previous:
+            streak.append(f"{what} declared again in a turn started by its own NEXT, nothing changed")
+        elif in_window and not same_as_previous:
+            streak.append(f"{what} declared again after other waits, nothing changed (alternating)")
+        # else: the standing wait, accepted, declared again after a wake (a re-check included): neutral
+        if is_wait and signature not in window:
+            window.append(signature)
+        new = {"log": streak[-max(limit, 1):], "sig": signature, "seen": window[-LOOP_WINDOW:],
+               "cmts": seen_gists[-LOOP_WINDOW:],
+               "st": status or state.get("st", ""), "met": met_at or state.get("met", ""),
+               "last": "next" if outcome.kind == "next" else "wait"}
+        if len(streak) < limit:
+            self.store.mark(agent, tid, LOOP_STREAK, json.dumps(new))
+            return False
+        why = (f"{len(streak)} turns in a row without progress (nothing changed in the worktree, no new "
+               f"comment from {agent}, no new wait): " +
+               "; ".join(f"{i}. {line}" for i, line in enumerate(streak[-limit:], 1)))
+        self.store.mark(agent, tid, LOOP_STREAK, "")        # a fresh start begins a fresh streak
+        self.store.event(a.id, "loop", why)
+        log.info("%s: #%s loop: %s", agent, a.task8, why)
+        self._hand_up(a, task, "🔁 LOOP", why, "loop")
         return True
 
     def _over_compaction_cap(self, a: Attempt, task: dict | None, new: int) -> bool:
@@ -2566,9 +2815,10 @@ class AgentRunner:
         lead, why_not = self._pick_lead(task) if task else (None, "")
         if why_not:
             why += f"; {why_not}"
-        if why_not and not lead:
+        if why_not and not lead and short != "loop":
             # a lead exists but cannot take it now (it came back, the leads are capped, the
             # lead is in another workspace): the agent keeps it, in todo, until tomorrow
+            # (a loop is not held to a clock: it falls through to the hold on a new comment)
             self._to_todo(a, task)
             self._finish(a, "failed", f"{short}: {why}")
             log.info("%s: #%s %s: kept until tomorrow: %s", self.agent.name, a.task8, short, why)
@@ -5384,7 +5634,8 @@ class Runner:
             except BlockingIOError:
                 raise AlreadyRunning(f"another runner owns {cfg.state_dir}") from None
         self.store = Store(cfg.state_dir / "runner.sqlite")
-        gitlab = GitLab(cfg.gitlab_url, cfg.gitlab_token) if cfg.gitlab_url else None
+        github = GitHub(cfg.github_token, cfg.github_api_url, cfg.github_orgs) if cfg.github_orgs else None
+        gitlab = GitLab(cfg.gitlab_url, cfg.gitlab_token, github) if (cfg.gitlab_url or github) else None
         # one sqlite connection per agent: each agent ticks in its own thread (run_forever)
         self.agents = [AgentRunner(cfg, a, Store(cfg.state_dir / "runner.sqlite"), gitlab=gitlab)
                        for a in cfg.agents]

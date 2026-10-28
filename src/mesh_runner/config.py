@@ -14,6 +14,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # review_label_prefix = "verified-by:"   # MR label recording a review verdict ('' = off)
     # turn_cap_continue_on_progress = false  # at max_turns a progressing attempt restarts fresh on the same agent
     # turn_cap_progress_min = 3        # step/next outcomes among the last 10 that count as progress
+    # loop_streak_limit = 6            # consecutive turns without progress before a task is handed up as a LOOP (0 = off)
     # requeue_on_cap = false           # a capped task returns to todo and restarts on new input, not a clock
     # cap_wake_next_day = false        # a capped task of an agent without a lead restarts on the next UTC day
     # soft_person_asks_to_lead = false # a question to a person that no hard rule matches goes to the lead
@@ -276,7 +277,13 @@ class RunnerConfig:
     wake_poll_seconds: int = 120
     heartbeat_seconds: int = 300
     checkout_ttl_minutes: int = 120
-    max_no_outcome: int = 1
+    max_no_outcome: int = 1            # immediate corrections (same session) after an unreadable outcome
+    # Consecutive turns without a readable outcome on one task (any lane; a readable outcome resets the
+    # count) after which it is routed to the lead. The second miss in a row puts the task back in todo
+    # with the same lane until new input arrives (``requeue_on_cap`` inputs, no timer; needs
+    # ``requeue_on_cap``, else it is handed up as before). A task already routed up for this reason is
+    # only held by the receiving lead, never handed further, until a readable outcome.
+    no_outcome_route_after: int = 3
     daily_start_cap: int = 0           # starts of one task by one agent per UTC day; past it -> lead (0 = off)
     mention_requests: bool = False     # an @-address on someone else's task becomes a request card
     max_compactions: int = 0           # context compactions in one attempt; past it -> lead (0 = off)
@@ -366,6 +373,9 @@ class RunnerConfig:
     abort_backoff_minutes: int = 15
     gitlab_url: str = ""
     gitlab_token: str = field(default="", repr=False)
+    github_orgs: tuple = ()                 # `org` or `org/repo` prefixes whose mr:/merge: targets are GitHub PRs
+    github_token: str = field(default="", repr=False)
+    github_api_url: str = "https://api.github.com"
     # Agent Chat (protocol v1): off unless `[chat] enabled = true`. Interactive sessions only.
     announce_controllers: bool = False      # lead every configured agent in Mesh (agent_controllers), chat or not
     chat_enabled: bool = False
@@ -404,6 +414,22 @@ class RunnerConfig:
     # ('' = off)
     review_label_prefix: str = "verified-by:"
     project_leads: dict[str, str] = field(default_factory=dict)   # project id -> lead (name or agent id)
+    # Loop guard: a task is handed up (banner LOOP) after this many consecutive turns without
+    # progress. A turn has no progress when it is a NEXT that left the worktree as it was and wrote
+    # nothing new, a WAIT the runner sent back and the agent declared again, a wait the agent
+    # already declared in the current window (alternating between two waits), or the same WAIT
+    # declared again in a turn the agent started with its own NEXT. An accepted standing wait
+    # re-declared after a wake (a runner re-check included) leaves the streak as it is. A change in
+    # the worktree or the card status, a met wake, a wait not yet seen in the window, or a comment
+    # of the agent's own that is news (40+ characters once numbers, times and ids are removed, and
+    # not seen in the window) resets it. 0 = off.
+    loop_streak_limit: int = 6
+    # The per-task, per-UTC-day turn counters below stop a task by count, whether or not it
+    # progresses (a release QA card with 12 waits stopped at 8). With loop_streak_limit on they are a
+    # backstop only: a rollback path and a bound against a loop the streak cannot see (an agent that
+    # alternates between two waits, or writes a different comment each turn). Set them high
+    # (e.g. 100000) to leave the streak as the only loop guard; they stay config-driven so the fleet
+    # can roll back to the counters alone with loop_streak_limit = 0.
     daily_next_budget: int = 6
     daily_wait_budget: int = 8
     # waits declared right after the previous wait was met (CI finished, a card closed, the
@@ -530,6 +556,16 @@ def _merge_command(value) -> tuple:
                 raise ConfigError(f"merge_command: unknown placeholder {{{name}}}; "
                                   f"use {', '.join('{' + n + '}' for n in MERGE_PLACEHOLDERS)}")
     return tuple(value)
+
+
+def _loop_streak_limit(value) -> int:
+    """Consecutive turns without progress before a task is handed up as a loop: an integer >= 0
+    (0 = off)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"loop_streak_limit must be an integer, got {value!r}")
+    if value < 0:
+        raise ConfigError(f"loop_streak_limit must be >= 0, got {value!r}")
+    return value
 
 
 def _positive(value, name: str, integer: bool = False):
@@ -682,6 +718,7 @@ def load(path: str | Path) -> RunnerConfig:
         heartbeat_seconds=int(r.get("heartbeat_seconds", 300)),
         checkout_ttl_minutes=int(r.get("checkout_ttl_minutes", 120)),
         max_no_outcome=int(r.get("max_no_outcome", 1)),
+        no_outcome_route_after=max(int(r.get("no_outcome_route_after", 3)), 1),
         daily_start_cap=int(r.get("daily_start_cap", 0)),
         mention_requests=bool(r.get("mention_requests", False)),
         comment_wake=comment_wake,
@@ -741,6 +778,7 @@ def load(path: str | Path) -> RunnerConfig:
         review_own_verdict_pattern=_pattern(r.get("review_own_verdict_pattern", DEFAULT_OWN_VERDICT_PATTERN),
                                             "[runner]"),
         review_label_prefix=str(r.get("review_label_prefix", "verified-by:")),
+        loop_streak_limit=_loop_streak_limit(r.get("loop_streak_limit", 6)),
         daily_next_budget=int(r.get("daily_next_budget", 6)),
         project_leads={str(k): str(v) for k, v in (raw.get("project_leads") or {}).items()},
         daily_wait_budget=int(r.get("daily_wait_budget", 8)),
@@ -797,4 +835,9 @@ def load(path: str | Path) -> RunnerConfig:
         gitlab_url=gl.get("base_url", ""),
         gitlab_token=read_secret(gl.get("token_file"), gl.get("token_env"), "gitlab token")
         if gl.get("base_url") else "",
+        github_orgs=tuple(_string_list((raw.get("github") or {}).get("orgs"), "[github] orgs", ())),
+        github_token=read_secret((raw.get("github") or {}).get("token_file"),
+                                 (raw.get("github") or {}).get("token_env"), "github token")
+        if (raw.get("github") or {}).get("token_file") or (raw.get("github") or {}).get("token_env") else "",
+        github_api_url=str((raw.get("github") or {}).get("api_url") or "https://api.github.com"),
     )

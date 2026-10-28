@@ -73,7 +73,8 @@ Event streams go to files, not pipes; processes are detached into their own grou
 restarted runner re-attaches by pid and log path: while the process group lives, the slot
 stays occupied; once it is gone, the turn is settled from its event file. An attempt whose
 process never started is aborted and its task given back. A turn cut off without a result
-counts as a turn without an outcome (asked once in the same session, then released).
+counts as a turn without an outcome (asked once in the same session, then back in todo with the same lane until new input
+arrives; handed to the lead from the `no_outcome_route_after`-th turn in a row without a readable outcome).
 
 ## Worktree pool
 
