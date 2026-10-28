@@ -60,6 +60,11 @@ class Adapter:
         when it had to do something, '' otherwise."""
         return ""
 
+    def session_known(self, session_id: str, cwd: Path, env: dict) -> bool:
+        """False only when the harness certainly cannot resume ``session_id`` under ``env``
+        (checked after ``prepare_resume``); a harness that cannot tell says True."""
+        return True
+
     def resume_argv(self, session_id: str, cwd: Path, add_dirs: list[Path]) -> list[str]:
         raise NotImplementedError
 

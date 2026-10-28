@@ -46,20 +46,43 @@ class ClaudeAdapter(Adapter):
             argv += ["--add-dir", str(d)]
         return argv + self.extra_args
 
+    ACCOUNTS_DIR = ".claude-accounts"
+
+    @classmethod
+    def _config_dirs(cls, env: dict) -> tuple[Path, list[Path]]:
+        """``(current config dir, every config dir on this host that may hold the session)``:
+        the current one, the default ``~/.claude``, its siblings, and the fleet's account
+        directories ``~/.claude-accounts/*``. A lane on the default directory (no
+        CLAUDE_CONFIG_DIR) has no siblings of its own, so the account directories must be
+        named: 28.10 six turns resumed a session that only the account the lane had just left
+        held, and Claude answered "No conversation found"."""
+        home = Path(env.get("HOME") or Path.home())
+        current = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+        dirs = [current, home / ".claude"]
+        roots = [home / cls.ACCOUNTS_DIR]
+        if current.parent != home:
+            roots.append(current.parent)
+        for root in roots:
+            if root.is_dir():
+                dirs += sorted(p for p in root.iterdir() if p.is_dir())
+        return current, list(dict.fromkeys(dirs))        # ordered, no duplicates
+
+    def session_known(self, session_id: str, cwd: Path, env: dict) -> bool:
+        """The current config directory holds the session's transcript: only then can
+        ``--resume`` find it. Call after ``prepare_resume``."""
+        current, _ = self._config_dirs(env)
+        return any((current / "projects").glob(f"*/{session_id}.jsonl"))
+
     def prepare_resume(self, session_id: str, cwd: Path, env: dict) -> str:
         """Claude keeps sessions per config directory (CLAUDE_CONFIG_DIR). When the
         agent now runs under another account than the one that last ran the session
         (a quota switch, a pin), --resume finds nothing, or an older copy. Bring the
         newest transcript on this host into the current config directory, keeping its
         project folder."""
-        home = Path(env.get("HOME") or Path.home())
-        current = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+        current, dirs = self._config_dirs(env)
         name = f"{session_id}.jsonl"
-        dirs = [current, home / ".claude"]
-        if current.parent.is_dir() and current.parent != home:
-            dirs += sorted(p for p in current.parent.iterdir() if p.is_dir())
         copies = []
-        for d in dict.fromkeys(dirs):                    # ordered, no duplicates
+        for d in dirs:
             if (d / "projects").is_dir():
                 copies += [(f.stat().st_mtime, d, f) for f in (d / "projects").glob(f"*/{name}")]
         if not copies:

@@ -871,14 +871,19 @@ class AgentRunner:
         log_path = self.log_dir() / f"{a.id}.turn{a.turns + 1}.{a.harness}.jsonl"
         sid = a.session_id or (str(uuid.uuid4()) if adapter.session_id_known_upfront else "")
         anchor = self._anchor(self._comments(a.task_id))
-        argv = (adapter.resume_argv if resume else adapter.start_argv)(
-            sid, self.agent.profile_dir, workspaces)
-        model = self.store.mark(self.agent.name, a.task_id, "model")
-        if model and model[0]:
-            argv = adapter.with_model(argv, model[0])
-        effort = self.store.mark(self.agent.name, a.task_id, "effort")
-        if effort and effort[0]:
-            argv = adapter.with_effort(argv, effort[0])
+
+        def build_argv() -> list[str]:
+            argv = (adapter.resume_argv if resume else adapter.start_argv)(
+                sid, self.agent.profile_dir, workspaces)
+            model = self.store.mark(self.agent.name, a.task_id, "model")
+            if model and model[0]:
+                argv = adapter.with_model(argv, model[0])
+            effort = self.store.mark(self.agent.name, a.task_id, "effort")
+            if effort and effort[0]:
+                argv = adapter.with_effort(argv, effort[0])
+            return argv
+
+        argv = build_argv()
         if self.pool.disk_hold():
             self._disk_hold_attempt(a)
             return False
@@ -890,6 +895,23 @@ class AgentRunner:
             if note:
                 self.store.event(a.id, "session_carry", note[:200])
                 log.info("%s: #%s %s", self.agent.name, a.task8, note)
+            try:
+                known = adapter.session_known(sid, self.agent.profile_dir, env)
+            except OSError:
+                known = True
+            if not known and first_prompt is not None:
+                # The account the lane runs on now holds no copy of the session and none could be
+                # carried (28.10: six turns died at start with "No conversation found" after a quota
+                # switch). Resuming would fail the turn; the task continues in a new session instead,
+                # in this very turn, with the same first prompt a fresh start gets.
+                log.info("%s: #%s session %s not found under the routed account; new session",
+                         self.agent.name, a.task8, sid[:8])
+                self.store.event(a.id, "session_missing", sid[:8])
+                self.store.update(a, session_id="")
+                a = self.store.get(a.id) or a
+                resume, prompt_text = False, first_prompt()
+                sid = str(uuid.uuid4()) if adapter.session_id_known_upfront else ""
+                argv = build_argv()
         scope = self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY)
         if (not workspaces and metadata_receipt(scope[0] if scope else None, a.id)
                 and not self.pool.leased_to(a.id)):
