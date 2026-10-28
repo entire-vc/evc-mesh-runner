@@ -41,10 +41,23 @@ class Standing(Bench):
         self.assertTrue(reason)
         self.assertTrue(r._gate_task_only)
         self.assertEqual(before, (r._gate_hold, r._gate_failures, r._agent_gate_hold))
-        self.assertEqual(hook.call_args.kwargs['timeout'], 10)
+        self.assertEqual(hook.call_args.kwargs['timeout'], 15)
         env = hook.call_args.args[1]
         self.assertEqual((env['MESH_RUNNER_PHASE'], env['MESH_RUNNER_TASK'], env['MESH_RUNNER_MODE']),
                          ('transport', '', 'chat'))
+
+    def test_transport_allows_a_thirteen_second_operator_probe(self):
+        r = self.runner(FakeMesh([]))
+        self.agent.start_gate_command = ['operator-gate']
+        def bounded_probe(command, env, *, timeout):
+            # Model the operator's 12-second network probe / 13-second process
+            # budget without spending real wall time in this regression.
+            return (0, '', '') if timeout > 13 else (-1, '', 'timed out')
+        with patch.object(r, '_run_hook', side_effect=bounded_probe) as hook:
+            self.assertEqual(r._gate('transport', '', 'chat'), ('', {}))
+            self.assertEqual(hook.call_args.kwargs['timeout'], 15)
+            r._gate('reserve', 'task', 'work')
+            self.assertEqual(hook.call_args.kwargs['timeout'], 120)
 
 
 class Claims(unittest.TestCase):

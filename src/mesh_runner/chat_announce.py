@@ -7,7 +7,7 @@ import logging
 import socket
 import threading
 
-from . import __version__
+from . import RUNNER_NAME, __version__
 from .mesh import MeshError
 
 log = logging.getLogger("mesh_runner")
@@ -18,7 +18,7 @@ def announce(mesh, runner_id: str, host: str = "") -> bool:
     """One announcement for the agent behind ``mesh``. False when another runner leads it."""
     try:
         mesh.request("POST", "/agents/me/controller", {
-            "runner_id": runner_id, "name": "mesh-runner", "host": host or socket.gethostname(),
+            "runner_id": runner_id, "name": RUNNER_NAME, "host": host or socket.gethostname(),
             "version": __version__})
         return True
     except MeshError as e:

@@ -224,11 +224,15 @@ NEXT and step caps still apply; UTC midnight starts a new daily budget.
 
 By default any comment by someone other than the agent wakes a waiting session
 (`comment_wake = "all"`). With `[runner] comment_wake = "addressed"` a comment written by
-another agent no longer ends a pipeline, MR, time or decision wait early unless it
+another agent no longer ends a pipeline, MR, merge, card, time or decision wait early unless it
 @-mentions the waiting agent, comes from an author listed in `comment_wake_always_from`,
 or (decision waits) is written by the addressee or carries an `Answer:`/`Decision:`
-marker. A person's comment always wakes, and so does any comment whose author kind the
-API does not state. Card and `❓ Blocking` waits are not filtered. A held-back comment is
+marker. A comment that opens with an FYI marker (`FYI`, `**FYI`, `[FYI]`, `fyi:`, or a first
+bold or heading line with `(FYI`) does not wake by authorship alone, so an `always_from`
+author's cross-posted note stays quiet unless it @-mentions the waiting agent. A person's
+comment always wakes, and so does any comment whose author kind the API does not state.
+`❓ Blocking` waits are not filtered; card and merge waits still end on their own event (the
+awaited card closing or shipping, the MR merging or closing). A held-back comment is
 not lost: the session reads every comment since its previous turn when the wait ends for
 its own reason. Measured on one fleet over a week, such a wake ended in an unchanged
 re-declared wait in about a quarter of the cases.
@@ -332,7 +336,7 @@ state_dir = "~/.local/state/mesh-runner"
 # review_own_hold_hours = 1               # own work in review waits this long for someone else
 # wait_first_recheck_hours = 2            # first fallback re-check; healthy observable waits stay asleep
 # max_wait_hours = 6
-# comment_wake = "all"                    # "addressed": agents' unaddressed comments do not end a pipeline/MR/time/decision wait
+# comment_wake = "all"                    # "addressed": agents' unaddressed comments do not end a pipeline/MR/merge/card/time/decision wait
 # comment_wake_always_from = []           # author names that always wake, with comment_wake = "addressed"
 # decision_wake = "any"                   # "answer": a decision wait with a request card wakes on an answer only, not on the addressee's progress notes
 # decision_reuse_hours = 24               # a new question from the same source to the same agent reuses its request card (0 = file a new one)
@@ -428,7 +432,7 @@ Optional hooks per agent:
   holds only that task for 10 minutes. An observed update of the refused task permits a fresh gate decision; a
   successful local turn release also rechecks a capacity refusal. Neither event
   authorizes a start. Successful admission resets the backoff.
-  Chat starts use a separate `transport` phase (10-second hook timeout), with
+  Chat starts use a separate `transport` phase (15-second hook timeout), with
   empty task/attempt and mode `chat`. It must check only transport, without
   reserving capacity or reading a task. Any refusal leaves a standing pane
   unchanged and Mesh turns queued before claim; it does not spend task failure
@@ -607,6 +611,76 @@ rotate_days = 30                                       # POST /ext/me/token/rota
 
 `runner_url` in the Mesh extension settings must reach `host:port`.
 
+### Updating the runner
+
+The version this host runs is the version installed in Mesh. A new release reaches the host in one
+way only:
+
+1. The release is published to the extension catalog (signed artifact, `mesh-extension.json`
+   `version` = `mesh_runner.__version__` = `pyproject.toml` `version`).
+2. An instance admin opens **Extensions → Updates** in Mesh and updates Agent Runner
+   (`POST /api/v1/extensions/agent-runner/update`; new permissions ask for consent first). The
+   Installed column now shows the new version.
+3. The operator installs exactly that release on the host: download the artifact, check its
+   sha256 against the catalog entry, unpack it next to the previous one and point the service at
+   it (`PYTHONPATH=<release>/src`), then restart the runner.
+4. Check: `python3 -c 'import mesh_runner; print(mesh_runner.__version__)'` under the service's
+   `PYTHONPATH` equals the Installed version, and the runner's lease in Mesh reports it.
+
+Never update the host from a git checkout or a hand-copied directory: Mesh would keep showing the
+old version. Rollback is the reverse: **Updates → Roll back** in Mesh, then point the service at the
+previous release directory and restart.
+
+## Runtime catalog
+
+With `[catalog] enabled = true` the runner is the catalog controller of the listed workspaces: it
+reads its slice of the runtime catalog, checks that this host can execute it and reports what it
+applied, under its own name (`mesh-runner`, the same name its agent leases carry) and version.
+Off by default.
+
+Every `interval_seconds` (120), per `[[catalog.workspace]]`:
+
+- `GET /api/v1/workspaces/:ws/runtime/controllers/mesh-runner/desired` with `If-None-Match`; 304 keeps
+  what is applied.
+- The slice is checked against the host manifest (`manifest`): references resolve, every profile
+  belongs to this controller and names an account, mode and harness the manifest knows with
+  capabilities this host offers, and every account carries the manifest's own `credential_ref` and
+  asks only for pools the manifest gives that mode. Credentials never travel in the slice.
+- A slice that passes becomes `applied.json` (revision + digest; never an older revision than the
+  one applied). A slice that fails is reported `rejected` for exactly its revision and digest, and
+  `applied.json` stays as it was.
+- `POST .../controllers/mesh-runner/report` (schema v2): the applied revision and digest, the
+  controller's capabilities, `emergency_paused` (a file `emergency-pause` in `home`), pool states
+  and profile models.
+
+Pool states are read from files other host jobs write; the runner never probes a provider for them.
+`observations` (`quota-observations/v1`: provider numbers per window) is mapped with `thresholds`
+(default: block new launches at 90 %, transfer at 95 %, readmit below 80 % after 10 min).
+`harness_limits` (`harness-limits/v1`) holds usage limits a lane's own session printed: while one is
+in effect the account's pools are `exhausted`. No data, stale data or an error is `unknown`, never
+0 %. Without `observations` every pool is reported `unknown`.
+
+Each pass writes `home/state.json` (`status: ok|error`, `outcome`, `revision`, `last_report_at`, and
+`version_mismatch` when the catalog's controller version differs from this host's) and
+`home/pools.json`; `desired.json` and `applied.json` go to `catalog_dir`. All files are mode 600.
+
+```toml
+[catalog]
+enabled = true
+manifest = "~/runtime/accounts.json"
+observations = "~/runtime/quota-observations.json"
+harness_limits = "~/runtime/harness-limits.json"
+thresholds = "~/runtime/thresholds.json"
+# interval_seconds = 120
+
+[[catalog.workspace]]
+id = "00000000-0000-0000-0000-000000000000"
+reporter_key_file = "~/.config/mesh-runner/reporter.key"   # mode 600: an agent with the reporter grant
+# home = "~/.local/state/mesh-runner/catalog/<id>"
+# catalog_dir = "<home>"
+# manifest = "..."                                        # this workspace's own manifest
+```
+
 ## Accounts
 
 The publisher of this extension holds no accounts and receives none of yours. The runner uses, on
@@ -726,3 +800,21 @@ then opt in to the measured floor and verify `plan`/`pool`/`status.json` and one
 normal admission. To roll back the policy, set the floor back to `0`. Removed
 clean worktrees are recreated on demand, while the base clone's refs remain.
 This feature alone does not prove any host's pool is below a size target.
+
+### Rearm one start after infrastructure recovery
+
+Preview an explicit, scoped permission after repairing infrastructure:
+
+```
+mesh-runner rearm-cap --config runner.toml --agent Riker-VC --task <full-task-uuid> --reason "transport repaired and verified"
+```
+
+Add `--apply` to record the permission; `--dry-run` is the default. Only a current
+start cap with no open attempt or declared WAIT qualifies. One permission may
+be issued per exact cap record. The next attempt atomically consumes it and
+records its ID, reason, time and attempt in durable audit history. Failed launch
+also spends the permission: there is no retry loop or counter reset. Normal
+authentication, human, dependency, WAIT and turn-budget admission checks still
+run. Holds before attempt reservation leave it pending; later refusal, including
+authentication at launch, spends it without bypassing the hold. A changed cap invalidates
+it. This command never edits Mesh or clears other holds.

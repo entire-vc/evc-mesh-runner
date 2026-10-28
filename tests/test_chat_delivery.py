@@ -69,6 +69,23 @@ class Driver(unittest.TestCase):
             list(d.run({"turn_id": "turn-12345678"}, lambda: False))
         self.assertNotIn("SECRET-SCREEN", cm.output[0])
 
+    def test_failed_turn_log_names_the_driver_error_kind(self):
+        failed = {"type": "turn.failed", "error": {"message": "interactive session exited at start: SECRET-SCREEN"}}
+        d = self.delivery("import sys\nsys.stdin.read()\nprint(%r)" % json.dumps(failed))
+        with self.assertLogs("mesh_runner.chat_delivery", level="WARNING") as cm:
+            list(d.run({"turn_id": "turn-12345678"}, lambda: False))
+        self.assertIn("kind=interactive session exited at start", cm.output[0])
+        self.assertRegex(cm.output[0], r"sha256=[0-9a-f]{12}")
+        self.assertNotIn("SECRET-SCREEN", cm.output[0])
+
+    def test_failed_turn_log_classifies_a_start_up_stall(self):
+        failed = {"type": "turn.failed", "error": {"message": "codex start-up stalled for 95s, the prompt was not taken: SECRET-SCREEN"}}
+        d = self.delivery("import sys\nsys.stdin.read()\nprint(%r)" % json.dumps(failed))
+        with self.assertLogs("mesh_runner.chat_delivery", level="WARNING") as cm:
+            list(d.run({"turn_id": "turn-12345678"}, lambda: False))
+        self.assertIn("kind=codex start-up stalled", cm.output[0])
+        self.assertNotIn("SECRET-SCREEN", cm.output[0])
+
     def test_answer_text_does_not_stay_on_disk_after_the_turn(self):
         d = self.delivery("import sys\nsys.stdin.read()\nprint('secret answer')")
         list(d.run({"turn_id": "turn-12345678"}, lambda: False))

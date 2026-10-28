@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
-    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "pool", "suspend-wait-workspace", "clear-auth-hold"])
+    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "pool", "suspend-wait-workspace", "clear-auth-hold", "rearm-cap"])
     p.add_argument("--config", required=True)
     p.add_argument("--path", help="slot path for free-slot")
     p.add_argument("--archive", action="store_true",
@@ -76,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--agent")
     p.add_argument("--task")
     p.add_argument("--attempt")
+    p.add_argument("--reason")
+    p.add_argument("--dry-run", action="store_true")
     p.add_argument("--wait-generation")
     p.add_argument("--request-id")
     p.add_argument("--evict", action="store_true", help="pool: preview (or with --apply, perform) eviction")
@@ -96,6 +98,30 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.command == "rearm-cap":
+        from . import cap_rearm
+        from uuid import UUID
+        if not args.agent or not args.task or not args.reason or not args.reason.strip():
+            p.error("rearm-cap requires --agent, --task and --reason")
+        if args.apply and args.dry_run:
+            p.error("choose --apply or --dry-run")
+        try:
+            if str(UUID(args.task)) != args.task:
+                raise ValueError()
+        except ValueError:
+            p.error("--task must be a full canonical UUID")
+        cfg = config_mod.load(args.config)
+        if not any(a.name == args.agent for a in cfg.agents):
+            p.error("--agent must name an exact configured lane")
+        store = Store(cfg.state_dir / "runner.sqlite")
+        try:
+            result = cap_rearm.request(store, args.agent, args.task, args.reason, apply=args.apply)
+        except ValueError as exc:
+            print(json.dumps({"eligible": False, "reason": str(exc)}))
+            return 1
+        print(json.dumps(result))
+        return 0
 
     if args.command == "clear-auth-hold":
         if not args.profile or not auth.PROFILE.fullmatch(args.profile):

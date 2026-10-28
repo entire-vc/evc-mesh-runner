@@ -323,10 +323,10 @@ def answers_wait(c: dict, wait: dict) -> bool:
     return bool(ANSWER_MARKER.search(c.get("body") or ""))
 
 
-# Waits whose own event (a pipeline result, an MR change, a deadline, an answer) is what the
-# agent sleeps for, so a stranger's remark is the cheapest thing to defer. Card and blocking
-# waits keep waking on every comment: a card's progress notes and a person's ask are news.
-ADDRESSED_FILTERED_KINDS = frozenset({"decision", "pipeline", "mr", "time"})
+# Waits whose own event (a pipeline result, an MR change, a deadline, an answer, the awaited card
+# closing, the MR merging) is what the agent sleeps for, so a stranger's remark is the cheapest
+# thing to defer. Blocking waits keep waking on every comment: a person's ask is news.
+ADDRESSED_FILTERED_KINDS = frozenset({"decision", "pipeline", "mr", "time", "card", "merge"})
 
 _MENTION = re.compile(r"(?<![\w.\-])@([\w\-]+(?:\.[\w\-]+)*)")
 
@@ -341,11 +341,14 @@ def wakes_on_comment(c: dict, wait: dict, agent_name: str, always_from=()) -> bo
     """Whether a foreign comment may end ``wait`` early under ``comment_wake = "addressed"``.
 
     Only a comment provably written by another agent (``author_type == "agent"``) is ever
-    held back, and only on pipeline/MR/time/decision waits. Always wakes: a person's comment
-    (or one whose author kind is not stated), an @-mention of the waiting agent, an author the
-    operator listed in ``comment_wake_always_from``, and on a decision wait the addressee or
-    an explicit answer marker (``answers_wait``). A held-back comment is not lost: the agent
-    reads every comment since its previous turn when the wait ends for its own reason."""
+    held back, and only on pipeline/MR/time/decision/card/merge waits (a card wait ends when the
+    awaited card closes or ships, a merge wait when the MR merges or closes: neither is a comment).
+    Always wakes: a person's comment (or one whose author kind is not stated), an @-mention of the
+    waiting agent, an author the operator listed in ``comment_wake_always_from`` unless the comment
+    opens with an FYI marker (``is_fyi``: it asks nothing, so authorship alone does not wake), and
+    on a decision wait the addressee or an explicit answer marker (``answers_wait``). A held-back
+    comment is not lost: the agent reads every comment since its previous turn when the wait ends
+    for its own reason."""
     if wait.get("kind") not in ADDRESSED_FILTERED_KINDS:
         return True
     if c.get("author_type") != "agent":
@@ -353,7 +356,7 @@ def wakes_on_comment(c: dict, wait: dict, agent_name: str, always_from=()) -> bo
     if mentions(c.get("body") or "", agent_name):
         return True
     who = str(c.get("author_name") or (c.get("author") or {}).get("name") or "").casefold()
-    if who and who in {str(x).casefold() for x in always_from}:
+    if who and who in {str(x).casefold() for x in always_from} and not is_fyi(c.get("body") or ""):
         return True
     return wait.get("kind") == "decision" and answers_wait(c, wait)
 
@@ -362,6 +365,23 @@ def wakes_on_comment(c: dict, wait: dict, agent_name: str, always_from=()) -> bo
 # «Решение Ray: ...», «[decision-answer] ...». Measured: addressees answer this way far more often
 # than with the strict ``Answer:`` form, and those answers carry no @-mention.
 ANSWER_LEAD = re.compile(r"^[\s*_>#\[\]✅:\-]*(?:decision-answer|answer|ответ|решение|decision)\b", re.I)
+
+
+# A comment that only informs: it opens with FYI («FYI», «**FYI», «[FYI]», «fyi:»), or its first
+# bold or heading line carries «(FYI ...)» like «**Combined handback (FYI, same grant).**».
+# Cross-posted handbacks and notes look like this and ask the reader nothing.
+FYI_LEAD = re.compile(r"^[\s*_>#\[\](){}:\-]*fyi\b", re.I)
+_FYI_MARKED_LINE = re.compile(r"^\s*[*_>#]+[^\n]*\(\s*fyi\b", re.I)
+
+
+def is_fyi(body: str) -> bool:
+    """True when ``body`` opens as a pure notification (see ``FYI_LEAD``). Callers check an
+    @-mention of the reader first; a mention still wakes."""
+    body = body or ""
+    if FYI_LEAD.match(body):
+        return True
+    first = next((ln for ln in body.splitlines() if ln.strip()), "")
+    return bool(_FYI_MARKED_LINE.match(first))
 
 
 def answers_on_source(c: dict, wait: dict, agent_name: str, always_from=()) -> bool:

@@ -169,15 +169,38 @@ class Store:
                                "ESCAPE '\\'", (agent, cutoff, agent, cutoff))
         return {r[0] for r in rows}
 
-    def create(self, agent: str, task_id: str, harness: str, title: str = "", mode: str = "work") -> Attempt:
+    def create(self, agent: str, task_id: str, harness: str, title: str = "", mode: str = "work",
+               cap_rearm: str | None = None) -> Attempt:
         """Reserve a new attempt. Raises sqlite3.IntegrityError when the agent
         already holds an open attempt on this task (one writer per task)."""
         a = Attempt(id=str(uuid.uuid4()), agent=agent, task_id=task_id, harness=harness,
                     state="starting", title=title, created_at=iso(), updated_at=iso(), mode=mode)
         cols = [f.name for f in fields(Attempt)]
         vals = [json.dumps(getattr(a, c)) if c in _JSON else getattr(a, c) for c in cols]
-        self.db.execute(f"INSERT INTO attempts ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
-        self.event(a.id, "created", task_id)
+        if cap_rearm is not None:
+            self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if cap_rearm is not None:
+                from . import cap_rearm as rearm
+                grant = rearm.pending(self, agent, task_id)
+                if not grant or grant["id"] != cap_rearm:
+                    raise sqlite3.IntegrityError("cap rearm no longer available")
+                if self.db.execute("SELECT 1 FROM attempts WHERE task_id=? AND state IN (" +
+                                   ",".join("?" for _ in OPEN) + ") LIMIT 1",
+                                   (task_id, *OPEN)).fetchone():
+                    raise sqlite3.IntegrityError("task has an open attempt")
+            self.db.execute(f"INSERT INTO attempts ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
+            self.event(a.id, "created", task_id)
+            if cap_rearm is not None:
+                self.mark(agent, task_id, "cap_rearm", "")
+                self.mark(agent, task_id, "cap_rearm_audit:" + cap_rearm,
+                          json.dumps({**grant, "consumed_at": iso(), "attempt": a.id}))
+                self.event(a.id, "cap_rearm_consumed", cap_rearm)
+                self.db.execute("COMMIT")
+        except BaseException:
+            if cap_rearm is not None:
+                self.db.execute("ROLLBACK")
+            raise
         return a
 
     def update(self, a: Attempt, expect: str | tuple[str, ...] | None = None, **changes) -> bool:
