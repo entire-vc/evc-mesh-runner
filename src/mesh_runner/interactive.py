@@ -273,6 +273,9 @@ class InteractiveAdapter(Adapter):
     def prepare_resume(self, session_id: str, cwd: Path, env: dict) -> str:
         return self.base.prepare_resume(session_id, cwd, env)
 
+    def session_known(self, session_id: str, cwd: Path, env: dict) -> bool:
+        return self.base.session_known(session_id, cwd, env)
+
     def parse(self, log_path: Path) -> TurnResult:
         return self.base.parse(log_path)
 

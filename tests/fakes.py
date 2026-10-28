@@ -329,9 +329,14 @@ class FakeProfileAdapter(ClaudeAdapter):
 class FakeAdapter(ClaudeAdapter):
     """Claude-shaped adapter that runs FAKE_AGENT instead of claude."""
 
+    sessions_known = True      # a test sets False: the routed account holds no copy of the session
+
     def __init__(self, script: Path):
         super().__init__(binary=sys.executable)
         self.script = script
+
+    def session_known(self, session_id, cwd, env):
+        return self.sessions_known
 
     def start_argv(self, session_id, cwd, add_dirs):
         return [sys.executable, str(self.script), "--session-id", session_id]
