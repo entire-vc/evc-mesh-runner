@@ -43,6 +43,17 @@ commit created without modifying the checkout carries staged-only git blobs
 into the bundle. Snapshot refs and checkpoint files remain for recovery until
 checkpoint garbage collection (below) removes them.
 
+A repository nested in an untracked path (a CI job's source checkout kept as task evidence, a cloned
+fixture, a vendored repo) is opaque data, not an error: the directory is stored whole, its own `.git`
+included, and put back byte for byte (contents, modes, symlinks, empty directories). Nothing inside it is
+left out as a regenerable cache. Its inventory entry is marked `repo`, and only beneath such a root may a
+manifest name a `.git` component. A nested repository is capped at `max_nested_bytes` (default 256 MiB,
+counted per repository); over the cap the capture fails with
+`checkpoint: nested repository <path>/ holds more than <limit> bytes ...`, the lease is retained and the
+failure takes the usual suspend retry/quarantine path. The bytes also count toward the disk budget below.
+A gitlink (submodule) path is not covered by this: configured one-level submodules keep their own
+bundle, and a populated gitlink without matching `.gitmodules` metadata still fails closed, naming the path.
+
 The manifest records HEAD, configured upstream base SHA, original branch,
 workspaces, launch cwd, native session, harness and full WAIT condition. The
 filesystem inventory hashes contents, modes and symlink targets. A scratch git
@@ -55,8 +66,7 @@ with no symlink ancestors, no
 per-worktree/shared modules metadata. Their external repository OIDs survive
 in the parent bundle/index; no external repository data is claimed saved.
 Non-UTF8 gitlink paths, staged deletion/replacement of HEAD gitlinks,
-populated or configured submodules (including dirty/untracked work), nested
-repositories, split indexes,
+populated or configured submodules (including dirty/untracked work), split indexes,
 special files and unverifiable states retain their leases.
 
 Capture reserves enough available disk for the complete filesystem copies and
