@@ -182,6 +182,25 @@ class ChatAuthTests(unittest.TestCase):
         self.assertEqual(routed_env(ar, clock=lambda: now[0], ttl=30)["A"], "2")
         self.assertEqual(len(calls), 2)
 
+    def test_a_new_runner_never_gets_the_entry_of_a_gone_one(self):
+        # CPython reuses the id of a freed object: an entry keyed by id alone would serve a gone runner's
+        # env (its HOME, its account) to the next runner allocated at the same address
+        from types import SimpleNamespace as NS
+        from mesh_runner.chat_host import routed_env, _env_cache
+
+        def make(n):
+            return NS(_read_env=lambda: {"N": str(n)}, _route_env=lambda raw: (dict(raw), "claude", None))
+        _env_cache.clear()
+        first = make(0)
+        gone = id(first)
+        self.assertEqual(routed_env(first)["N"], "0")
+        del first
+        for n in range(1, 2000):
+            ar = make(n)
+            self.assertEqual(routed_env(ar)["N"], str(n), "served the entry of a gone runner" if id(ar) == gone else "")
+            del ar
+        _env_cache.clear()
+
     def test_a_turn_builds_its_command_on_a_private_adapter_pinned_to_its_entry(self):
         from types import SimpleNamespace as NS
         from mesh_runner.chat_host import pinned, routed, _env_cache

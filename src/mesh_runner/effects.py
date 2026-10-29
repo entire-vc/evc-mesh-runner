@@ -9,9 +9,10 @@ a task assigned to it. This module keeps those in step with the attempt:
   waits for) or ``stopped`` (human gate) while it waits, ``queued`` when woken;
   re-published every ``HEARTBEAT`` because Mesh treats it as stale after 15 min,
   cleared when the attempt closes;
-- ``start_after``: a time wait uses its time; an event wait gets a rolling 24 h
-  horizon renewed before it runs out; cleared on wake, so nothing else picks the
-  task up while its session is parked. Schedules are compared as instants (Mesh
+- ``start_after``: only a time wait writes one (its time, with the evidence Mesh asks of an
+  agent); cleared on wake. An event wait (pipeline, mr, merge, card, decision, blocking, queue)
+  follows its event with no timer and writes nothing; a hold an older runner wrote for one is
+  taken back the next time the wait is touched. Schedules are compared as instants (Mesh
   answers them in UTC, not as written); a clear refused with 409 is retried on a
   fresh read, and one that still fails is remembered in the store and retried on
   later ticks until it lands or the task carries another schedule;
@@ -52,8 +53,6 @@ log = logging.getLogger("mesh_runner")
 
 HEARTBEAT = dt.timedelta(minutes=5)
 CREATE_WINDOW = dt.timedelta(minutes=10)   # a lost create may still commit this long
-EVENT_HORIZON = dt.timedelta(hours=24)
-RENEW_BEFORE = dt.timedelta(hours=6)
 SKIP_WRITES_PER_TICK = 20
 SKIP_EVERY = dt.timedelta(minutes=2)
 SKIP_EVALUATE = 40                      # tasks whose hold reason is read per pass
@@ -73,7 +72,14 @@ STATE_FIELDS = ("kind", "ref", "reason")
 BACKLOG_BLOCKER = "blocked by a card in backlog: "
 EDGE_DENIED_MARK = "edge_denied"        # store mark prefix: an edge this lane's key may not remove / add (HTTP 403)
 UNSCHEDULE_MARK = "unschedule"          # store mark: a start_after this lane set and could not clear yet
-UNSCHEDULE_TRIES = 3                    # PATCHes per clear when Mesh answers 409 (re-read in between)
+UNSCHEDULE_TRIES = 2                    # clears per attempt when Mesh answers 409: one re-read, one retry
+MIN_WHY = 10                            # Mesh: why must say what happens at the date
+_URL = re.compile(r"https://[^\s<>\"'`]+")
+_URL_TRAILING = ".,;:!?)]}>»*_"          # punctuation that ends a sentence, not the URL
+EVIDENCE_MAX = 500                      # Mesh bounds event_ref, source, why and the clear reason to this
+# Words Mesh refuses in an event_ref as "a retry or poll, not an external event" (domain.genericRetryWords)
+GENERIC_RETRY_WORDS = frozenset({"retry", "retries", "poll", "polling", "backoff", "recheck", "timer",
+                                 "reminder", "later", "followup"})
 UNSCHEDULE_PER_PASS = 10                # pending clears retried per tick
 UNSCHEDULE_RETRY = dt.timedelta(minutes=1)        # first retry of a pending clear; doubles
 UNSCHEDULE_RETRY_MAX = dt.timedelta(minutes=30)
@@ -116,6 +122,22 @@ def own_schedule(start_after: str | None, wait: dict | None) -> bool:
     answer was lost but may have committed (``scheduled_maybe``)."""
     w = wait or {}
     return any(same_instant(start_after, v) for v in (w.get("scheduled"), w.get("scheduled_maybe")) if v)
+
+
+def _error_code(e: MeshError) -> str:
+    """Mesh's machine-readable ``error_code`` of a refusal ('' when it sent none)."""
+    return str(e.body.get("error_code") or e.body.get("code") or "") if isinstance(e.body, dict) else ""
+
+
+def _event_ref(kind: str, ref: str) -> str:
+    """A stable name for what a wait awaits, shaped for Mesh's check: at most 500 characters and no
+    word that names a timer (``retry``, ``poll``, ``timer`` ...; Mesh splits on non-alphanumerics). A
+    reference holding one of those words (a project called ``retry-service``) is replaced by a digest
+    of itself: still stable, still unique per target."""
+    text = re.sub(r"[^a-z0-9]+", "-", f"{kind}-{ref}".casefold()).strip("-")
+    if set(text.split("-")) & GENERIC_RETRY_WORDS:
+        text = f"{kind}-{hashlib.sha1(str(ref).encode()).hexdigest()[:12]}"
+    return text[:EVIDENCE_MAX]
 
 
 def _asked_at(posted, floor: str) -> str:
@@ -455,8 +477,8 @@ class Effects:
         kind = wait.get("kind")
         if kind == "time" and wait.get("until"):
             self._schedule(a, wait, wait["until"])
-        elif kind in ("pipeline", "mr", "merge", "card", "decision", "blocking"):
-            self._schedule(a, wait, iso(now() + EVENT_HORIZON))
+        else:
+            self._drop_event_hold(a, wait)
         if kind == "card":
             self._add_edge(a, wait)
         if kind == "decision" and wait.get("handle"):
@@ -472,12 +494,17 @@ class Effects:
         return True
 
     def renew(self, a: Attempt, wait: dict) -> None:
-        """Keep an event wait's rolling horizon ahead of now."""
-        if not self.enabled or wait.get("kind") == "time":
-            return
-        until = parse_time(wait.get("scheduled"))
-        if until and until - now() < RENEW_BEFORE:
-            self._schedule(a, wait, iso(now() + EVENT_HORIZON))
+        """Nothing is renewed: an event wait writes no hold. What an older runner wrote for one
+        (a rolling horizon) is taken back here, the first time the wait is touched."""
+        if self.enabled and wait.get("kind") != "time":
+            self._drop_event_hold(a, wait)
+
+    def _drop_event_hold(self, a: Attempt, wait: dict) -> None:
+        """An event wait follows its event without a timer (owner rule of 28.10): a start_after this
+        wait still carries from an older runner is cleared through compare-clear, only if Mesh shows
+        exactly that instant."""
+        if wait.get("scheduled") or wait.get("scheduled_maybe"):
+            self._end_schedule(a, wait)
 
     def on_end(self, a: Attempt, wait: dict, why: str, *, close_request: bool = False) -> None:
         """Undo scheduling/edges on every wake; an observation is not an answer."""
@@ -510,17 +537,53 @@ class Effects:
 
     # ------------------------------------------------------------- helpers
     def _schedule(self, a: Attempt, wait: dict, when: str) -> None:
+        """Hold the task until ``when`` on the server. Mesh takes an agent's start_after only with
+        ``start_after_evidence`` (event_ref, source, why); a refusal is logged once for this wait
+        and is not repeated by ``renew``: the wait itself stays local to the runner."""
+        evidence = self.start_after_evidence(a, wait, when)
+        if evidence is None:
+            if not wait.get("schedule_skipped"):
+                wait["schedule_skipped"] = "no https source for the evidence"
+                log.info("%s: schedule #%s: not written, Mesh needs an https source for start_after_evidence "
+                         "and its URL is not https; the wait stays local", self.lane, a.task8)
+            return
         try:
-            self.mesh.patch_task(a.task_id, {"start_after": when})
+            self.mesh.patch_task(a.task_id, {"start_after": when, "start_after_evidence": evidence})
             wait["scheduled"] = when
             wait.pop("scheduled_maybe", None)
+            wait.pop("schedule_skipped", None)
             self._forget_unschedule(a.task_id)     # the lane owns the task's schedule again
         except MeshError as e:
             if e.status == 0 or e.status >= 500:
                 # the answer was lost, the write may have committed: remember it so the end
                 # of the wait still takes it back (only if Mesh shows exactly this instant)
                 wait["scheduled_maybe"] = when
+            elif e.status == 422:
+                # a refusal of this evidence repeats on every try: say it once, keep the wait local
+                wait["schedule_skipped"] = _error_code(e) or "refused"
             log.warning("%s: schedule #%s: %s", self.lane, a.task8, e)
+
+    def start_after_evidence(self, a: Attempt, wait: dict, when: str) -> dict | None:
+        """What Mesh asks of an agent's start_after (docs/api/typed-outcomes.md, "start_after"), for
+        a time wait: ``event_ref`` names the awaited moment, ``source`` is the first https URL in the
+        agent's WAIT line (the external event's source) or else the card's own URL, ``why`` is the
+        WAIT line. None when no https source can be built."""
+        line = " ".join(str(wait.get("line") or "").split())
+        note = " ".join(str(wait.get("note") or "").split())
+        cited = _URL.search(line)
+        source = cited.group(0).rstrip(_URL_TRAILING) if cited else ""
+        if not source:
+            base = str(getattr(self.mesh, "base", "") or "")
+            if not base.startswith("https://"):
+                return None
+            source = f"{base}/tasks/{a.task_id}"
+        why = line
+        if len(why) < MIN_WHY and note:
+            why = f"{why} {note}".strip()
+        if len(why) < MIN_WHY:
+            why = f"{why} (the runner holds the card until {when})".strip()
+        ref = f"{a.task8}-{(parse_time(when) or now()).strftime('%Y%m%dT%H%MZ')}"
+        return {"event_ref": _event_ref("time", ref), "source": source[:EVIDENCE_MAX], "why": why[:EVIDENCE_MAX]}
 
     # ------------------------------------------------------------- unschedule
     def _end_schedule(self, a: Attempt, wait: dict) -> None:
@@ -541,8 +604,10 @@ class Effects:
 
     def _unschedule(self, task_id: str, mine: list[str]) -> tuple[str, str]:
         """Clear the task's start_after if it is one of ``mine``. Returns (outcome, instant):
-        ``cleared``; ``gone`` (no schedule, someone else's, or the task is gone: left alone);
-        anything else is the error that kept it. A 409 is retried on a fresh read."""
+        ``cleared``; ``gone`` (no schedule, someone else's, a person's, or the task is gone: left
+        alone); anything else is the error that kept it. Mesh clears an agent's start_after only
+        through compare-clear, which removes exactly the schedule that was read: on a 409 the task
+        is read again and the clear tried once more."""
         last = ""
         for attempt in range(UNSCHEDULE_TRIES):
             try:
@@ -557,15 +622,49 @@ class Effects:
             if not held:
                 return "gone", ""              # nothing to clear, or a schedule someone else set
             try:
-                self.mesh.patch_task(task_id, {"start_after": None})
+                self._clear_start_after(task_id, task)
                 if attempt:
                     log.info("%s: unschedule #%s: cleared after %d conflict(s)", self.lane, task_id[:8], attempt)
                 return "cleared", held
             except MeshError as e:
                 last = str(e)
+                if e.status == 403 and "person" in str(e.body or e).casefold():
+                    log.info("%s: unschedule #%s: start_after was set by a person; left alone",
+                             self.lane, task_id[:8])
+                    return "gone", held
                 if e.status != 409:
                     return last, held
         return last, held
+
+    def _clear_start_after(self, task_id: str, task: dict) -> None:
+        """One clear of the schedule ``task`` shows: compare-clear with the date, version, origin and
+        receipt as read, so a schedule set again meanwhile (even to the same instant) is not removed.
+        A Mesh that shows no ``start_after_origin`` predates provenance and has no such endpoint: the
+        plain null write is all it knows."""
+        origin, version = task.get("start_after_origin"), task.get("version")
+        if origin is None or version is None:
+            self.mesh.patch_task(task_id, {"start_after": None})
+            return
+        receipt = task.get("start_after_receipt_id")
+        self.mesh.compare_clear_start_after(
+            task_id, expected_start_after=task["start_after"], expected_version=version,
+            expected_origin=origin, schedule_receipt_id=receipt,
+            # the same read repeats the same key (a lost answer is replayed, not cleared twice);
+            # a changed schedule or version is a different clear
+            idempotency_key=f"mesh-runner:{self.lane}:{receipt or origin}:{version}"[:200],
+            reason="the runner's wait ended; it takes back the start_after it set")
+
+    def clear_start_after(self, task_id: str, current: str) -> str:
+        """Take back ``current`` (a start_after read from the task) outside a wait's own end, for a
+        task that goes back to the queue. Never raises: what could not be cleared is kept for the
+        per-tick retry and the caller carries on. Returns the outcome of ``_unschedule``."""
+        outcome, held = self._unschedule(task_id, [current])
+        if outcome not in ("cleared", "gone"):
+            if self.store is not None:
+                self._remember_unschedule(task_id, [held or current])
+            log.warning("%s: unschedule #%s: %s%s", self.lane, task_id[:8], outcome,
+                        "; retried on later ticks" if self.store is not None else "")
+        return outcome
 
     def _remember_unschedule(self, task_id: str, scheduled: list[str]) -> None:
         self.store.mark(self.lane, task_id, UNSCHEDULE_MARK,

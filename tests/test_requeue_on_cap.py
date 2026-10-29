@@ -8,6 +8,7 @@ from fakes import AGENT_ID, FakeMesh, calls, task, write_replies
 from test_runner import Bench
 
 from mesh_runner.config import AgentConfig
+from mesh_runner.effects import UNSCHEDULE_MARK
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import CAP_REASSIGNED, CAP_WAIT
 from mesh_runner.selection import Policy
@@ -185,28 +186,37 @@ class StartCap(CapBench):
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
         self.assertFalse(r._cap_wait(t["id"]))
 
-    def test_a_failed_move_or_start_after_clear_takes_the_hand_up_path_without_a_mark(self):
-        for label in ("move", "start_after"):
-            with self.subTest(label):
-                self.setUp()
-                t = task(1, cat="in_progress", start_after="2099-01-01T00:00:00Z")
-                mesh = FakeMesh([t], max_concurrent=1)
-                self.agent.lead = "lead"
-                r = self.runner(mesh)
-                r.refresh_me()
-                self.started(r, t)
-                real_move, real_patch = mesh.move, mesh.patch_task
-                if label == "move":
-                    mesh.move = lambda tid, sid, **kw: (_ for _ in ()).throw(MeshError(503, "down")) \
-                        if mesh.tasks[tid]["assignee_id"] == AGENT_ID else real_move(tid, sid, **kw)
-                else:
-                    mesh.patch_task = lambda tid, f: (_ for _ in ()).throw(MeshError(503, "down"))
-                r._start_cap(dict(mesh.tasks[t["id"]]), 2)
-                self.assertFalse(r._cap_wait(t["id"]))
-                self.assertEqual(self.notes(r, t), [])
-                self.assertFalse(any("Back in the queue" in b for b in self.bodies(mesh, t)))
-                self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")   # the old path ran
-                self.tmp.cleanup()
+    def test_a_failed_move_takes_the_hand_up_path_without_a_mark(self):
+        t = task(1, cat="in_progress", start_after="2099-01-01T00:00:00Z")
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.agent.lead = "lead"
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        real_move = mesh.move
+        mesh.move = lambda tid, sid, **kw: (_ for _ in ()).throw(MeshError(503, "down")) \
+            if mesh.tasks[tid]["assignee_id"] == AGENT_ID else real_move(tid, sid, **kw)
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
+        self.assertFalse(r._cap_wait(t["id"]))
+        self.assertEqual(self.notes(r, t), [])
+        self.assertFalse(any("Back in the queue" in b for b in self.bodies(mesh, t)))
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")   # the old path ran
+
+    def test_a_start_after_that_will_not_clear_does_not_send_the_task_up(self):
+        t = task(1, cat="in_progress", start_after="2099-01-01T00:00:00Z")
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.agent.lead = "lead"
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        mesh.patch_task = lambda tid, f: (_ for _ in ()).throw(MeshError(503, "down"))
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
+        got = mesh.tasks[t["id"]]
+        self.assertEqual((got["assignee_id"], mesh.category(got)), (AGENT_ID, "todo"))   # requeued in place
+        self.assertTrue(r._cap_wait(t["id"]))
+        self.assertIn("cap: requeued (start cap)", self.notes(r, t))
+        # the clear is kept and retried by the tick, not given up
+        self.assertIn(t["id"], r.store.marked("builder", UNSCHEDULE_MARK))
 
     def test_a_failed_move_after_a_turn_cap_keeps_the_attempt_for_the_old_path(self):
         t = task(1, cat="in_progress")

@@ -11,7 +11,8 @@ consecutive turns without progress; see the README) and COMPACTION CAP
 (`max_compactions`) no longer hand the task to the lead or keep it until tomorrow:
 
 1. The task moves to the project's `todo` status, the assignee stays, `start_after` is cleared
-   and no backoff is set. The attempt note is `cap: requeued (<start cap|turn budget|loop|compaction cap>)`
+   (compare-clear; one that will not clear, a person's date or a card that keeps changing, is retried per
+   tick or left in place, and never sends the task up) and no backoff is set. The attempt note is `cap: requeued (<start cap|turn budget|loop|compaction cap>)`
    (a START CAP has no attempt, so the runner writes a closed row of its own for the audit) and
    an event `cap` goes to `events.jsonl`. One comment per cap event says where the task is and
    what restarts it.

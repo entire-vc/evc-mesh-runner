@@ -36,6 +36,12 @@ class Stub:
     def without_local_memory(self, env):
         return env
 
+    def prepare_resume(self, sid, cwd, env):
+        return ""
+
+    def session_known(self, sid, cwd, env):
+        return True
+
 
 def runner(state, adapter):
     ar = SimpleNamespace(_routed_harness="claude", agent=SimpleNamespace(profile_dir=state, harness="claude"),
@@ -192,6 +198,91 @@ class FakePool:
         self.released.append(attempt)
         self.held.pop(attempt, None)
         return []
+
+
+class LostTranscript(unittest.TestCase):
+    """A chat whose transcript was removed from the machine continues in a new session fed from Mesh."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.home = Path(tempfile.mkdtemp())
+        self.mesh = FakeChatMesh()
+        self.mesh.history["th-1"] = [{"role": "user", "body": "the code word is heron-417"},
+                                     {"role": "assistant", "body": "Noted: heron-417."}]
+        self.client = ChatClient("https://mesh.test", "secret", opener=self.mesh)
+        self.turn = {"turn_id": "t", "thread_id": "th-1", "message": {"body": "what is the code word?"},
+                     "settings": {}}
+
+    def plan(self, base, sid):
+        from mesh_runner.interactive import wrap
+        ad = wrap(base, "a", "interactive", self.state, "tmux", 4)
+        write_meta(ad.dir, window_key("th-1"), {"session_id": sid, "harness": base.name})
+        ar = runner(self.state, ad)
+        ar._routed_harness = base.name
+        ar._read_env = ar._fresh_env = lambda: {"HOME": str(self.home)}
+        return make_plan(ar, self.client, "read")(self.turn)
+
+    def history_calls(self):
+        return [r for r in self.mesh.requests if r == ("GET", "/threads/th-1/history")]
+
+    def test_claude_without_transcript_starts_anew_with_the_history(self):
+        from mesh_runner.adapters.claude import ClaudeAdapter
+        sid = session_id_for("th-1")
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            argv, _, _, prompt, _ = self.plan(ClaudeAdapter(), sid)
+        tail = argv[argv.index("--") + 1:]
+        self.assertNotIn("--resume", tail)
+        self.assertNotIn(sid, tail)                          # a new id: the old one may still have side data
+        self.assertIn("--session-id", tail)
+        self.assertEqual(len(self.history_calls()), 1)
+        self.assertIn("heron-417", prompt)
+        self.assertLess(prompt.index("heron-417"), prompt.index("what is the code word?"))
+        text = "\n".join(logs.output)
+        self.assertIn("has no transcript on this machine", text)
+        self.assertIn("history (limit=20, before=-) gave 2 messages", text)
+
+    def test_a_failed_history_call_logs_one_line_without_the_server_text(self):
+        from mesh_runner.adapters.claude import ClaudeAdapter
+        self.mesh.history.clear()
+        self.mesh.fail_next.append((500, "boom\nFORGED entry"))
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            _, _, _, prompt, _ = self.plan(ClaudeAdapter(), session_id_for("th-1"))
+        line = next(o for o in logs.output if "history" in o)
+        self.assertNotIn("\n", line)
+        self.assertIn("failed: 500 'boom\\nFORGED entry'", line)
+        self.assertEqual(prompt.split("\n\n")[-1], "what is the code word?")
+
+    def test_claude_with_transcript_resumes_without_history(self):
+        from mesh_runner.adapters.claude import ClaudeAdapter
+        sid = session_id_for("th-1")
+        proj = self.home / ".claude" / "projects" / "-p"
+        proj.mkdir(parents=True)
+        (proj / f"{sid}.jsonl").write_text("{}\n")
+        argv, _, _, prompt, _ = self.plan(ClaudeAdapter(), sid)
+        tail = argv[argv.index("--") + 1:]
+        self.assertEqual(tail[tail.index("--resume") + 1], sid)
+        self.assertEqual(self.history_calls(), [])
+        self.assertNotIn("heron-417", prompt)
+
+    def test_codex_without_rollout_starts_anew_with_the_history(self):
+        from mesh_runner.adapters.codex import CodexAdapter
+        (self.home / ".codex" / "sessions" / "2026" / "10" / "29").mkdir(parents=True)
+        argv, _, _, prompt, _ = self.plan(CodexAdapter(), "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000")
+        tail = argv[argv.index("--") + 1:]
+        self.assertNotIn("resume", tail)
+        self.assertEqual(len(self.history_calls()), 1)
+        self.assertIn("heron-417", prompt)
+
+    def test_codex_with_rollout_resumes(self):
+        from mesh_runner.adapters.codex import CodexAdapter
+        thread = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
+        day = self.home / ".codex" / "sessions" / "2026" / "10" / "29"
+        day.mkdir(parents=True)
+        (day / f"rollout-2026-10-29T08-00-00-{thread}.jsonl").write_text("{}\n")
+        argv, *_ = self.plan(CodexAdapter(), thread)
+        tail = argv[argv.index("--") + 1:]
+        self.assertEqual(tail[tail.index("resume") + 1], thread)
+        self.assertEqual(self.history_calls(), [])
 
 
 class ChatMcp(unittest.TestCase):

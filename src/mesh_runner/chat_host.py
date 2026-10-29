@@ -58,10 +58,11 @@ def session_id_for(thread_id: str) -> str:
 
 
 CHAT_POLL, CHAT_SETTLE = "0.2", "0.3"
+HISTORY_LIMIT = 20                                          # messages a new session of an old chat is fed
 
 
 ENV_TTL = 30.0
-_env_cache: dict[int, tuple[float, dict, str, object]] = {}
+_env_cache: dict[int, tuple[float, dict, str, object, object]] = {}     # the entry holds its runner: ids recycle
 _env_lock = threading.Lock()
 
 
@@ -77,7 +78,7 @@ def routed(ar, clock=time.monotonic, ttl: float = ENV_TTL) -> tuple[dict, str, o
     with lock:
         with _env_lock:
             hit = _env_cache.get(id(ar))
-        if hit is None:                          # the agent's first call: nothing to serve, wait for the router
+        if hit is None or hit[4] is not ar:                          # the agent's first call: nothing to serve, wait for the router
             return _store(ar, clock, ar._read_env())
         with _env_lock:
             refresh = clock() - hit[0] >= ttl and id(ar) not in _refreshing
@@ -118,7 +119,7 @@ def _store(ar, clock, raw: dict) -> tuple[dict, str, object]:
     env, harness, profile = ar._route_env(raw)           # pure: derived from the read env alone
     env = session_env(env)                                # what a session gets: the allowlisted runner env + the lane's
     with _env_lock:
-        _env_cache[id(ar)] = (clock(), dict(env), harness, profile)
+        _env_cache[id(ar)] = (clock(), dict(env), harness, profile, ar)
     return dict(env), harness, profile
 
 
@@ -193,6 +194,21 @@ def make_plan(ar, client: ChatClient, chat_workspace: str = "none"):
         warm_id = str(meta.get("session_id") or "")
         sid = warm_id or (session_id_for(thread) if adapter.session_id_known_upfront else "")
         resume = bool(warm_id)
+        if resume:
+            try:
+                note = adapter.prepare_resume(sid, ar.agent.profile_dir, env)
+                known = adapter.session_known(sid, ar.agent.profile_dir, env)
+            except OSError as e:
+                note, known = f"could not carry the session over: {e}", True
+            if note:
+                log.info("chat %s: %s", key, note[:200])
+            if not known:
+                # the transcript is gone from this machine (deleted by hand, a lost account): --resume
+                # would fail the turn, so a new session starts and is fed the chat's past from Mesh
+                log.info("chat %s: session %s has no transcript on this machine; new session with history",
+                         key, sid[:8])
+                resume = False
+                sid = str(uuid.uuid4()) if adapter.session_id_known_upfront else ""
         had_slot = chat_workspace == "write" and ar.pool.leased_path(key) is not None
         slot = lease_slot(ar, thread) if chat_workspace == "write" else None
         # a write chat runs IN its slot, so its write tools reach the slot and nothing else of the agent's
@@ -219,9 +235,15 @@ def make_plan(ar, client: ChatClient, chat_workspace: str = "none"):
         history = None
         if not resume:                                      # a new session for an old chat: feed it the past
             try:
-                history = client.history(thread, limit=20).get("messages") or None
-            except ChatError:
+                history = client.history(thread, limit=HISTORY_LIMIT).get("messages") or None
+            except ChatError as e:
+                # status and code only, escaped: the message text comes from the server
+                log.warning("chat %s: history (limit=%d, before=-) failed: %s %r", key, HISTORY_LIMIT,
+                            e.status, str(e.error_code)[:60])
                 history = None
+            else:
+                log.info("chat %s: history (limit=%d, before=-) gave %d messages", key, HISTORY_LIMIT,
+                         len(history or ()))
         files = fetch_attachments(client, turn, ar.cfg.state_dir)
         return argv, cwd, env, build_prompt(turn, files, history), harness
     return plan

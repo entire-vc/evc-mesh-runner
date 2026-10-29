@@ -26,26 +26,42 @@ def mesh_time(value):
 
 
 class RealisticMesh(FakeMesh):
-    """FakeMesh that normalises start_after and can refuse PATCHes on demand."""
+    """FakeMesh with Mesh's start_after contract: dates answered in UTC, an agent's date needs
+    evidence and is cleared only by compare-clear, and a write can be refused on demand."""
 
     def __init__(self, tasks):
         super().__init__(tasks)
-        self.patch_errors = []        # MeshError per call, None = let it through
-        self.apply_failed = False     # a failed PATCH still commits (answer lost)
-        self.patches = []
+        self.strict_start_after = True
+        self.patch_errors = []        # MeshError per start_after write, None = let it through
+        self.apply_failed = False     # a failed write still commits (answer lost)
+        self.patches = []             # every start_after write: the PATCH and the compare-clear
+
+    def _injected(self, record, apply):
+        self.patches.append(record)
+        err = self.patch_errors.pop(0) if self.patch_errors else None
+        if err is not None:
+            if self.apply_failed:
+                apply()
+            raise err
 
     def patch_task(self, tid, fields):
         fields = dict(fields)
         if "start_after" in fields:
             fields["start_after"] = mesh_time(fields["start_after"])
-        self.patches.append((tid, dict(fields)))
-        err = self.patch_errors.pop(0) if self.patch_errors else None
-        if err is not None:
-            if self.apply_failed:
-                self.tasks[tid].update(fields)
-            raise err
-        self.tasks[tid].update(fields)
-        return dict(self.tasks[tid])
+        self._injected((tid, dict(fields)), lambda: super(RealisticMesh, self).patch_task(tid, fields))
+        return super().patch_task(tid, fields)
+
+    def compare_clear_start_after(self, tid, **kw):
+        self._injected((tid, {"compare_clear": dict(kw)}),
+                       lambda: super(RealisticMesh, self).compare_clear_start_after(tid, **kw))
+        return super().compare_clear_start_after(tid, **kw)
+
+
+def time_wait(hours=20, **extra):
+    """A time wait: the only kind that holds the card on the server."""
+    until = now() + dt.timedelta(hours=hours)
+    return {"kind": "time", "until": iso(until), "since": iso(), "started": iso(),
+            "line": f"⏳ WAIT {until.strftime('%Y-%m-%dT%H:%MZ')}: soak window", "note": "soak window", **extra}
 
 
 def conflict():
@@ -59,7 +75,7 @@ class UnscheduleRetry(Bench):
         r = self.runner(mesh)
         r.refresh_me()
         a = r.store.create(self.agent.name, t["id"], "claude")
-        wait = wait or {"kind": "merge", "target": "g/app!7", "since": iso(), "started": iso()}
+        wait = wait or time_wait()
         r.effects.on_wait(a, t, wait, r.me)
         r.store.update(a, state="waiting", wait=wait)
         return r, mesh, t, r.store.get(a.id)
@@ -110,7 +126,7 @@ class UnscheduleRetry(Bench):
         self.assertIsNone(self.start_after(mesh, t))
         self.assertIsNone(self.pending(r, t))
 
-    def test_task_left_while_waiting_clears_the_event_horizon(self):
+    def test_task_left_while_waiting_clears_the_time_hold(self):
         r, mesh, t, a = self.setup_wait()
         self.assertTrue(same_instant(self.start_after(mesh, t), a.wait["scheduled"]))
         mesh.tasks[t["id"]]["assignee_id"] = "agent-lead"
@@ -184,7 +200,7 @@ class UnscheduleRetry(Bench):
         mesh.patch_errors = [MeshError(503, "unavailable")]
         r.effects.on_end(a, dict(a.wait), "woken", close_request=False)
         self.assertIsNotNone(self.pending(r, t))
-        again = {"kind": "merge", "target": "g/app!7", "since": iso(), "started": iso()}
+        again = time_wait(hours=30)
         r.effects.on_wait(a, mesh.tasks[t["id"]], again, r.me)
         self.assertIsNone(self.pending(r, t))
         self.assertTrue(same_instant(self.start_after(mesh, t), again["scheduled"]))
@@ -206,11 +222,11 @@ class UnscheduleRetry(Bench):
         r, mesh, t, a = self.setup_wait()
         theirs = mesh_time(iso(now() + dt.timedelta(days=2)))
 
-        def conflicting(tid, fields, _orig=mesh.patch_task):
-            mesh.patch_task = _orig
+        def conflicting(tid, **kw):
+            del mesh.compare_clear_start_after
             mesh.tasks[tid]["start_after"] = theirs     # the concurrent write we lost to
             raise conflict()
-        mesh.patch_task = conflicting
+        mesh.compare_clear_start_after = conflicting
         r.effects.on_end(a, dict(a.wait), "woken", close_request=False)
         self.assertEqual(self.start_after(mesh, t), theirs)
         self.assertIsNone(self.pending(r, t))
@@ -224,7 +240,7 @@ class UnscheduleRetry(Bench):
         a = r.store.create(self.agent.name, t["id"], "claude")
         mesh.apply_failed = True
         mesh.patch_errors = [MeshError(0, "TimeoutError: timed out")]
-        wait = {"kind": "merge", "target": "g/app!7", "since": iso(), "started": iso()}
+        wait = time_wait()
         r.effects.on_wait(a, t, wait, r.me)
         self.assertIsNotNone(self.start_after(mesh, t))   # committed although the answer was lost
         self.assertNotIn("scheduled", wait)
@@ -236,7 +252,7 @@ class UnscheduleRetry(Bench):
     def test_a_refused_schedule_is_not_taken_for_ours(self):
         r, mesh, t, a = self.setup_wait()
         mesh.patch_errors = [conflict()]                   # 409: nothing was written
-        wait = {"kind": "merge", "target": "g/app!8", "since": iso(), "started": iso()}
+        wait = time_wait(hours=30)
         r.effects.on_wait(a, mesh.tasks[t["id"]], wait, r.me)
         self.assertNotIn("scheduled_maybe", wait)
 
@@ -247,8 +263,9 @@ class UnscheduleRetry(Bench):
         r = self.runner(mesh)
         r.refresh_me()
         scheduled = iso(now() + dt.timedelta(hours=20))
-        mesh.tasks[t["id"]]["start_after"] = mesh_time(
-            iso(now() + dt.timedelta(days=2)) if foreign else scheduled)
+        mesh.tasks[t["id"]].update(
+            start_after=mesh_time(iso(now() + dt.timedelta(days=2)) if foreign else scheduled),
+            start_after_origin="agent_evidence", start_after_receipt_id="rcpt-1")
         old = r.store.create("other-lane", t["id"], "claude")
         r.store.update(old, state="waiting" if open_owner else "completed",
                        wait={"kind": "merge", "target": "g/app!7", "scheduled": scheduled},

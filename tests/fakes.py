@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import json
+import re
 import subprocess
 import sys
 import time
@@ -51,6 +52,12 @@ class FakeMesh:
                        {"id": "agent-reviewer", "name": "reviewer"}]
         self.refuse_patch = False
         self.heartbeats = 0
+        self.base = "https://mesh.test/api/v1"       # what MeshClient.base is: the evidence source is built from it
+        # Mesh's start_after contract (docs/api/typed-outcomes.md): False keeps the old permissive
+        # model, True refuses an agent's null / evidence-less date the way the server does
+        self.strict_start_after = False
+        self.start_after_calls: list[tuple[str, str, dict]] = []   # ("patch" | "compare-clear", task, body)
+        self.clear_receipts: dict[tuple[str, str], dict] = {}
 
     # MeshClient surface used by the runner
     def me(self):
@@ -183,8 +190,79 @@ class FakeMesh:
     def patch_task(self, tid, fields):
         if self.refuse_patch:
             raise MeshError(403, "forbidden")
+        fields = dict(fields)
+        evidence = fields.pop("start_after_evidence", None)
+        if "start_after" in fields:
+            self.start_after_calls.append(("patch", tid, {"start_after": fields["start_after"],
+                                                          "start_after_evidence": evidence}))
+            if self.strict_start_after:
+                fields = self._strict_start_after(tid, fields, evidence)
         self.tasks[tid].update(fields)
         return dict(self.tasks[tid])
+
+    def _refuse(self, status, message, code, **extra):
+        raise MeshError(status, message, {"message": message, "code": code, "error_code": code, **extra},
+                        endpoint="PATCH /tasks/<uuid>")
+
+    def _strict_start_after(self, tid, fields, evidence):
+        """The server's check of an agent's start_after write (domain.ValidateStartAfterEvidence)."""
+        from mesh_runner.effects import GENERIC_RETRY_WORDS, same_instant
+        t = self.tasks[tid]
+        if fields["start_after"] is None:
+            if t.get("start_after"):
+                self._refuse(422, "an agent clears start_after only through POST /tasks/:id/start-after/compare-clear",
+                             "clear_requires_compare")
+            return fields
+        if same_instant(fields["start_after"], t.get("start_after")):
+            return fields
+        ev = evidence if isinstance(evidence, dict) else {}
+        if not all(isinstance(ev.get(k), str) and ev[k].strip() for k in ("event_ref", "source", "why")):
+            self._refuse(422, "start_after from an agent needs start_after_evidence: event_ref, source and why",
+                         "missing_evidence")
+        if any(len(ev[k]) > 500 for k in ("event_ref", "source", "why")) or len(ev["why"].strip()) < 10 \
+                or not ev["source"].startswith("https://"):
+            self._refuse(422, "start_after_evidence does not qualify", "missing_evidence")
+        if set(re.split(r"[^a-z0-9]+", ev["event_ref"].lower())) & GENERIC_RETRY_WORDS:
+            self._refuse(422, "event_ref names a retry or poll, not an external event", "generic_retry")
+        return dict(fields, start_after_origin="agent_evidence", start_after_receipt_id=str(uuid.uuid4()),
+                    version=t.get("version", 1) + 1)
+
+    def compare_clear_start_after(self, tid, *, expected_start_after, expected_version, idempotency_key,
+                                  expected_origin=None, schedule_receipt_id=None, reason=None):
+        """POST /tasks/:id/start-after/compare-clear (internal/repository/postgres/start_after_repo.go)."""
+        from mesh_runner.effects import same_instant
+        body = {"expected_start_after": expected_start_after, "expected_version": expected_version,
+                "expected_origin": expected_origin, "schedule_receipt_id": schedule_receipt_id,
+                "idempotency_key": idempotency_key, "reason": reason}
+        self.start_after_calls.append(("compare-clear", tid, body))
+        if tid not in self.tasks:
+            raise MeshError(404, "not found")
+        t = self.tasks[tid]
+        prior = self.clear_receipts.get((tid, idempotency_key))
+        if prior:
+            return {"receipt": prior, "replayed": True, "version": t.get("version", 1)}
+        same = (t.get("start_after") and t.get("start_after_origin")
+                and same_instant(t["start_after"], expected_start_after)
+                and t.get("version", 1) == expected_version
+                and (expected_origin is None or expected_origin == t["start_after_origin"])
+                and (schedule_receipt_id is None or schedule_receipt_id == t.get("start_after_receipt_id")))
+        if not same:
+            msg = "cas_conflict: start_after changed since it was read"
+            raise MeshError(409, msg, {"code": "cas_conflict", "error_code": "cas_conflict", "message": msg,
+                                       "current_version": t.get("version", 1),
+                                       "current_start_after": t.get("start_after"),
+                                       "current_origin": t.get("start_after_origin"),
+                                       "current_receipt": t.get("start_after_receipt_id")},
+                            endpoint=f"POST /tasks/{tid}/start-after/compare-clear")
+        if t["start_after_origin"] == "human_explicit":
+            raise MeshError(403, "start_after was set by a person; an agent cannot clear it",
+                            {"message": "start_after was set by a person; an agent cannot clear it"})
+        receipt = {"id": str(uuid.uuid4()), "op": "clear", "cleared_receipt_id": t.get("start_after_receipt_id"),
+                   "idempotency_key": idempotency_key}
+        self.clear_receipts[(tid, idempotency_key)] = receipt
+        t.update(start_after=None, start_after_origin=None, start_after_receipt_id=None,
+                 version=t.get("version", 1) + 1)
+        return {"receipt": receipt, "replayed": False, "version": t["version"]}
 
     def statuses(self, pid):
         return list(STATUSES)

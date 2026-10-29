@@ -35,6 +35,7 @@ class FakeChatMesh:
         self.tokens_issued = 0
         self.fail_next: list[tuple[int, str]] = []        # injected (status, error_code) for the next calls
         self.n = 0
+        self.history: dict[str, list[dict]] = {}       # thread -> messages, oldest first
 
     # ---- scenario setup -------------------------------------------------------------
     def queue_turn(self, text="hello", agent="agent-1", thread="thread-1", attachments=()) -> dict:
@@ -74,6 +75,9 @@ class FakeChatMesh:
                                        for t in self.turns.values() if t["state"] in ("claimed", "streaming")]})
         if parts[0] == "commands" and len(parts) == 1:
             return self._ok({"commands": list(self.commands.values())})
+        if parts[0] == "threads" and len(parts) == 3 and parts[2] == "history":
+            msgs = self.history.get(parts[1], [])[-int(query.get("limit", 20)):]
+            return self._ok({"messages": list(reversed(msgs))})      # newest first, as Mesh answers
         if parts[0] == "claim":
             return self._claim(req, query)
         if parts[0] == "turns" and len(parts) == 3:
