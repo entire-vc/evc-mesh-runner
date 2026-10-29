@@ -2,7 +2,7 @@
 from dataclasses import replace
 from unittest.mock import patch
 from test_runner import Bench
-from fakes import AGENT_ID, FakeMesh, task, write_replies
+from fakes import AGENT_ID, FakeMesh, task, write_replies, FUTURE_AT
 from mesh_runner.config import ConfigError, RunnerConfig, load
 from mesh_runner.effects import DECISION_LABELS
 from mesh_runner.mesh import MeshError
@@ -57,7 +57,7 @@ class DecisionMetadataProducer(Bench):
         self.agent.repos[0] = replace(self.agent.repos[0], max_slots=1)
         recipient = self.runner(RecipientMesh([request], max_concurrent=1))
         held = recipient.pool.lease('other-attempt', 'app')
-        write_replies(self.replies, {request['id'][:8]: '⏳ WAIT 20m: reviewing evidence'})
+        write_replies(self.replies, {request['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 reviewing evidence'})
         recipient.tick()
         attempt, = recipient.store.by_state('coordinator', ('running',))
         self.assertEqual(attempt.task_id, request['id'])

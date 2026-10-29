@@ -40,11 +40,30 @@ The agent ends each turn with a comment on the task whose last line is one of:
 ⏳ WAIT pipeline:<group>/<project>#<id>     ⏳ WAIT mr:<group>/<project>!<iid>
 ⏳ WAIT card:#<8hex>                        ⏳ WAIT decision:@<handle>
 ⏳ WAIT merge:<group>/<project>!<iid> after=<sha>   (opt-in, see Merge waits)
-⏳ WAIT 2h | 2026-10-20T06:00Z              ↻ NEXT
+⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
+↻ NEXT
 ❓ Blocking @<human>: <question>
 ```
 
-or moves the task to its review/done status. No outcome → the runner asks once
+Time WAIT requires a specific external event with a known, future timestamp from the cited
+source: a scheduled job/window, an approved measurement endpoint, or a provider Retry-After/quota
+reset. Explain why that time and the cancellation condition in the comment. The runner validates
+structure, not the truth of the cited evidence. Bare dates, relative intervals and `poll:` are
+rejected; MR/CI/card/decision dependencies use their event marker. Missing GitLab configuration
+retains a visible integration-blocked event wait, without manufacturing a retry deadline.
+Internal transport retries/backoff stay internal and never become task `start_after`.
+
+Invalid declarations get the normal bounded correction turn, then a visible failed attempt
+with a repair owner and action. That correction hold survives restart, cooldown and the next
+UTC day; another author's correction comment or the same identity's explicit newer
+`↻ NEXT: <what was corrected>` releases it. Ordinary own comments, old NEXT declarations and
+runner notices cannot release it. It never writes task `start_after`.
+Existing persisted time waits are not retroactively guessed invalid: preserve them until an
+explicit audit records the source and either confirms the external deadline or posts a
+correction and clears that specific wait. This parser alone does not migrate old waits.
+The fields enforce an evidence contract; they do not prove the external source is truthful.
+
+Or moves the task to its review/done status. No outcome → the runner asks once
 in the same session (`max_no_outcome`). A second turn in a row without a readable
 outcome puts the task back in todo with the same lane until new input arrives (a comment,
 a change to a linked merge request or pipeline, a closed dependency: the `requeue_on_cap`
@@ -53,19 +72,14 @@ inputs; no timer; without `requeue_on_cap` it is handed up as before). The
 any lane; a readable outcome resets the count) hands it to the lead. A task that was handed up
 for this reason is only ever kept by the lead that receives it, never handed further up.
 
-A time wait whose reason names an event (a verdict, an answer, a person, a card) is answered
-once, in the same session, with the forms that wait on the event itself; that answer does not
-count as a missing outcome. The same form repeated afterwards is an ordinary miss. An absolute
-`⏳ WAIT <moment>` whose moment has already passed (or is within a minute) means `↻ NEXT`.
 
 Observable waits are polled without starting the agent while their target is healthy
 and unchanged; time waits wake at their deadline. Age re-checks apply to unreadable
 or unavailable targets and human gates, using `wait_first_recheck_hours` (2), then
 `max_wait_hours` (6), without counting against the daily wait budget. A `❓ Blocking`
-ask to a person retains its separate one-day re-check. A time wait longer than an
-hour must give a reason (`⏳ WAIT 6h: <why>`), and one whose reason names a merge
-request, a card or a pipeline is sent back once to wait on that event instead. A
-`card:` wait whose card is itself waiting on this agent is woken as a cycle.
+ask to a person retains its separate one-day re-check. A pipeline or MR wait with no
+GitLab/GitHub observer is not re-checked by age: it stays integration-blocked until the
+observer is restored. A `card:` wait whose card is itself waiting on this agent is woken as a cycle.
 
 With `queue_wait_freshness_v1` enabled, a parked typed refill can adopt queue
 WAIT without a turn. The newest machine timestamp selects the source; its typed

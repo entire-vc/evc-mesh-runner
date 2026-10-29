@@ -53,12 +53,12 @@ from .effects import (BACKLOG_BLOCKER, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SK
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
-from .outcome import DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
-from .selection import StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
+from .outcome import TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
+from .selection import CLOSED, StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from .wake import (GitHub, GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
-                   ci_observation_gen, manual_pipeline_text, owner_action_delivered, Delivered, PIPELINE_DONE,
+                   ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign)
 from .workspace import DIRTY_HOLD_NOTE, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, git
 from .workspace_scope import (RECEIPT_KEY, metadata_instructions, metadata_only, metadata_receipt,
@@ -88,9 +88,6 @@ LOOP_COMMENT_NOISE = (              # loop guard: what _comment_gist removes, in
 LOOP_STREAK = "loop_streak"          # store mark: the task's run of turns without progress (loop_streak_limit)
 CAP_REASSIGNED = "cap_reassigned"    # store mark: the UTC day a cap moved this task to this agent
 WAITING_FOR_INPUT = "waiting for new input after "      # hold reason of a capped task
-# what a time WAIT's reason may name that the runner can watch instead of a clock
-TIME_WAIT_EVENT = re.compile(r"\b(?:pipeline|mr|card):\S+|(?:[\w.\-]+/[\w.\-/]+)?![0-9]+\b"
-                             r"|#[0-9a-f]{8}\b|\bpipeline\s*#?[0-9]+\b", re.IGNORECASE)
 # a task named in a decision question: a full uuid, or #<8hex>
 TASK_REF = re.compile(r"(?<![\w-])(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![\w-])"
                       r"|#(?P<short>[0-9a-f]{8})(?![\w-])", re.IGNORECASE)
@@ -1350,6 +1347,11 @@ class AgentRunner:
             return
         comments = self._comments(a.task_id)
         outcome, at = self._read_outcome(a, result, comments)
+        if outcome is not None and outcome.kind == "time":
+            # Settlement is the admission boundary, including programmatic outcomes.
+            outcome = self._parse(outcome.line, now(), a.task8)
+            if outcome.kind != "time":
+                outcome = Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=outcome.line)
         if outcome is None or outcome.kind == "unparsed":
             self._no_outcome(a, task, outcome)
             return
@@ -1364,13 +1366,17 @@ class AgentRunner:
                     queue_contract = None
             except MeshError:
                 return  # retry settlement, without another turn or a stale source
-        told = "" if queue_contract else self._time_wait_told(a, task, outcome)
-        if told:
+        missing = self._missing_pipeline_wait(a, outcome)
+        if missing:
             if sent_back():
                 return
-            # sent back before anything is recorded: a rejected declaration spends no budget
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, told))
-            log.info("%s: #%s time wait sent back: %s", self.agent.name, a.task8, told[:80])
+            # a wait that can never be observed: same budget as the other sent-back waits
+            self.store.outcome(a, "wait")
+            if self._over_budget(a, task):
+                return
+            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, missing))
+            log.info("%s: #%s wait on %s sent back: the pipeline does not exist on its host",
+                     self.agent.name, a.task8, outcome.target)
             return
         dead, dead_again = self._canceled_pipeline_wait(a, outcome)
         if dead:
@@ -1504,7 +1510,7 @@ class AgentRunner:
                 "note": outcome.note}
         if queue_contract:
             wait.update(kind="queue", until="", queue_request=queue_wait.new_request(a.task_id, queue_contract))
-        for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from"):
+        for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time"):
             if outcome.extra.get(key):
                 wait[key] = outcome.extra[key]
         if outcome.kind == "merge":
@@ -1513,10 +1519,14 @@ class AgentRunner:
             wait["cap_event_signature"] = prev_wait["cap_event_signature"]
         if rechecks:
             wait["rechecks"] = rechecks
-        if outcome.kind in ("pipeline", "mr") and self.gitlab is None and not typed_wait(wait):
-            # nothing can observe CI here: come back to it after a while instead of never
-            wait.update(kind="time", until=iso(now() + dt.timedelta(minutes=30)),
-                        note=f"{outcome.kind} {outcome.target} (no GitLab configured)")
+        if outcome.kind in ("pipeline", "mr") and self.gitlab is None:
+            # Preserve the event and baseline. Missing integration cannot assert a deadline.
+            wait["integration_blocked"] = "GitLab observer unavailable"
+            if not prev_wait.get("integration_blocked"):
+                self._comment(a.task_id, "⚠️ Integration blocked: GitLab observer unavailable for "
+                              f"`{outcome.kind}:{outcome.target}`. The event wait is retained with no "
+                              "timer/start_after. Restore this lane's GitLab observer or route the "
+                              "integration repair to its owner; a timer cannot resolve this dependency.")
         if wait["kind"] in ("mr", "pipeline") and self.gitlab is not None and not typed_wait(wait):
             try:
                 # what is already there: a result that is final now wakes the wait on the
@@ -1542,11 +1552,11 @@ class AgentRunner:
                                 "the holder), or WAIT on a different event")
                             seeded["dead_rewaits"] = 1
                         elif was_final:
-                            # told once and declared it again: hand control back on a clock
-                            # instead of sleeping on an event that cannot come
-                            seeded["dead_rewaits"] = rewaits + 1
-                            wait.update(kind="time", until=iso(now() + dt.timedelta(hours=2)),
-                                        note=f"{outcome.kind} {outcome.target} is final and unchanged; re-check")
+                            # Already corrected once: neither a 2h timer nor repeated cap wakeups
+                            # can change this terminal result. Require a concrete correction.
+                            self._correction_hold(a, task, f"{was_final}; the result remains final. "
+                                                  "Take the required action or declare a different real event")
+                            return
                     told = (prev.get("seen") or {}).get("no_pipeline_told")
                     if told:
                         seeded.setdefault("seen", {})["no_pipeline_told"] = told
@@ -1619,19 +1629,14 @@ class AgentRunner:
     def _no_outcome(self, a: Attempt, task: dict, outcome: Outcome | None) -> None:
         """The turn ended without a declaration the runner can read.
 
-        A time WAIT whose reason names an event is answered once with the forms to use; that is not a
-        miss. Misses are counted while unbroken by a readable outcome, across lanes. The first is
-        corrected in the same session (``max_no_outcome``). The second in a row sends the task back to
-        todo with the same lane until new input arrives (no timer). From the ``no_outcome_route_after``-th
-        in a row it goes to the lead, unless it already went up for this reason: the lead that receives
-        it never hands it further up."""
+        Misses are counted while unbroken by a readable outcome, across lanes. The first is
+        corrected in the same session (``max_no_outcome``). A malformed time WAIT repeated after
+        that correction becomes a correction hold (no timer). Otherwise the second in a row sends
+        the task back to todo with the same lane until new input arrives (no timer). From the
+        ``no_outcome_route_after``-th in a row it goes to the lead, unless it already went up for
+        this reason: the lead that receives it never hands it further up."""
         line = outcome.line if outcome else ""
         prompt = prompts.no_outcome_prompt(task, line, outcome.note if outcome else "", merge=self.merge_enabled)
-        if (outcome and outcome.extra.get("event_reason")
-                and not self.store.events_since_readable(a.task_id, "event_reason_corrected")):
-            self.store.event(a.id, "event_reason_corrected", line.strip()[:200])
-            self.store.update(a, state="ready", wake_text=prompt)           # not counted as a miss
-            return
         self.store.event(a.id, "no_outcome", line.strip()[:200])
         misses = self.store.events_since_readable(a.task_id, "no_outcome")
         routed = self.store.events_on_task(a.task_id, "no_outcome_routed") > 0   # survives readable outcomes
@@ -1643,6 +1648,9 @@ class AgentRunner:
             self.store.update(a, state="ready", no_outcome=a.no_outcome + 1, wake_text=prompt)
             return
         why = f"{misses} turns in a row ended without a readable outcome" + last
+        if outcome and outcome.note == TIME_WAIT_GUIDANCE:
+            self._correction_hold(a, task, f"{why}; {outcome.note}")
+            return
         if (self.cfg.requeue_on_cap and a.mode == "work"
                 and self._requeue_on_event(task, "no outcome", "🔁 NO OUTCOME", why, a, keep_lane=True)):
             return
@@ -1774,77 +1782,6 @@ class AgentRunner:
                        extra={"watch_comments_by": {"id": addressee["id"], "name": name},
                               "converted_from": f"decision:@{name}"})
 
-    def _time_wait_told(self, a: Attempt, task: dict, outcome: Outcome) -> str:
-        """A time WAIT longer than ``time_wait_reason_after_minutes`` that gives no reason, or
-        whose reason names a merge request, a card, a pipeline or another agent, is sent back
-        once per task and UTC day: a deferral must say why, and a wait for an event must wait on the event
-        (it wakes the moment it happens, not when a guessed hour comes). Declared again, it
-        stands."""
-        if outcome.kind != "time" or not outcome.until:
-            if self.store.mark(self.agent.name, a.task_id, "short_time_waits"):
-                self.store.mark(self.agent.name, a.task_id, "short_time_waits", "")
-            return ""
-        if outcome.until - now() <= dt.timedelta(minutes=self.cfg.time_wait_reason_after_minutes):
-            return self._short_series_told(a, outcome)
-        self.store.mark(self.agent.name, a.task_id, "short_time_waits", "")
-        note = (outcome.note or "").strip()
-        event = TIME_WAIT_EVENT.search(note)
-        agent = "" if event or not note else self._agent_named(note)
-        if note and not event and not agent:
-            return ""
-        if not self.store.claim(TASK_WIDE, a.task_id, "time_wait_told", now().date().isoformat()):
-            return ""                    # told today already (by any agent): this declaration stands
-        line = outcome.line.strip()[:160]
-        if event:
-            return (f"your `{line}` waits for {event.group(0)}, an event the runner can watch. Wait on it "
-                    "instead (⏳ WAIT mr:<group>/<project>!<iid>, ⏳ WAIT card:#<8hex>, "
-                    "⏳ WAIT pipeline:<group>/<project>#<id>): you are woken the moment it happens. "
-                    "If time itself is the condition, declare the time WAIT again with the reason.")
-        if agent:
-            return (f"your `{line}` waits for {agent}. Another agent's action is an event: wait on "
-                    f"it with `⏳ WAIT decision:@{agent}: <what you need from them>` ({agent} gets a "
-                    "request card and you are woken when they answer), or `⏳ WAIT card:#<8hex>` "
-                    "for their card. If time itself is the condition, declare the time WAIT again "
-                    "with the reason.\n\n" + DECISION_WAIT_GUIDANCE)
-        return (f"your `{line}` gives no reason. Either do the work now, or declare it again as "
-                "`⏳ WAIT <when>: <why not now, and what must happen for the wait to end>`.")
-
-    def _short_series_told(self, a: Attempt, outcome: Outcome) -> str:
-        """Short time WAITs declared back to back on one task (each with a new ``until``, so a
-        repeated wait is not what catches them) are polling on a timer: it spends the daily turn
-        budget for nothing. From the ``short_time_wait_series``-th in a row the declaration is
-        sent back once per task and UTC day, naming the events a wait can use; declared again,
-        it stands. Any other outcome, or a longer time WAIT, ends the series."""
-        limit = self.cfg.short_time_wait_series
-        if limit <= 0:
-            return ""
-        prev = self.store.mark(self.agent.name, a.task_id, "short_time_waits")
-        n = (int(prev[0]) if prev and prev[0].isdigit() else 0) + 1
-        self.store.mark(self.agent.name, a.task_id, "short_time_waits", str(n))
-        if n < limit or not self.store.claim(TASK_WIDE, a.task_id, "short_series_told", now().date().isoformat()):
-            return ""
-        return (f"your `{outcome.line.strip()[:160]}` is the {n}th short time WAIT in a row on this task: "
-                "polling on a timer spends the daily turn budget. Wait on the thing that will change "
-                "(⏳ WAIT mr:<group>/<project>!<iid>, ⏳ WAIT pipeline:<group>/<project>#<id>, "
-                "⏳ WAIT card:#<8hex>, ⏳ WAIT decision:@<agent>): you are woken the moment it happens. "
-                "If time itself is the condition, declare the time WAIT again with the reason and a "
-                "longer interval.\n\n" + DECISION_WAIT_GUIDANCE)
-
-    def _agent_named(self, note: str) -> str:
-        """Another workspace agent named in a time WAIT's reason, '' if none.
-
-        Matched as written (case-sensitive, a whole word) so that prose does not trip it;
-        the agent's own name and ``time_wait_ignore_names`` (agent names that double as
-        everyday or product words in a deployment) do not count."""
-        mine = {self.agent.name.casefold(), str(self.me.get("name") or "").casefold()}
-        ignore = {n.casefold() for n in self.cfg.time_wait_ignore_names}
-        for name in sorted(self.effects.agent_names(self.me), key=len, reverse=True):
-            if len(name) < 3 or name.casefold() in mine or name.casefold() in ignore:
-                continue
-            if re.search(r"(?<![\w-])@?" + re.escape(name) + r"(?![\w-])", note):
-                return name
-        return ""
-
     def _recipient_matches(self, handle: str) -> dict:
         """The workspace recipients a handle names, keyed (kind, id). An agent's service user
         shares its slug ("Example (QA Mesh)" next to agent Example): that pair counts as the agent."""
@@ -1968,13 +1905,12 @@ class AgentRunner:
                   else f"no-marker:{outcome.kind}")
         prev = self.store.mark(self.agent.name, a.task_id, "ask_not_raised")
         if prev and prev[0] == reason:
-            # told once and declared the same ask again: no gate stands behind it and Mesh
-            # will not raise one, so a person-ask wait would sleep on a question nobody sees
-            # (measured: a card with a secret-rotation ask refused by policy). Hand control
-            # back on a clock instead.
+            # Mesh refused the gate: no person event exists. Surface the routing failure and
+            # stop this attempt without a guessed 6h schedule or another automatic prompt loop.
             wait.pop("person_ask", None)
-            wait.update(kind="time", until=iso(now() + dt.timedelta(hours=6)),
-                        note=f"ask to @{outcome.handle} was not raised by Mesh; re-check")
+            self._correction_hold(a, task, f"integration blocked: ask to @{outcome.handle} was not raised by Mesh; "
+                                  "repair the recipient/gate route or act on the existing answer. "
+                                  "No retry timer was created")
             return ""
         self.store.mark(self.agent.name, a.task_id, "ask_not_raised", reason)
         return prompts.ask_not_raised_prompt(task, outcome.handle, (refusal or {}).get("body") or "")
@@ -2711,22 +2647,77 @@ class AgentRunner:
                  (fresh.get("checked_out_by") or "-")[:8])
         return True
 
-    def _unseen_input(self, task: dict) -> bool:
-        """A comment from someone else newer than this agent's last working session on the task.
-        Such a comment reached nobody: a START CAP taken now would store a fingerprint that already
-        contains it, and the task would wait for input that has arrived. One more start, then the
-        cap applies again (the session that reads it ends later than the comment). A read that
-        fails is not news."""
+    def _start_news(self, task: dict) -> str:
+        """What reached the task since this agent's last working session on it, in words ('' =
+        nothing). A start that such an event woke is not a restart of a loop: it does not count toward
+        ``daily_start_cap`` (``informed_start``), and a START CAP taken now would store a fingerprint
+        that already contains the event, so the task would wait for input that has arrived. Events:
+        a comment from someone else; a linked merge request merged or closed, a pipeline finished, a
+        link added; a blocker closed; and, when the session ended parked on a card or a human gate, that
+        card closed or that gate lifted. Restarts after a crash, a failed turn, a cooldown or a turn
+        cap have none of these. A read that fails is not news."""
         tid = task["id"]
-        ended = self.store.last_work_end(self.agent.name, tid)
-        if ended is None:
-            return False
+        last = self.store.last_work_session(self.agent.name, tid)
+        if last is None:
+            return ""
+        since, wait, note = last
+        parked = bool(wait) and note.startswith(LEFT_WHILE_IDLE)
+        if parked:
+            # the attempt is closed when the runner notices the card left the agent, long after the
+            # session itself stopped: the wait's own start is where the session ended
+            declared = parse_time(wait.get("since"))
+            if declared is not None and declared < since:
+                since = declared
         try:
             comments = self.mesh.comments(tid)
         except MeshError:
-            return False
-        return any(is_foreign(c, self.agent_id) and (parse_time(c.get("created_at")) or ended) > ended
-                   for c in comments)
+            comments = []
+        if any(is_foreign(c, self.agent_id) and (parse_time(c.get("created_at")) or since) > since
+               for c in comments):
+            return "a comment arrived after the last session"
+        try:
+            event = vcs_event(self.mesh.vcs_links(tid), since, SELF_ECHO)
+        except MeshError:
+            event = ""
+        if event:
+            return f"{event} since the last session"
+        event = self._blocker_closed_since(tid, since)
+        if event:
+            return f"{event} since the last session"
+        if parked and wait.get("kind") == "card" and wait.get("target") and not wait.get("settled"):
+            try:
+                waited = self.mesh.task_by_short(str(wait["target"]))
+            except MeshError:
+                waited = None
+            if isinstance(waited, dict):
+                waited = waited.get("task", waited)
+                cat = self.cats.category(waited)
+                closed = parse_time(waited.get("completed_at") or waited.get("updated_at"))
+                if cat in CLOSED and closed is not None and closed > since:
+                    return f"task #{wait['target']} is {cat} since the last session"
+        elif parked and wait.get("kind") == "blocking" and not task.get("human_gate"):
+            return "the human gate was lifted since the last session"
+        return ""
+
+    def _blocker_closed_since(self, tid: str, since: dt.datetime) -> str:
+        """A ``blocks`` dependency of the task closed after ``since`` ('' = none; an unreadable one is not news)."""
+        try:
+            rows = self.mesh.dependencies(tid)
+            if isinstance(rows, dict):
+                rows = rows["outgoing"] if "outgoing" in rows else rows.get("dependencies") or rows.get("items") or []
+            for dep in rows or []:
+                bid = dep.get("depends_on_task_id")
+                if (dep.get("dependency_type") or "blocks").lower() != "blocks" or not bid:
+                    continue
+                blocker = self.mesh.task(bid)
+                blocker = blocker.get("task", blocker) if isinstance(blocker, dict) else {}
+                cat = self.cats.category(blocker)
+                closed = parse_time(blocker.get("completed_at") or blocker.get("updated_at"))
+                if cat in CLOSED and closed is not None and closed > since:
+                    return f"blocker #{bid[:8]} is {cat}"
+        except MeshError:
+            pass
+        return ""
 
     def _fingerprint_or_none(self, task: dict) -> dict | None:
         try:
@@ -2809,6 +2800,20 @@ class AgentRunner:
             log.info("%s: #%s turn cap: handing up: %s", self.agent.name, a.task8, verdict)
         self.store.event(a.id, "turn_cap", "handed up" + (f": {verdict}" if verdict else ""))
         self._give_up(a, task, why)
+
+    def _correction_hold(self, a: Attempt, task: dict | None, why: str) -> None:
+        """A broken wait contract needs new input, not a cooldown or daily-budget retry.
+
+        Persist the hold in the failed attempt so a runner restart cannot lose it. A foreign
+        correction comment or an explicit own NEXT releases selection; neither elapsed
+        time nor our notice does.
+        """
+        self._to_todo(a, task)
+        self._finish(a, "failed", "wait correction required: " + why)
+        self._comment(a.task_id, "⚠️ WAIT CORRECTION REQUIRED: " + why
+                      + f". Repair owner: @{self.agent.lead or self.agent.name}; replace the malformed wait with the event "
+                      + "or cited external timestamp above, then have another author post a correction, or explicitly "
+                      + "post `↻ NEXT: <what was corrected>` from this Mesh identity. No retry timer was created.")
 
     def _give_up(self, a: Attempt, task: dict | None, why: str) -> None:
         """The runner cannot carry this task further. It must not stay in the
@@ -3503,6 +3508,11 @@ class AgentRunner:
             comment_wake_always_from=self.cfg.comment_wake_always_from,
             decision_wake=self.agent.decision_wake or self.cfg.decision_wake, merge_gate=self.merge_enabled))
         negative = wait.pop("negative_observation", None)   # telemetry only, never persisted
+        if wait.get("integration_blocked") and not expected_wait.get("integration_blocked"):
+            self._comment(a.task_id, "⚠️ Integration blocked: GitLab observer unavailable. "
+                          f"The `{wait.get('kind')}:{wait.get('target')}` event wait and baseline "
+                          "are retained without a timer/start_after. Restore the observer or "
+                          "route the integration repair to its owner.")
         met = wait.pop("met", False)
         if met:
             # the awaited thing happened: whatever the agent declares next is the next step of
@@ -4023,6 +4033,21 @@ class AgentRunner:
         except MeshError:
             return False
 
+    def _correction_rearmed(self, task_id: str, failed_at: dt.datetime) -> bool:
+        """Explicit own NEXT repairs same-identity coordinator holds; routine notes cannot."""
+        try:
+            comments = self.mesh.comments(task_id)
+        except MeshError:
+            return False
+        if foreign_comment(comments, self.agent_id, failed_at):
+            return True
+        declared = own_next_after(comments, self.agent_id, failed_at)
+        if not declared:
+            return False
+        lines = declaration_lines(declared.get("body") or "")
+        outcome = self._parse(lines[-1], now())
+        return outcome.kind == "next" and bool(outcome.note.strip())
+
     def _failed_recently(self, task_id: str, failed_at: dt.datetime) -> bool:
         """A failed task is not retried until someone else writes on it or the
         cooldown passes: retrying at once only repeats the same failure."""
@@ -4179,6 +4204,26 @@ class AgentRunner:
             log.warning("%s: #%s stale CI baseline check failed, baseline retained: %r",
                         self.agent.name, a.task8, exc)
             return ""
+
+    def _missing_pipeline_wait(self, a: Attempt, outcome: Outcome) -> str:
+        """Send-back text for a ``pipeline`` wait whose target its host answers 404 for: it can
+        never be observed, so parking it would only wait for the error limit. Any other failure
+        (timeout, 5xx, unreadable answer) is transient: '' and the wait stands."""
+        if outcome.kind != "pipeline" or self.gitlab is None:
+            return ""
+        target = outcome.target
+        try:
+            self.gitlab.get_pipeline(target)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                log.info("%s: #%s pipeline wait check failed, wait kept: %r", self.agent.name, a.task8, exc)
+                return ""
+            return (f"pipeline {target} not found on {pipeline_host(self.gitlab, target)}; give a GitLab "
+                    "pipeline id or a GitHub Actions run of a GitHub-hosted repo. This wait cannot complete "
+                    "on its own and was sent back.")
+        except Exception as exc:                # noqa: BLE001 - unreadable: the wait stands
+            log.info("%s: #%s pipeline wait check failed, wait kept: %r", self.agent.name, a.task8, exc)
+        return ""
 
     def _canceled_pipeline_wait(self, a: Attempt, outcome: Outcome) -> tuple[str, bool]:
         """(bounce text, dead_again) for a typed ``pipeline`` wait (until=change or until=success)
@@ -4460,7 +4505,8 @@ class AgentRunner:
         """Text for a ``card`` wait on X when X itself waits on a timer, a measurement window, a
         person or a review (a human gate): by the 21.10 dependency scheme that does not hold
         development. '' = accept: X runs, waits on a pipeline/mr/card (code is coming), is an
-        epic/umbrella, is closed, or is unknown to this store."""
+        epic/umbrella, is closed, or is unknown to this store. A release-batch / kind:release card
+        waiting on X is accepted whatever X waits for: it holds only the release gate."""
         if outcome.kind != "card" or not outcome.target:
             return ""
         try:
@@ -4483,6 +4529,12 @@ class AgentRunner:
             t = self._task(target[0].task_id)
             labels = {str(l.get("name") if isinstance(l, dict) else l).casefold() for l in (t or {}).get("labels") or []}
             if not t or labels & {"epic", "umbrella"}:
+                return ""
+            # the waiting card is a release step (no code left, only the release gate: QA, live
+            # acceptance, a person's access): the 21.10 scheme attaches those gates to release
+            me = self._task(a.task_id)
+            mine = {str(l.get("name") if isinstance(l, dict) else l).casefold() for l in (me or {}).get("labels") or []}
+            if mine & {"release-batch", "kind:release"}:
                 return ""
             return (f"#{outcome.target} itself waits for {idle}; under the 21.10 dependency scheme that does not "
                     "hold development. Do your part now, or name the code in it that you need and wait "
@@ -5039,7 +5091,10 @@ class AgentRunner:
             self._backoff_checked.pop(task["id"], None)
         if failed:
             at, note = max(failed, key=lambda f: f[0])
-            if note.startswith(DAILY_CAP_NOTES):
+            if note.startswith("wait correction required:"):
+                if not self._correction_rearmed(task["id"], at):
+                    return "wait correction required; waits for a foreign correction comment or explicit own NEXT with repair reason"
+            elif note.startswith(DAILY_CAP_NOTES):
                 # the per-day budget is spent: a restart today only runs one turn into the same
                 # cap (no lead to take it). It waits for the next UTC day or a new comment; after
                 # either, no cooldown applies and the other holds below still decide.
@@ -5191,21 +5246,32 @@ class AgentRunner:
             return False
         rearm = cap_rearm.pending(self.store, self.agent.name, task["id"]) if mode == "work" else None
         cap = self.cfg.daily_start_cap
+        news = ""
         # review feeds have their own refeed rule (_review_hold); the cap is for work starts
         # a decision request is reopened per question of its requester: its starts are answers, not a loop
-        if (cap and mode != "review" and DECISION_REQUEST_LABEL not in (task.get("labels") or [])
-                and self.store.starts_today(self.agent.name, task["id"]) >= cap):
-            # a capped task that got past hold_reason has new input: one more start, then the cap again
-            if not (self.cfg.requeue_on_cap and self._cap_wait(task["id"])):
-                # the fingerprint first, the comment check second: a comment between them is seen by
-                # the check, one after them changes the fingerprint and wakes the task
-                fp = self._fingerprint_or_none(task) if self.cfg.requeue_on_cap else None
-                if fp is not None and self._unseen_input(task):
-                    log.info("%s: #%s start cap not applied: a comment arrived after the last session",
-                             self.agent.name, task["id"][:8])
-                else:
-                    self._start_cap(task, cap, fp)
+        if cap and mode != "review" and DECISION_REQUEST_LABEL not in (task.get("labels") or []):
+            starts = self.store.starts_today(self.agent.name, task["id"])
+            if not self.cfg.requeue_on_cap:
+                if starts >= cap:
+                    self._start_cap(task, cap, None)
                     return False
+            elif starts >= cap and self._cap_wait(task["id"]):
+                # a capped task that got past hold_reason has new input, and that input is the news: one
+                # more start, not counted, then the cap again. An operator's rearm is a permission, not
+                # news: that start keeps counting (cap_rearm).
+                if not rearm:
+                    news = self._cap_wake_reasons.get(task["id"]) or "new input after the start cap"
+            else:
+                # the fingerprint first, the news check second: an event between them is seen by
+                # the check, one after them changes the fingerprint and wakes the task
+                fp = self._fingerprint_or_none(task) if starts >= cap else None
+                news = self._start_news(task)
+                if starts >= cap:
+                    if news and fp is not None:
+                        log.info("%s: #%s start cap not applied: %s", self.agent.name, task["id"][:8], news)
+                    else:
+                        self._start_cap(task, cap, fp)
+                        return False
         self._gate_task_only = False
         self._gate_asked = True
         reason, gate = self._gate("reserve", task["id"], mode)
@@ -5229,6 +5295,8 @@ class AgentRunner:
             self._turn_end(task["id"], mode, None, gate, "not-started")
             return False
         self._remember_gate(a, gate)
+        if news:
+            self.store.event(a.id, "informed_start", news)       # not a start of the daily_start_cap
         if self.cfg.requeue_on_cap:
             woken = self._cap_wait(task["id"])
             if woken:
@@ -5924,15 +5992,12 @@ class Runner:
             log.info("extension endpoint on %s:%s", cfg.extension_host, cfg.extension_port)
         token = cfg.extension_token
         if token is not None and token.file and cfg.extension_rotate_days > 0 and self.agents:
+            from .extension_service import rotate_token
             client = self.agents[0].mesh
 
             def rotate_loop() -> None:
                 while not stop.wait(cfg.extension_rotate_days * 86400):
-                    try:
-                        token.rotate(client)
-                        log.info("extension token rotated")
-                    except (MeshError, RuntimeError, OSError) as e:
-                        log.warning("extension token rotation failed: %s", type(e).__name__)
+                    rotate_token(token, client)
             threading.Thread(target=rotate_loop, name="extension-token", daemon=True).start()
         return service
 

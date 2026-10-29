@@ -10,7 +10,7 @@ from mesh_runner.effects import runtime_state
 from mesh_runner.outcome import CONTRACT, MERGE_WAIT_GUIDANCE, contract, parse_line
 from mesh_runner.prompt import no_outcome_prompt, start_prompt
 from mesh_runner.store import iso
-from fakes import FakeGitLab, FakeMesh, task, write_replies
+from fakes import FakeGitLab, FakeMesh, task, write_replies, FUTURE_AT
 from test_runner import Bench
 
 NOW = dt.datetime.now(dt.timezone.utc)      # parser tests only
@@ -601,7 +601,7 @@ class ReleasedWorkspace(MergeBench):
         a = self.check(r, a)
         self.assertEqual(a.state, "ready")
         self.assertIn("merged at " + "c" * 40, a.wake_text)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2h: verifying"})
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 verifying"})
         r._resume_one(a)
         resumed = r.store.get(a.id)
         self.assertEqual(resumed.state, "running")
@@ -656,7 +656,7 @@ class IdleBudget(MergeBench):
         self.assertEqual(r.store.idle_waits_today(self.agent.name, t["id"]), 4)    # 3 earlier + this one
 
     def test_time_wait_over_the_idle_budget_is_still_capped(self):
-        r, t = self.run_turn("⏳ WAIT 2h: soak window")
+        r, t = self.run_turn(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window")
         self.assertTrue(self.capped(r, t))
         self.assertEqual(r.store.by_state(self.agent.name, ("waiting",)), [])
 

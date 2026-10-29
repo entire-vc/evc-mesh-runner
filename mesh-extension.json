@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "agent-runner",
   "name": "Agent Runner",
-  "version": "0.1.9",
+  "version": "0.1.11",
   "kind": "plugin",
   "runtime": "external",
   "mesh_api": ">=1 <2",
@@ -14,7 +14,7 @@
   "repository": "https://github.com/entire-vc/evc-mesh-runner",
   "levels": {"instance": false, "workspace": true, "project": false},
   "capabilities": {
-    "api": ["tasks:read", "tasks:write", "comments:read", "comments:write", "agents:read"],
+    "api": ["tasks:read", "tasks:write", "comments:read", "comments:write", "agents:read", "ext_token:self_rotate"],
     "events": ["task.assigned", "task.updated", "comment.created"],
     "network": {"allowed_domains": [], "reasoning": "Runs on the operator's host; talks only to this Mesh instance and, optionally, the operator's GitLab."}
   },

@@ -388,11 +388,15 @@ class Store:
 
     def starts_today(self, agent: str, task_id: str) -> int:
         """Attempts this agent began on this task since UTC midnight that ran at least
-        one turn that was not a provider outage (a start the gate held before it ran is not a start)."""
+        one turn that was not a provider outage (a start the gate held before it ran is not a start).
+        A start that an event woke (see ``informed_start``) is not counted: only restarts with nothing
+        new behind them make a loop."""
         midnight = iso(now().replace(hour=0, minute=0, second=0, microsecond=0))
         row = self.db.execute("SELECT COUNT(*) FROM attempts WHERE agent=? AND task_id=? AND created_at>=? "
                               "AND mode='work' AND turns > (SELECT COUNT(DISTINCT detail) FROM events "
-                              "WHERE attempt=attempts.id AND kind='provider_outage')",
+                              "WHERE attempt=attempts.id AND kind='provider_outage') "
+                              "AND NOT EXISTS (SELECT 1 FROM events WHERE attempt=attempts.id "
+                              "AND kind='informed_start')",
                               (agent, task_id, midnight)).fetchone()   # outage-only turns are not a start
         return int(row[0]) if row else 0
 
@@ -411,11 +415,20 @@ class Store:
                               "WHERE a.task_id=? AND e.kind=?", (task_id, kind)).fetchone()
         return int(row[0]) if row else 0
 
-    def last_work_end(self, agent: str, task_id: str) -> "dt.datetime | None":
-        """When this agent's latest session on this task that ran a turn last changed."""
-        row = self.db.execute("SELECT MAX(updated_at) FROM attempts WHERE agent=? AND task_id=? "
-                              "AND turns>0 AND mode='work'", (agent, task_id)).fetchone()
-        return parse_time(row[0]) if row and row[0] else None
+    def last_work_session(self, agent: str, task_id: str) -> "tuple[dt.datetime, dict, str] | None":
+        """(when it last changed, what it was parked on, how it ended) for this agent's latest
+        session on this task that ran a turn; None when there is none."""
+        row = self.db.execute("SELECT updated_at, wait, note FROM attempts WHERE agent=? AND task_id=? "
+                              "AND turns>0 AND mode='work' ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                              (agent, task_id)).fetchone()
+        at = parse_time(row[0]) if row and row[0] else None
+        if at is None:
+            return None
+        try:
+            wait = json.loads(row[1] or "{}")
+        except ValueError:
+            wait = {}
+        return at, wait if isinstance(wait, dict) else {}, row[2] or ""
 
     def active_count(self, agent: str) -> int:
         return len(self.by_state(agent, ACTIVE))

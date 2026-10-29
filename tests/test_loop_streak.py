@@ -3,7 +3,7 @@ import datetime as dt
 import json
 import unittest
 
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies
+from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT
 from test_requeue_on_cap import CapBench
 from test_runner import Bench
 
@@ -123,12 +123,12 @@ class RunsOfNothing(LoopBench):
         self.assertEqual(self.mesh.tasks[self.t["id"]]["assignee_id"], "agent-lead")
 
     def test_a_wait_declared_again_in_a_turn_started_by_its_own_next_extends_it(self):
-        r = self.start("⏳ WAIT 2h: waiting for the vendor")
+        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
         self.settle_all(r)
         for _ in range(3):
             self.assertEqual(self.looped(), [])
             self.assertEqual(self.step(r, "↻ NEXT").state, "ready")
-            self.step(r, "⏳ WAIT 2h: waiting for the vendor")
+            self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
         self.assertEqual(self.turns(), 7)
         self.assertIn("started by its own NEXT", self.looped()[0])
 
@@ -156,20 +156,20 @@ class AcceptedWaitsAreNeutral(LoopBench):
         self.assertEqual(self.looped(), [])
 
     def test_the_same_accepted_wait_after_any_wake_is_neutral(self):
-        r = self.start("⏳ WAIT 2h: waiting for the vendor")
+        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
         self.settle_all(r)
         for _ in range(12):
-            self.wake(r, "⏳ WAIT 2h: waiting for the vendor")
+            self.wake(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
         self.assertEqual(self.turns(), 13)
         self.assertEqual(self.looped(), [])
 
     def test_a_neutral_recheck_between_empty_nexts_does_not_reset_the_count(self):
-        r = self.start("⏳ WAIT 2h: waiting for the vendor")
+        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
         self.settle_all(r)
         self.assertEqual(self.step(r, "↻ NEXT").state, "ready")                                  # 1
         self.assertEqual(self.step(r, "↻ NEXT").state, "ready")                                  # 2
-        self.assertEqual(self.step(r, "⏳ WAIT 2h: waiting for the vendor").state, "waiting")    # 3: its own NEXT
-        self.assertEqual(self.step(r, "⏳ WAIT 2h: waiting for the vendor", recheck=True).state, "waiting")
+        self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor").state, "waiting")    # 3: its own NEXT
+        self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor", recheck=True).state, "waiting")
         for _ in range(2):                                                                       # 4, 5
             self.assertEqual(self.step(r, "↻ NEXT").state, "ready")
         self.assertEqual(self.looped(), [])
@@ -182,7 +182,7 @@ class AcceptedWaitsAreNeutral(LoopBench):
         for _ in range(4):
             self.finish_turn(r)
             r.tick()
-        self.assertEqual(self.step(r, "⏳ WAIT 2h: waiting for the vendor").state, "waiting")    # a different wait: reset
+        self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor").state, "waiting")    # a different wait: reset
         self.assertEqual(json.loads(r.store.mark(self.agent.name, self.t["id"], LOOP_STREAK)[0])["log"], [])
 
 
@@ -196,28 +196,28 @@ class ProgressIsNeverStopped(LoopBench):
         self.assertEqual(self.looped(), [])
 
     def test_many_waits_on_different_things_are_never_a_loop(self):
-        r = self.start("⏳ WAIT 2h: soak round 0")
+        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak round 0")
         self.settle_all(r)
         for i in range(1, 16):
-            self.wake(r, f"⏳ WAIT 2h: soak round {i}")
+            self.wake(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak round {i}")
         self.assertEqual(self.turns(), 16)
         self.assertEqual(self.looped(), [])
         self.assertEqual(self.states(r), {self.t["id"][:8]: "waiting"})
 
     def test_the_same_wait_after_a_met_event_is_a_step_not_a_loop(self):
-        r = self.start("⏳ WAIT 2h: the release train")
+        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 the release train")
         self.settle_all(r)
         for _ in range(15):
             # the awaited thing happened and woke the session; it waits for the next round of the same
-            self.wake(r, "⏳ WAIT 2h: the release train",
+            self.wake(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 the release train",
                       lambda a: r.store.mark(self.agent.name, self.t["id"], "met_wake", a.id))
         self.assertEqual(self.turns(), 16)
         self.assertEqual(self.looped(), [])
 
     def test_the_same_wait_with_a_new_comment_each_time_is_not_a_loop(self):
-        r = self.start("⏳ WAIT 2h: review of the change")
+        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 review of the change")
         self.settle_all(r)
-        write_replies(self.replies, {self.t["id"][:8]: "⏳ WAIT 2h: review of the change"})
+        write_replies(self.replies, {self.t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 review of the change"})
         for i in range(12):
             self.mesh.add_comment(self.t["id"], f"ping {i}", author="someone")
             r.tick()                                   # the comment wakes the session and it starts a turn
@@ -352,7 +352,7 @@ class NothingNew(LoopBench):
 
 
 class PingPong(LoopBench):
-    A, B = "⏳ WAIT 2h: soak alpha", "⏳ WAIT 2h: soak beta"
+    A, B = f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak alpha", f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak beta"
 
     def test_alternating_between_two_waits_is_handed_up(self):
         r = self.start(self.A)
@@ -391,10 +391,10 @@ class PingPong(LoopBench):
         self.assertEqual(state["log"], [])
 
     def test_all_new_waits_are_never_a_loop(self):
-        r = self.start("⏳ WAIT 2h: soak a")
+        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak a")
         self.settle_all(r)
         for name in "bcdefghijkl":
-            self.assertEqual(self.step(r, f"⏳ WAIT 2h: soak {name}").state, "waiting")
+            self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak {name}").state, "waiting")
         self.assertEqual(self.turns(), 12)
         self.assertEqual(self.looped(), [])
 

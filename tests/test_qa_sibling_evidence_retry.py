@@ -10,7 +10,7 @@ import time
 from unittest import mock
 
 from test_runner import Bench
-from fakes import FakeGitLab, FakeMesh, calls, task, write_replies
+from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT
 import mesh_runner.runner as mod
 import mesh_runner.store as store_clock
 
@@ -66,7 +66,7 @@ class SiblingEvidenceRetry(Bench):
         mode.write_text(REASON)
         gate_log.write_text('')
         self.agent.start_gate_command = [sys.executable, str(gate), str(mode), str(gate_log)]
-        write_replies(self.replies, {t['id'][:8]: '⏳ WAIT 2h: synthetic review follow-up'})
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 synthetic review follow-up'})
         runners = []
 
         def boot():

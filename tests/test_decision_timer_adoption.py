@@ -2,7 +2,7 @@
 import datetime as dt
 from unittest.mock import patch
 
-from fakes import FAKE_AGENT, FakeMesh, calls, task, write_replies
+from fakes import FAKE_AGENT, FakeMesh, calls, task, write_replies, FUTURE_AT
 from mesh_runner.store import iso, now
 from test_runner import Bench
 
@@ -11,8 +11,8 @@ class DecisionTimerAdoption(Bench):
     def setUp(self):
         super().setUp()
         # A deterministic producer: follow the supplied decision guidance, else
-        # reproduce the old timer loop. This is no language-model simulation.
-        script = FAKE_AGENT.replace('if reply.startswith("GATE:"):', '''
+        # reproduce a forbidden timer loop. This is no language-model simulation.
+        script = FAKE_AGENT.replace('if reply.startswith("GATE:"):', f'''
 if reply == "PENDING_ANSWER":
     guided = "WAIT decision:@" in prompt and "same question" in prompt
     reply = ("⏳ WAIT decision:@lead: approve the plan?" if guided
@@ -20,7 +20,7 @@ if reply == "PENDING_ANSWER":
 if reply == "SCHEDULED_WORK":
     from pathlib import Path
     Path(__file__).with_name("scheduled-result.txt").write_text("scheduled result\\n")
-    reply = "⏳ WAIT 2h: next scheduled check"
+    reply = "⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 next scheduled check"
 if reply.startswith("GATE:"):''')
         (self.root / 'agent.py').write_text(script)
 
@@ -35,10 +35,10 @@ if reply.startswith("GATE:"):''')
         write_replies(self.replies, {source['id'][:8]: '⏳ WAIT decision:@lead: approve the plan?'})
         attempt = self.turn(runner)
         request = attempt.wait['request']['id']
-        # An observation is not an answer. The producer incorrectly chooses a
-        # generic timer while the canonical question is still open (the bug).
+        # An observation is not an answer. A separate sourced external deadline
+        # must retain the canonical question for adoption after the event.
         mesh.add_comment(source['id'], 'review still pending', author='bystander')
-        write_replies(self.replies, {source['id'][:8]: '⏳ WAIT 2h: awaiting response'})
+        write_replies(self.replies, {source['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 awaiting response'})
         attempt = self.turn(runner)
         self.assertEqual(attempt.wait['kind'], 'time')
         self.assertEqual(mesh.category(mesh.tasks[request]), 'todo')

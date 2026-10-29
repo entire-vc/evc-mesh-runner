@@ -30,11 +30,21 @@ PIPELINE_STATES = PIPELINE_DONE | PIPELINE_IN_PROGRESS
 NO_PIPELINE_GRACE = dt.timedelta(minutes=15)    # a push takes a moment to get its pipeline
 
 
+# GitHub Actions run -> the status vocabulary of a GitLab pipeline.
+RUN_STATUSES = {"queued": "pending", "requested": "pending", "pending": "pending",
+                "in_progress": "running", "waiting": "waiting_for_resource"}
+RUN_CONCLUSIONS = {"success": "success", "neutral": "success", "failure": "failed", "timed_out": "failed",
+                   "startup_failure": "failed", "cancelled": "canceled", "stale": "canceled",
+                   "skipped": "skipped", "action_required": "manual"}
+
+
 @dataclass
 class GitHub:
     """Reads a GitHub pull request as the merge-request dict the wait evaluators already
     understand (``state`` opened/merged/closed, ``sha``, ``merge_commit_sha``, ``labels``,
-    ``target_branch``), so ``mr:`` / ``merge:`` waits on a GitHub target need no second code path."""
+    ``target_branch``), and a GitHub Actions run as the pipeline dict (``id``, ``sha``, ``ref``,
+    ``status`` in GitLab's vocabulary), so ``mr:`` / ``merge:`` / ``pipeline:`` waits on a GitHub
+    target need no second code path."""
     token: str = ""
     api_url: str = "https://api.github.com"
     orgs: tuple = ()
@@ -43,8 +53,10 @@ class GitHub:
         return f"GitHub({self.api_url!r})"
 
     def owns(self, target: str) -> bool:
-        """True for ``org/repo!N`` whose org (or full org/repo) is configured as GitHub-hosted."""
-        project = target.rsplit("!", 1)[0]
+        """True for ``org/repo!N`` (pull request) and ``org/repo#N`` (Actions run) whose org (or
+        full org/repo) is configured as GitHub-hosted. One repo can be listed alone, because the
+        same org may also exist on GitLab."""
+        project = re.split(r"[!#]", target, maxsplit=1)[0]
         return any(project == o or project.startswith(o.rstrip("/") + "/") for o in self.orgs)
 
     def get(self, path: str) -> dict:
@@ -68,6 +80,25 @@ class GitHub:
                 "labels": [l.get("name") for l in pr.get("labels") or [] if isinstance(l, dict)],
                 "head_pipeline": None, "web_url": pr.get("html_url")}
 
+    def get_run(self, target: str) -> dict:
+        """A GitHub Actions run as a GitLab pipeline row. ``finished_at`` is the run's last update
+        once it is completed: a re-run moves it, as a retried GitLab pipeline moves its own."""
+        project, run_id = target.rsplit("#", 1)
+        run = self.get(f"repos/{project}/actions/runs/{run_id}")
+        status, conclusion = run.get("status"), run.get("conclusion")
+        if status == "completed":
+            if conclusion not in RUN_CONCLUSIONS:
+                raise ValueError(f"unknown GitHub run conclusion {conclusion!r}")
+            mapped = RUN_CONCLUSIONS[conclusion]
+        elif status in RUN_STATUSES:
+            mapped = RUN_STATUSES[status]
+        else:
+            raise ValueError(f"unknown GitHub run status {status!r}")
+        return {"id": run.get("id"), "sha": run.get("head_sha"), "ref": run.get("head_branch"),
+                "status": mapped, "created_at": run.get("created_at"), "updated_at": run.get("updated_at"),
+                "finished_at": run.get("updated_at") if status == "completed" else None,
+                "web_url": run.get("html_url")}
+
 
 @dataclass
 class GitLab:
@@ -90,7 +121,19 @@ class GitLab:
     def project(path: str) -> str:
         return urllib.parse.quote(path, safe="")
 
+    def github_owns(self, target: str) -> bool:
+        return self.github is not None and self.github.owns(target)
+
+    def host(self, target: str) -> str:
+        """The host a CI/MR target is read from: github.com for a GitHub-hosted repo, else GitLab's."""
+        if self.github_owns(target):
+            host = urllib.parse.urlsplit(self.github.api_url).hostname or "github.com"
+            return "github.com" if host == "api.github.com" else host
+        return urllib.parse.urlsplit(self.base_url).hostname or self.base_url or "GitLab"
+
     def get_pipeline(self, target: str) -> dict:
+        if self.github_owns(target):
+            return self.github.get_run(target)
         project, pid = target.rsplit("#", 1)
         return self.get(f"projects/{self.project(project)}/pipelines/{pid}")
 
@@ -100,12 +143,17 @@ class GitLab:
     def pipeline_has_active_jobs(self, target: str) -> bool:
         """True while any job of the pipeline is queued or running (a pipeline can read
         ``canceled`` for a moment with jobs still winding down)."""
+        if self.github_owns(target):
+            return self.github.get_run(target)["status"] in PIPELINE_IN_PROGRESS
         project, pid = target.rsplit("#", 1)
         scopes = "&".join(f"scope[]={s}" for s in sorted(PIPELINE_IN_PROGRESS))
         return bool(self.get(f"projects/{self.project(project)}/pipelines/{pid}/jobs?{scopes}&per_page=1"))
 
     def newer_pipeline(self, target: str, row: dict | None = None) -> dict | None:
-        """The latest pipeline of the same ref that is newer than ``target``, or None."""
+        """The latest pipeline of the same ref that is newer than ``target``, or None (always None
+        for a GitHub run: the runs of a branch are not listed)."""
+        if self.github_owns(target):
+            return None
         project, pid = target.rsplit("#", 1)
         row = row if row is not None else self.get_pipeline(target)
         ref = row.get("ref")
@@ -532,6 +580,14 @@ def _terminal_generation(head: dict) -> str:
         return ""
     when = parse_time(raw.upper())
     return when.astimezone(dt.timezone.utc).isoformat() if when else ""
+
+
+def pipeline_host(gitlab, target: str) -> str:
+    """The host a pipeline target is read from, for messages; works on any observer."""
+    host = getattr(gitlab, "host", None)
+    if callable(host):
+        return host(target)
+    return urllib.parse.urlsplit(str(getattr(gitlab, "base_url", "") or "")).hostname or "GitLab"
 
 
 def ci_observation(gitlab, kind: str, target: str, row: dict | None = None) -> tuple[str, int, str]:
@@ -1038,18 +1094,10 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
                 event = _watched_comment(mesh, target, wait, since)
         elif kind in ("pipeline", "mr"):
             if gitlab is None:
-                if typed_wait(wait):
-                    # Observer loss is UNKNOWN, never an age-based result of
-                    # an explicit predicate. Keep its baseline and receipt.
-                    return ""
-                # New waits are shortened to a time wait when declared. A persisted
-                # pre-existing pipeline/MR wait can survive a restart without that
-                # observer, though; absence is not a healthy unchanged observation.
-                if now - started >= interval:
-                    wait["recheck_due"] = True
-                    return (f"re-check: the {kind} wait ({wait.get('target') or ''}) has lasted "
-                            f"{_hours(now - started)}; GitLab observer unavailable")
+                wait["integration_blocked"] = "GitLab observer unavailable"
+                # UNKNOWN integration state, never a time result or an age-based recheck.
                 return ""
+            wait.pop("integration_blocked", None)
             if typed_wait(wait):
                 observation = {}
                 event = typed_event(gitlab, kind, wait["target"], wait,

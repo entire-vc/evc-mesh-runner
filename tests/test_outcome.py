@@ -23,13 +23,13 @@ class OutcomeGrammar(unittest.TestCase):
     def test_card_cannot_wait_for_itself(self):
         self.assertEqual(self.p("⏳ WAIT card:#abcdef12", "abcdef12").kind, "unparsed")
 
-    def test_durations_are_clamped(self):
-        self.assertEqual(self.p("⏳ WAIT 1m").until, NOW + dt.timedelta(minutes=5))
-        self.assertEqual(self.p("⏳ WAIT 2h").until, NOW + dt.timedelta(hours=2))
-        self.assertEqual(self.p("⏳ WAIT 90h").until, NOW + dt.timedelta(hours=24))
+    def test_durations_are_rejected(self):
+        self.assertEqual(self.p("⏳ WAIT 1m").kind, "unparsed")
+        self.assertEqual(self.p("⏳ WAIT 2h").kind, "unparsed")
+        self.assertEqual(self.p("⏳ WAIT 90h").kind, "unparsed")
 
     def test_absolute_time(self):
-        o = self.p("⏳ WAIT 2026-10-20T06:00Z: data window")
+        o = self.p("⏳ WAIT 2026-10-20T06:00Z: external=export-window source=card:#abcdef12 data window")
         self.assertEqual(o.until, dt.datetime(2026, 10, 20, 6, 0, tzinfo=dt.timezone.utc))
         self.assertEqual(self.p("⏳ WAIT 2030-01-01").kind, "unparsed")
 
@@ -45,10 +45,9 @@ class OutcomeGrammar(unittest.TestCase):
 
     def test_pipe_separated_explanation_and_mr_named_as_pipeline(self):
         o = self.p("⏳ WAIT 8h | 2026-10-17T03:30Z")
-        self.assertEqual((o.kind, o.until), ("time", NOW + dt.timedelta(hours=8)))
-        self.assertEqual(o.note, "2026-10-17T03:30Z")
+        self.assertEqual(o.kind, "unparsed")
         o = self.p("⏳ WAIT 2026-10-17T03:30Z | night run")
-        self.assertEqual(o.kind, "time")
+        self.assertEqual(o.kind, "unparsed")
         o = self.p("⏳ WAIT pipeline:group/project!158")
         self.assertEqual((o.kind, o.target), ("mr", "group/project!158"))
 
@@ -72,20 +71,20 @@ class TimeWaitReason(unittest.TestCase):
             self.assertIn("⏳ WAIT card:#<8hex>", o.note)
             self.assertIn("decision:@<agent>", o.note)
 
-    def test_time_as_the_condition_still_parses(self):
+    def test_untyped_time_reason_cannot_replace_evidence(self):
         for line in ("⏳ WAIT 2h: soak window", "⏳ WAIT 2h", "⏳ WAIT 2026-10-20T06:00Z: measurement window ends",
                      "⏳ WAIT 24h: traffic needs a full day"):
-            self.assertEqual(self.p(line).kind, "time", line)
+            self.assertEqual(self.p(line).kind, "unparsed", line)
 
-    def test_poll_of_an_outside_channel_is_a_time_wait(self):
+    def test_poll_of_an_outside_channel_is_rejected(self):
         # the reply comes in a chat outside Mesh; the reason named
         # the answer, the line was refused and the card was given up.
         for line in ("⏳ WAIT 2026-10-26T12:20Z: poll: Telegram inbox; on reply, copy it verbatim",
                      "⏳ WAIT 6h: POLL: mail from the registrar, answer expected",
                      "⏳ WAIT 2h: poll : @alice reply in Telegram"):
             o = self.p(line)
-            self.assertEqual(o.kind, "time", line)
-            self.assertTrue(o.note.lower().startswith("poll"), o.note)
+            self.assertEqual(o.kind, "unparsed", line)
+            self.assertIn("source=", o.note)
 
     def test_poll_further_in_the_reason_does_not_exempt(self):
         o = self.p("⏳ WAIT 2h: answer from @alice, then poll: CI")

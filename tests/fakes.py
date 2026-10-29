@@ -14,6 +14,11 @@ from pathlib import Path
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.mesh import Checkout, MeshError
 
+# A moment ahead of the real clock for time-WAIT fixtures: the parser refuses a past or bare
+# timestamp, so a fixed calendar date would turn these tests red once it passes.
+FUTURE_AT = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=60)).strftime("%Y-%m-%dT%H:%MZ")
+
+
 AGENT_ID = "agent-1"
 STATUSES = [
     {"id": "s-todo", "category": "todo"}, {"id": "s-prog", "category": "in_progress"},
@@ -442,11 +447,14 @@ class FakeGitLab:
         self.pipeline_rows = {}  # target -> pipeline JSON
         self.active_jobs = set()  # targets with a queued or running job
         self.newer = {}          # target -> pipeline row of the same ref with a higher id
+        self.pipeline_errors = {}  # target -> exception get_pipeline raises (404, a timeout)
 
     def get_mr(self, target):
         return dict(self.mr_rows.get(target, {}))
 
     def get_pipeline(self, target):
+        if target in self.pipeline_errors:
+            raise self.pipeline_errors[target]
         return dict(self.pipeline_rows.get(target, {}))
 
     def pipeline_has_active_jobs(self, target):

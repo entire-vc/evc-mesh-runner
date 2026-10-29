@@ -8,8 +8,11 @@ import threading
 import unittest
 from pathlib import Path
 
-from mesh_runner.extension_service import ExtensionService, ExtensionToken, sign
-from mesh_runner.mesh import MeshClient
+from mesh_runner import __version__
+from mesh_runner.extension_service import ExtensionService, ExtensionToken, rotate_token, sign
+from mesh_runner.mesh import MeshClient, MeshError
+
+ROOT = Path(__file__).resolve().parent.parent
 
 SECRET = "s3cr3t-" + "x" * 32
 NOW = 1_800_000_000
@@ -238,6 +241,41 @@ class TokenTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 tok.rotate(Client())
             self.assertEqual(tok(), "ext_old")
+
+    def test_rotation_refused_403_names_the_capability_and_keeps_going(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "tok"
+            f.write_text("ext_old")
+            tok = ExtensionToken(f)
+
+            class Client:
+                calls = 0
+
+                def request(self, method, path, body=None):
+                    Client.calls += 1
+                    if Client.calls == 1:
+                        raise MeshError(403, "extension lacks the consented capability api:ext_token:self_rotate",
+                                        endpoint=path)
+                    return {"extension_token": "ext_new"}
+            with self.assertLogs("mesh_runner", "WARNING") as logs:
+                self.assertFalse(rotate_token(tok, Client()))
+            text = "\n".join(logs.output)
+            self.assertIn("403", text)
+            self.assertIn("ext_token:self_rotate", text)
+            self.assertNotIn("ext_old", text)
+            self.assertEqual(tok(), "ext_old")
+            # the next round of the loop still rotates
+            self.assertTrue(rotate_token(tok, Client()))
+            self.assertEqual(tok(), "ext_new")
+
+
+class ManifestTest(unittest.TestCase):
+    def test_manifest_asks_for_self_rotate_and_versions_agree(self):
+        manifest = json.loads((ROOT / "mesh-extension.json").read_text())
+        self.assertIn("ext_token:self_rotate", manifest["capabilities"]["api"])
+        pyproject = (ROOT / "pyproject.toml").read_text()
+        self.assertIn(f'\nversion = "{manifest["version"]}"\n', pyproject)
+        self.assertEqual(manifest["version"], __version__)
 
 
 if __name__ == "__main__":

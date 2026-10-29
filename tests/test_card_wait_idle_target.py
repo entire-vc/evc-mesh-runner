@@ -5,8 +5,8 @@ from test_runner import Bench
 
 
 class CardWaitOnIdleTarget(Bench):
-    def flow(self, x_state='waiting', x_wait=None, x_extra=None, x_gate=False):
-        t, x = task(1), task(2, **(x_extra or {}))
+    def flow(self, x_state='waiting', x_wait=None, x_extra=None, x_gate=False, t_extra=None):
+        t, x = task(1, **(t_extra or {})), task(2, **(x_extra or {}))
         if x_gate:
             x['human_gate'] = True
         r = self.runner(FakeMesh([t, x], max_concurrent=1))
@@ -36,6 +36,21 @@ class CardWaitOnIdleTarget(Bench):
     def test_human_gate_ready_target_is_sent_back(self):
         r, t, x = self.flow(x_state='ready', x_gate=True)
         self.assertTrue(self.sent_back(self.turn(r, t, x)))
+
+    def release_waiter(self, label):
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead'}, x_gate=True,
+                            t_extra={'labels': [label]})
+        return self.turn(r, t, x)
+
+    def test_release_batch_waiter_on_idle_target_is_accepted(self):
+        self.assertEqual(self.release_waiter('release-batch').state, 'waiting')
+
+    def test_kind_release_waiter_on_idle_target_is_accepted(self):
+        self.assertEqual(self.release_waiter('kind:release').state, 'waiting')
+
+    def test_release_batch_waiter_on_gated_ready_target_is_accepted(self):
+        r, t, x = self.flow(x_state='ready', x_gate=True, t_extra={'labels': ['release-batch']})
+        self.assertEqual(self.turn(r, t, x).state, 'waiting')
 
     def test_pipeline_target_is_accepted(self):
         r, t, x = self.flow(x_wait={'kind': 'pipeline', 'target': 'g/app#1'})

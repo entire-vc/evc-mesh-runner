@@ -110,6 +110,30 @@ class ExtensionToken:
         os.replace(tmp, self.file)
 
 
+def rotate_token(token: ExtensionToken, client) -> bool:
+    """One rotation step of the runner's token loop; a failure is logged and never raised.
+
+    The current token stays in the file on any failure. The server's message is not logged: only the
+    status, so nothing it echoes can end up in the log.
+    """
+    from .mesh import MeshError
+    try:
+        token.rotate(client)
+    except MeshError as e:
+        if e.status == 403:
+            log.error("extension token rotation refused (HTTP 403): the installed extension has no consented "
+                      "capability ext_token:self_rotate; update agent-runner in Mesh and accept its consent, "
+                      "or set rotate_days = 0. The current token stays in use")
+        else:
+            log.warning("extension token rotation failed: HTTP %s", e.status)
+        return False
+    except (RuntimeError, OSError) as e:
+        log.warning("extension token rotation failed: %s", type(e).__name__)
+        return False
+    log.info("extension token rotated")
+    return True
+
+
 class ExtensionService:
     def __init__(self, state_dir: Path, wake: Callable[[], None], workspace_id: str,
                  expected_secret: str = "", trust_first_install: bool = False,

@@ -4,7 +4,7 @@ import sys
 from unittest import mock
 
 from test_runner import Bench
-from fakes import FakeMesh, task, write_replies, calls
+from fakes import FakeMesh, task, write_replies, calls, FUTURE_AT
 import mesh_runner.runner as mod
 import mesh_runner.store as clock
 
@@ -76,7 +76,7 @@ class QAInfraHold(Bench):
                     self.assertEqual(len(calls(self.calls)), prior_calls)
                 # The next scheduled probe discovers recovery without requiring a card edit.
                 self.agent.start_gate_command = [sys.executable, '-c', 'raise SystemExit(0)']
-                write_replies(self.replies, {t['id'][:8]: '⏳ WAIT 2h: review follow-up'})
+                write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 review follow-up'})
                 with mock.patch.object(mod, 'now', return_value=same_day_retry + dt.timedelta(minutes=61)), mock.patch.object(clock, 'now', return_value=same_day_retry + dt.timedelta(minutes=61)):
                     r._gate_hold.clear(); r._hold_cache.clear()
                     r._start_one(review())
