@@ -53,6 +53,15 @@ class CodexAdapter(Adapter):
             argv += ["resume", session_id]
         return argv + self.extra_args
 
+    def session_known(self, session_id: str, cwd: Path, env: dict) -> bool:
+        """False only when the Codex home of ``env`` keeps rollouts and none is this thread's:
+        ``resume <thread>`` would find nothing. A home without a sessions directory says True."""
+        home = Path(env.get("CODEX_HOME") or Path(env.get("HOME") or Path.home()) / ".codex")
+        sessions = home / "sessions"
+        if not session_id or not sessions.is_dir():
+            return True
+        return any(sessions.glob(f"**/rollout-*{session_id}*.jsonl"))
+
     def with_read_only(self, argv: list[str]) -> list[str]:
         """Codex's own read-only sandbox; a root option, so it goes before any subcommand."""
         return self._sandboxed(argv, "read-only")

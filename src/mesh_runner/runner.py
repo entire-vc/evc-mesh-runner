@@ -2391,10 +2391,11 @@ class AgentRunner:
     def _requeue_on_event(self, task: dict, kind: str, banner: str, why: str, a: Attempt | None = None,
                           fp: dict | None = None, keep_lane: bool = False) -> bool:
         """A cap put the task back in the queue (``requeue_on_cap``). Same assignee, status todo,
-        no ``start_after``, no backoff: it starts again when its inputs change (see inputs.py), or
-        at once on a free peer of its pool for a fresh start. False when it could not be done safely
-        (the inputs are unreadable, or the move to todo / clearing start_after failed): nothing is
-        marked or said, and the caller keeps the older behaviour."""
+        no ``start_after`` (taken back by compare-clear; one that will not clear is retried per tick and
+        does not stop the requeue), no backoff: it starts again when its inputs change (see inputs.py),
+        or at once on a free peer of its pool for a fresh start. False when it could not be done safely
+        (the inputs are unreadable, or the move to todo failed): nothing is marked or said, and the
+        caller keeps the older behaviour."""
         tid = task["id"]
         try:
             fp = fp if fp is not None else self._input_fingerprint(task)
@@ -2402,11 +2403,11 @@ class AgentRunner:
             log.warning("%s: #%s %s: inputs unreadable (%s); using the hand-up path", self.agent.name, tid[:8],
                         kind, e.status)
             return False
-        # Status and start_after first, while the task is still ours: a failure here changes nothing
-        # that matters and the caller takes the hand-up path. Nothing retries a start_after left set
-        # (it would hold the task before the cap-wait logic ever runs), so success is required.
+        # Status first, while the task is still ours: a failure here changes nothing that matters and
+        # the caller takes the hand-up path. A start_after that will not clear is not such a failure:
+        # compare-clear is retried per tick and the task is requeued meanwhile.
         if not self._back_to_todo(task):
-            log.warning("%s: #%s %s: could not move it to todo / clear start_after; using the hand-up path",
+            log.warning("%s: #%s %s: could not move it to todo; using the hand-up path",
                         self.agent.name, tid[:8], kind)
             return False
         peer = None if keep_lane else self._free_peer(task)
@@ -2453,17 +2454,23 @@ class AgentRunner:
         return True
 
     def _back_to_todo(self, task: dict) -> bool:
-        """Status todo and no start_after. True only when both are in place."""
+        """Status todo, and the task's start_after taken back. False only when the move to todo
+        failed. A start_after that could not be cleared (a person's date, a card that changed twice,
+        Mesh unreachable) is not a reason to hand the task up: the clear is kept and retried per tick
+        (``Effects.clear_start_after``) and the task waits in todo, held by that date if it stays."""
         tid = task["id"]
         try:
             if self.cats.category(task) != "todo":
                 if not self._guarded_todo(tid, task, self.agent_id, tid[:8]):
                     return False
-            if task.get("start_after"):
-                self.mesh.patch_task(tid, {"start_after": None})
         except MeshError as e:
             log.warning("%s: requeue #%s: %s", self.agent.name, tid[:8], e)
             return False
+        if task.get("start_after"):
+            outcome = self.effects.clear_start_after(tid, task["start_after"])
+            if outcome not in ("cleared", "gone"):
+                log.info("%s: requeue #%s: start_after not cleared yet (%s); the task stays in the queue",
+                         self.agent.name, tid[:8], outcome)
         return True
 
     def _keep_until_tomorrow(self, task_id: str, text: str, kind: str = "start cap") -> None:

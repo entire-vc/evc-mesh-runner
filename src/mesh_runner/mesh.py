@@ -250,6 +250,21 @@ class MeshClient:
     def patch_task(self, task_id: str, fields: dict) -> dict:
         return self.request("PATCH", f"/tasks/{task_id}", fields)
 
+    def compare_clear_start_after(self, task_id: str, *, expected_start_after: str, expected_version: int,
+                                  idempotency_key: str, expected_origin: str | None = None,
+                                  schedule_receipt_id: str | None = None, reason: str | None = None) -> dict:
+        """Clear start_after only if it is still exactly the schedule that was read (the only way an
+        agent removes one). 200 with the receipt (``replayed`` for a repeated key); 409 ``cas_conflict``
+        with the current values when the card changed since, nothing written; 403 for a date a person
+        set. An agent names the origin and, unless that is ``legacy_unknown``, the receipt."""
+        body = {"expected_start_after": expected_start_after, "expected_version": int(expected_version),
+                "idempotency_key": idempotency_key}
+        for key, value in (("expected_origin", expected_origin), ("schedule_receipt_id", schedule_receipt_id),
+                           ("reason", reason)):
+            if value is not None:
+                body[key] = value
+        return self.request("POST", f"/tasks/{task_id}/start-after/compare-clear", body) or {}
+
     def statuses(self, project_id: str) -> list[dict]:
         return _items(self.request("GET", f"/projects/{project_id}/statuses"))
 

@@ -1112,7 +1112,7 @@ class MeshEffects(Bench):
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
-        self.assertTrue(mesh.tasks[t["id"]].get("start_after"))
+        self.assertFalse(mesh.tasks[t["id"]].get("start_after"))     # an event wait writes no hold
         self.assertEqual([e["depends_on_task_id"] for e in mesh.edges[t["id"]]], [other["id"]])
         mesh.set_category(other["id"], "done")
         r.tick()
@@ -1154,7 +1154,7 @@ class MeshEffects(Bench):
         r.tick()
         self.assertEqual(len(mesh.created), 1)
         self.assertEqual(mesh.created[0]["assignee_id"], "agent-lead")
-        self.assertTrue(mesh.tasks[t["id"]].get("start_after"))
+        self.assertFalse(mesh.tasks[t["id"]].get("start_after"))     # an event wait writes no hold
 
     def test_ambiguous_decision_create_requires_reconciliation_instead_of_duplicate(self):
         t = task(1)
