@@ -185,7 +185,7 @@ While the wait is open the runner runs `merge_command` (an argv template, no she
 that agent's sessions (so it acts under the lane's identity), and judges the result by a fresh read of
 the merge request, never by the command's text:
 
-- MR state `merged`: the agent is woken once ("MR !56 merged at <sha>: deploy / verify ...").
+- MR state `merged`: the agent is woken once ("MR !56 merged at `<sha>`: deploy / verify ...").
 - The command's last output line is `⏳ WAIT pipeline:<project>#<id> ...` (queued): the agent stays
   asleep. The command is run again when that pipeline or the MR's head pipeline reaches a final
   status, and in any case every `merge_rerun_minutes`; once the wait has been
