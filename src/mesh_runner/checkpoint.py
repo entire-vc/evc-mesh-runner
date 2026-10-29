@@ -10,9 +10,11 @@ tree, the fingerprint and the status hash, and the manifest records which paths 
 oldest format and is replayed in full. A slim bundle's base is resolved in the object store recorded
 at capture (`objects`: a pool slot's is its base clone's, which outlives the slot). Configured
 submodules (empty or populated, one level) are captured with their own bundle/index and replayed
-into the target's private modules directory. Unsupported nested repositories, recursive
-submodules, special files and split indexes fail closed. Checkpoints are
-retained after restore, including failures, for operator recovery.
+into the target's private modules directory. A repository nested in an untracked path (an evidence
+checkout, a cloned fixture, a vendored repo) is opaque data: the directory is stored whole, its own
+`.git` included, and put back byte for byte; its size is capped (`max_nested_bytes`, per repository).
+Unconfigured populated gitlinks, recursive submodules, special files and split indexes fail closed.
+Checkpoints are retained after restore, including failures, for operator recovery.
 """
 from __future__ import annotations
 
@@ -58,6 +60,10 @@ def _run(args, *, timeout=600, input=None, capture_output=False, check=False, **
     return result
 
 
+class CheckpointNestedTooLarge(WorkspaceError):
+    """A repository nested in an untracked path is bigger than the per-repository cap. Retrying cannot help."""
+
+
 # Agent threads can checkpoint different repositories on the same filesystem.
 # Serialize admission through publication/cleanup, including scratch replay,
 # so they do not all spend the same observed free-space budget.
@@ -91,38 +97,59 @@ def atomic_json(path: Path, value: dict) -> None:
     _sync(path.parent)
 
 
-def inventory(root: Path, submodules: tuple = (), excludes: frozenset = frozenset()) -> dict:
-    """Hash contents/modes without following links; reject sockets/devices/nested repos.
+NESTED = 'repo'     # third field of a directory entry that holds a repository of its own (see `inventory`)
+
+
+def nested_repos(tree: dict) -> list:
+    """Roots of the repositories nested in untracked paths, as an inventory marks them."""
+    return sorted(n for n, v in tree.items() if v[0] == 'dir' and len(v) > 2 and v[2] == NESTED)
+
+
+def inventory(root: Path, submodules: tuple = (), excludes: frozenset = frozenset(),
+              nested_limit: int | None = None) -> dict:
+    """Hash contents/modes without following links; reject sockets/devices.
 
     `submodules` lists the worktree paths whose `.git` pointer file is replaced on restore.
     `excludes` lists relative directory paths left out of the snapshot (not walked, not hashed).
+    A directory holding a `.git` of its own (other than a listed submodule) is a nested repository:
+    its entry is marked `['dir', mode, 'repo']` and everything beneath it, its `.git` included, is
+    recorded as plain data. With `nested_limit`, a nested repository whose files add up to more than
+    that many bytes fails before the rest of it is hashed.
     """
     result = {}
     pointers = {f'{p}/.git' for p in submodules}
-    def walk(path: Path):
+    def walk(path: Path, repo: str | None = None, used: list | None = None):
         for child in sorted(path.iterdir()):
             name = child.relative_to(root).as_posix()
-            if name == '.git' or name in excludes:
+            if name in excludes or (name == '.git' and repo is None):
                 continue
             s = child.lstat()
             if name in pointers and stat.S_ISREG(s.st_mode):
                 continue
-            if child.name == '.git':
-                raise WorkspaceError('checkpoint: nested repository unsupported')
             mode = stat.S_IMODE(s.st_mode)
             if stat.S_ISLNK(s.st_mode):
                 result[name] = ['link', mode, os.readlink(child)]
             elif stat.S_ISDIR(s.st_mode):
-                result[name] = ['dir', mode]
-                walk(child)
+                if repo is None and os.path.lexists(child / '.git') and f'{name}/.git' not in pointers:
+                    result[name] = ['dir', mode, NESTED]
+                    walk(child, name, [0])
+                else:
+                    result[name] = ['dir', mode]
+                    walk(child, repo, used)
             elif stat.S_ISREG(s.st_mode):
+                if used is not None:
+                    used[0] += s.st_size
+                    if nested_limit is not None and used[0] > nested_limit:
+                        raise CheckpointNestedTooLarge(
+                            f'checkpoint: nested repository {repo}/ holds more than {nested_limit} bytes '
+                            f'(limit per nested repository); lease retained')
                 h = hashlib.sha256()
                 with child.open('rb') as stream:
                     for block in iter(lambda: stream.read(1024 * 1024), b''):
                         h.update(block)
                 result[name] = ['file', mode, s.st_size, h.hexdigest()]
             else:
-                raise WorkspaceError('checkpoint: special file unsupported')
+                raise WorkspaceError(f'checkpoint: special file unsupported: {name}')
     walk(root)
     return result
 
@@ -174,6 +201,19 @@ def _safe_rel(name: str) -> bool:
     return bool(name) and not p.is_absolute() and '..' not in p.parts and '.git' not in p.parts
 
 
+def _valid_tree_name(name, roots: set) -> bool:
+    """A manifest path stays inside the tree; a `.git` component is allowed only inside a nested repository."""
+    if not isinstance(name, str) or not name or '\0' in name:
+        return False
+    p = Path(name)
+    # canonical relative form only: no absolute path, `..`, `.`, empty or doubled components
+    if p.is_absolute() or '..' in p.parts or not p.parts or name != '/'.join(p.parts):
+        return False
+    if '.git' not in p.parts:
+        return True
+    return any('/'.join(p.parts[:i]) in roots for i in range(1, len(p.parts)))
+
+
 def _submodule_names(source: Path) -> dict:
     """gitlink path -> submodule name, from the worktree .gitmodules (never from config values)."""
     r = _run(['git', '-C', str(source), 'config', '-f', '.gitmodules', '-z',
@@ -188,7 +228,7 @@ def _submodule_names(source: Path) -> dict:
         try:
             names[value.decode('utf-8')] = key.decode('utf-8')[len('submodule.'):-len('.path')]
         except UnicodeDecodeError:
-            raise WorkspaceError('checkpoint: non-UTF8 gitlink path unsupported') from None
+            raise WorkspaceError(f'checkpoint: non-UTF8 gitlink path unsupported: {value!r}') from None
     return names
 
 
@@ -211,7 +251,8 @@ def submodule_plan(source: Path) -> list:
     head_links = {r.split(b'\t', 1)[1] for r in head.stdout.split(b'\0') if r.startswith(b'160000 ')}
     index_links = {r.split(b'\t', 1)[1] for r in records}
     if head_links - index_links:
-        raise WorkspaceError('checkpoint: removed or replaced gitlink unsupported')
+        gone = ', '.join(sorted(l.decode('utf-8', 'replace') for l in head_links - index_links))
+        raise WorkspaceError(f'checkpoint: removed or replaced gitlink unsupported: {gone}')
     if not records:
         return []
     configured = _run(['git', '-C', str(source), 'config',
@@ -230,9 +271,9 @@ def submodule_plan(source: Path) -> list:
         try:
             name = Path(raw_name.decode('utf-8'))
         except UnicodeDecodeError:
-            raise WorkspaceError('checkpoint: non-UTF8 gitlink path unsupported') from None
+            raise WorkspaceError(f'checkpoint: non-UTF8 gitlink path unsupported: {raw_name!r}') from None
         if header.split()[2] != b'0' or name.is_absolute() or '..' in name.parts:
-            raise WorkspaceError('checkpoint: unmerged or unsafe gitlink unsupported')
+            raise WorkspaceError(f'checkpoint: unmerged or unsafe gitlink unsupported: {name.as_posix()}')
         populated = False
         current = source
         for part in name.parts:
@@ -242,16 +283,16 @@ def submodule_plan(source: Path) -> list:
             except FileNotFoundError:
                 break  # absent placeholder, including an absent parent
             if not stat.S_ISDIR(mode):
-                raise WorkspaceError('checkpoint: symlink or non-directory gitlink unsupported')
+                raise WorkspaceError(f'checkpoint: symlink or non-directory gitlink unsupported: {name.as_posix()}')
         else:
             populated = any(current.iterdir())
         if not metadata:
             if populated:
-                raise WorkspaceError('checkpoint: populated submodule unsupported')
+                raise WorkspaceError(f'checkpoint: populated submodule unsupported: {name.as_posix()}')
             continue
         sub = name.as_posix()
         if sub not in names or not _safe_rel(names[sub]) or '.git' in Path(sub).parts:
-            raise WorkspaceError('checkpoint: configured submodule metadata unsupported')
+            raise WorkspaceError(f'checkpoint: configured submodule metadata unsupported: {sub}')
         plan.append({'path': sub, 'name': names[sub], 'populated': populated,
                      'gitdir': os.path.lexists(modules / names[sub])})
     if not metadata:
@@ -260,9 +301,10 @@ def submodule_plan(source: Path) -> list:
     known = {Path(e['name']).parts[0] for e in plan}
     if os.path.lexists(modules):
         if modules.is_symlink() or not modules.is_dir():
-            raise WorkspaceError('checkpoint: configured submodule metadata unsupported')
-        if any(child.name not in known for child in modules.iterdir()):
-            raise WorkspaceError('checkpoint: configured submodule metadata unsupported')
+            raise WorkspaceError(f'checkpoint: configured submodule metadata unsupported: {modules}')
+        stray = sorted(child.name for child in modules.iterdir() if child.name not in known)
+        if stray:
+            raise WorkspaceError(f"checkpoint: configured submodule metadata unsupported: {modules}/{stray[0]}")
     _check_locks(source, modules, plan)
     for e in plan:
         gd = modules / e['name']
@@ -272,27 +314,27 @@ def submodule_plan(source: Path) -> list:
                 if part == modules.parent:
                     break
                 if part.is_symlink():
-                    raise WorkspaceError('checkpoint: symlinked submodule gitdir unsupported')
+                    raise WorkspaceError(f"checkpoint: symlinked submodule gitdir unsupported: {e['path']}")
             if not gd.is_dir() or os.path.lexists(gd / 'modules'):
-                raise WorkspaceError('checkpoint: recursive submodule unsupported')
+                raise WorkspaceError(f"checkpoint: recursive submodule unsupported: {e['path']}")
         if e['populated']:
             pointer = wt / '.git'
             if not e['gitdir'] or pointer.is_symlink() or not pointer.is_file() or pointer.stat().st_size > 4096:
-                raise WorkspaceError('checkpoint: populated submodule unsupported')
+                raise WorkspaceError(f"checkpoint: populated submodule unsupported: {e['path']}")
             text = pointer.read_text(errors='surrogateescape')
             if not text.startswith('gitdir: ') or '\n' in text.strip():
-                raise WorkspaceError('checkpoint: populated submodule unsupported')
+                raise WorkspaceError(f"checkpoint: populated submodule unsupported: {e['path']}")
             if os.path.realpath(wt / text[len('gitdir: '):].strip()) != os.path.realpath(gd):
-                raise WorkspaceError('checkpoint: submodule gitdir outside own modules unsupported')
+                raise WorkspaceError(f"checkpoint: submodule gitdir outside own modules unsupported: {e['path']}")
             inner = _run(['git', '-C', str(wt), 'ls-files', '--stage', '-z'], capture_output=True)
             if inner.returncode:
-                raise WorkspaceError('checkpoint: cannot inspect submodule')
+                raise WorkspaceError(f"checkpoint: cannot inspect submodule: {e['path']}")
             if any(r.startswith(b'160000 ') for r in inner.stdout.split(b'\0')):
-                raise WorkspaceError('checkpoint: recursive submodule unsupported')
+                raise WorkspaceError(f"checkpoint: recursive submodule unsupported: {e['path']}")
             if _gitdir(gd, 'rev-parse', '--verify', '-q', 'HEAD', check=False) == '':
-                raise WorkspaceError('checkpoint: unborn submodule unsupported')
+                raise WorkspaceError(f"checkpoint: unborn submodule unsupported: {e['path']}")
         elif e['gitdir'] and _gitdir(gd, 'rev-parse', '--verify', '-q', 'HEAD', check=False) == '':
-            raise WorkspaceError('checkpoint: unborn submodule unsupported')
+            raise WorkspaceError(f"checkpoint: unborn submodule unsupported: {e['path']}")
     return plan
 
 
@@ -437,8 +479,10 @@ def find_excludes(source: Path, names: tuple) -> list:
             if child.name == '.git' or child.is_symlink() or not child.is_dir():
                 continue
             name = child.relative_to(source).as_posix()
-            if name in tracked and (source / name / '.git').exists():
-                continue  # populated submodule: its tracked files live in its own repository
+            if (source / name / '.git').exists():
+                # A populated submodule keeps its tracked files in its own repository; a nested repository
+                # is stored whole (see `inventory`), so nothing inside it is left out as regenerable.
+                continue
             if child.name in names and name not in tracked:
                 found.append(name)
             else:
@@ -473,7 +517,8 @@ def _clear_tree(root: Path) -> None:
             child.unlink()
 
 
-def fingerprint(path: Path, submodules: list | None = None, excludes: tuple = (), ignored: tuple = ()) -> dict:
+def fingerprint(path: Path, submodules: list | None = None, excludes: tuple = (), ignored: tuple = (),
+                nested_limit: int | None = None) -> dict:
     # Untracked-but-not-ignored excluded dirs show up in `status`; leave them out of it too.
     spec = ['--', '.', *(f':(exclude,literal){e}' for e in excludes)] if excludes else []
     def raw(*args):
@@ -486,7 +531,8 @@ def fingerprint(path: Path, submodules: list | None = None, excludes: tuple = ()
               'staged': raw('diff', '--cached', '--binary', '--no-ext-diff'),
               'unstaged': raw('diff', '--binary', '--no-ext-diff'),
               'status': raw('status', '--porcelain=v1', '-z', '--untracked-files=all', *spec),
-              'tree': inventory(path, tuple(e['path'] for e in subs if e['populated']), frozenset((*excludes, *ignored)))}
+              'tree': inventory(path, tuple(e['path'] for e in subs if e['populated']), frozenset((*excludes, *ignored)),
+                                nested_limit)}
     if subs:
         modules = _modules_dir(path)
         result['submodules'] = {e['path']: _submodule_state(path, e, modules) for e in subs}
@@ -494,6 +540,7 @@ def fingerprint(path: Path, submodules: list | None = None, excludes: tuple = ()
 
 
 MAX_UNTRACKED_BYTES = 16 * 1024 * 1024    # an untracked file above this is not worth a snapshot slot
+MAX_NESTED_REPO_BYTES = 256 * 1024 * 1024   # a repository nested in an untracked path is stored whole, up to this
 
 
 def _status_entries(source: Path) -> list:
@@ -570,6 +617,9 @@ def _delta_plan(source: Path, before: dict, excludes: list, ignored: list) -> di
         parts = Path(item.decode('utf-8', 'surrogateescape')).parts
         tracked_dirs.update('/'.join(parts[:i]) for i in range(1, len(parts) + 1))   # a gitlink is a dir too
     tree = before['tree']
+    # A nested repository is opaque: git lists it as one directory, so take every file beneath it.
+    for root in nested_repos(tree):
+        files.update(k for k, v in tree.items() if k.startswith(root + '/') and v[0] in ('file', 'link'))
     dirs = sorted(n for n, v in tree.items() if v[0] == 'dir' and n not in tracked_dirs
                   and not any(k.startswith(n + '/') for k in tree))
     return {'files': sorted(files), 'deleted': sorted(deleted), 'dirs': dirs}
@@ -629,8 +679,9 @@ def _alternate(gitdir_objects: Path, reference: Path) -> None:
 class Checkpoints:
     def __init__(self, root: Path, reserve_bytes: int = 512 * 1024 * 1024, *, capture_min_free_bytes: int = 0,
                  exclude_names: tuple = DEFAULT_EXCLUDE_NAMES, slim: bool = True,
-                 max_untracked_bytes: int = MAX_UNTRACKED_BYTES):
+                 max_untracked_bytes: int = MAX_UNTRACKED_BYTES, max_nested_bytes: int | None = None):
         self.root = root
+        self.max_nested_bytes = MAX_NESTED_REPO_BYTES if max_nested_bytes is None else max_nested_bytes
         self.slim = slim
         self.max_untracked_bytes = max_untracked_bytes
         self.exclude_names = tuple(exclude_names)
@@ -657,7 +708,8 @@ class Checkpoints:
         try:
             return self._create(key, source, metadata, slim=True)
         except WorkspaceError as e:
-            if 'insufficient disk' in str(e) or 'source changed' in str(e) or 'unsupported' in str(e):
+            if (isinstance(e, CheckpointNestedTooLarge) or 'insufficient disk' in str(e)
+                    or 'source changed' in str(e) or 'unsupported' in str(e)):
                 raise
             # The compact form did not replay to the same state (filters, skip-worktree, a
             # missing base): keep the full form, which is always self-contained.
@@ -678,7 +730,7 @@ class Checkpoints:
         if slim:
             ignored = find_ignored(source, excludes)
             excludes += find_large_untracked(source, [*excludes, *ignored], self.max_untracked_bytes)
-        before = fingerprint(source, plan, tuple(excludes), tuple(ignored))
+        before = fingerprint(source, plan, tuple(excludes), tuple(ignored), self.max_nested_bytes)
         delta = _delta_plan(source, before, excludes, ignored) if slim and not plan else None
         if submodule_plan(source) != plan:
             raise WorkspaceError('checkpoint: source changed during capture; lease retained')
@@ -748,7 +800,7 @@ class Checkpoints:
             # scratch allocation; failure removes only this pending copy.
             self._budget(self.root, size + 2 * object_size, self.capture_min_free_bytes)
             self.verify(pending)
-            if submodule_plan(source) != plan or fingerprint(source, plan, tuple(excludes), tuple(ignored)) != before:
+            if submodule_plan(source) != plan or fingerprint(source, plan, tuple(excludes), tuple(ignored), self.max_nested_bytes) != before:
                 raise WorkspaceError('checkpoint: source changed during capture; lease retained')
             # fsync all regular files before publishing the checkpoint directory.
             for p in pending.rglob('*'):
@@ -835,8 +887,17 @@ class Checkpoints:
                 if not (_safe_rel(entry['path']) and _safe_rel(entry['name'])
                         and isinstance(entry['populated'], bool) and isinstance(entry['gitdir'], bool)):
                     raise ValueError()
-            # No names supplied by a manifest may escape the tree.
-            for name in [*data['fingerprint']['tree'], *data.get('excludes', [])]:
+            # No names supplied by a manifest may escape the tree; a `.git` component is only
+            # legitimate beneath a nested repository's root, which itself has none.
+            tree = data['fingerprint']['tree']
+            roots = set(nested_repos(tree))
+            if any(not _safe_rel(r) for r in roots):
+                raise ValueError()
+            delta = data.get('delta') or {}
+            names = [*tree, *delta.get('files', []), *delta.get('dirs', []), *delta.get('deleted', [])]
+            if not all(_valid_tree_name(n, roots) for n in names):
+                raise ValueError()
+            for name in data.get('excludes', []):
                 p = Path(name)
                 if not isinstance(name, str) or p.is_absolute() or '..' in p.parts or '.git' in p.parts:
                     raise ValueError()
@@ -956,12 +1017,21 @@ class Checkpoints:
     def _overlay_delta(tree: Path, target: Path, full: dict, delta: dict) -> None:
         """HEAD's files from the object store (already fetched), then the delta over them."""
         git(target, 'checkout-index', '--all', '--force')
-        for name in delta['deleted']:
+        root = os.path.realpath(target)
+        def inside(name: str) -> Path:
+            # Defence in depth behind `read()`: whatever is written or removed lies under the restore root
+            # (the last component may itself be a link, which is acted on, never followed).
             p = target / name
+            parent = os.path.realpath(p.parent)
+            if parent != root and not parent.startswith(root + os.sep):
+                raise WorkspaceError(f'checkpoint: delta path outside the restore root: {name}')
+            return p
+        for name in delta['deleted']:
+            p = inside(name)
             if os.path.lexists(p) and not p.is_dir():
                 p.unlink()
         for name in sorted(delta['files']):
-            src, out = tree / name, target / name
+            src, out = tree / name, inside(name)
             out.parent.mkdir(parents=True, exist_ok=True)
             if os.path.lexists(out):
                 if out.is_dir() and not out.is_symlink():
@@ -973,7 +1043,7 @@ class Checkpoints:
             else:
                 shutil.copy2(src, out)
         for name in delta['dirs']:
-            (target / name).mkdir(parents=True, exist_ok=True)
+            inside(name).mkdir(parents=True, exist_ok=True)
         # Checkout creates files with this process's umask; the source had its own. Put the recorded
         # modes back (files first, directories deepest-first so a read-only parent is closed last).
         for kind in ('file', 'link', 'dir'):
@@ -999,19 +1069,19 @@ class Checkpoints:
             gd = modules / entry['name']
             if os.path.lexists(gd):
                 if any(c.is_symlink() for c in (modules, *[gd.parents[k] for k in range(len(Path(entry['name']).parts) - 1)], gd)):
-                    raise WorkspaceError('checkpoint: symlinked submodule gitdir in target unsupported')
+                    raise WorkspaceError(f"checkpoint: symlinked submodule gitdir in target unsupported: {entry['path']}")
                 have = _submodule_state(target, {**entry, 'populated': False}, modules)
                 want = data['fingerprint']['submodules'][entry['path']]
                 if any(have.get(k) != want.get(k) for k in ('gitdir', 'head', 'branch', 'refs')):
                     if any(os.path.lexists(gd / lock) for lock in ('index.lock', 'HEAD.lock')):
-                        raise WorkspaceError('checkpoint: active git writer in target submodule; lease retained')
+                        raise WorkspaceError(f"checkpoint: active git writer in target submodule {entry['path']}; lease retained")
                     why = _stale_submodule_work(target, entry, gd)
                     if why:
-                        raise WorkspaceError(f'checkpoint: submodule gitdir differs in target ({why}); lease retained')
+                        raise WorkspaceError(f"checkpoint: submodule gitdir differs in target ({why}): {entry['path']}; lease retained")
                     stale.append(entry)
                     continue
                 if any(os.path.lexists(gd / lock) for lock in ('index.lock', 'HEAD.lock')):
-                    raise WorkspaceError('checkpoint: active git writer in target submodule; lease retained')
+                    raise WorkspaceError(f"checkpoint: active git writer in target submodule {entry['path']}; lease retained")
                 self._require_same_submodule_work(checkpoint, target, entry, data, gd)
         return stale
 
@@ -1103,7 +1173,7 @@ class Checkpoints:
             now = {k: v for k, v in inventory(target, roots, frozenset(data.get('excludes', []))).items() if k.startswith(prefix)}
             differs = differs or now != {k: v for k, v in data['fingerprint']['tree'].items() if k.startswith(prefix)}
         if differs:
-            raise WorkspaceError('checkpoint: submodule work in target differs from checkpoint; lease retained')
+            raise WorkspaceError(f"checkpoint: submodule work in target differs from checkpoint: {entry['path']}; lease retained")
 
     def _replay_submodule(self, src: Path, target: Path, modules: Path, entry: dict, data: dict) -> None:
         gd = modules / entry['name']
@@ -1124,7 +1194,7 @@ class Checkpoints:
             _gitdir(gd, 'config', 'core.bare', 'false')
             _gitdir(gd, 'config', 'core.worktree', os.path.relpath(os.path.realpath(wt), os.path.realpath(gd)))
         if any(os.path.lexists(gd / lock) for lock in ('index.lock', 'HEAD.lock')):
-            raise WorkspaceError('checkpoint: active git writer in target submodule; lease retained')
+            raise WorkspaceError(f"checkpoint: active git writer in target submodule {entry['path']}; lease retained")
         if (src / 'index').is_file():
             tmp = gd / 'runner-checkpoint-index.tmp'
             shutil.copy2(src / 'index', tmp)
@@ -1134,7 +1204,7 @@ class Checkpoints:
         if entry['populated']:
             pointer = target / entry['path'] / '.git'
             if pointer.is_symlink():
-                raise WorkspaceError('checkpoint: unsafe submodule pointer')
+                raise WorkspaceError(f"checkpoint: unsafe submodule pointer: {entry['path']}")
             tmp = pointer.with_name('.git.runner-tmp')
             tmp.write_text('gitdir: ' + os.path.relpath(os.path.realpath(gd), os.path.realpath(pointer.parent)) + '\n')
             os.replace(tmp, pointer)

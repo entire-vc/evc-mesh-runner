@@ -449,10 +449,251 @@ class Checkpoint(unittest.TestCase):
         self.assertEqual((target / 'README').read_text(), 'new work')
         self.assertEqual(self.pool._checkpoint_rows('attempt')[0]['phase'], 'released')
 
-    def test_nested_repo_fails_closed(self):
-        (self.source / 'nested').mkdir()
-        git(self.source / 'nested', 'init', '--quiet')
-        with self.assertRaisesRegex(WorkspaceError, 'nested'):
+    def test_special_file_fails_closed_and_names_the_path(self):
+        os.mkfifo(self.source / 'pipe')
+        with self.assertRaisesRegex(WorkspaceError, 'special file unsupported: pipe'):
+            self.pool.suspend('attempt', {}, writer_stopped=True)
+        self.assertTrue(self.pool.full('app'))
+
+    # -- repositories nested in untracked paths are opaque data ----------------------------------
+
+    def _nested_repos(self, p):
+        """An evidence checkout with a commit, a staged edit, an unstaged edit, an untracked file, an empty
+        directory and a build directory; and a vendored copy whose `.git` is a pointer file."""
+        ev = p / '.task-evidence' / 'job-1' / 'src'
+        ev.mkdir(parents=True)
+        ident = ('-c', 'user.name=t', '-c', 'user.email=t@t')
+        git(ev, 'init', '--quiet')
+        (ev / 'main.py').write_text('print(1)\n')
+        (ev / 'var').mkdir()
+        (ev / 'var' / 'tracked.txt').write_text('tracked inside a cache-named dir')
+        git(ev, 'add', '.')
+        git(ev, *ident, 'commit', '-qm', 'first')
+        (ev / 'main.py').write_text('print(2)\n')
+        git(ev, 'add', 'main.py')
+        (ev / 'main.py').write_text('print(3)\n')
+        (ev / 'new.txt').write_bytes(b'untracked\0inside')
+        (ev / 'node_modules' / 'dep').mkdir(parents=True)
+        (ev / 'node_modules' / 'dep' / 'index.js').write_text('module.exports = 1')
+        (ev / 'empty').mkdir()
+        (ev / 'run.sh').write_text('#!/bin/sh\n')
+        (ev / 'run.sh').chmod(0o755)
+        (p / '.task-evidence' / 'note.txt').write_text('sibling of the nested repository')
+        vend = p / 'vendored' / 'lib'
+        vend.mkdir(parents=True)
+        (vend / '.git').write_text('gitdir: /nonexistent/elsewhere\n')
+        (vend / 'lib.c').write_text('int x;\n')
+        return ev, vend
+
+    @staticmethod
+    def _bytes_of(path):
+        """Every entry beneath `path`, `.git` included: kind, mode and content or link target."""
+        out = {}
+        for q in sorted(path.rglob('*')):
+            rel = q.relative_to(path).as_posix()
+            m = q.lstat().st_mode & 0o7777
+            if q.is_symlink():
+                out[rel] = ('link', m, os.readlink(q))
+            elif q.is_dir():
+                out[rel] = ('dir', m)
+            else:
+                out[rel] = ('file', m, q.read_bytes())
+        return out
+
+    def test_untracked_nested_repo_round_trips_through_suspend_and_restore(self):
+        p = self.source
+        (p / 'README').write_bytes(b'staged\0binary')
+        git(p, 'add', 'README')
+        (p / 'README').write_bytes(b'unstaged\0binary')
+        ev, vend = self._nested_repos(p)
+        inner = {'status': git(ev, 'status', '--porcelain=v1', '--untracked-files=all'),   # may refresh its index
+                 'diff': git(ev, 'diff', '--cached'), 'log': git(ev, 'log', '--format=%H %s')}
+        keep = {'ev': self._bytes_of(ev), 'vend': self._bytes_of(vend),
+                'note': (p / '.task-evidence' / 'note.txt').read_bytes()}
+        self.assertIn('?? new.txt', inner['status'])
+        outer = {'staged': git(p, 'diff', '--cached', '--stat'), 'status': git(p, 'status', '--porcelain=v1')}
+        expected = fingerprint(p)
+        self.assertEqual([n for n in expected['tree'] if expected['tree'][n][-1:] == ['repo']],
+                         ['.task-evidence/job-1/src', 'vendored/lib'])
+        self.pool.suspend('attempt', {'session_id': 'old', 'wait': {'target': 'card'}}, writer_stopped=True)
+        self.assertFalse(self.pool.full('app'))
+        other = self.pool.lease('other', 'app')
+        self.assertFalse((other / '.task-evidence').exists())
+        self.pool.release('other')
+        paths, _ = self.pool.restore('attempt')
+        back = Path(paths[0])
+        self.assertEqual(fingerprint(back), expected)
+        self.assertEqual(self._bytes_of(back / '.task-evidence' / 'job-1' / 'src'), keep['ev'])
+        self.assertEqual(self._bytes_of(back / 'vendored' / 'lib'), keep['vend'])
+        self.assertEqual((back / '.task-evidence' / 'note.txt').read_bytes(), keep['note'])
+        ev2 = back / '.task-evidence' / 'job-1' / 'src'
+        self.assertEqual(git(ev2, 'status', '--porcelain=v1', '--untracked-files=all'), inner['status'])
+        self.assertEqual(git(ev2, 'diff', '--cached'), inner['diff'])
+        self.assertEqual(git(ev2, 'log', '--format=%H %s'), inner['log'])
+        self.assertEqual(git(ev2, 'fsck', '--no-dangling', check=False), '')
+        self.assertEqual((back / 'README').read_bytes(), b'unstaged\0binary')
+        self.assertEqual(git(back, 'diff', '--cached', '--stat'), outer['staged'])
+        self.assertEqual(git(back, 'status', '--porcelain=v1'), outer['status'])
+
+    def test_untracked_nested_repo_round_trips_in_the_slim_and_the_full_form(self):
+        p = self.source
+        ev, vend = self._nested_repos(p)
+        status = git(ev, 'status', '--porcelain=v1', '--untracked-files=all')    # may refresh its index: before the copy
+        want = {'ev': self._bytes_of(ev), 'vend': self._bytes_of(vend)}
+        for slim in (True, False):
+            with self.subTest(slim=slim):
+                cp = Checkpoints(self.root / f'cp-{slim}', slim=slim)
+                checkpoint = cp.create('n1', p, {})
+                data = cp.read(checkpoint)
+                self.assertEqual(('delta' in data), slim)
+                self.assertTrue((checkpoint / 'tree' / '.task-evidence' / 'job-1' / 'src' / '.git' / 'HEAD').is_file())
+                target = self.root / f'target-{slim}'
+                target.mkdir()
+                git(target, 'init', '--quiet')
+                cp.restore(checkpoint, target)
+                self.assertEqual(self._bytes_of(target / '.task-evidence' / 'job-1' / 'src'), want['ev'])
+                self.assertEqual(self._bytes_of(target / 'vendored' / 'lib'), want['vend'])
+                self.assertEqual(fingerprint(target, None, tuple(data['excludes']), tuple(data.get('ignored', []))),
+                                 data['fingerprint'])
+                self.assertEqual(git(target / '.task-evidence' / 'job-1' / 'src', 'status', '--porcelain=v1',
+                                     '--untracked-files=all'), status)
+
+    def test_nested_repo_replaces_what_a_reused_slot_left_behind(self):
+        p = self.source
+        ev, _ = self._nested_repos(p)
+        cp = Checkpoints(self.root / 'cp')
+        checkpoint = cp.create('n2', p, {})
+        target = self.root / 'dirty-target'
+        target.mkdir()
+        git(target, 'init', '--quiet')
+        (target / '.task-evidence' / 'job-1' / 'src').mkdir(parents=True)
+        (target / '.task-evidence' / 'job-1' / 'src' / 'stale.txt').write_text('left by an earlier lease')
+        cp.restore(checkpoint, target)
+        self.assertFalse((target / '.task-evidence' / 'job-1' / 'src' / 'stale.txt').exists())
+        self.assertEqual(self._bytes_of(target / '.task-evidence' / 'job-1' / 'src'), self._bytes_of(ev))
+
+    def test_nested_repo_over_the_cap_is_refused_naming_the_path(self):
+        p = self.source
+        self._nested_repos(p)
+        cp = Checkpoints(self.root / 'cp', max_nested_bytes=1000)
+        with self.assertRaisesRegex(WorkspaceError, r'nested repository (\.task-evidence/job-1/src|vendored/lib)/ holds more than 1000 bytes'):
+            cp.create('big', p, {})
+        self.assertEqual(sorted(q.name for q in (self.root / 'cp').iterdir()), [])    # nothing half-written
+        # the same worktree fits under a roomier cap
+        self.assertTrue(Checkpoints(self.root / 'cp2', max_nested_bytes=10_000_000).create('fits', p, {}).is_dir())
+
+    def test_nested_repo_over_the_cap_keeps_the_lease_through_the_pool(self):
+        p = self.source
+        self._nested_repos(p)
+        with patch('mesh_runner.checkpoint.MAX_NESTED_REPO_BYTES', 1000):
+            with self.assertRaisesRegex(WorkspaceError, 'nested repository .*/ holds more than 1000 bytes.*lease retained'):
+                self.pool.suspend('attempt', {}, writer_stopped=True)
+        self.assertTrue(self.pool.full('app'))
+        self.assertTrue((p / '.task-evidence' / 'job-1' / 'src' / '.git').exists())
+
+    def test_cap_failure_is_not_retried_as_a_full_capture(self):
+        self._nested_repos(self.source)
+        cp = Checkpoints(self.root / 'cp', max_nested_bytes=1000)
+        with patch.object(Checkpoints, '_create', wraps=cp._create) as created:
+            with self.assertRaises(WorkspaceError):
+                cp.create('big', self.source, {})
+        self.assertEqual(created.call_count, 1)
+
+    def test_manifest_cannot_smuggle_a_dot_git_path_outside_a_nested_repository(self):
+        p = self.source
+        self._nested_repos(p)
+        cp = Checkpoints(self.root / 'cp')
+        checkpoint = cp.create('n3', p, {})
+        manifest = checkpoint / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        data['fingerprint']['tree']['.task-evidence/job-1/src'] = ['dir', 0o755]     # no longer marked as a repository
+        manifest.write_text(json.dumps(data))
+        with self.assertRaisesRegex(WorkspaceError, 'invalid manifest'):
+            cp.read(checkpoint)
+        data['fingerprint']['tree']['.task-evidence/job-1/src'] = ['dir', 0o755, 'repo']
+        data['fingerprint']['tree']['.git/hooks/post-checkout'] = ['file', 0o755, 1, 'x']
+        manifest.write_text(json.dumps(data))
+        with self.assertRaisesRegex(WorkspaceError, 'invalid manifest'):
+            cp.read(checkpoint)
+
+    def _tampered(self, cp, key, mutate):
+        p = self.source
+        (p / 'gone.txt').write_text('tracked')
+        git(p, 'add', 'gone.txt')
+        git(p, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'tracked file')
+        (p / 'gone.txt').unlink()                    # a deletion lands in delta['deleted']
+        self._nested_repos(p)
+        checkpoint = cp.create(key, p, {'base_sha': git(p, 'rev-parse', 'HEAD~1')})
+        manifest = checkpoint / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        self.assertEqual(data['delta']['deleted'], ['gone.txt'])
+        mutate(data)
+        manifest.write_text(json.dumps(data))
+        return checkpoint
+
+    def test_delta_deletion_names_are_validated_like_files_and_dirs(self):
+        cp = Checkpoints(self.root / 'cp')
+        bad = ['../../outside', '/etc/hostname', '.git/config', 'sub/.git/config', '.task-evidence/.git/config',
+               'a//b', './x', 'a/./b', 'trailing/', '', 'x\0y', '.task-evidence/job-1/src/../../../escape']
+        checkpoint = self._tampered(cp, 'd1', lambda d: None)
+        manifest = checkpoint / 'manifest.json'
+        good = json.loads(manifest.read_text())
+        for name in bad:
+            for field in ('deleted', 'files', 'dirs'):
+                with self.subTest(name=name, field=field):
+                    data = json.loads(json.dumps(good))
+                    data['delta'][field].append(name)
+                    manifest.write_text(json.dumps(data))
+                    with self.assertRaisesRegex(WorkspaceError, 'invalid manifest'):
+                        cp.read(checkpoint)
+
+    def test_deletion_beneath_a_nested_repository_is_accepted_and_replays(self):
+        cp = Checkpoints(self.root / 'cp')
+        checkpoint = self._tampered(cp, 'd2', lambda d: d['delta']['deleted'].append('.task-evidence/job-1/src/.git/gone'))
+        cp.read(checkpoint)
+        target = self._restore_elsewhere(cp, checkpoint)
+        self.assertFalse((target / 'gone.txt').exists())
+        self.assertTrue((target / '.task-evidence' / 'job-1' / 'src' / '.git' / 'HEAD').is_file())
+        self.assertTrue((target / '.git' / 'HEAD').is_file())
+
+    def test_overlay_refuses_a_path_outside_the_restore_root_even_if_validation_is_bypassed(self):
+        outside = self.root / 'outside.txt'
+        outside.write_text('keep')
+        target = self.root / 'overlay-target'
+        target.mkdir()
+        git(target, 'init', '--quiet')
+        tree = self.root / 'overlay-tree'
+        tree.mkdir()
+        (target / 'link').symlink_to(self.root)         # a link inside the root that leads out of it
+        for field, name in (('deleted', '../outside.txt'), ('deleted', 'link/outside.txt'),
+                            ('files', 'link/outside.txt'), ('dirs', 'link/newdir')):
+            with self.subTest(field=field, name=name):
+                delta = {'files': [], 'deleted': [], 'dirs': []}
+                delta[field].append(name)
+                with self.assertRaisesRegex(WorkspaceError, 'outside the restore root'):
+                    Checkpoints._overlay_delta(tree, target, {}, delta)
+                self.assertEqual(outside.read_text(), 'keep')
+                self.assertFalse((self.root / 'newdir').exists())
+        self.assertTrue((target / '.git' / 'config').is_file())
+
+    def test_symlinked_submodule_gitdir_at_capture_names_the_submodule(self):
+        self.add_submodule()
+        gd = _modules(self.source) / 'materialized'
+        moved = self.root / 'moved-gd'
+        gd.rename(moved)
+        os.symlink(moved, gd)
+        with self.assertRaisesRegex(WorkspaceError, 'symlinked submodule gitdir unsupported: materialized$'):
+            submodule_plan(self.source)
+        with self.assertRaisesRegex(WorkspaceError, 'symlinked submodule gitdir unsupported: materialized$'):
+            self.pool.suspend('attempt', {}, writer_stopped=True)
+        self.assertTrue(self.pool.full('app'))
+
+    def test_populated_gitlink_without_submodule_metadata_still_fails_closed_and_names_the_path(self):
+        vend = self.add_gitlink('infra/vendored')
+        vend.mkdir(parents=True)
+        git(vend, 'init', '--quiet')
+        (vend / 'f').write_text('x')
+        with self.assertRaisesRegex(WorkspaceError, 'populated submodule unsupported: infra/vendored'):
             self.pool.suspend('attempt', {}, writer_stopped=True)
         self.assertTrue(self.pool.full('app'))
 
@@ -987,7 +1228,7 @@ class Checkpoint(unittest.TestCase):
         target = self._stale_target('never')
         gd = _modules(target) / 'never'
         moved = self.root / 'moved-gd'; gd.rename(moved); os.symlink(moved, gd)
-        with self.assertRaisesRegex(WorkspaceError, 'symlinked submodule gitdir'):
+        with self.assertRaisesRegex(WorkspaceError, 'symlinked submodule gitdir in target unsupported: never$'):
             checkpoints.restore(cp, target)
         self.assertTrue(gd.is_symlink())
 
@@ -1005,7 +1246,7 @@ class Checkpoint(unittest.TestCase):
         real = self.root / 'external-gitdir'
         gd.rename(real); os.symlink(real, gd)
         index = (real / 'index').read_bytes()
-        with self.assertRaisesRegex(WorkspaceError, 'symlinked submodule gitdir'):
+        with self.assertRaisesRegex(WorkspaceError, 'symlinked submodule gitdir in target unsupported: materialized$'):
             checkpoints.restore(cp, target)
         self.assertEqual((real / 'index').read_bytes(), index)
 

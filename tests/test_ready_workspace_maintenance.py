@@ -1,6 +1,7 @@
 """Lease maintenance runs independently of ready admission and its early holds."""
 import datetime as dt
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -122,7 +123,7 @@ class ReadyMaintenance(Bench):
                 if refusal == 'disabled':
                     self.agent.workspace_wait_release_minutes = 0
                 if refusal == 'inventory':
-                    (Path(a.workspaces[0]) / 'nested' / '.git').mkdir(parents=True)
+                    os.mkfifo(Path(a.workspaces[0]) / 'unsupported.fifo')
                 if refusal in ('future-clock', 'other-attempt'):
                     r.store.mark(a.agent, a.task_id, 'workspace_ready_hold', json.dumps({
                         'attempt': 'foreign' if refusal == 'other-attempt' else a.id,

@@ -170,9 +170,9 @@ class WorkspaceRequests(Bench):
         paths = [str(first), str(second)]
         for path in (first, second):
             (path / 'README').write_text('preserve ' + path.name)
-        # Actual unsupported nested metadata, no mocked state/pool/checkpoint.
-        nested = second / 'nested' / '.git'
-        nested.mkdir(parents=True)
+        # Actual unsupported state (a FIFO is not snapshotable), no mocked state/pool/checkpoint.
+        fifo = second / 'unsupported.fifo'
+        os.mkfifo(fifo)
         r.store.update(a, workspaces=paths)
         r.mesh.tasks[a.task_id]['human_gate'] = True
         r.mesh.tasks[a.task_id]['labels'] = ['no-runner']
@@ -183,8 +183,7 @@ class WorkspaceRequests(Bench):
         self.assertEqual(r.pool.leased_to(a.id), [str(second)])
         self.assertEqual((second / 'README').read_text(), 'preserve ' + second.name)
         self.assertFalse(r.mesh.checkouts)
-        nested.rmdir()
-        nested.parent.rmdir()
+        fifo.unlink()
         restarted = self.runner(r.mesh)
         restarted.refresh_me()
         self.assertEqual(restarted.store.get(a.id).state, 'waiting')

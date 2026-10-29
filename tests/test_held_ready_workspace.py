@@ -1,6 +1,7 @@
 """Held ready attempts return only their own verified Git leases."""
 import datetime as dt
 import json
+import os
 from pathlib import Path
 from contextlib import nullcontext
 from unittest.mock import patch
@@ -119,7 +120,7 @@ class HeldReady(Bench):
                 if refusal == 'disabled':
                     self.agent.workspace_wait_release_minutes = 0
                 if refusal == 'inventory':
-                    (source/'nested'/'.git').mkdir(parents=True)
+                    os.mkfifo(source/'unsupported.fifo')
                 target = ('mesh_runner.runner.group_alive' if refusal == 'writer' else
                           'mesh_runner.checkpoint.shutil.disk_usage')
                 value = True if refusal == 'writer' else type('D', (), {'free': 0})()
