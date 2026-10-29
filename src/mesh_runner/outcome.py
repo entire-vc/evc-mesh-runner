@@ -9,7 +9,7 @@ the attempt started and takes the last declaration line in it:
     ⏳ WAIT merge:<group>/<project>!<iid> after=<sha>      the runner runs the merge gate (opt-in)
     ⏳ WAIT card:#<8hex>                                   another task closes
     ⏳ WAIT decision:@<agent>                              another agent answers
-    ⏳ WAIT 30m   (or 2h, 2026-10-20, 2026-10-20T06:00Z)  time passes
+    ⏳ WAIT <absoluteISO>: external=<reference> source=<https-url|card:#8hex> <why>
     ⏳ WAIT pipeline:<proj>#<id> until=success|change     a changed/successful pipeline (``after=`` optional)
     ↻ NEXT[: note]                                         continue right away
     ❓ Blocking @<person>: <question>                      a person must decide (Mesh raises the gate)
@@ -53,27 +53,29 @@ _MERGE = re.compile(
 _MERGE_HEAD = re.compile(_WAIT_HEAD + r"merge:")
 _CARD = re.compile(_WAIT_HEAD + r"card:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _DECISION = re.compile(_WAIT_HEAD + r"decision:@(?P<handle>[\w.\-]+)" + _EXPLANATION)
-_DURATION = re.compile(
-    _WAIT_HEAD + r"(?P<n>\d+)\s*(?P<unit>m|min|мин|h|ч)\b" + _EXPLANATION, re.IGNORECASE)
-_ABSOLUTE = re.compile(
-    _WAIT_HEAD + r"(?P<when>\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:?\d\d)?)?)" + _EXPLANATION)
+# Time is a structured assertion about a specific external schedule, not a retry interval.
+# Any other WAIT is a time wait: `2h`, `tomorrow`, `in 2 hours`, `poll:` all get the time guidance.
+_TIME_HEAD = re.compile(_WAIT_HEAD + r"(?!(?:pipeline|mr|merge|card|decision)\s*:)\S", re.IGNORECASE)
+_EXTERNAL_TIME = re.compile(
+    _WAIT_HEAD + r"(?P<when>\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d)):"
+    r"\s+external=(?P<external>[A-Za-z0-9][A-Za-z0-9._:/@#%+!?=~-]{0,255})"
+    r"\s+source=(?P<source>https://[^\s]+|card:#[0-9a-f]{8})\s+(?P<why>\S.*)$")
 _NEXT = re.compile(r"^\s*↻\s*NEXT(?:\s*:\s*(?P<note>.*))?\s*$")
 _BLOCKING = re.compile(r"^\s*❓\s+(?:\*\*)?Blocking\s+@(?P<handle>[\w.\-]+)(?:\*\*)?\s*:?\s*(?P<note>.*)$")
 
-# A time wait whose reason names an answer, a verdict, a person or a card is a poll for an event:
-# the event has its own wait kind and wakes the session when it happens.
-_EVENT_REASON = re.compile(
-    r"verdict|answer|decision|\bapprov|вердикт|ответ|решени|павел|\bpavel\b|@[\w.\-]+|#[0-9a-f]{8}\b",
-    re.IGNORECASE)
-
-# A scheduled check of a channel outside Mesh: time is the condition by declaration.
-_POLL_REASON = re.compile(r"poll\s*:", re.IGNORECASE)
-
-MIN_WAIT = dt.timedelta(minutes=5)
-MAX_WAIT = dt.timedelta(hours=24)
 MAX_ABSOLUTE = dt.timedelta(days=400)
-# An absolute WAIT whose moment is already here (or within this much) means "continue now".
-PAST_GRACE = dt.timedelta(minutes=1)
+
+TIME_WAIT_GUIDANCE = (
+    "invalid external time wait: use `⏳ WAIT <absoluteISO-with-timezone>: "
+    "external=<stable-reference> source=<https-url|card:#8hex> <why>`. "
+    "The future timestamp must come from the cited external event/window, scheduled job, "
+    "measurement endpoint, or provider Retry-After/quota reset. Describe cancellation in the comment. "
+    "Relative intervals, bare dates, `poll:` and invented retries are not time events. "
+    "MR/CI/card/answer dependencies use `⏳ WAIT mr:<group>/<project>!<iid>`, "
+    "`⏳ WAIT pipeline:<group>/<project>#<id>`, `⏳ WAIT card:#<8hex>`, "
+    "`⏳ WAIT decision:@<agent>` or `❓ Blocking @<person>: <question>`. "
+    "If an observer is missing, report the integration blocker; do not replace the event with a timer."
+)
 
 
 @dataclass(frozen=True)
@@ -107,22 +109,6 @@ def _explicit_wait_problem(line: str) -> str:
                 "`until=merged after=<sha>:opened`")
     return ("invalid explicit VCS wait: expected `until=change|success after=<full-sha>:<pipeline-id>:<status>` "
             "or `until=merged after=<full-sha>:opened`")
-
-
-def _event_reason_hint(reason: str) -> str:
-    """Send-back text when a time wait's reason is an event (a verdict, an answer, a person, a
-    card), else ''. Time is the condition only for a measurement window, a dated start, or a
-    `poll:` check of a channel the runner cannot watch (a Telegram inbox, mail, an outside site):
-    a person answering there leaves no Mesh event to wait on, so a timer is the only wake."""
-    if _POLL_REASON.match(reason or "") or not _EVENT_REASON.search(reason or ""):
-        return ""
-    return ("a time wait must name time as the condition, but its reason waits for an event "
-            "(a verdict, an answer, a decision, a person or a card). Wait on the event itself: "
-            "`⏳ WAIT card:#<8hex>` for another task, `⏳ WAIT decision:@<agent>: <question>` for an "
-            "agent's answer, `⏳ WAIT mr:<group>/<project>!<iid>` / `⏳ WAIT pipeline:<group>/<project>#<id>` "
-            "for review or CI, `❓ Blocking @<person>: <question>` for a person. If the answer comes "
-            "through a channel the runner cannot watch (Telegram, mail, an outside site), keep the time "
-            "wait and start its reason with `poll:` (`⏳ WAIT 6h: poll: Telegram inbox for the reply`)")
 
 
 def declaration_lines(text: str) -> list[str]:
@@ -178,25 +164,28 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         return Outcome("card", m["id"], note=note(m), line=line)
     if m := _DECISION.match(line):
         return Outcome("decision", handle=m["handle"], note=note(m), line=line)
-    if m := _DURATION.match(line):
-        if hint := _event_reason_hint(note(m)):
-            return Outcome("unparsed", note=hint, line=line, extra={"event_reason": True})
-        unit = m["unit"].lower()
-        delta = dt.timedelta(hours=int(m["n"])) if unit in {"h", "ч"} else dt.timedelta(minutes=int(m["n"]))
-        delta = min(max(delta, MIN_WAIT), MAX_WAIT)
-        return Outcome("time", until=now + delta, note=note(m), line=line)
-    if m := _ABSOLUTE.match(line):
+    if m := _EXTERNAL_TIME.match(line):
         until = _parse_when(m["when"])
-        if until is None or until > now + MAX_ABSOLUTE:
-            return Outcome("unparsed", note="time target out of range", line=line)
-        if until <= now + PAST_GRACE:
-            # the moment is already here: nothing to wait for, continue now
-            return Outcome("next", note=note(m), line=line, extra={"hint": (
-                f"your `⏳ WAIT {m['when']}` named a moment that had already passed, so the runner continued "
-                "you at once; declare a future moment, a duration, or the event itself")})
-        if hint := _event_reason_hint(note(m)):
-            return Outcome("unparsed", note=hint, line=line, extra={"event_reason": True})
-        return Outcome("time", until=max(until, now + MIN_WAIT), note=note(m), line=line)
+        # Never move a past event to now+5m, clamp a deadline, or invent a timezone.
+        if until is None or until <= now or until > now + MAX_ABSOLUTE:
+            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
+        from urllib.parse import urlsplit
+        source = m["source"]
+        try:
+            url = urlsplit(source)
+            _ = url.port  # Reject malformed ports as well as bracketed hosts.
+        except ValueError:
+            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
+        if (source.startswith("https://") and (not url.hostname or url.username or url.password)
+                or m["external"].lower().startswith(("mr:", "pipeline:", "card:", "decision:", "poll:"))):
+            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
+        why = m["why"].strip()
+        if not why or why.lower().startswith("poll:"):
+            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
+        external = {"event": m["external"], "source": source, "why": why, "at": until.isoformat()}
+        return Outcome("time", until=until, note=why, line=line, extra={"external_time": external})
+    if _TIME_HEAD.match(line):
+        return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
     if m := _NEXT.match(line):
         return Outcome("next", note=(m["note"] or "").strip(), line=line)
     if m := _BLOCKING.match(line):
@@ -230,10 +219,10 @@ If the condition is an unanswered question to another agent, end with
   ⏳ WAIT decision:@<recipient>: <same question>
 When re-declaring an unchanged pending question, keep the same recipient and the same question:
 Runner reuses the open request.
-An unchanged question is not a reason for another WAIT 2h polling turn. New comments/evidence
+An unchanged question is not a reason for another polling turn. New comments/evidence
 still wake a decision wait; only an addressed answer or explicit answer marker resolves it.
-Use a time WAIT when the deadline itself requires useful work (a scheduled check or action),
-even if a separate question remains unanswered. Do not turn actionable schedules into decision waits.
+A known external scheduled event may use the structured time WAIT contract below, even if a separate
+question remains unanswered. An internal retry/backoff is not a task schedule or Mesh start_after.
 """
 
 
@@ -243,8 +232,8 @@ When you stop working on this task, post ONE comment on it whose last line decla
   ⏳ WAIT mr:<group>/<project>!<iid>        — a merge request must change
   ⏳ WAIT card:#<8hex>                      — another task must close
   ⏳ WAIT decision:@<agent>: <question>     — another agent must answer
-  ⏳ WAIT 2h: <why, and what ends it>       — only when time itself is the condition
-  ⏳ WAIT 2026-10-20T06:00Z: <why>           — the same, as a moment (UTC)
+  ⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
+      — only a specific external event with a known timestamp and cited source
 After observing a known CI result, wait for a NEW observation explicitly:
   ⏳ WAIT mr:<group>/<project>!<iid> until=change after=<full-head-sha>:<pipeline-id>:<status>
 Use until=success to require a changed successful head pipeline; pending does not satisfy it.
@@ -260,9 +249,11 @@ To await the merge itself, use:
 Copy the observed opened MR's SHA. This baseline is NOT an approval pin: a later head may merge.
 Only merged MR state completes this predicate; closing without merge wakes once as terminal failure.
 Pipeline success/manual and head changes do not complete it. UNKNOWN retains the wait, without age wakes.
-@@MERGE_WAIT@@A time wait over 1h without a reason, or one that names an MR, a card or a pipeline, is sent back:
-wait on the event itself. Healthy observable targets stay asleep until an event; time waits wake at
-their deadline. Age re-checks apply only where the target cannot be observed or a human gate requires one.
+@@MERGE_WAIT@@Time waits require all structured fields above and a future exact timestamp from the source.
+Describe why this time and when the wait is cancelled in the comment. No relative intervals, bare dates,
+poll bypasses, or invented 6h/24h retries for dependencies. A missing observer is an integration blocker,
+not permission to poll. Internal retry/backoff never writes a task's start_after.
+Healthy observable targets stay asleep until an event; external time waits wake at their exact deadline.
   ↻ NEXT                                    — you did a piece of work (an edit, a commit, a check run, a result
                                               posted) and want to continue immediately. Reading the task and
                                               writing a plan is not a piece of work: keep working in the same turn.

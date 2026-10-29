@@ -138,7 +138,7 @@ class CIIdleBudget(Bench):
                 if kind == 'card':
                     child = task(0xabcdef12, assignee_id='other')
                     r.mesh.tasks[child['id']] = child
-                line = {'time': '⏳ WAIT 2h: soak', 'card': '⏳ WAIT card:#abcdef12',
+                line = {'time': f'⏳ WAIT {(dt.datetime.now(dt.timezone.utc)+dt.timedelta(hours=2)).isoformat(timespec="seconds")}: external=fixture-window source=card:#abcdef12 soak', 'card': '⏳ WAIT card:#abcdef12',
                         'decision': '⏳ WAIT decision:@lead'}[kind]
                 a = self.turn(r, t, line, first=True)
                 if kind == 'time':

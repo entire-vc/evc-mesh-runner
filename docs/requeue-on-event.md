@@ -44,6 +44,25 @@ consecutive turns without progress; see the README) and COMPACTION CAP
 
 With the flag off the code path is the previous one.
 
+### What counts toward `daily_start_cap`
+
+With `requeue_on_cap` only restarts with nothing new behind them are counted: a crash or no-outcome
+restart, a failed-turn retry, a `failed_cooldown_hours` retry, a `turn_cap_continue_on_progress`
+restart, a `cap_wake_next_day` restart. A start that a real event woke is not counted, so a card that
+progresses, each start woken by something that happened, is never parked by the cap. The runner looks
+for such an event when it starts a session (a few reads of the task, none of them GitLab) and records
+it on the attempt as an `informed_start` event. Since the agent's previous session on the task:
+
+- a comment from someone else (not the agent, a `[runner]` note or Mesh itself);
+- a linked merge request merged or closed, its pipeline finished, or a link added (with a 2 minute
+  allowance for the webhook of the agent's own last push or merge);
+- a `blocks` dependency closed;
+- when that session was parked on `WAIT card:#id` and the card left the agent meanwhile: that card
+  closed; when it was parked on a blocking ask: the human gate lifted.
+
+When the cap would have applied, the log says `start cap not applied: <event> since the last session`.
+A read that fails is not news.
+
 ## Questions to agents (`unanswerable_ask_to_lead`, default on)
 
 `WAIT decision:@agent` files a decision request, a task labelled `decision-request` assigned to the

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from mesh_runner import config as config_mod
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies
+from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT
 from test_runner import Bench
 
 
@@ -50,7 +50,7 @@ class Continue(TurnCapBench):
     def test_progressing_attempt_continues_on_the_same_agent_in_a_new_attempt(self):
         t = task(1, cat="in_progress")
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2h: soak"})
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
         r = self.runner(mesh)
         a = self.capped(r, t, ["step", "step", "next", "wait", "step", "wait", "next", "step", "wait"])
         self.assertEqual(a.state, "completed")
@@ -69,9 +69,9 @@ class Continue(TurnCapBench):
     def test_capped_turn_declaring_a_wait_waits_then_continues_on_wake(self):
         t = task(1, cat="in_progress")
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2h: soak"})
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
         r = self.runner(mesh)
-        a = self.last_turn(r, t, ["step", "next", "step"], "done for now\n⏳ WAIT 2h: soak")
+        a = self.last_turn(r, t, ["step", "next", "step"], f"done for now\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak")
         self.assertEqual(a.state, "waiting")                       # the wait is recorded, not lost to the cap
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
         self.assertEqual(self.bodies(mesh, t), [])
@@ -88,7 +88,7 @@ class Continue(TurnCapBench):
         t = task(1, cat="in_progress")
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
-        a = self.last_turn(r, t, ["wait"] * 5, "idle\n⏳ WAIT 2h: soak")
+        a = self.last_turn(r, t, ["wait"] * 5, f"idle\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak")
         self.assertEqual(a.state, "waiting")
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
         r.store.update(a, state="ready", wake_text="the wait is over")
@@ -115,7 +115,7 @@ class Continue(TurnCapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.turn_cap_continue_on_progress = False
         r = self.runner(mesh)
-        a = self.last_turn(r, t, ["step"] * 5, "idle\n⏳ WAIT 2h: soak")
+        a = self.last_turn(r, t, ["step"] * 5, f"idle\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak")
         self.assertIn("routed to lead", a.note)
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
         self.assertEqual(r.store.recent_outcomes(a.id, 1), ["step"])          # the wait was never recorded

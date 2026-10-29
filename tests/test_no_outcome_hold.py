@@ -1,5 +1,5 @@
-"""A turn that ends without a readable outcome: event-reason time waits get one correction that is not
-a miss, past absolute waits continue, `until=` without `after=` takes the declared state as baseline,
+"""A turn that ends without a readable outcome: an unsourced time wait is corrected once and then
+held for correction, `until=` without `after=` takes the declared state as baseline,
 and consecutive misses wait for new input (no timer) and route to the lead only on the third in a row,
 never twice for the same run of misses."""
 import datetime as dt
@@ -9,7 +9,7 @@ from fakes import AGENT_ID, FakeGitLab, FakeMesh, calls, task, write_replies
 from test_requeue_on_cap import CapBench
 from test_runner import Bench
 
-from mesh_runner.outcome import parse_outcome
+from mesh_runner.outcome import TIME_WAIT_GUIDANCE, parse_outcome
 
 SHA = "a" * 40
 NOW = dt.datetime(2026, 10, 28, 12, 0, tzinfo=dt.timezone.utc)
@@ -23,78 +23,58 @@ def row(pid=7, status="running", sha=SHA, state="opened"):
     return {"sha": sha, "state": state, "head_pipeline": {"sha": sha, "id": pid, "status": status}}
 
 
-class EventReasonCorrection(Bench):
-    """1. A time WAIT whose reason names an event is corrected once in the same session."""
+class UnsourcedTimeWait(Bench):
+    """1. A time WAIT without a sourced external timestamp is unreadable: a relative interval, a
+    reason naming an event, `poll:`, a bare date and a moment already past are all refused with
+    the same guidance (which names the event forms), never scheduled and never turned into NEXT."""
 
     LINE = "⏳ WAIT 20m: идёт независимое ревью PR77, закончится вердиктом SHIP"
 
-    def test_it_stays_unreadable_but_is_flagged_and_names_the_forms(self):
-        o = p(self.LINE)
-        self.assertEqual((o.kind, o.until, o.extra), ("unparsed", None, {"event_reason": True}))
+    def test_every_unsourced_form_is_refused_with_the_guidance(self):
+        for line in (self.LINE, "⏳ WAIT 6h: soak window", "⏳ WAIT 6h: poll: Telegram inbox for the reply",
+                     "⏳ WAIT 2026-10-30T06:00Z: decision from the lead", "⏳ WAIT 2026-10-28: today, date only",
+                     "⏳ WAIT 2026-10-28T07:05Z: external=night-run source=card:#abcdef12 already past",
+                     "⏳ WAIT 2026-10-28T12:00Z: external=night-run source=card:#abcdef12 exactly now",
+                     "⏳ WAIT tomorrow", "⏳ WAIT in 2 hours: the export", "⏳ WAIT until the vendor replies"):
+            o = p(line)
+            self.assertEqual((o.kind, o.until, o.note), ("unparsed", None, TIME_WAIT_GUIDANCE), line)
         for form in ("⏳ WAIT card:#<8hex>", "⏳ WAIT decision:@<agent>", "⏳ WAIT mr:<group>/<project>!<iid>",
                      "⏳ WAIT pipeline:<group>/<project>#<id>"):
-            self.assertIn(form, o.note)
-        self.assertEqual(p("⏳ WAIT 2026-10-30T06:00Z: decision from the lead").extra, {"event_reason": True})
+            self.assertIn(form, TIME_WAIT_GUIDANCE)
 
-    def test_time_as_the_condition_and_poll_are_not_flagged(self):
-        for line in ("⏳ WAIT 6h: soak window", "⏳ WAIT 6h: poll: Telegram inbox for the reply"):
-            o = p(line)
-            self.assertEqual((o.kind, o.extra), ("time", {}), line)
+    def test_a_malformed_event_wait_keeps_its_own_reading(self):
+        for line in ("⏳ WAIT card:xyz", "⏳ WAIT decision: someone", "⏳ WAIT mr: soon"):
+            self.assertNotEqual(p(line).note, TIME_WAIT_GUIDANCE, line)
 
-    def test_correction_in_the_same_session_is_not_a_miss(self):
+    def test_a_sourced_moment_just_ahead_is_kept_exactly(self):
+        o = p("⏳ WAIT 2026-10-28T12:02Z: external=night-run source=card:#abcdef12 the export starts")
+        self.assertEqual((o.kind, o.until), ("time", NOW + dt.timedelta(minutes=2)))
+
+    def test_the_first_is_corrected_in_the_same_session_and_schedules_nothing(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         write_replies(self.replies, {t["id"][:8]: self.LINE})
         r = self.runner(mesh)
         r.tick()
         a = self.finish_turn(r)
-        self.assertEqual((a.state, a.no_outcome), ("ready", 0))
-        self.assertIn("⏳ WAIT card:#<8hex>", a.wake_text)
-        self.assertIn("⏳ WAIT mr:<group>/<project>!<iid>", a.wake_text)
-        self.assertEqual(r.store.events_since_readable(t["id"], "no_outcome"), 0)
-        self.assertEqual(a.wait, {})                                  # and nothing was scheduled
-
-    def test_repeating_the_form_after_the_correction_is_a_normal_miss(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: self.LINE})
-        r = self.runner(mesh)
-        r.tick()
-        self.finish_turn(r)                                           # corrected, not a miss
-        r.tick()
-        a = self.finish_turn(r)                                       # same form again: miss 1
         self.assertEqual((a.state, a.no_outcome), ("ready", 1))
-        self.assertEqual(r.store.events_since_readable(t["id"], "no_outcome"), 1)
-        self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
+        self.assertIn("external=<stable-reference>", a.wake_text)
+        self.assertEqual(a.wait, {})
+        self.assertFalse(mesh.tasks[t["id"]].get("start_after"))
 
-
-class PastAbsoluteWait(Bench):
-    """2. An absolute WAIT whose moment is already here means: continue now."""
-
-    def test_past_or_immediate_moment_is_next(self):
-        for line in ("⏳ WAIT 2026-10-28T07:05Z: проверить позже",
-                     "⏳ WAIT 2026-10-28T12:00Z: now",
-                     "⏳ WAIT 2026-10-28T12:01Z: within a minute",
-                     "⏳ WAIT 2026-10-28: today, date only",
-                     "⏳ WAIT 2026-10-28T07:05Z: waiting for the verdict"):
-            o = p(line)
-            self.assertEqual(o.kind, "next", line)
-            self.assertIn("already passed", o.extra["hint"])
-
-    def test_a_moment_just_ahead_is_still_a_time_wait(self):
-        o = p("⏳ WAIT 2026-10-28T12:02Z: soon")
-        self.assertEqual((o.kind, o.until), ("time", NOW + dt.timedelta(minutes=5)))
-
-    def test_runner_continues_the_session(self):
+    def test_repeating_it_after_the_correction_is_a_correction_hold(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2020-01-01T07:05Z: later"})
+        line = "⏳ WAIT tomorrow: later"
+        write_replies(self.replies, {t["id"][:8]: line, t["id"][:8] + ":resume": line})
         r = self.runner(mesh)
         r.tick()
-        a = self.finish_turn(r)
-        self.assertEqual(a.state, "ready")
-        self.assertIn("↻ NEXT", a.wake_text)
-        self.assertIn("already passed", a.wake_text)
+        self.settle_all(r)
+        a = r.store.by_state(self.agent.name, ("failed",))[0]
+        self.assertTrue(a.note.startswith("wait correction required:"), a.note)
+        self.assertTrue(any(c["body"].startswith("[runner] ⚠️ WAIT CORRECTION REQUIRED") for c in mesh.comment_log[t["id"]]))
+        self.assertFalse(mesh.tasks[t["id"]].get("start_after"))
+        self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
 
 
 class CiWaitWithoutBaseline(Bench):

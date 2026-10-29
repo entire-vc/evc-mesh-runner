@@ -11,7 +11,7 @@ from mesh_runner import queue_wait as q
 from mesh_runner.store import Store, iso
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import Runner
-from fakes import AGENT_ID, FakeMesh, task
+from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT
 from test_runner import Bench
 
 NOW = 1792500000
@@ -84,7 +84,7 @@ class QueueWait(Bench):
         a = r.store.get(a.id)
         path = self.root/'after-proof.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-            result='⏳ WAIT 6h: owner acceptance required', session_id='s'))+'\n')
+            result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s'))+'\n')
         r.store.update(a, state='running', log_path=str(path), turns=1)
         r.settle(a)
         self.assertEqual(a.wait['kind'], 'time')
@@ -161,7 +161,7 @@ class QueueWait(Bench):
         r,a,t = self.setup_wait()
         path=self.root/'turn.jsonl'
         path.write_text(json.dumps(dict(type='result',subtype='success',is_error=False,
-                                        result='⏳ WAIT 2h: queue empty',session_id='s'))+'\n')
+                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window',session_id='s'))+'\n')
         r.store.update(a,state='running',log_path=str(path),turns=1)
         r.settle(a)
         self.assertEqual(a.state,'waiting')
@@ -807,7 +807,7 @@ class FirstMove(QueueWait):
         r.store.mark(a.agent, a.task_id, a.wait['queue_delivery']['key'], 'delivered')
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result='⏳ WAIT 2h: waiting for the developers', session_id='s')) + '\n')
+                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
         r.store.update(a, state='running', log_path=str(path), turns=1)
         r.settle(a)
         self.assertEqual((a.state, a.wait['kind']), ('waiting', 'queue'))   # the lead's WAIT is not acceptance
@@ -878,7 +878,7 @@ class FirstMove(QueueWait):
         r, a, t = self.setup_wait()
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result='⏳ WAIT 2h: queue empty', session_id='s')) + '\n')
+                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
         r.store.update(a, state='running', log_path=str(path), turns=1,
                        turn_started_at=iso(dt.datetime.fromtimestamp(turn_started, dt.timezone.utc)))
         r.settle(a)
@@ -901,7 +901,7 @@ class FirstMove(QueueWait):
         r, a, t = self.setup_wait(start_after=future)
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result='⏳ WAIT 2h: queue empty', session_id='s')) + '\n')
+                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
         r.store.update(a, state='running', log_path=str(path), turns=1,
                        turn_started_at=iso(dt.datetime.fromtimestamp(NOW - 3600, dt.timezone.utc)))
         r.settle(a)
@@ -932,7 +932,7 @@ class FirstMove(QueueWait):
         self.assertEqual(q.floor(r.store, a.agent, a.task_id), NOW + 1)
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result='⏳ WAIT 2h: waiting for the developers', session_id='s')) + '\n')
+                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
         r.store.update(a, log_path=str(path))
         r.settle(a)
         self.assertNotEqual(a.wait.get('queue_request', {}).get('contract'), old['contract'])

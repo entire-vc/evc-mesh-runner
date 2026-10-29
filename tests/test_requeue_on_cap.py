@@ -1,10 +1,11 @@
 """A task that hit a cap goes back to the queue and restarts on new input, never on a clock."""
+import dataclasses
 import datetime as dt
 import json
 import time
 from unittest import mock
 
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies
+from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT
 from test_runner import Bench
 
 from mesh_runner.config import AgentConfig
@@ -65,7 +66,7 @@ class StartCap(CapBench):
     def test_unchanged_inputs_do_not_start_and_new_comment_starts_once(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2h: soak"})
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
@@ -82,7 +83,7 @@ class StartCap(CapBench):
     def test_a_comment_after_the_last_session_is_not_swallowed_by_the_start_cap(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2h: soak"})
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
@@ -442,7 +443,7 @@ class OtherCaps(CapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.max_compactions = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "COMPACT:2:⏳ WAIT 2h: soak window"})
+        write_replies(self.replies, {t["id"][:8]: f"COMPACT:2:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -609,3 +610,169 @@ class StartCapStaleSnapshot(CapBench):
         mesh.tasks[t["id"]]["checked_out_by"] = "other-agent"
         r._start_cap(dict(mesh.tasks[t["id"]]), 2)
         self.assertEqual(self.bodies(mesh, t), [])
+
+
+def _stamp(delta=dt.timedelta(0)):
+    return (dt.datetime.now(dt.timezone.utc) + delta).isoformat()
+
+
+class EventWokenStarts(CapBench):
+    """A start that a real event woke is not a start of a loop: it does not count toward
+    ``daily_start_cap``. A restart with nothing new behind it still does."""
+
+    def capped(self, wait=None):
+        """A card whose agent started it up to the cap; ``wait`` is what its last session was parked on."""
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        if wait is not None:
+            for last in r.store.by_state("builder", ("completed",)):      # created in the same millisecond
+                r.store.update(last, note="task left the agent while waiting",
+                               wait=dict(wait, since=_stamp(-dt.timedelta(minutes=5))))
+        return t, mesh, r
+
+    def assert_event_start(self, r, t, phrase):
+        with self.assertLogs("mesh_runner", level="INFO") as logs:
+            self.settle_all(r)
+        self.assertEqual(len(calls(self.calls)), 1)                      # started although the cap is reached
+        self.assertEqual(self.notes(r, t), [])
+        self.assertFalse(r._cap_wait(t["id"]))
+        self.assertTrue(any("start cap not applied: " + phrase in m for m in logs.output), logs.output)
+
+    def test_a_waited_card_done_since_the_last_session_is_not_capped(self):
+        t, mesh, r = self.capped({"kind": "card", "target": "00000002"})
+        other = task(2, cat="done", completed_at=_stamp(dt.timedelta(seconds=30)))
+        mesh.tasks[other["id"]] = other
+        self.assert_event_start(r, t, "task #00000002 is done since the last session")
+
+    def test_a_merged_mr_since_the_last_session_is_not_capped(self):
+        t, mesh, r = self.capped()
+        mesh.links = {t["id"]: [{"url": "https://git/g/p/-/merge_requests/49", "link_type": "pr",
+                                 "status": "merged", "status_synced_at": _stamp(dt.timedelta(minutes=10))}]}
+        self.assert_event_start(r, t, "MR https://git/g/p/-/merge_requests/49 was merged since the last session")
+
+    def test_a_finished_pipeline_since_the_last_session_is_not_capped(self):
+        t, mesh, r = self.capped()
+        mesh.links = {t["id"]: [{"url": "https://git/g/p/-/merge_requests/50", "link_type": "pr", "status": "open",
+                                 "pipeline_status": "success",
+                                 "pipeline_updated_at": _stamp(dt.timedelta(minutes=10))}]}
+        self.assert_event_start(r, t, "MR https://git/g/p/-/merge_requests/50: pipeline success since the last session")
+
+    def test_a_link_added_since_the_last_session_is_not_capped(self):
+        t, mesh, r = self.capped()
+        mesh.links = {t["id"]: [{"url": "https://git/g/p/-/merge_requests/51", "link_type": "pr", "status": "open",
+                                 "created_at": _stamp(dt.timedelta(minutes=10))}]}
+        self.assert_event_start(r, t, "MR linked: https://git/g/p/-/merge_requests/51 since the last session")
+
+    def test_the_echo_of_the_agents_own_push_is_not_news(self):
+        t, mesh, r = self.capped()
+        mesh.links = {t["id"]: [{"url": "https://git/g/p/-/merge_requests/52", "link_type": "pr", "status": "open",
+                                 "created_at": _stamp(dt.timedelta(seconds=30))}]}   # inside the webhook allowance
+        r.tick()
+        self.assertEqual(calls(self.calls), [])
+        self.assertIn("cap: requeued (start cap)", self.notes(r, t))
+
+    def test_a_closed_blocker_since_the_last_session_is_not_capped(self):
+        t, mesh, r = self.capped()
+        blocker = task(3, cat="done", completed_at=_stamp(dt.timedelta(seconds=30)))
+        mesh.tasks[blocker["id"]] = blocker
+        mesh.deps[t["id"]] = [{"depends_on_task_id": blocker["id"], "dependency_type": "blocks"}]
+        self.assert_event_start(r, t, "blocker #00000003 is done since the last session")
+
+    def test_a_lifted_human_gate_since_the_last_session_is_not_capped(self):
+        t, mesh, r = self.capped({"kind": "blocking", "handle": "pavel"})
+        mesh.tasks[t["id"]]["human_gate"] = False
+        self.assert_event_start(r, t, "the human gate was lifted since the last session")
+
+    def test_a_comment_still_says_what_it_did(self):
+        t, mesh, r = self.capped()
+        mesh.add_comment(t["id"], "do the prod screenshots", author="someone")
+        self.assert_event_start(r, t, "a comment arrived after the last session")
+
+    def close_last(self, r, wait=None):
+        """The newest session ends; ``wait`` is what it was parked on when the card left the agent."""
+        last = [a for a in r.store.by_state("builder", ("starting", "running", "waiting", "ready", "completed"))
+                if a.turns][-1]
+        if wait is None:
+            r.store.update(last, state="completed", note="task left the agent's working statuses")
+        else:
+            r.store.update(last, state="completed", note="task left the agent while waiting",
+                           wait=dict(wait, since=_stamp()))
+
+    def test_a_capped_card_woken_by_new_input_is_not_counted(self):
+        # the production case: the cap parked the card (cap wait), then a comment woke it
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
+        self.assertTrue(r._cap_wait(t["id"]))
+        before = {a.id for a in r.store.by_state("builder", ("completed",))}
+        mesh.add_comment(t["id"], "please look again", author="someone")
+        self.settle_all(r)
+        woken = [a for a in r.store.by_state("builder", ("waiting", "completed", "running")) if a.id not in before]
+        self.assertEqual(len(woken), 1)
+        self.assertTrue(any(e[1] == "informed_start" for e in r.store.events(woken[0].id)))
+        self.assertEqual(r.store.starts_today("builder", t["id"]), 2)      # the woken start is not counted
+
+    def test_five_event_woken_starts_in_a_day_are_not_capped(self):
+        # the lead card of 29.10: started on a comment, a merged MR, a done card, a done blocker and a
+        # lifted gate in turn; the cap is 2
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        other = task(2, cat="done")
+        mesh.tasks[other["id"]] = other
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        self.agent.repos[0] = dataclasses.replace(self.agent.repos[0], max_slots=16)   # closed sessions keep their leases
+        r = self.runner(mesh)
+        r.refresh_me()
+        later = _stamp(dt.timedelta(minutes=10))
+        events = [
+            (None, lambda: None),
+            (None, lambda: mesh.add_comment(t["id"], "again", author="someone")),
+            (None, lambda: setattr(mesh, "links", {t["id"]: [
+                {"url": "u", "link_type": "pr", "status": "merged", "status_synced_at": later}]})),
+            ({"kind": "card", "target": "00000002"}, lambda: (setattr(mesh, "links", {}),
+                                                              other.update(completed_at=later))),
+            (None, lambda: (other.update(completed_at=later), mesh.deps.update(
+                {t["id"]: [{"depends_on_task_id": other["id"], "dependency_type": "blocks"}]}))),
+            ({"kind": "blocking"}, lambda: (mesh.deps.clear(),
+                                            mesh.tasks[t["id"]].update(human_gate=False))),
+        ]
+        for i, (wait, event) in enumerate(events):    # wait: what the session before the event was parked on
+            if i:
+                self.close_last(r, wait)
+            event()
+            r._task_backoff.clear()
+            mesh.tasks[t["id"]].update(assignee_id=AGENT_ID, start_after=None)    # the last WAIT was a timer
+            self.settle_all(r)
+            self.assertEqual(len(calls(self.calls)), i + 1, f"start {i + 1} was not made")
+        self.assertFalse(any("START CAP" in b for b in self.bodies(mesh, t)))
+        self.assertEqual(r.store.starts_today("builder", t["id"]), 1)      # only the first had no event behind it
+
+    def test_restarts_with_nothing_new_are_still_capped(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        old = _stamp(-dt.timedelta(hours=1))
+        other = task(2, cat="done", completed_at=old)
+        mesh.tasks[other["id"]] = other
+        mesh.links = {t["id"]: [{"url": "u", "link_type": "pr", "status": "merged", "status_synced_at": old,
+                                 "pipeline_status": "success", "pipeline_updated_at": old}]}
+        mesh.deps[t["id"]] = [{"depends_on_task_id": other["id"], "dependency_type": "blocks"}]
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        r = self.runner(mesh)
+        r.refresh_me()
+        for i in range(5):                             # crashes and retries: nothing new reached the card
+            if i:
+                self.close_last(r, {"kind": "card", "target": "00000002"})
+            r._task_backoff.clear()
+            mesh.tasks[t["id"]].update(assignee_id=AGENT_ID, start_after=None)    # the last WAIT was a timer
+            self.settle_all(r)
+        self.assertEqual(len(calls(self.calls)), 2)
+        self.assertEqual(r.store.starts_today("builder", t["id"]), 2)
+        self.assertIn("cap: requeued (start cap)", self.notes(r, t))

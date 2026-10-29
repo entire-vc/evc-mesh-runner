@@ -273,15 +273,16 @@ class CrossWorkspaceCardWait(unittest.TestCase):
         self.assertEqual(check(None, None, HealthyGitLab(), {}, wait, "me", [], NOW), "")
         self.assertNotIn("recheck_due", wait)
 
-    def test_persisted_pipeline_without_observer_gets_bounded_recheck_not_met(self):
+    def test_persisted_pipeline_without_observer_stays_visible_without_recheck(self):
         # Simulates a pre-restart WAIT whose GitLab observer was absent on recovery.
         original = {"kind": "pipeline", "target": "g/a#5", "since": NOW.isoformat(),
                     "started": (NOW - dt.timedelta(hours=3)).isoformat(), "seen": {"pipeline": "running"}}
         wait = json.loads(json.dumps(original))
         event = check(None, None, None, {}, wait, "me", [], NOW,
                       max_wait=dt.timedelta(hours=6), first_recheck=dt.timedelta(hours=2))
-        self.assertIn("observer unavailable", event)
-        self.assertTrue(wait["recheck_due"])
+        self.assertEqual(event, "")
+        self.assertEqual(wait["integration_blocked"], "GitLab observer unavailable")
+        self.assertFalse(wait.get("recheck_due"))
         self.assertFalse(wait.get("met"))
         self.assertEqual(wait["kind"], "pipeline")
         self.assertEqual(wait["target"], original["target"])
@@ -291,15 +292,17 @@ class CrossWorkspaceCardWait(unittest.TestCase):
         wait = {"kind": "mr", "target": "g/a!7", "since": NOW.isoformat(),
                 "started": (NOW - dt.timedelta(hours=7)).isoformat(), "rechecks": 1}
         first = check(None, None, None, {}, wait, "me", [], NOW)
-        self.assertIn("observer unavailable", first)
-        self.assertTrue(wait["recheck_due"])
+        self.assertEqual(first, "")
+        self.assertIn("observer unavailable", wait["integration_blocked"])
+        self.assertFalse(wait.get("recheck_due"))
         self.assertFalse(wait.get("met"))
         # Persist the marker and check again: absence must never be mistaken for a
         # healthy unchanged MR or for a completed condition.
         wait = json.loads(json.dumps(wait))
         again = check(None, None, None, {}, wait, "me", [], NOW)
-        self.assertIn("observer unavailable", again)
-        self.assertTrue(wait["recheck_due"])
+        self.assertEqual(again, "")
+        self.assertIn("observer unavailable", wait["integration_blocked"])
+        self.assertFalse(wait.get("recheck_due"))
         self.assertFalse(wait.get("met"))
 
 

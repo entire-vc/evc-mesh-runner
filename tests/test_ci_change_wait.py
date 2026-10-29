@@ -393,15 +393,16 @@ class TypedCI(Bench):
                 finally:
                     r.store.update(a, state='completed')
 
-    def test_missing_observer_legacy_wait_keeps_age_recheck(self):
+    def test_missing_observer_legacy_wait_retains_event_without_age_recheck(self):
         for kind, target in (('mr', 'g/app!56'), ('pipeline', 'g/app#14845')):
             with self.subTest(kind=kind):
                 wait = {'kind': kind, 'target': target,
                         'since': iso(NOW - dt.timedelta(days=30)),
                         'started': iso(NOW - dt.timedelta(days=30))}
                 event = check(None, None, None, {}, wait, 'me', [], NOW)
-                self.assertIn('GitLab observer unavailable', event)
-                self.assertTrue(wait['recheck_due'])
+                self.assertEqual(event, '')
+                self.assertEqual(wait['integration_blocked'], 'GitLab observer unavailable')
+                self.assertFalse(wait.get('recheck_due'))
                 self.assertFalse(wait.get('met'))
 
 

@@ -284,7 +284,8 @@ class RunnerConfig:
     # ``requeue_on_cap``, else it is handed up as before). A task already routed up for this reason is
     # only held by the receiving lead, never handed further, until a readable outcome.
     no_outcome_route_after: int = 3
-    daily_start_cap: int = 0           # starts of one task by one agent per UTC day; past it -> lead (0 = off)
+    daily_start_cap: int = 0           # starts of one task by one agent per UTC day; past it -> lead (0 = off).
+                                       # With requeue_on_cap a start an event woke does not count (docs/requeue-on-event.md)
     mention_requests: bool = False     # an @-address on someone else's task becomes a request card
     max_compactions: int = 0           # context compactions in one attempt; past it -> lead (0 = off)
     max_failures: int = 3
@@ -363,17 +364,16 @@ class RunnerConfig:
     # request: the question is posted on the asking task for the addressee to object, and the asker
     # continues with its default at once. False: a request is filed.
     decision_default_proceeds: bool = True
-    time_wait_reason_after_minutes: float = 60.0   # a longer time WAIT must say why and what it waits for
-    # this many short (<= time_wait_reason_after_minutes) time WAITs in a row on one task are sent back
-    # once per UTC day: polling on a timer burns the daily turn budget; wait on the event. 0 = off
+    # Obsolete: read so existing configs still load. Time WAITs need a sourced external
+    # timestamp (outcome.TIME_WAIT_GUIDANCE); relative intervals are rejected outright.
+    time_wait_reason_after_minutes: float = 60.0
     short_time_wait_series: int = 3
-    # agent names that are also everyday or product words here: a time WAIT naming them is not a wait on the agent
     time_wait_ignore_names: list[str] = field(default_factory=list)
     quota_pause_minutes: int = 30
     abort_backoff_minutes: int = 15
     gitlab_url: str = ""
     gitlab_token: str = field(default="", repr=False)
-    github_orgs: tuple = ()                 # `org` or `org/repo` prefixes whose mr:/merge: targets are GitHub PRs
+    github_orgs: tuple = ()                 # `org` or `org/repo` prefixes whose mr:/merge:/pipeline: targets are on GitHub
     github_token: str = field(default="", repr=False)
     github_api_url: str = "https://api.github.com"
     # Agent Chat (protocol v1): off unless `[chat] enabled = true`. Interactive sessions only.
@@ -531,6 +531,16 @@ def _string_list(value, name: str, default: tuple) -> tuple:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ConfigError(f"{name} must be a list of strings")
     return tuple(value)
+
+
+def _github_hosted(section: dict) -> tuple:
+    """`[github] orgs` (whole orgs, or `org/repo`) plus `repos` (exactly `org/repo`, for an org that
+    also lives on GitLab): the prefixes whose mr:/merge:/pipeline: targets are read from GitHub."""
+    repos = _string_list(section.get("repos"), "[github] repos", ())
+    for repo in repos:
+        if not re.fullmatch(r"[^/\s]+/[^/\s]+", repo):
+            raise ConfigError(f"[github] repos: {repo!r} must be org/repo")
+    return tuple(_string_list(section.get("orgs"), "[github] orgs", ())) + repos
 
 
 def _ask_patterns(value) -> tuple:
@@ -835,7 +845,7 @@ def load(path: str | Path) -> RunnerConfig:
         gitlab_url=gl.get("base_url", ""),
         gitlab_token=read_secret(gl.get("token_file"), gl.get("token_env"), "gitlab token")
         if gl.get("base_url") else "",
-        github_orgs=tuple(_string_list((raw.get("github") or {}).get("orgs"), "[github] orgs", ())),
+        github_orgs=_github_hosted(raw.get("github") or {}),
         github_token=read_secret((raw.get("github") or {}).get("token_file"),
                                  (raw.get("github") or {}).get("token_env"), "github token")
         if (raw.get("github") or {}).get("token_file") or (raw.get("github") or {}).get("token_env") else "",

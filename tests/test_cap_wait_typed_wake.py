@@ -2,7 +2,7 @@
 change of the linked merge request or pipeline."""
 import datetime as dt
 
-from fakes import FakeGitLab, FakeMesh, calls, task, write_replies
+from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT
 from test_requeue_on_cap import CapBench
 
 from mesh_runner.outcome import parse_line
@@ -188,7 +188,7 @@ class TypedCapWake(CapBench):
     def test_the_start_after_a_cap_logs_what_woke_it(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT 2h: soak"})
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
