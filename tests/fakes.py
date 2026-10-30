@@ -448,6 +448,7 @@ class FakeGitLab:
         self.active_jobs = set()  # targets with a queued or running job
         self.newer = {}          # target -> pipeline row of the same ref with a higher id
         self.pipeline_errors = {}  # target -> exception get_pipeline raises (404, a timeout)
+        self.jobs = {}           # pipeline target -> GitLab job rows of that pipeline
 
     def get_mr(self, target):
         return dict(self.mr_rows.get(target, {}))
@@ -459,6 +460,9 @@ class FakeGitLab:
 
     def pipeline_has_active_jobs(self, target):
         return target in self.active_jobs
+
+    def pipeline_jobs(self, target):
+        return [dict(j) for j in self.jobs.get(target, [])]
 
     def newer_pipeline(self, target, row=None):
         return self.newer.get(target)

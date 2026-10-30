@@ -122,7 +122,7 @@ class AgentAddressee(AskBench):
         self.assertNotIn("asked_handle", self.wait)
 
     def test_a_question_to_yourself_without_a_lead_is_not_a_wait(self):
-        # 23.10: ten cards sat in `WAIT decision:@<their own agent>` for a day; no lead, no answerer
+        # `WAIT decision:@<their own agent>` has no answerer when the agent has no lead.
         self.setup_route("builder")
         self.agent.lead = ""
         told = self.route()
@@ -317,7 +317,7 @@ class Classifier(unittest.TestCase):
                      "give me access to the server", "Выдать доступ", "добавлять платный раннер в пул?",
                      "выдай @bender роль Developer", "нажми «Connect» в расширении", "Войди в Glama и напиши «вошёл»",
                      "сделаешь прогон на своём iPhone", "please log in and click Allow",
-                     "перетащи #bbcdd544 в Done", "подай плагин с макбука"):
+                     "перетащи #55556666 в Done", "подай плагин с макбука"):
             with self.subTest(text):
                 self.assertTrue(asks.classify(text, []).hard, text)
 

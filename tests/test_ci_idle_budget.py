@@ -66,8 +66,8 @@ class CIIdleBudget(Bench):
         self.assertEqual(a.state, 'waiting', a.note)
         self.assertFalse(any('TURN CAP' in c['body'] for c in r.mesh.comment_log.get(a.task_id, [])))
 
-    def test_observed_f866205a_nine_waits_and_twelve_steps_need_only_last_ci_receipt(self):
-        # Exact W/S order from the 2026-10-20 production outcome receipt.
+    def test_nine_waits_and_twelve_steps_need_only_last_ci_receipt(self):
+        # Interleave idle waits and progress; only the final step needs CI proof.
         sequence = 'WWWW S WW SSSSSS W SS W SSS W'.replace(' ', '')
         self.assertEqual((sequence.count('W'), sequence.count('S')), (9, 12))
         r, t, gl = self.setup_flow()

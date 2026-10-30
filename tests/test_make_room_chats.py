@@ -1,4 +1,4 @@
-"""Card #face4a7a: chat windows count against interactive_max_sessions but are never closed by make_room."""
+"""Chat windows count against interactive_max_sessions but are never closed by make_room."""
 import tempfile
 import unittest
 from pathlib import Path

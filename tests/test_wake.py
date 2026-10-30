@@ -192,7 +192,7 @@ class CrossWorkspaceCardWait(unittest.TestCase):
         return mine, check(mine.mesh, mine, None, {}, wait, "me", [], NOW)
 
     def wait(self, **kw):
-        return dict({"kind": "card", "target": "ddd9ac2c", "since": NOW.isoformat(), "started": NOW.isoformat()}, **kw)
+        return dict({"kind": "card", "target": "22223333", "since": NOW.isoformat(), "started": NOW.isoformat()}, **kw)
 
     def test_a_denial_nobody_can_read_around_does_not_wake_the_session(self):
         wait = self.wait()

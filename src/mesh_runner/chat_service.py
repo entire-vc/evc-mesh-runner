@@ -20,7 +20,7 @@ from .chat_turn import ChatTurnRunner, Delivery
 
 log = logging.getLogger("mesh_runner")
 
-# a turn waits this long for its session token; a slower Mesh answer (the 30 s timeout of 26.10, ec202e35) lands later
+# a turn waits this long for its session token; a slower Mesh answer lands later
 TOKEN_FIRST_WAIT = 2.0
 ORDERS_EVERY = 20.0          # seconds between order fetches while claims come back idle
 

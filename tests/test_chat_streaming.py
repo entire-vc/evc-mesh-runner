@@ -126,7 +126,7 @@ class CodexToolCalls(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
-        self.rollout = self.root / "rollout-2026-10-26T07-46-47-01a17688-500c-72d2-a1c4-781a6119feed.jsonl"
+        self.rollout = self.root / "rollout-2026-01-01T00-00-00-11111111-2222-4333-8444-555555555555.jsonl"
         self.rollout.write_text("")
         self.out = io.StringIO()
         self.d = Driver(harness="codex", agent="builder", state=self.root / "state", tmux=object(), max_sessions=1,

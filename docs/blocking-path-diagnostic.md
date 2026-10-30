@@ -29,23 +29,20 @@ Missing/invalid identity, status or gate fields, incomplete or paginated edges,
 cycles, edge responses over 256 rows, budget cuts and API errors produce `UNKNOWN`, never an inferred gate or
 successful traversal. The error reason contains only a fixed category or HTTP
 status, never exception bodies. Only the canonical `relates_to` and `is_child_of`
-types are ignored. `blocks` and the legacy `depends_on` spelling supported by
-the fleet audit digest are traversed; missing, malformed, differently cased or
-unknown types produce `UNKNOWN`. Closed tasks are terminal observations, not
+types are ignored. `blocks` and the legacy `depends_on` spelling are traversed;
+missing, malformed, differently cased or unknown types produce `UNKNOWN`. Closed tasks are terminal observations, not
 permission to wake.
 
-The full-list dependency contract was checked against Mesh
-`0cd22c6cee8f9f09bfa8915b471394451f547be0`: `DependencyHandler.List` returns
-`outgoing`/`incoming`, `ListByTaskBothDirections` reads both complete lists, and
-`TaskDependencyRepo.ListByTask` has no SQL limit. Thus absent `total`, `has_more`
-and `next_page` are valid; the API does not require these fields. If present,
-`total` must be an integer exactly equal to the number of outgoing rows
-(including nonblocking edges), `has_more` must be literal `false`, and
-`next_page` must be `null`. Boolean, negative, fractional, string or null totals,
-inconsistent counts and invalid/continuation metadata produce `UNKNOWN`.
-The canonical edge types are also confirmed by the `add_dependency` API schema;
-legacy compatibility follows the reviewed fleet audit digest's `DEP_TYPES`
-at `f30b961cf03238086149f2bd61b0aab851184cbc`.
+The full-list dependency contract: the Mesh dependency list endpoint returns
+`outgoing`/`incoming` arrays that are complete, with no server-side limit, so
+absent `total`, `has_more` and `next_page` are valid; the API does not require
+these fields. If present, `total` must be an integer exactly equal to the number
+of outgoing rows (including nonblocking edges), `has_more` must be literal
+`false`, and `next_page` must be `null`. Boolean, negative, fractional, string or
+null totals, inconsistent counts and invalid/continuation metadata produce
+`UNKNOWN`. The canonical edge types are the ones the `add_dependency` API schema
+accepts; the legacy `depends_on` spelling is kept for compatibility with older
+dependency data.
 
 Successes and failures are cached for 300 seconds in the existing SQLite marks
 under `blocking_path_diagnostic_v1`, keyed by lane/task and exact wait target.

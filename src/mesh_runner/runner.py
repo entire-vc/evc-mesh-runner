@@ -59,7 +59,7 @@ from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from .wake import (GitHub, GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
-                   blocked_mr_next_step, mr_merge_blocker, is_foreign)
+                   blocked_mr_next_step, mr_merge_blocker, is_foreign, target_jobs_state, UnknownJobs)
 from .workspace import DIRTY_HOLD_NOTE, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, git
 from .workspace_scope import (RECEIPT_KEY, metadata_instructions, metadata_only, metadata_receipt,
                               read_only, recorded_scope)
@@ -120,6 +120,11 @@ OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY = "_runtime", "_provider_outage", "p
 POLICY_REFUSAL_HINT = re.compile(r"flagged for possible cybersecurity risk", re.I)
 # Codex says "No saved session found with ID …" when it cannot resume a thread
 NO_SESSION_HINT = re.compile(r"no conversation found|no saved session found|session .*not found|thread .*not found", re.I)
+# Codex refuses to resume a child thread of another session (-32600, unloaded multi-agent v2, parent
+# first): the same resume fails the same way, so it is not retried as an ordinary failed turn
+UNSUPPORTED_RESUME_HINT = re.compile(
+    r"multi-?agent v2|parent (?:thread )?(?:must be|first|not loaded)|resume .*child (?:thread|session)"
+    r"|child (?:thread|session) .*(?:resume|parent)", re.I)
 
 
 def public_harness_error(text: str) -> str:
@@ -222,6 +227,7 @@ MERGE_TAIL_CHARS = 6000
 MERGE_LINE_CHARS = 2000        # bytes kept of one output line
 MERGE_HISTORY = 8
 MERGE_ENV_RETRIES = 3
+MERGE_FOLLOWS = 5                  # head moves followed by the gate per wait (merge_follow_head)
 # the merge gate's last line when it is queued behind a pipeline: the one convention the runner parses
 MERGE_QUEUED = re.compile(r"^\s*⏳\s*WAIT\s+pipeline:(?P<target>[\w.\-/]+#[1-9]\d{0,11})(?!\d)")
 
@@ -421,6 +427,7 @@ class AgentRunner:
                                identical_no_reopen=cfg.decision_identical_no_reopen)
         self.procs: dict[str, subprocess.Popen] = {}
         self.me: dict = {}
+        self.owners = TaskOwners()               # shared with the Runner: task id -> agent name
         self._last_beat: dict[str, float] = {}
         self._closed_seen: set[str] = set()      # attempts whose closed card the beat saw once
         self._last_wake_check: dict[str, float] = {}
@@ -622,8 +629,8 @@ class AgentRunner:
 
     def _handed_back(self, task: dict | None) -> bool:
         """The attempt ended with the task in the work statuses for this agent: assigned to it, or
-        with no assignee at all (a move_task to todo without assignee_id clears it, measured on
-        #b7d5a574). A task assigned to another agent is not a hand-back."""
+        with no assignee at all (a move_task to todo without assignee_id clears it).
+        A task assigned to another agent is not a hand-back."""
         if not task:
             return False
         assignee = task.get("assignee_id") or (task.get("assignee") or {}).get("id")
@@ -927,8 +934,8 @@ class AgentRunner:
                 known = True
             if not known and first_prompt is not None:
                 # The account the lane runs on now holds no copy of the session and none could be
-                # carried (28.10: six turns died at start with "No conversation found" after a quota
-                # switch). Resuming would fail the turn; the task continues in a new session instead,
+                # carried after an account switch. Resuming would fail with "No conversation found";
+                # the task continues in a new session instead,
                 # in this very turn, with the same first prompt a fresh start gets.
                 log.info("%s: #%s session %s not found under the routed account; new session",
                          self.agent.name, a.task8, sid[:8])
@@ -1108,10 +1115,13 @@ class AgentRunner:
         """``until=`` without ``after=``: the baseline is the CI/MR state at the moment the wait is
         declared. A target that is already final (a pipeline in any terminal status, a merge request
         merged or closed), one that cannot be read, or no GitLab leaves the plain wait, which wakes on
-        the next check when the result is final; only a non-final target keeps a typed baseline."""
+        the next check when the result is final; only a non-final target keeps a typed baseline.
+        A ``jobs=[...]`` wait never falls back to the plain wait: the pipeline aggregate can stay
+        ``manual`` forever, so without a baseline it is sent back instead."""
         plain = dataclasses.replace(out, extra={})
+        jobs = (out.extra.get("ci_default") or {}).get("jobs")
         if self.gitlab is None:
-            return plain
+            return self._jobs_baseline_refused(out, "no GitLab is configured") if jobs else plain
         try:
             if out.extra.get("mr_default"):
                 row = self.gitlab.get_mr(out.target)
@@ -1124,15 +1134,27 @@ class AgentRunner:
             predicate = out.extra["ci_default"]["predicate"]
             row = self.gitlab.get_mr(out.target) if out.kind == "mr" else self.gitlab.get_pipeline(out.target)
             if out.kind == "mr" and (not isinstance(row, dict) or row.get("state") != "opened"):
+                if jobs:
+                    return self._jobs_baseline_refused(out, "its merge request is not open")
                 return plain                    # merged, closed or in transit: nothing a baseline could wait for
             sha, pid, status = ci_observation(self.gitlab, out.kind, out.target, row=row)
         except Exception as e:                  # noqa: BLE001 - unreadable: the plain wait stands
             log.info("%s: default CI baseline for %s unreadable: %r", self.agent.name, out.target, e)
-            return plain
+            return self._jobs_baseline_refused(out, "its pipeline could not be read") if jobs else plain
+        if jobs:
+            # read from the named jobs: a final pipeline status (manual) says nothing about them
+            return dataclasses.replace(out, extra={"ci_change": {
+                "predicate": predicate, "sha": sha, "pipeline": pid, "status": status, "jobs": jobs}})
         if status in PIPELINE_DONE:
             return plain                        # already final: the plain wait wakes on the next check
         return dataclasses.replace(out, extra={"ci_change": {
             "predicate": predicate, "sha": sha, "pipeline": pid, "status": status}})
+
+    @staticmethod
+    def _jobs_baseline_refused(out: Outcome, why: str) -> Outcome:
+        return Outcome("unparsed", line=out.line, note=(
+            f"`jobs=[...]` wait on {out.target} sent back: {why}, so there is no baseline to read the "
+            "named jobs from; declare it again, or with an explicit `after=<sha>:<pipeline-id>:<status>`"))
 
     def _read_outcome(self, a: Attempt, result: TurnResult, comments: list[dict]) -> tuple[Outcome | None, str]:
         """The agent's newest declaration written after the turn started (Mesh
@@ -1316,7 +1338,15 @@ class AgentRunner:
             self._give_up(a, task, f"stopped after {a.turns} turns on this task")
             return
         no_session = NO_SESSION_HINT.search(f"{stderr} {result.error_details or result.error}")
+        unsupported = a.turns > 1 and UNSUPPORTED_RESUME_HINT.search(
+            f"{stderr} {result.error_details or result.error}") and (not result.finished or result.is_error)
         restarted = self.store.mark(self.agent.name, a.task_id, "session_restart")
+        if unsupported and restarted and restarted[0] == a.id:
+            # the fresh session was refused the same way: no more unchanged resumes, checkpoint and lease stay
+            self._give_up(a, task, "the harness cannot resume this thread (child of another session); "
+                                   "restarting it once did not help")
+            return
+        no_session = no_session or unsupported
         if (a.turns > 1 and no_session and (not result.finished or result.is_error)
                 and not (restarted and restarted[0] == a.id)):
             # resumed a session the harness does not know (it may report that as an error
@@ -1402,6 +1432,17 @@ class AgentRunner:
             log.info("%s: #%s wait on %s sent back: the pipeline does not exist on its host",
                      self.agent.name, a.task8, outcome.target)
             return
+        jobs_problem = self._jobs_wait_problem(a, outcome)
+        if jobs_problem:
+            if sent_back():
+                return
+            # a wait on named jobs that cannot wake: same budget as the other sent-back waits
+            self.store.outcome(a, "wait")
+            if self._over_budget(a, task):
+                return
+            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, jobs_problem))
+            log.info("%s: #%s wait on jobs of %s sent back", self.agent.name, a.task8, outcome.target)
+            return
         dead, dead_again = self._canceled_pipeline_wait(a, outcome)
         if dead:
             if sent_back():
@@ -1421,8 +1462,8 @@ class AgentRunner:
         if stale:
             if sent_back():
                 return
-            # This wait could never wake (measured 21.10: one card waited on another with
-            # after=...:running, already delivered as failed). Send it back, but count it as an
+            # This wait cannot wake when its after=...:running baseline was already delivered as
+            # failed. Send it back, but count it as an
             # idle wait: a session that keeps re-declaring it still reaches the wait budget.
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
@@ -1838,9 +1879,9 @@ class AgentRunner:
         A person is asked only by Mesh: it raises the gate from the ``❓ Blocking``
         line of the agent's comment after checking that the question was not
         answered already. The runner never sets the gate itself: such a gate skips
-        that check, carries no question and only a person can lift it (measured
-        17.10: a refused repeat ask, a shadow-mode lead and an ask to an agent all
-        sat in the owner's triage). When Mesh raised nothing, the agent is told why,
+        that check, carries no question and only a person can lift it. A refused repeat
+        ask, a shadow-mode lead or an ask to an agent must not enter human triage.
+        When Mesh raised nothing, the agent is told why,
         once per reason; after that the wait holds until someone comments."""
         # A real gate remains authoritative even if this turn names a bad handle
         # or the roster is unavailable. Never bypass an existing human hold.
@@ -3786,6 +3827,16 @@ class AgentRunner:
         if state == "locked":
             return ""                          # GitLab is merging it right now
         head = str(mr.get("sha") or "")
+        if head != m["sha"] and self.cfg.merge_follow_head and re.fullmatch(r"[0-9a-f]{40,64}", head) \
+                and int(m.get("follows", 0) or 0) < MERGE_FOLLOWS:
+            # A server rebase moved the head. Not a verdict: the gate re-reads the review evidence
+            # and carries the SHIP over only when the MR's own diff is unchanged, else it refuses
+            # and that refusal wakes the author. Bounded, so a head that keeps moving still wakes.
+            m["history"] = (list(m.get("history") or []) + [f"{iso()} head {m['sha'][:12]} -> {head[:12]}"])[-MERGE_HISTORY:]
+            m.update(sha=head, runs=0, follows=int(m.get("follows", 0) or 0) + 1)
+            for k in ("obs", "pipeline", "first_run", "last_run"):
+                m.pop(k, None)
+            result = None
         if head != m["sha"]:
             return (f"MR {target}: the head moved to {head[:12] or 'an unknown commit'} (you waited on "
                     f"{m['sha'][:12]}); the review covers the old head, a new review is needed")
@@ -4331,6 +4382,8 @@ class AgentRunner:
         '' = fine (baseline is current, the result is new to the agent, the predicate would not
         wake on it anyway, or it cannot be read/validated: the normal evaluator owns those)."""
         contract = wait["ci_change"]
+        if contract.get("jobs"):
+            return ""                           # read from its jobs: _jobs_wait_problem owns this
         try:
             sha, pid, status = ci_observation(self.gitlab, wait["kind"], wait["target"])
             if (sha, pid, status) == (contract["sha"], contract["pipeline"], contract["status"]):
@@ -4354,6 +4407,44 @@ class AgentRunner:
             log.warning("%s: #%s stale CI baseline check failed, baseline retained: %r",
                         self.agent.name, a.task8, exc)
             return ""
+
+    def _jobs_wait_problem(self, a: Attempt, outcome: Outcome) -> str:
+        """Send-back text for a typed wait on named jobs (``jobs=[...]``) that cannot wake: a name
+        the pipeline has no job for, a target with no job reads (a GitHub run), or jobs whose final
+        result was already delivered to the agent. '' = accept (also: not a jobs wait, or the
+        target is unreadable right now — the wait stands)."""
+        ci = outcome.extra.get("ci_change") or {}
+        jobs = ci.get("jobs")
+        if outcome.kind not in ("pipeline", "mr") or not jobs or self.gitlab is None:
+            return ""
+        target, names = outcome.target, ",".join(jobs)
+        try:
+            sha, pid, _status = ci_observation(self.gitlab, outcome.kind, target)
+            status, identity = target_jobs_state(self.gitlab, target, pid, jobs)
+        except UnknownJobs as e:
+            return (f"{outcome.kind} {target}: {e} (pipeline {pid}, {sha[:8]}), so this wait cannot complete "
+                    "and was sent back. Copy the job names from the pipeline, or wait on the pipeline itself.")
+        except ValueError as e:
+            if getattr(self.gitlab, "github_owns", lambda _t: False)(target):
+                return (f"{outcome.kind} {target}: jobs=[...] waits read GitLab pipeline jobs; a GitHub run has "
+                        "none. Wait on the run itself, without jobs=.")
+            log.info("%s: #%s jobs wait check failed, wait kept: %r", self.agent.name, a.task8, e)
+            return ""
+        except Exception as e:                  # noqa: BLE001 - unreadable: the wait stands
+            log.info("%s: #%s jobs wait check failed, wait kept: %r", self.agent.name, a.task8, e)
+            return ""
+        if status == "running":
+            return ""
+        delivered = lambda key: self._ci_delivered(a.task_id, key)  # noqa: E731
+        if ci.get("predicate") == "success" and status != "success":
+            told = owner_action_delivered(target, sha, pid, f"jobs[{names}]:{status}", delivered, identity)
+        else:
+            told = delivered(ci_delivery_key(target, pid, jobs)) == f"{sha}:{pid}:{identity}:{status}"
+        if not told:
+            return ""                           # new to the agent: the evaluator wakes on it
+        return (f"{outcome.kind} {target}: job(s) {names} already finished: {status} (pipeline {pid}, "
+                f"{sha[:8]}) and you were told, so this wait would never wake. Act on the result (fix, "
+                "retry the job, merge, ROUTE), then wait on the new state.")
 
     def _missing_pipeline_wait(self, a: Attempt, outcome: Outcome) -> str:
         """Send-back text for a ``pipeline`` wait whose target its host answers 404 for: it can
@@ -4384,7 +4475,7 @@ class AgentRunner:
         bounce it either) and leaves a ``dead_pipeline_rewait`` mark for the hourly report.
         ('', False) = not this case, or unreadable: the wait stands."""
         ci = outcome.extra.get("ci_change")
-        if outcome.kind != "pipeline" or not ci or self.gitlab is None:
+        if outcome.kind != "pipeline" or not ci or ci.get("jobs") or self.gitlab is None:
             return "", False
         target = outcome.target
         try:
@@ -4453,6 +4544,8 @@ class AgentRunner:
             return ""
         ci, merged = outcome.extra.get("ci_change"), outcome.extra.get("mr_state")
         target = outcome.target
+        if ci and ci.get("jobs"):
+            return ""                           # read from its jobs, not the aggregate: _jobs_wait_problem
         if outcome.kind == "pipeline" and not ci:
             return self._delivered_manual_plain_wait(a, target)
         try:
@@ -4653,10 +4746,12 @@ class AgentRunner:
 
     def _card_wait_told(self, a: Attempt, outcome: Outcome) -> str:
         """Text for a ``card`` wait on X when X itself waits on a timer, a measurement window, a
-        person or a review (a human gate): by the 21.10 dependency scheme that does not hold
+        person or a review (a human gate): these release gates do not hold
         development. '' = accept: X runs, waits on a pipeline/mr/card (code is coming), is an
         epic/umbrella, is closed, or is unknown to this store. A release-batch / kind:release card
-        waiting on X is accepted whatever X waits for: it holds only the release gate."""
+        waiting on X is accepted whatever X waits for: it holds only the release gate. So is a
+        kind:review card: its own part is done, what is left is the independent verdict, and
+        sending that wait back wakes the finished review part again with no new event."""
         if outcome.kind != "card" or not outcome.target:
             return ""
         try:
@@ -4681,12 +4776,12 @@ class AgentRunner:
             if not t or labels & {"epic", "umbrella"}:
                 return ""
             # the waiting card is a release step (no code left, only the release gate: QA, live
-            # acceptance, a person's access): the 21.10 scheme attaches those gates to release
+            # acceptance, a person's access): those gates attach to release
             me = self._task(a.task_id)
             mine = {str(l.get("name") if isinstance(l, dict) else l).casefold() for l in (me or {}).get("labels") or []}
-            if mine & {"release-batch", "kind:release"}:
+            if mine & {"release-batch", "kind:release", "kind:review"}:
                 return ""
-            return (f"#{outcome.target} itself waits for {idle}; under the 21.10 dependency scheme that does not "
+            return (f"#{outcome.target} itself waits for {idle}; a release gate does not "
                     "hold development. Do your part now, or name the code in it that you need and wait "
                     "for its merge (`⏳ WAIT mr:<group>/<project>!<iid>`).")
         except Exception as exc:                 # noqa: BLE001 - an unreadable target: the wait stands
@@ -5301,6 +5396,8 @@ class AgentRunner:
         out += [dict(t, _mode="work") for t in self._work_order(work)]
         for task in out:
             self._gate_event(task)
+        mine = {tid for tid in held | {t.get("id") for t in out} if tid}
+        self.owners.replace_for(self.agent.name, mine)   # Mesh events name a task; this says whose it is
         return out
 
     def _work_order(self, work: list[dict]) -> list[dict]:
@@ -5850,8 +5947,38 @@ class AgentRunner:
 
 
 STALL_TICKS = 10
+MIN_SLEEP_SECONDS = 5.0                # a slow Mesh must not turn polling into one request a second
+WAKE_DEBOUNCE_SECONDS = 5.0            # events inside this window after a tick start collapse into one wake tick
 STALL_MIN_SECONDS = 900.0              # a first fetch of a big repo may legitimately take minutes
 STOP_GRACE_SECONDS = 60.0
+
+
+class TaskOwners:
+    """Task id -> agent name, shared by every agent loop and the event endpoint thread; one lock guards it."""
+
+    def __init__(self) -> None:
+        self._owner: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def get(self, task_id: str) -> str:
+        with self._lock:
+            return self._owner.get(task_id, "")
+
+    def set(self, task_id: str, name: str) -> None:
+        with self._lock:
+            self._owner[task_id] = name
+
+    def replace_for(self, name: str, mine: set[str]) -> None:
+        """This agent now holds exactly ``mine``: forget the rest of its tasks, record these."""
+        with self._lock:
+            for tid in [k for k, v in self._owner.items() if v == name and k not in mine]:
+                del self._owner[tid]
+            for tid in mine:
+                self._owner[tid] = name
+
+    def as_dict(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._owner)
 
 
 class Runner:
@@ -5883,15 +6010,40 @@ class Runner:
         self.checkpoint_bytes: int | None = None     # None until the first measurement
         self._started = time.time()
         self._latest_lock = threading.Lock()
-        self._wake_gen = 0                 # bumped by a Mesh event: agent loops poll now, not at poll_seconds
+        self._wake_gen: dict[str, int] = {}    # per agent, bumped by a Mesh event addressed to it
+        self._task_owner = TaskOwners()        # task id -> agent name, learnt from each agent's polls
+        for ar in self.agents:
+            ar.owners = self._task_owner
 
-    def wake(self) -> None:
-        self._wake_gen += 1
+    def wake(self, names=()) -> None:
+        """Make the loops of these agents poll now, not at poll_seconds; nobody else wakes."""
+        for name in names:
+            self._wake_gen[name] = self._wake_gen.get(name, 0) + 1
 
-    def _sleep(self, stop: threading.Event, seconds: float, gen: int) -> None:
-        """Wait out the poll interval; a stop or a Mesh event (``wake``) ends it early."""
+    def wake_event(self, kind: str, payload: dict) -> list[str]:
+        """Wake only the agents a Mesh event is about: the assignee in the payload, or the agent known to
+        hold ``task_id``. An event nobody can be named for wakes no one: the regular poll finds its
+        work. An agent's own comment never wakes it (the runner's own writes must not feed back)."""
+        names: set[str] = set()
+        assignee, task_id, author = (str(payload.get(k) or "") for k in ("assignee_id", "task_id", "author_id"))
+        if assignee:
+            names |= {ar.agent.name for ar in self.agents if ar.agent_id == assignee}
+            if task_id and names:
+                self._task_owner.set(task_id, next(iter(names)))
+        owner = self._task_owner.get(task_id) if task_id else ""
+        if owner:
+            names.add(owner)
+        if author:                                       # author_id is a Mesh agent id: map it to the loop's name
+            author_names = {ar.agent.name for ar in self.agents if ar.agent_id == author}
+            names -= author_names
+        self.wake(sorted(names))
+        return sorted(names)
+
+    def _sleep(self, stop: threading.Event, seconds: float, name: str, gen: int, not_before: float = 0.0) -> None:
+        """Wait out the poll interval; a stop or a Mesh event addressed to this agent (``wake``) ends it
+        early, but not before ``not_before`` (monotonic): events inside that window collapse into one tick."""
         end = time.monotonic() + seconds
-        while time.monotonic() < end and self._wake_gen == gen:
+        while time.monotonic() < end and (self._wake_gen.get(name, 0) == gen or time.monotonic() < not_before):
             if stop.wait(min(0.5, max(0.0, end - time.monotonic()))):
                 return
 
@@ -5948,7 +6100,7 @@ class Runner:
                 counts[a["state"]] = counts.get(a["state"], 0) + 1
             for state in ("running", "starting", "waiting", "ready", "unknown"):
                 lines.append(f'mesh_runner_attempts{{agent="{name}",state="{state}"}} {counts.get(state, 0)}')
-        try:                                    # card #face4a7a: chats and cards share interactive_max_sessions
+        try:                                    # chats and cards share interactive_max_sessions
             listed = interactive.Tmux(self.cfg.tmux_binary).all_windows()
             chats = sum(1 for _, w in listed if w.startswith(interactive.CHAT_PREFIX))
             lines += ["# TYPE mesh_runner_interactive_windows gauge",
@@ -6049,9 +6201,10 @@ class Runner:
         try:
             while not stop.is_set():
                 started = time.monotonic()
-                gen = self._wake_gen
+                gen = self._wake_gen.get(ar.agent.name, 0)
                 self._tick_agent(ar)
-                self._sleep(stop, max(1.0, self.cfg.poll_seconds - (time.monotonic() - started)), gen)
+                self._sleep(stop, max(MIN_SLEEP_SECONDS, self.cfg.poll_seconds - (time.monotonic() - started)),
+                            ar.agent.name, gen, not_before=started + WAKE_DEBOUNCE_SECONDS)
         except BaseException as e:       # a dead loop must show at once, not as a stale healthy row
             log.critical("%s: agent loop died: %r", ar.agent.name, e)
             with self._latest_lock:
@@ -6142,7 +6295,7 @@ class Runner:
         service = None
         if cfg.extension_enabled:
             from .extension_service import ExtensionService
-            service = ExtensionService(cfg.state_dir, self.wake, cfg.extension_workspace_id,
+            service = ExtensionService(cfg.state_dir, self.wake_event, cfg.extension_workspace_id,
                                        expected_secret=cfg.extension_secret,
                                        trust_first_install=cfg.extension_trust_first_install, allow_rekey=cfg.extension_allow_rekey,
                                        tolerance=cfg.extension_tolerance_seconds)

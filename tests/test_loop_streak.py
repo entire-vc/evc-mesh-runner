@@ -343,7 +343,7 @@ class NothingNew(LoopBench):
         from mesh_runner.runner import AgentRunner
         gist = AgentRunner._comment_gist
         a = gist("Still waiting for pipeline 21234 (checked 14:05) - see https://git.example/x/-/pipelines/21234?page=2&scope=all, "
-                 "commit 4739602a065f on 2026-10-28T14:05:11Z")
+                 "commit abcdef123456 on 2026-10-28T14:05:11Z")
         b = gist("STILL waiting for pipeline 99 (checked 9:41 pm)... see https://git.example/x/-/pipelines/99?foo=bar, "
                  "commit deadbeef0 on 2027-01-02 07:30")
         self.assertEqual(a, b)

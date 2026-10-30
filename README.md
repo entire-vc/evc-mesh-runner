@@ -112,6 +112,26 @@ CI/MR state read at the moment the wait is declared as its baseline. A target th
 already final (a pipeline in any terminal status, a merge request merged or closed), or that
 cannot be read, leaves the plain wait; only a non-final target keeps a typed baseline.
 
+A typed wait can name the jobs it is about: append `jobs=[<job>,<job>]` (GitLab job
+names) to `until=change|success`, with or without `after=`:
+
+```
+⏳ WAIT pipeline:group/project#22634 until=success after=<full-head-sha>:22634:manual jobs=[browser-tests]
+⏳ WAIT mr:group/project!56 until=success jobs=[e2e]
+```
+
+The predicate is then read from those jobs (the latest try of each), not from the
+pipeline status: once every named job is final the wait wakes, `until=change` on any
+final result and `until=success` when all of them succeeded; a failed, canceled,
+skipped or manual named job under `until=success` wakes once with an action-required
+notice. Jobs outside the list are ignored, so a pipeline left `manual` by unstarted
+sibling jobs no longer holds back a target job that has finished. A retried job is a new
+observation. An `mr:` wait reads the jobs of the MR's current head pipeline. A name the
+pipeline has no job for, `jobs=[]`, a GitHub run, or a result already delivered to the
+agent is sent back at declaration. The older spelling `⏳ WAIT pipeline:<proj>#<id>
+jobs=[...]` is read as `until=change jobs=[...]` with the state of the moment as its
+baseline. Sibling jobs are never started and no timer replaces the event.
+
 An ordinary typed `pipeline:... until=success after=...` wait also gives one
 action-required notice when that exact pipeline and SHA have finished with
 `failed`, `canceled`/`cancelled`, or `skipped`, or are blocked in aggregate `manual`

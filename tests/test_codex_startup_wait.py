@@ -1,7 +1,7 @@
 """Codex start-up on a loaded host: the driver waits for it instead of failing the turn.
 
-Measured 26.10 on a saturated Mini: a resumed Codex shows its prompt box at once ("Resuming session…"), a
-prompt entered then is queued under "Waiting for startup · esc cancel", and start-up took 30-130 s. The
+On a saturated host, a resumed Codex can show its prompt box at once ("Resuming session…"); a
+prompt entered then is queued under "Waiting for startup · esc cancel", and start-up can take 30-130 s. The
 driver ran on a scripted tmux and a fake clock, so minutes of waiting cost no time.
 """
 import io

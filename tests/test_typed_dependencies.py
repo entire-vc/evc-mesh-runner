@@ -53,7 +53,7 @@ class TypedDependencySatisfaction(unittest.TestCase):
         self.assertEqual(run(edge(), {"status_category": "in_progress"})[0], ["b1"])
 
     def test_false_on_an_untyped_condition_falls_back_to_the_blocker_state(self):
-        # 26.10: the production server computes condition_satisfied from evidence only, so a
+        # A server may compute condition_satisfied from evidence only, so a
         # task_done edge to a done blocker reads False; that must not hold the dependant
         self.assertEqual(run(edge(condition="task_done", condition_satisfied=False), {"status_category": "done"})[0], [])
         self.assertEqual(run(edge(condition_satisfied=False), {"status_category": "cancelled"})[0], [])

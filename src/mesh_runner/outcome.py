@@ -11,6 +11,7 @@ the attempt started and takes the last declaration line in it:
     ⏳ WAIT decision:@<agent>                              another agent answers
     ⏳ WAIT <absoluteISO>: external=<reference> source=<https-url|card:#8hex> <why>
     ⏳ WAIT pipeline:<proj>#<id> until=success|change     a changed/successful pipeline (``after=`` optional)
+    ⏳ WAIT pipeline:<proj>#<id> until=... jobs=[a,b]     the same, read from the named jobs only
     ↻ NEXT[: note]                                         continue right away
     ❓ Blocking @<person>: <question>                      a person must decide (Mesh raises the gate)
 
@@ -28,6 +29,9 @@ DECLARATION = re.compile(r"^\s*(⏳\s*WAIT\b|↻\s*NEXT(?:\s*:|\s*$)|❓\s+(?:\*
 _EXPLANATION = r"(?P<note>(?:\s*:.*|\s*[—–].*|\s*\|.*|\s+-(?:\s.*)?)?)$"
 _WAIT_HEAD = r"^\s*⏳\s*WAIT\s+"
 
+_JOBS = r"(?:\s+jobs=\[(?P<jobs>[^\]]*)\])?"
+# ``jobs=[...]`` written between the target and ``until=`` is moved behind the baseline.
+_JOBS_FIRST = re.compile(r"^(\s*⏳\s*WAIT\s+(?:mr|pipeline):\S+)(\s+jobs=\[[^\]]*\])(\s+until=\S+(?:\s+after=\S+)?)")
 _PIPELINE = re.compile(
     _WAIT_HEAD + r"pipeline:(?P<project>[\w.\-/]+)#(?P<id>\d+)(?:\s+jobs=\[(?P<jobs>[^\]]*)\])?" + _EXPLANATION)
 _MR = re.compile(_WAIT_HEAD + r"(?:mr|pipeline):(?P<project>[\w.\-/]+)!(?P<id>\d+)" + _EXPLANATION)
@@ -35,13 +39,13 @@ _CI_CHANGE = re.compile(
     _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
     r"\s+until=(?P<predicate>change|success)\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64}):"
     r"(?P<pipeline>[1-9]\d{0,11}):(?P<status>created|waiting_for_resource|preparing|pending|running|success|failed|canceled|cancelled|skipped|manual|scheduled)"
-    + _EXPLANATION)
+    + _JOBS + _EXPLANATION)
 # ``until=`` without ``after=``: the baseline is the state at the moment the wait is declared. The
 # parser cannot read GitLab, so it only marks the wait (``extra["ci_default"]`` / ``["mr_default"]``)
 # and the runner fills the baseline in (or falls back to the plain wait when it cannot read it).
 _CI_DEFAULT = re.compile(
     _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
-    r"\s+until=(?P<predicate>change|success)" + _EXPLANATION)
+    r"\s+until=(?P<predicate>change|success)" + _JOBS + _EXPLANATION)
 _MR_MERGED_DEFAULT = re.compile(
     _WAIT_HEAD + r"mr:(?P<project>[\w.\-/]+)!(?P<id>[1-9]\d{0,11})\s+until=merged" + _EXPLANATION)
 _MR_STATE = re.compile(
@@ -108,7 +112,19 @@ def _explicit_wait_problem(line: str) -> str:
                 "until/after (`⏳ WAIT mr:<group>/<project>!<iid>`) or wait for the merge with "
                 "`until=merged after=<sha>:opened`")
     return ("invalid explicit VCS wait: expected `until=change|success after=<full-sha>:<pipeline-id>:<status>` "
-            "or `until=merged after=<full-sha>:opened`")
+            "(optionally followed by `jobs=[<job>,<job>]`) or `until=merged after=<full-sha>:opened`")
+
+
+def _jobs(m: re.Match) -> tuple[str, ...] | None:
+    """The job names of a ``jobs=[...]`` field: () without the field, None when it names none."""
+    if m.group("jobs") is None:
+        return ()
+    names = tuple(dict.fromkeys(j.strip() for j in m.group("jobs").split(",") if j.strip()))
+    return names or None
+
+
+JOBS_EMPTY = ("invalid explicit VCS wait: `jobs=[]` names no job; list the job names "
+              "(`jobs=[browser-tests,lint]`) or drop the field to wait on the whole pipeline")
 
 
 def declaration_lines(text: str) -> list[str]:
@@ -118,6 +134,7 @@ def declaration_lines(text: str) -> list[str]:
 def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = False) -> Outcome:
     """``merge``: the runner is configured to run a merge gate for ``merge:`` waits."""
     note = lambda m: (m.group("note") or "").strip(" :—–-|")  # noqa: E731
+    line = _JOBS_FIRST.sub(r"\1\3\2", line, count=1)
     if _MERGE_HEAD.match(line):
         if not merge:
             return Outcome("unparsed", note=(
@@ -137,9 +154,15 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         kind = "mr" if m["sep"] == "!" else "pipeline"
         if (m["kind"] == "mr" and kind != "mr") or (kind == "pipeline" and m["pipeline"] != m["id"]):
             return Outcome("unparsed", note="CI baseline does not match target", line=line)
-        return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", note=note(m), line=line,
-                       extra={"ci_change": {"predicate": m["predicate"], "sha": m["sha"],
-                                            "pipeline": int(m["pipeline"]), "status": m["status"]}})
+        jobs = _jobs(m)
+        if jobs is None:
+            return Outcome("unparsed", note=JOBS_EMPTY, line=line)
+        contract = {"predicate": m["predicate"], "sha": m["sha"],
+                    "pipeline": int(m["pipeline"]), "status": m["status"]}
+        if jobs:
+            contract["jobs"] = list(jobs)
+        return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", jobs=jobs, note=note(m), line=line,
+                       extra={"ci_change": contract})
     if m := _MR_MERGED_DEFAULT.match(line):
         return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line,
                        extra={"mr_default": {"predicate": "merged"}})
@@ -147,15 +170,25 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         kind = "mr" if m["sep"] == "!" else "pipeline"
         if m["kind"] == "mr" and kind != "mr":
             return Outcome("unparsed", note="CI baseline does not match target", line=line)
-        return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", note=note(m), line=line,
-                       extra={"ci_default": {"predicate": m["predicate"]}})
+        jobs = _jobs(m)
+        if jobs is None:
+            return Outcome("unparsed", note=JOBS_EMPTY, line=line)
+        default = {"predicate": m["predicate"], **({"jobs": list(jobs)} if jobs else {})}
+        return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", jobs=jobs, note=note(m), line=line,
+                       extra={"ci_default": default})
     # Explicit fields are a contract, including when malformed; never seed a
     # legacy already-terminal wait from an invalid typed declaration.
     if re.match(_WAIT_HEAD + r"(?:mr|pipeline):[^\s]+\s+(?:until|after)\b", line):
         return Outcome("unparsed", note=_explicit_wait_problem(line), line=line)
     if m := _PIPELINE.match(line):
-        jobs = tuple(j.strip() for j in (m.group("jobs") or "").split(",") if j.strip())
-        return Outcome("pipeline", f"{m['project']}#{m['id']}", jobs=jobs, note=note(m), line=line)
+        jobs = _jobs(m)
+        if jobs is None:
+            return Outcome("unparsed", note=JOBS_EMPTY, line=line)
+        if jobs:
+            # the older spelling: read as `until=change jobs=[...]` with the baseline of the moment
+            return Outcome("pipeline", f"{m['project']}#{m['id']}", jobs=jobs, note=note(m), line=line,
+                           extra={"ci_default": {"predicate": "change", "jobs": list(jobs)}})
+        return Outcome("pipeline", f"{m['project']}#{m['id']}", note=note(m), line=line)
     if m := _MR.match(line):
         return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line)
     if m := _CARD.match(line):
@@ -238,6 +271,8 @@ After observing a known CI result, wait for a NEW observation explicitly:
   ⏳ WAIT mr:<group>/<project>!<iid> until=change after=<full-head-sha>:<pipeline-id>:<status>
 Use until=success to require a changed successful head pipeline; pending does not satisfy it.
 Use pipeline:<group>/<project>#<id> with the same fields to observe retries of that exact pipeline.
+To wait for specific jobs only, append jobs=[<job>,<job>] (GitLab job names): the wait is read from those jobs
+and wakes once all are final, even while other jobs (manual siblings) leave the pipeline unfinished.
 After you yourself run an authorized manual job, wait for its RESULT: until=success on that pipeline.
 until=change on a baseline that is already final (manual, failed, canceled, success) is sent back: nothing changes
 without your action. Act first (merge wrapper, start the job, push, retry), then wait on the new state.

@@ -1,4 +1,4 @@
-"""A usage-limit notice left on the pane is not a running turn (live 28.10).
+"""A usage-limit notice left on the pane is not a running turn.
 
 Claude Code keeps "Usage limit reached · continuing automatically at 12pm · esc to cancel" on screen after the
 stated time. BUSY_RE read its "esc to cancel" as a running turn, so every later turn on that window waited

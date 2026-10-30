@@ -2,8 +2,8 @@
 
 A time wait sets the task's `start_after` to its own time so that no other scheduler picks
 the task up while its session is parked. An event wait (pipeline, mr, merge, card, decision,
-blocking, queue) writes nothing: it follows its event with no timer (owner rule of 28.10, a
-`start_after` is for a specific external event with a known timestamp). A rolling horizon that an
+blocking, queue) writes nothing: it follows its event with no timer. A
+`start_after` is for a specific external event with a known timestamp. A rolling horizon that an
 older runner wrote for an event wait is compare-cleared the next time the runner touches that wait
 (renew, adopt or wake). When the wait ends (woken, resumed, or the attempt closes because the task
 left the agent) the runner takes that schedule back. A schedule the runner did not set is

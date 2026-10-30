@@ -107,8 +107,8 @@ class AddressedFilter(unittest.TestCase):
 
     def test_an_always_from_author_with_an_fyi_lead_does_not_wake(self):
         fyi = ["FYI: the grant is the same", "**FYI** same grant", "[FYI] same grant", "fyi: same grant",
-               "  \n> **FYI** same grant", "FYI из #307566d2 (CI auth contract): the token moved",
-               "**Combined handback e7073fa8 (FYI, same grant).**\n\nbody text"]
+               "  \n> **FYI** same grant", "FYI из #11112222 (CI auth contract): the token moved",
+               "**Combined handback 33334444 (FYI, same grant).**\n\nbody text"]
         for kind in ("time", "pipeline", "mr", "decision", "card", "merge"):
             w = {"kind": kind, "handle": "lead"}
             for body in fyi:

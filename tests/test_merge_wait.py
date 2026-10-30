@@ -381,6 +381,36 @@ class Gate(MergeBench):
         self.assertIn("new review is needed", a.wake_text)
         self.assertEqual(self.runs(), [])
 
+    def test_follow_head_runs_the_gate_on_the_rebased_head(self):
+        # a clean server rebase woke the author for a new review before the gate could carry the SHIP
+        self.cfg.merge_follow_head = True
+        r, a, t, gl = self.waiting()
+        gl.mr_rows[TARGET] = mr_row(sha=OTHER)
+        self.say("MR merged by the gate\n", rc=0)
+        a = self.check(r, a)
+        self.assertEqual(a.state, "waiting")
+        self.assertEqual(self.runs(), [f"56 {PROJECT} {OTHER}"])
+        self.assertEqual(a.wait["merge"]["sha"], OTHER)
+
+    def test_follow_head_refusal_still_wakes_with_the_gate_tail(self):
+        # own change to the MR: the wrapper refuses to carry the SHIP, the author is told why
+        self.cfg.merge_follow_head = True
+        r, a, t, gl = self.waiting()
+        gl.mr_rows[TARGET] = mr_row(sha=OTHER)
+        self.say("HOLD: own changes differ from the reviewed head\n", rc=2)
+        a = self.check(r, a)
+        a = self.check(r, a)
+        self.assertEqual(a.state, "ready")
+        self.assertIn("own changes differ", a.wake_text)
+
+    def test_follow_head_is_bounded(self):
+        self.cfg.merge_follow_head = True
+        r, a, t, gl = self.waiting(follows=5)
+        gl.mr_rows[TARGET] = mr_row(sha=OTHER)
+        a = self.check(r, a)
+        self.assertEqual((a.state, self.runs()), ("ready", []))
+        self.assertIn("new review is needed", a.wake_text)
+
     def test_head_moving_while_queued_wakes(self):
         r, a, t, gl = self.waiting()
         gl.pipeline_rows[QUEUE] = {"status": "running"}
