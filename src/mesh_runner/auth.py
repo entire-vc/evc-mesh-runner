@@ -58,7 +58,10 @@ def clear(store: Store, profile: str) -> bool:
         raise ValueError("expected the exact profile fingerprint from status")
     cur = store.db.execute("UPDATE marks SET value='' WHERE agent=? AND task_id=? AND key=? AND value!=''",
                            (OWNER, PREFIX + profile, KEY))
-    return cur.rowcount == 1
+    cleared = cur.rowcount == 1
+    if cleared:
+        store.db.execute("DELETE FROM marks WHERE task_id=? AND key='auth_route_attempt'", (PREFIX + profile,))
+    return cleared
 
 
 def status(store: Store, config_path: str = "<runner.toml>") -> list[dict]:

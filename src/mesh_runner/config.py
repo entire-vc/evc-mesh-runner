@@ -182,6 +182,7 @@ class AgentConfig:
     inline_env: dict[str, str] = field(default_factory=dict, repr=False)
     env_command: list[str] = field(default_factory=list)   # prints KEY=VALUE lines; run before every spawn
     on_limit_command: list[str] = field(default_factory=list)  # run on a provider limit; exit 0 = switched
+    on_auth_command: list[str] = field(default_factory=list)  # exact auth hold; exit 0 = routed, never clears hold
     start_gate_command: list[str] = field(default_factory=list)  # before a start/resume: 0 go, 75 hold
     turn_end_command: list[str] = field(default_factory=list)    # after every turn, with the gate's output
     alt: dict = field(default_factory=dict)    # other harnesses the agent may be routed to: {"codex": {"profile", "args", "binary"}}
@@ -689,6 +690,7 @@ def load(path: str | Path) -> RunnerConfig:
             inline_env={k: str(v) for k, v in (a.get("env") or {}).items()},
             env_command=list(a.get("env_command") or []),
             on_limit_command=list(a.get("on_limit_command") or []),
+            on_auth_command=list(a.get("on_auth_command") or []),
             start_gate_command=list(a.get("start_gate_command") or []),
             turn_end_command=list(a.get("turn_end_command") or []),
             chat=dict(a.get("chat") or {}),

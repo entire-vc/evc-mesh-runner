@@ -402,3 +402,194 @@ class ClearCommand(unittest.TestCase):
                 self.assertEqual(main(["clear-auth-hold", "--config", str(cfg), "--profile", a]), 0)
             self.assertFalse(auth.held(store, a))
             self.assertTrue(auth.held(store, b))
+
+
+class AuthRouting(Bench):
+    """Local fake processes only: no provider calls or Mesh mutations outside FakeMesh."""
+
+    expire = AuthLoop.expire
+
+    def route_to_codex(self, r, *, rc=0):
+        from fakes import FakeProfileAdapter
+        route = self.root / "codex-route"
+        count = self.root / "auth-route-calls"
+        self.agent.on_auth_command = [sys.executable, "-c",
+            f"from pathlib import Path; import sys; Path({str(count)!r}).open('a').write('called\\n');"
+            + (f"Path({str(route)!r}).touch();" if rc == 0 else "") + f"sys.exit({rc})"]
+        self.agent.env_command = [sys.executable, "-c",
+            f"from pathlib import Path; print('MESH_RUNNER_HARNESS=codex') if Path({str(route)!r}).exists() else None;"
+            "print('MESH_RUNNER_PROFILE=builder')"]
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "builder")}
+        return route, count
+
+    def test_auth_route_preserves_uuid_verified_checkpoint_and_context_without_claude_override(self):
+        import subprocess
+        r, mesh, t, a, profile = self.expire()
+        old_session = a.session_id
+        path = Path(a.workspaces[0])
+        (path / "staged.txt").write_text("staged work")
+        subprocess.run(["git", "-C", str(path), "add", "staged.txt"], check=True)
+        (path / "untracked.txt").write_text("untracked work")
+        r.pool.suspend(a.id, {"session_id": old_session, "harness": "claude", "workspaces": a.workspaces,
+                             "wait": {}}, writer_stopped=True)
+        r.store.update(a, wake_text="dependency complete; preserve investigation")
+        r.store.mark(self.agent.name, t["id"], "model", "sonnet")
+        r.store.mark(self.agent.name, t["id"], "effort", "low")
+        route, count = self.route_to_codex(r)
+        r._authentication_failed(r.store.get(a.id), profile)
+        self.assertTrue(route.exists())
+        self.assertFalse(mesh.checkouts)
+        self.assertTrue(auth.held(r.store, profile))
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        r.tick()
+        self.settle_all(r)
+        kept = r.store.get(a.id)
+        self.assertEqual((kept.task_id, kept.harness, kept.state), (t["id"], "codex", "waiting"))
+        spawned = calls(self.calls)[-1]
+        self.assertFalse(spawned["resume"])
+        self.assertNotEqual(spawned["sid"], old_session)
+        self.assertEqual((spawned["profile"], spawned["model"], spawned["effort"]), ("builder", "", ""))
+        self.assertIn("Restored verified WAIT checkpoint", spawned["prompt"])
+        self.assertIn("preserve investigation", spawned["prompt"])
+        restored = Path(kept.workspaces[0])
+        self.assertEqual((restored / "untracked.txt").read_text(), "untracked work")
+        self.assertIn("staged.txt", subprocess.check_output(["git", "-C", str(restored), "diff", "--cached", "--name-only"], text=True))
+        self.assertEqual(count.read_text().splitlines(), ["called"])
+        self.assertEqual(r.store.mark(self.agent.name, t["id"], "model")[0], "sonnet")
+
+    def test_failed_route_backoff_is_durable_capped_and_clear_rearms(self):
+        r, mesh, t, a, profile = self.expire()
+        _, count = self.route_to_codex(r, rc=1)
+        r._authentication_failed(a, profile)
+        r = self.runner(mesh)             # no in-memory retry guard survives
+        from fakes import FakeProfileAdapter
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "builder")}
+        for _ in range(3):
+            r._resume_hold.clear()
+            r.tick()
+        self.assertEqual(count.read_text().splitlines(), ["called"])
+        self.assertEqual(len(calls(self.calls)), 1)
+        self.assertEqual(r.store.get(a.id).state, "ready")
+        self.assertFalse(mesh.checkouts)
+        for tries in (1, 2):
+            r.store.mark(self.agent.name, auth.PREFIX + profile, "auth_route_attempt",
+                         json.dumps({"tries": tries, "retry_at": 0}))
+            r._authentication_failed(a, profile)
+        self.assertEqual(len(count.read_text().splitlines()), 3)
+        r._authentication_failed(a, profile)
+        self.assertEqual(len(count.read_text().splitlines()), 3)
+        r.store.mark(self.agent.name, auth.PREFIX + profile, "auth_route_attempt",
+                     json.dumps({"tries": 20, "retry_at": 0}))
+        before = time.time()
+        r._authentication_failed(a, profile)
+        mark = json.loads(r.store.mark(self.agent.name, auth.PREFIX + profile, "auth_route_attempt")[0])
+        self.assertGreaterEqual(mark["retry_at"], before + 900)
+        self.assertLess(mark["retry_at"], time.time() + 901)
+        self.assertTrue(auth.clear(r.store, profile))
+        auth.hold(r.store, profile)
+        r._authentication_failed(a, profile)
+        self.assertEqual(len(count.read_text().splitlines()), 5)
+
+    def test_held_before_start_retains_one_ready_attempt_without_abort_storm(self):
+        r, mesh, t, a, profile = self.expire()
+        self.route_to_codex(r, rc=1)
+        second = task(2)
+        mesh.tasks[second["id"]] = second
+        self.assertFalse(r._start_one(second))
+        held = r.store.open_for_task(self.agent.name, second["id"])
+        self.assertIsNotNone(held)
+        self.assertEqual((held.state, held.turns, held.workspaces), ("ready", 0, []))
+        for _ in range(3):
+            r._resume_hold.clear()
+            r.tick()
+        self.assertEqual(r.store.open_for_task(self.agent.name, second["id"]).id, held.id)
+        self.assertEqual(len(calls(self.calls)), 1)
+        self.assertFalse(mesh.checkouts)
+
+    def test_missing_alt_adapter_never_runs_the_auth_command(self):
+        r, mesh, t, a, profile = self.expire()
+        _, count = self.route_to_codex(r)
+        r.alt_adapters = {}
+        r._authentication_failed(a, profile)
+        self.assertFalse(count.exists())
+        self.assertTrue(auth.held(r.store, profile))
+
+    def test_quota_command_routes_same_attempt_to_codex_and_keeps_workdir(self):
+        r, mesh, t, a, profile = self.expire()
+        self.route_to_codex(r)
+        self.agent.on_limit_command = self.agent.on_auth_command
+        self.assertTrue(r._switch_on_limit(a))
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        r._resume_hold.clear()
+        r.tick()
+        self.settle_all(r)
+        kept = r.store.get(a.id)
+        self.assertEqual((kept.task_id, kept.workspaces, kept.harness), (a.task_id, a.workspaces, "codex"))
+        self.assertIn("existing task after a harness switch", calls(self.calls)[-1]["prompt"])
+
+    def test_network_error_cannot_request_auth_route(self):
+        r, mesh, t, a, profile = self.expire()
+        auth.clear(r.store, profile)
+        _, count = self.route_to_codex(r)
+        self.assertFalse(r._switch_on_auth(a, profile))
+        self.assertFalse(count.exists())
+        with tempfile.TemporaryDirectory() as root:
+            p = Path(root) / "network.jsonl"
+            p.write_text(json.dumps({"type": "result", "is_error": True, "result": "Connection error: ECONNRESET 401"}) + "\n")
+            self.assertFalse(ClaudeAdapter().parse(p).auth_failed)
+
+    def test_permanent_routing_hold_does_not_retry_after_backoff(self):
+        r, mesh, t, a, profile = self.expire()
+        _, count = self.route_to_codex(r, rc=78)
+        r._authentication_failed(a, profile)
+        marker = json.loads(r.store.mark(self.agent.name, auth.PREFIX + profile, "auth_route_attempt")[0])
+        self.assertTrue(marker["permanent"])
+        marker["retry_at"] = 0
+        r.store.mark(self.agent.name, auth.PREFIX + profile, "auth_route_attempt", json.dumps(marker))
+        r._authentication_failed(a, profile)
+        self.assertEqual(count.read_text().splitlines(), ["called"])
+        self.assertIn("permanent routing hold", r.store.get(a.id).note)
+
+    def test_next_turn_still_obeys_admission_after_successful_auth_route(self):
+        r, mesh, t, a, profile = self.expire()
+        self.route_to_codex(r)
+        r._authentication_failed(a, profile)
+        self.agent.start_gate_command = [sys.executable, "-c", "import sys; print('QA independence refused'); sys.exit(75)"]
+        r.tick()
+        self.assertEqual(len(calls(self.calls)), 1)
+        self.assertEqual(r.store.get(a.id).state, "ready")
+        self.assertFalse(mesh.checkouts)
+        self.assertTrue(auth.held(r.store, profile))
+
+    def test_legacy_claude_mark_on_native_codex_lane_does_not_override_codex(self):
+        r, mesh, t, a, profile = self.expire()
+        from fakes import FakeProfileAdapter
+        self.agent.harness = "codex"
+        r.adapter = FakeProfileAdapter(self.adapter.script, "builder")
+        r.alt_adapters = {"claude": self.adapter}
+        r.store.mark(self.agent.name, t["id"], "model", "opus")
+        r.store.mark(self.agent.name, t["id"], "effort", "low")
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        r._resume_hold.clear()
+        r.tick()
+        self.settle_all(r)
+        self.assertEqual((calls(self.calls)[-1]["model"], calls(self.calls)[-1]["effort"]), ("", ""))
+
+    def test_task_specific_qa_hold_does_not_permanently_block_other_task_fallback(self):
+        r, mesh, t, a, profile = self.expire()
+        self.route_to_codex(r, rc=75)
+        r.store.update(a, mode="review")
+        r._authentication_failed(a, profile)
+        marker = json.loads(r.store.mark(self.agent.name, auth.PREFIX + profile, "auth_route_attempt")[0])
+        self.assertFalse(marker["permanent"])
+        marker["retry_at"] = 0                 # the existing runner's backoff has elapsed
+        r.store.mark(self.agent.name, auth.PREFIX + profile, "auth_route_attempt", json.dumps(marker))
+        second = task(2)
+        mesh.tasks[second["id"]] = second
+        other = r.store.create(self.agent.name, second["id"], "claude")
+        route, count = self.route_to_codex(r)
+        r._authentication_failed(other, profile)
+        self.assertTrue(route.exists())
+        self.assertEqual(len(count.read_text().splitlines()), 2)
+        self.assertTrue(auth.held(r.store, profile))
+        self.assertEqual(len(calls(self.calls)), 1)
