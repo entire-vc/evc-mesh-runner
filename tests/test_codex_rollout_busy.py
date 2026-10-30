@@ -190,6 +190,24 @@ class CodexRollout(RolloutCase):
         self.rollout(THREAD, meta(self.cwd))             # maybe another card's, just created
         self.assertEqual(d.fresh_rollout(), "")
 
+    def test_fresh_rollout_never_takes_a_foreign_child_thread_with_an_empty_prompt(self):
+        d = self.driver()                                # pre-prompt: nothing to tell the cards apart by
+        child = self.rollout(OTHER, rec("session_meta", id=OTHER, cwd=str(self.cwd),
+                                        source={"subagent": {"thread_spawn": {"parent_thread_id": THREAD}}}),
+                             started())
+        self.assertEqual(d.fresh_rollout(), "")
+        self.assertTrue(child.exists())
+
+    def test_run_binds_the_prompt_before_the_first_rollout_discovery(self):
+        d = self.driver()
+        seen = []
+        d.beat = lambda *a, **k: seen.append(d.prompt)
+        d.ensure_session = lambda: (_ for _ in ()).throw(tui_driver.DriverError("stop", close=True))
+        d.run("Task A: fix the lint")
+        self.assertEqual(seen[0], "Task A: fix the lint")
+        self.rollout(OTHER, meta(self.cwd))              # a foreign blank session, same cwd, new mtime
+        self.assertEqual(d.fresh_rollout(), "")
+
     def test_open_task_is_found_behind_more_than_one_tail_block(self):
         d = self.driver(sid=THREAD)
         filler = rec("response_item", type="function_call_output", output="x" * 4000)
@@ -222,7 +240,7 @@ def stamped(kind, at, **payload):
 
 
 class StaleOpenTask(RolloutCase):
-    """A task_started left by a Codex process that died mid-turn (26.10, lane Bart) is not a running turn."""
+    """A task_started left by a Codex process that died mid-turn is not a running turn."""
 
     def idle_driver(self, started_at, process_start=PROCESS_START, pid=str(PANE_PID)):
         d = self.driver(sid=THREAD)

@@ -165,10 +165,10 @@ class RecipientRosterPathAllowed(unittest.TestCase):
         paths = []
         client = MeshClient("http://mesh.invalid", "k")
         client.bounded_get = lambda path, timeout: paths.append(path) or []
-        client.workspace_recipients("3c1ead8e-a9e0-4583-a014-cdf2a1fd1159", "Lead")
+        client.workspace_recipients("11111111-1111-4111-8111-111111111111", "Lead")
         for hostile in ("/workspaces/x/mentionables?q=a", "/agents/me", "/tasks/../agents",
                         "/workspaces/" + "-" * 36 + "/mentionables?q=a&limit=50",
-                        "/workspaces/3c1ead8e-a9e0-4583-a014-cdf2a1fd1159/mentionables?q=%zz&limit=50"):
+                        "/workspaces/11111111-1111-4111-8111-111111111111/mentionables?q=%zz&limit=50"):
             with self.subTest(path=hostile), \
                     patch.object(MeshClient, "_bounded_get_request", return_value=[]) as fetched:
                 self.assertEqual(self.worker(hostile)["status"], 0)

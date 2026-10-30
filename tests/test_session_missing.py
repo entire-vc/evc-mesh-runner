@@ -1,5 +1,5 @@
-"""A lane moved to another Claude account must not resume a conversation that account does not hold
-(28.10: six turns died at start with "No conversation found with session ID")."""
+"""A lane moved to another Claude account must not resume a conversation that account does not hold:
+resuming it would fail with "No conversation found with session ID"."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,14 +13,14 @@ class CarryFromAccountDirectories(unittest.TestCase):
     def test_a_lane_on_the_default_directory_finds_the_session_of_an_account_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            proj = home / ".claude-accounts" / "riker-team" / "projects" / "-work-agent"
+            proj = home / ".claude-accounts" / "example-team" / "projects" / "-work-agent"
             proj.mkdir(parents=True)
             (proj / "s-1.jsonl").write_text("{}\n")
             (home / ".claude").mkdir()
             env = {"HOME": tmp}                              # no CLAUDE_CONFIG_DIR: the default directory
             a = ClaudeAdapter()
             self.assertFalse(a.session_known("s-1", Path("/work/agent"), env))
-            self.assertIn("riker-team", a.prepare_resume("s-1", Path("/work/agent"), env))
+            self.assertIn("example-team", a.prepare_resume("s-1", Path("/work/agent"), env))
             self.assertTrue(a.session_known("s-1", Path("/work/agent"), env))
             self.assertTrue((home / ".claude/projects/-work-agent/s-1.jsonl").is_file())
 

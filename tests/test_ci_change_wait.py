@@ -476,3 +476,152 @@ class ExplicitWaitDiagnosisTests(unittest.TestCase):
 
     def test_other_malformation_gets_the_forms(self):
         self.assertIn('expected', self.note('until=change after=nonsense'))
+
+
+def _manual_pipeline():
+    import json
+    import pathlib
+    return json.loads((pathlib.Path(__file__).parent / 'data' / 'jobs_wait_manual_pipeline.json').read_text())
+
+
+class TargetJobs(Bench):
+    """``jobs=[...]``: the predicate is read from the named jobs, never from the aggregate status."""
+    TARGET = 'example/project#9001'
+
+    def setup_wait(self, predicate='success', jobs='browser-tests', target_status='success', baseline='manual'):
+        fx = _manual_pipeline()
+        self.sha = fx['pipeline']['sha']
+        t = task(1)
+        gl = FakeGitLab()
+        gl.pipeline_rows[self.TARGET] = dict(fx['pipeline'])
+        gl.jobs[self.TARGET] = [dict(j, status=target_status) if j['name'] == 'browser-tests' else j
+                                for j in fx['jobs']]
+        r = self.runner(FakeMesh([t]), gl)
+        r.refresh_me()
+        a = r.store.create(self.agent.name, t['id'], 'claude')
+        o = parse_line(f'⏳ WAIT pipeline:{self.TARGET} until={predicate} '
+                       f'after={self.sha}:9001:{baseline} jobs=[{jobs}]', NOW)
+        r.store.update(a, state='waiting', wait={'kind': o.kind, 'target': o.target, **o.extra,
+                                                 'since': iso(), 'started': iso()})
+        return r, a, t, gl, o
+
+    def test_manual_pipeline_with_finished_target_job_wakes(self):
+        r, a, t, gl, o = self.setup_wait()
+        self.assertEqual(r._jobs_wait_problem(a, o), '')       # accepted at declaration
+        self.assertEqual(r._unattended_ci_wait(a, o), '')      # the manual aggregate does not bounce it
+        r._wake_one(a)
+        got = r.store.get(a.id)
+        self.assertEqual(got.state, 'ready')
+        self.assertIn('browser-tests finished: success', got.wake_text)
+
+    def test_failed_target_job_wakes(self):
+        for predicate in ('success', 'change'):
+            with self.subTest(predicate=predicate):
+                self.tearDown(), self.setUp()
+                r, a, t, gl, o = self.setup_wait(predicate=predicate, target_status='failed')
+                r._wake_one(a)
+                got = r.store.get(a.id)
+                self.assertEqual(got.state, 'ready')
+                self.assertIn('failed', got.wake_text)
+
+    def test_running_target_job_stays_asleep(self):
+        for status in ('running', 'pending', 'created'):
+            with self.subTest(status=status):
+                self.tearDown(), self.setUp()
+                r, a, t, gl, o = self.setup_wait(target_status=status)
+                r._wake_one(a)
+                self.assertEqual(r.store.get(a.id).state, 'waiting')
+
+    def test_one_listed_job_unfinished_keeps_the_wait(self):
+        r, a, t, gl, o = self.setup_wait(jobs='browser-tests,profile-check')
+        gl.jobs[self.TARGET] = [dict(j, status='running') if j['name'] == 'profile-check' else j
+                                for j in gl.jobs[self.TARGET]]
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, 'waiting')
+
+    def test_retried_job_reads_the_latest_try(self):
+        r, a, t, gl, o = self.setup_wait(target_status='failed')
+        gl.jobs[self.TARGET].append({'id': 9099, 'name': 'browser-tests', 'status': 'running'})
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, 'waiting')
+
+    def test_unknown_job_name_is_sent_back(self):
+        r, a, t, gl, o = self.setup_wait(jobs='browser-test')
+        text = r._jobs_wait_problem(a, o)
+        self.assertIn('no job named browser-test', text)
+        self.assertIn('sent back', text)
+
+    def test_delivered_result_is_sent_back_on_redeclaration(self):
+        r, a, t, gl, o = self.setup_wait()
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, 'ready')
+        r.store.mark(self.agent.name, t['id'], ci_delivery_key(self.TARGET, 9001, ('browser-tests',)),
+                     f'{self.sha}:9001:browser-tests=9012:success')
+        self.assertIn('already finished: success', r._jobs_wait_problem(a, o))
+
+    def test_default_baseline_keeps_jobs_on_a_manual_pipeline(self):
+        r, a, t, gl, o = self.setup_wait()
+        out = r._parse(f'⏳ WAIT pipeline:{self.TARGET} until=success jobs=[browser-tests]', NOW)
+        self.assertEqual(out.extra['ci_change']['jobs'], ['browser-tests'])
+        self.assertEqual(out.extra['ci_change']['status'], 'manual')
+        legacy = r._parse(f'⏳ WAIT pipeline:{self.TARGET} jobs=[browser-tests]', NOW)
+        self.assertEqual(legacy.extra['ci_change'], {'predicate': 'change', 'sha': self.sha,
+                                                     'pipeline': 9001, 'status': 'manual',
+                                                     'jobs': ['browser-tests']})
+
+    def test_default_baseline_jobs_wait_without_a_baseline_is_sent_back(self):
+        r, a, t, gl, o = self.setup_wait()
+        line = f'⏳ WAIT pipeline:{self.TARGET} until=success jobs=[browser-tests]'
+        with mock.patch.object(gl, 'get_pipeline', side_effect=RuntimeError('502')):
+            out = r._parse(line, NOW)
+        self.assertEqual(out.kind, 'unparsed')
+        self.assertIn('could not be read', out.note)
+        plain = r._parse(f'⏳ WAIT pipeline:{self.TARGET} until=success', NOW)
+        self.assertEqual(plain.kind, 'pipeline')                 # without jobs the plain wait still stands
+        r.gitlab = None
+        out = r._parse(line, NOW)
+        self.assertEqual(out.kind, 'unparsed')
+        self.assertIn('no GitLab', out.note)
+
+    def test_default_baseline_jobs_wait_on_a_closed_mr_is_sent_back(self):
+        r, a, t, gl, o = self.setup_wait()
+        gl.mr_rows['g/app!56'] = dict(row(pid=14846), state='merged')
+        out = r._parse('⏳ WAIT mr:g/app!56 until=success jobs=[e2e]', NOW)
+        self.assertEqual(out.kind, 'unparsed')
+        self.assertIn('not open', out.note)
+        plain = r._parse('⏳ WAIT mr:g/app!56 until=success', NOW)
+        self.assertEqual(plain.kind, 'mr')
+
+
+class JobsParsing(unittest.TestCase):
+    def test_jobs_field_in_typed_and_default_forms(self):
+        o = parse_line(f'⏳ WAIT pipeline:g/app#14845 until=success after={SHA}:14845:manual '
+                       'jobs=[browser-tests, lint]: post-review gate', NOW)
+        self.assertEqual(o.kind, 'pipeline')
+        self.assertEqual(o.extra['ci_change']['jobs'], ['browser-tests', 'lint'])
+        self.assertEqual(o.jobs, ('browser-tests', 'lint'))
+        self.assertEqual(o.note, 'post-review gate')
+        first = parse_line(f'⏳ WAIT pipeline:g/app#14845 jobs=[browser-tests] until=change '
+                           f'after={SHA}:14845:manual', NOW)
+        self.assertEqual(first.extra['ci_change']['jobs'], ['browser-tests'])
+        d = parse_line('⏳ WAIT mr:g/app!56 until=success jobs=[e2e]', NOW)
+        self.assertEqual(d.extra['ci_default'], {'predicate': 'success', 'jobs': ['e2e']})
+
+    def test_no_jobs_field_keeps_the_old_contract(self):
+        self.assertNotIn('jobs', parse_line(marker(), NOW).extra['ci_change'])
+
+    def test_empty_jobs_list_is_refused_not_ignored(self):
+        for text in (f'{marker()} jobs=[]', '⏳ WAIT pipeline:g/app#5 jobs=[ ]',
+                     '⏳ WAIT pipeline:g/app#5 until=success jobs=[]'):
+            with self.subTest(text=text):
+                o = parse_line(text, NOW)
+                self.assertEqual(o.kind, 'unparsed')
+                self.assertIn('names no job', o.note)
+
+    def test_legacy_jobs_form_is_read_as_a_typed_jobs_wait(self):
+        o = parse_line('⏳ WAIT pipeline:g/app#5 jobs=[a,b]', NOW)
+        self.assertEqual(o.extra['ci_default'], {'predicate': 'change', 'jobs': ['a', 'b']})
+
+    def test_contract_names_the_jobs_field(self):
+        from mesh_runner.outcome import CONTRACT
+        self.assertIn('jobs=[<job>,<job>]', CONTRACT)

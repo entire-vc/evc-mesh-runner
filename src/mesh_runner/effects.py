@@ -500,7 +500,7 @@ class Effects:
             self._drop_event_hold(a, wait)
 
     def _drop_event_hold(self, a: Attempt, wait: dict) -> None:
-        """An event wait follows its event without a timer (owner rule of 28.10): a start_after this
+        """An event wait follows its event without a timer: a start_after this
         wait still carries from an older runner is cleared through compare-clear, only if Mesh shows
         exactly that instant."""
         if wait.get("scheduled") or wait.get("scheduled_maybe"):

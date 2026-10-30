@@ -721,8 +721,8 @@ class EventWokenStarts(CapBench):
         self.assertEqual(r.store.starts_today("builder", t["id"]), 2)      # the woken start is not counted
 
     def test_five_event_woken_starts_in_a_day_are_not_capped(self):
-        # the lead card of 29.10: started on a comment, a merged MR, a done card, a done blocker and a
-        # lifted gate in turn; the cap is 2
+        # Start on a comment, a merged MR, a done card, a done blocker and a lifted gate in turn;
+        # event-woken starts do not consume the cap of 2.
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         other = task(2, cat="done")

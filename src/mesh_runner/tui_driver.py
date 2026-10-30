@@ -58,14 +58,14 @@ AUTH_RE = re.compile(r"(not logged in|run /login|please log in|oauth token (has 
 BUSY_RE = re.compile(r"(esc to interrupt|esc to cancel|working \(|ctrl\+b to run in background|…\s*\(\d+[ms])", re.I)
 # A usage-limit notice Claude Code leaves on screen ("⏺ Usage limit reached · continuing automatically at 12pm ·
 # esc to cancel", "⎿ You've hit your weekly limit · resets 12pm"). It is not a running turn although it carries
-# "esc to cancel", and it stays on screen after the stated time (28.10: 35 failed turns on an idle pane).
+# "esc to cancel", and it can stay on screen after the stated time, causing failed turns on an idle pane.
 LIMIT_NOTICE_RE = re.compile(r"(usage limit reached|continuing automatically at|"
                              r"hit your [\w -]{0,30}limit\b.*\bresets?\b)", re.I)
 LIMIT_NOTICE_LINES = 10        # the notice counts in the last non-empty lines only
 CODEX_READY_RE = re.compile(r"(ask codex to do anything|\? for shortcuts)", re.I)
 # Codex still starting: it shows the composer (so CODEX_READY_RE matches) while "Resuming session…" is on
 # screen, and a prompt entered then is queued under "Waiting for startup · esc cancel" until start-up
-# ends. On a saturated host that took 30-130 s (26.10). Not BUSY_RE: accepted() reads a busy screen as
+# ends. On a saturated host this can take 30-130 s. Not BUSY_RE: accepted() reads a busy screen as
 # "the prompt started a turn", and a queued prompt has started nothing.
 CODEX_STARTUP_RE = re.compile(r"waiting for startup", re.I)
 CODEX_RESUMING_RE = re.compile(r"resuming session", re.I)
@@ -73,13 +73,13 @@ STARTUP_TAIL_LINES = 8         # the markers count in the last lines only: older
 TRUST_RE = re.compile(r"trust this folder|do you trust the files|one you trust", re.I)
 UPDATE_RE = re.compile(r"update available|update now|new version", re.I)
 # Codex exits with status 1 when its own account check times out during start-up
-# ("account/read failed during TUI bootstrap: ... workspace routing discovery timed out");
-# measured 21.10 on the Mini: about one fresh start in three, with or without a proxy
+# ("account/read failed during TUI bootstrap: ... workspace routing discovery timed out").
+# This can happen with or without a proxy.
 BOOTSTRAP_RE = re.compile(r"^Error: .*failed during TUI bootstrap", re.I)
 PANE_DEAD_RE = re.compile(r"^Pane is dead\b")
 BOOTSTRAP_RETRIES = 2
 # seconds between a start-up exit and the next start, doubled per retry: the account check that timed out
-# is a host-load symptom (26.10: three starts in a row died inside 62 s), and an immediate restart meets the
+# can be a host-load symptom, and an immediate restart meets the
 # same load
 BOOTSTRAP_BACKOFF = 15.0
 # the pane's pid may be a wrapper that starts a moment before Codex; a task this close to the process
@@ -371,8 +371,8 @@ class Driver:
     def task_predates_pane(self, line: bytes) -> bool:
         """The open task_started was written before the Codex process in our pane started. A resumed
         Codex never continues the task of an earlier process, so that task_started is the leftover of a
-        process that died mid-turn: nothing will ever end it, and counting it as a running turn kept every
-        later turn on the thread waiting busy_wait and failing ("the session stayed busy", measured 26.10).
+        process that died mid-turn: nothing will ever end it, and counting it as a running turn would keep
+        later turns on the thread waiting busy_wait and failing ("the session stayed busy").
         A task younger than the process, or either time unknown, stays a running turn (fail-safe)."""
         try:
             at = datetime.fromisoformat(str(json.loads(line).get("timestamp"))).timestamp()
@@ -642,7 +642,7 @@ class Driver:
             os.close(fd)
 
     def make_room(self) -> bool:
-        """At most max_sessions runner windows on this host, chats included (card #face4a7a): close the
+        """At most max_sessions runner windows on this host, chats included: close the
         card window idle longest. A chat window counts against the cap but is never closed from here,
         it is the chat pool's (idle minutes, per-agent and host limits).
 
@@ -1131,8 +1131,12 @@ class Driver:
             try:
                 with open(path, "rb") as fh:
                     meta = json.loads(fh.readline(SCAN_CHUNK))
-                if os.path.realpath(str((meta.get("payload") or {}).get("cwd") or "")) != os.path.realpath(str(self.cwd)):
+                payload = meta.get("payload") or {}
+                if os.path.realpath(str(payload.get("cwd") or "")) != os.path.realpath(str(self.cwd)):
                     continue
+                if payload.get("forked_from_id") or payload.get("parent_thread_id") or \
+                        "subagent" in json.dumps(payload.get("source") or "").lower():
+                    continue                       # a child thread is never our task's root
             except (OSError, ValueError, AttributeError):
                 continue
             said = self.rollout_user_texts(path)
@@ -1386,6 +1390,7 @@ class Driver:
         self.meta = read_meta(self.dir, self.key)
         self.meta["busy_pid"] = os.getpid()
         self.save()
+        self.prompt = prompt        # bound before the first beat: rollout discovery tells cards apart by it
         self.beat(force=True)
         ok, close = False, False
         self.prompt_taken = False

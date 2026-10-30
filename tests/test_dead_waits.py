@@ -28,7 +28,7 @@ def change(kind, status, pid=16447, sha=SHA):
 
 class DeadWaits(Bench):
     def flow(self, mr=None, pipeline=None, linked=True):
-        t = task(0x819d7ee2)
+        t = task(0x1234abcd)
         mesh = FakeMesh([t], max_concurrent=1)
         mesh.links = {t['id']: [{'url': MR_URL, 'link_type': 'pr', 'status': 'open'}]} if linked else {}
         gl = FakeGitLab()
@@ -152,13 +152,13 @@ class DeadWaits(Bench):
 
     def test_unlinked_mr_naming_the_task_in_its_description_is_the_tasks_own(self):
         r, t, gl = self.flow(mr=mr_row('success', pid=16467,
-                                       description='Fixes 819d7ee2: a decision wait was rejected'),
+                                       description='Fixes 1234abcd: a decision wait was rejected'),
                              linked=False)
         a = self.turn(r, t, self.merged())
         self.assert_bounced(a, 'has no review label', 'nobody will merge it', 'until=merged')
 
     def test_unlinked_mr_naming_the_task_in_its_title_or_branch_is_the_tasks_own(self):
-        for extra in ({'title': 'route #819D7EE2 fix'}, {'source_branch': 'fix/819d7ee2-ask'}):
+        for extra in ({'title': 'route #1234ABCD fix'}, {'source_branch': 'fix/1234abcd-ask'}):
             with self.subTest(extra=extra):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(mr=mr_row('success', **extra), linked=False)
@@ -168,7 +168,7 @@ class DeadWaits(Bench):
                 r.store.db.close()
 
     def test_unlinked_mr_that_does_not_name_the_task_is_parked(self):
-        for extra in ({'description': 'unrelated'}, {'title': 'fix 819d7ee20 and 1819d7ee2'}, {}):
+        for extra in ({'description': 'unrelated'}, {'title': 'fix 1234abcd0 and 11234abcd'}, {}):
             with self.subTest(extra=extra):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(mr=mr_row('success', **extra), linked=False)
@@ -178,7 +178,7 @@ class DeadWaits(Bench):
 
     def test_unlinked_own_mr_with_a_review_label_is_parked(self):
         r, t, gl = self.flow(mr=mr_row('success', labels=['verified-by:qa'],
-                                       description='Fixes 819d7ee2'), linked=False)
+                                       description='Fixes 1234abcd'), linked=False)
         a = self.turn(r, t, self.merged())
         self.assertEqual(a.state, 'waiting')
 

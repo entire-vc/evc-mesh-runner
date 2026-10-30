@@ -67,7 +67,7 @@ EVENT_WAITS = {
 
 
 class EventWaitsWriteNoHold(ContractBench):
-    """Owner rule of 28.10: MR, CI, card, decision and blocking waits follow their event with no
+    """MR, CI, card, decision and blocking waits follow their event with no
     timer. A start_after is for a time wait with a known moment."""
 
     def test_no_event_wait_writes_a_start_after_on_wait_renew_or_adopt(self):

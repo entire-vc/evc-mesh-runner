@@ -29,6 +29,8 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # merge_timeout_minutes = 15       # one run of merge_command
     # merge_rerun_minutes = 5          # re-run a queued merge at least this often even if nothing changed
     # merge_max_runs = 30              # deprecated, ignored: a queued run always ends in a wake or another poll
+    # merge_follow_head = false        # a moved head (server rebase) runs the gate on it instead of waking the author;
+    #                                  # the gate alone decides whether the review carries over (fail-closed)
     # merge_queue_hours = 24           # a wait that stays queued this long wakes the agent too
 
     [catalog]                     # optional: apply the runtime catalog and report on it (off by default)
@@ -381,7 +383,7 @@ class RunnerConfig:
     announce_controllers: bool = False      # lead every configured agent in Mesh (agent_controllers), chat or not
     chat_enabled: bool = False
     chat_agents: tuple = ()                 # runner agent names whose chats this runner serves
-    chat_credential: str = field(default="", repr=False)   # runner credential (Mesh Doc, open question Q1)
+    chat_credential: str = field(default="", repr=False)   # runner credential for the Agent Chat protocol
     chat_max_per_agent: int = 3             # max_chat_sessions per agent
     chat_host_cap: int = 6                  # live sessions on this host, chats and cards together
     chat_idle_minutes: float = 10.0
@@ -500,6 +502,7 @@ class RunnerConfig:
     merge_rerun_minutes: float = 5.0
     merge_max_runs: int = 30
     merge_queue_hours: float = 24.0
+    merge_follow_head: bool = False
 
     @property
     def pool_root(self) -> Path:
@@ -828,6 +831,7 @@ def load(path: str | Path) -> RunnerConfig:
         merge_rerun_minutes=_positive(r.get("merge_rerun_minutes", 5.0), "merge_rerun_minutes"),
         merge_max_runs=_positive(r.get("merge_max_runs", 30), "merge_max_runs", integer=True),
         merge_queue_hours=_positive(r.get("merge_queue_hours", 24.0), "merge_queue_hours"),
+        merge_follow_head=bool(r.get("merge_follow_head", False)),
         memory_release_free_pct=float(r.get("memory_release_free_pct", 0)),
         memory_hold_swap_mb=float(r.get("memory_hold_swap_mb", 0)),
         memory_release_swap_mb=float(r.get("memory_release_swap_mb", 0)),

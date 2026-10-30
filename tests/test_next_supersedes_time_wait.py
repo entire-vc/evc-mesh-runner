@@ -1,4 +1,4 @@
-"""A fresh ``↻ NEXT`` from the agent supersedes an older time WAIT (#2ecb5c65, E2 #cab1113e)."""
+"""A fresh ``↻ NEXT`` from the agent supersedes an older time WAIT."""
 import datetime as dt
 import unittest
 

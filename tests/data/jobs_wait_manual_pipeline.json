@@ -1,0 +1,11 @@
+{
+  "_source": "Synthetic jobs-WAIT scenario: the target job browser-tests has finished while its sibling jobs sit in manual, so the pipeline aggregate reads manual and an until=success wait on the pipeline alone would never wake. The short SHA is padded to a full 40-character value.",
+  "pipeline": {"id": 9001, "sha": "abc12345aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "status": "manual",
+               "ref": "refs/merge-requests/1/head"},
+  "jobs": [
+    {"id": 9011, "name": "browser-tests-webkit", "stage": "post-review", "status": "manual", "allow_failure": true},
+    {"id": 9012, "name": "browser-tests", "stage": "post-review", "status": "success", "allow_failure": false,
+     "finished_at": "2026-01-01T12:00:00Z"},
+    {"id": 9013, "name": "profile-check", "stage": "post-review", "status": "manual", "allow_failure": false}
+  ]
+}

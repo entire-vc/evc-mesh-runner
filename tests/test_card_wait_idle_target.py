@@ -94,6 +94,16 @@ class CardWaitOnIdleTarget(Bench):
         r.refresh_me()
         self.assertEqual(self.turn(r, t, x).state, 'waiting')
 
+    def test_review_card_waiting_on_idle_target_is_accepted(self):
+        t, x = task(1, labels=['kind:review']), task(2)
+        r = self.runner(FakeMesh([t, x], max_concurrent=1))
+        self.addCleanup(r.store.db.close)
+        r.refresh_me()
+        ax = r.store.create(self.agent.name, x['id'], 'claude')
+        r.store.update(ax, state='waiting', wait={'kind': 'decision', 'target': '', 'handle': 'lead',
+                                                 'since': iso(), 'started': iso()})
+        self.assertEqual(self.turn(r, t, x).state, 'waiting')
+
     def test_repeat_counts_in_the_wait_budget(self):
         self.cfg.daily_wait_budget = 1
         r, t, x = self.flow(x_wait={'kind': 'time', 'target': '', 'until': iso()})

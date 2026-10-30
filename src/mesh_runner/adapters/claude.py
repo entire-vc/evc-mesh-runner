@@ -54,8 +54,8 @@ class ClaudeAdapter(Adapter):
         the current one, the default ``~/.claude``, its siblings, and the fleet's account
         directories ``~/.claude-accounts/*``. A lane on the default directory (no
         CLAUDE_CONFIG_DIR) has no siblings of its own, so the account directories must be
-        named: 28.10 six turns resumed a session that only the account the lane had just left
-        held, and Claude answered "No conversation found"."""
+        named: a session may exist only under the account the lane just left; resuming without
+        carrying it would fail with "No conversation found"."""
         home = Path(env.get("HOME") or Path.home())
         current = Path(env.get("CLAUDE_CONFIG_DIR") or home / ".claude")
         dirs = [current, home / ".claude"]

@@ -5,6 +5,7 @@ import os
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -33,7 +34,7 @@ class ServiceTest(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.wakes = []
-        self.svc = ExtensionService(Path(self.dir.name), lambda: self.wakes.append(1), WS, trust_first_install=True, clock=lambda: NOW)
+        self.svc = ExtensionService(Path(self.dir.name), lambda kind, payload: self.wakes.append(1), WS, trust_first_install=True, clock=lambda: NOW)
 
     def install(self, **kw):
         body = install_body(**kw)
@@ -160,7 +161,7 @@ class HttpTest(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.wakes = []
-        self.svc = ExtensionService(Path(self.dir.name), lambda: self.wakes.append(1), WS, expected_secret=SECRET)
+        self.svc = ExtensionService(Path(self.dir.name), lambda kind, payload: self.wakes.append(1), WS, expected_secret=SECRET)
         server = self.svc.serve("127.0.0.1", 0)
         self.addCleanup(self.svc.shutdown)
         self.port = server.server_address[1]
@@ -285,14 +286,71 @@ if __name__ == "__main__":
 class WakeAndConfigTest(unittest.TestCase):
     def test_wake_ends_the_poll_sleep(self):
         import time
-        from mesh_runner.runner import Runner
+        from mesh_runner.runner import Runner, TaskOwners
         r = Runner.__new__(Runner)
-        r._wake_gen = 0
+        r._wake_gen = {}
         stop = threading.Event()
-        threading.Timer(0.2, r.wake).start()
+        threading.Timer(0.2, r.wake, args=(["a"],)).start()
         t0 = time.monotonic()
-        r._sleep(stop, 30, 0)
+        r._sleep(stop, 30, "a", 0)
         self.assertLess(time.monotonic() - t0, 3)
+
+    @staticmethod
+    def _runner():
+        from types import SimpleNamespace as NS
+        from mesh_runner.runner import Runner, TaskOwners
+        r = Runner.__new__(Runner)
+        r._wake_gen, r._task_owner = {}, TaskOwners()
+        r.agents = [NS(agent=NS(name=n), agent_id=i) for n, i in (("a", "id-a"), ("b", "id-b"))]
+        r._task_owner.set("t1", "a")
+        return r
+
+    def test_event_for_one_agent_does_not_wake_another(self):
+        r = self._runner()
+        stop = threading.Event()
+        gen_b = r._wake_gen.get("b", 0)
+        r.wake_event("comment.created", {"task_id": "t1", "author_id": "someone"})
+        r.wake_event("task.assigned", {"task_id": "t2", "assignee_id": "id-a"})
+        self.assertEqual(r._wake_gen, {"a": 2})
+        t0 = time.monotonic()
+        r._sleep(stop, 1.0, "b", gen_b)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.9)      # b slept its whole interval
+
+    def test_sleep_floor_after_a_slow_tick_is_five_seconds(self):
+        from mesh_runner import runner
+        self.assertGreaterEqual(runner.MIN_SLEEP_SECONDS, 5.0)
+        self.assertGreaterEqual(runner.WAKE_DEBOUNCE_SECONDS, 5.0)
+
+    def test_task_that_left_an_agent_is_forgotten_by_the_owner_map(self):
+        from types import SimpleNamespace as NS
+        from mesh_runner.runner import AgentRunner, TaskOwners
+        ar = AgentRunner.__new__(AgentRunner)
+        owners = TaskOwners()
+        owners.set("gone", "a"), owners.set("other", "b")
+        ar.agent, ar.owners = NS(name="a", feed_review=False), owners
+        ar.store = NS(by_state=lambda *a: [NS(task_id="held")])
+        ar.mesh = NS(my_tasks=lambda cat: [{"id": "t9"}] if cat == "todo" else [])
+        ar._work_order, ar._gate_event = (lambda w: w), (lambda t: None)
+        ar.candidates()
+        self.assertEqual(ar.owners.as_dict(), {"other": "b", "held": "a", "t9": "a"})
+
+    def test_unaddressed_and_own_events_wake_nobody(self):
+        r = self._runner()
+        r.wake_event("task.updated", {"task_id": "unknown"})
+        r.wake_event("comment.created", {"task_id": "t1", "author_id": "id-a"})
+        self.assertEqual(r._wake_gen, {})
+
+    def test_ten_events_in_a_second_make_one_unplanned_tick(self):
+        r = self._runner()
+        stop = threading.Event()
+        started = time.monotonic()
+        for _ in range(10):
+            r.wake_event("task.updated", {"task_id": "t1"})
+        t0 = time.monotonic()
+        r._sleep(stop, 30, "a", 0, not_before=started + 1.0)
+        waited = time.monotonic() - t0
+        self.assertGreaterEqual(waited, 0.9)                     # held to the debounce window
+        self.assertLess(waited, 3)                               # then one tick, not ten
 
     def test_config_extension_section(self):
         from mesh_runner import config

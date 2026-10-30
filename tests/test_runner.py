@@ -268,10 +268,35 @@ class Loop(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
         a = self.error_envelope(r, t, "interactive session exited at start",
-                                errors=["ERROR: No saved session found with ID 01a16014-f527. "
+                                errors=["ERROR: No saved session found with ID 0199aaaa-bbbb. "
                                         "Run `codex resume` without an ID to choose from existing sessions."], turns=2)
         self.assertEqual((a.state, a.session_id, a.no_outcome), ("ready", "", 0))
         self.assertEqual(r.store.mark(self.agent.name, t["id"], "session_restart")[0], a.id)
+
+    def test_unsupported_child_resume_restarts_once_then_hands_up(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        err = "ERROR: -32600 cannot resume child thread: multi-agent v2 not loaded, parent first"
+        r = self.runner(mesh)
+        r.refresh_me()
+        a = r.store.create(self.agent.name, t["id"], "claude")
+        path = self.root / f"{a.id}.jsonl"
+        path.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                                    "result": "x", "errors": [err], "session_id": "s-error"}) + "\n")
+        r.store.update(a, state="running", turns=2, log_path=str(path))
+        r.settle(a)
+        a = r.store.get(a.id)
+        self.assertEqual((a.state, a.session_id, a.no_outcome), ("ready", "", 0))   # own task, fresh thread
+        r.store.update(a, state="running", turns=3, session_id="s-error")
+        r.settle(a)
+        self.assertNotEqual(r.store.get(a.id).state, "ready")                       # not four unchanged resumes
+
+    def test_a_bare_invalid_request_code_is_not_a_child_resume(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        a = self.error_envelope(r, t, "x", errors=["ERROR: -32600 invalid request: bad params"], turns=2)
+        self.assertEqual(r.store.mark(self.agent.name, t["id"], "session_restart"), None)
 
     def test_cap_bounds_parallel_sessions_and_waits_free_slots(self):
         t = [task(1, "high"), task(2), task(3, "low")]
@@ -489,9 +514,10 @@ class ReviewFindings(Bench):
         runner.agents = [fast, slow]
         stop = threading.Event()
         loop = threading.Thread(target=runner.run_forever, args=(stop,))
-        loop.start()
-        time.sleep(2.3)                                 # loops sleep at least 1 s between ticks
-        stop.set()
+        with mock.patch("mesh_runner.runner.MIN_SLEEP_SECONDS", 1.0):   # the real floor is 5 s
+            loop.start()
+            time.sleep(2.3)                             # loops sleep at least 1 s between ticks
+            stop.set()
         loop.join(timeout=15)
         self.assertGreaterEqual(fast.ticks, 2)          # sequential ticks would give 1: held by the slow one
         self.assertLessEqual(slow.ticks, 1)            # stop waits for its tick to finish
@@ -2425,7 +2451,7 @@ class Hardening(Bench):
     def test_lead_given_as_an_id_is_named_in_the_hand_off(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        lead_id = "3c1ead8e-0000-4000-8000-000000000000"
+        lead_id = "00000042-0000-4000-8000-000000000000"
         mesh.agents = list(mesh.agents) + [{"id": lead_id, "name": "Chief"}]
         self.cfg.daily_next_budget = 1
         self.cfg.project_leads = {"p1": lead_id}
@@ -2435,7 +2461,7 @@ class Hardening(Bench):
         mesh.agents = []
         r2 = self.runner(mesh)
         leads, _ = r2._lead_chain(dict(t))
-        self.assertEqual([x["name"] for x in leads], ["3c1ead8e"])
+        self.assertEqual([x["name"] for x in leads], ["00000042"])
 
     def test_refused_hand_off_is_reported_as_such(self):
         t = task(1, pinned=True)

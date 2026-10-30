@@ -11,7 +11,7 @@ macOS: ``sysctl kern.memorystatus_level`` (free %), ``sysctl vm.swapusage``.
 Linux: ``/proc/meminfo`` (MemAvailable / MemTotal, SwapFree).
 
 The load gate (LoadGate) is the same idea for CPU: a host whose 5-minute load average per CPU is far
-above 1 (26.10: load ~300 on 10 CPUs from runaway renderers) starts every session so slowly that the
+above 1 can start every session so slowly that the
 drivers' start-up and accept waits run out, and each failed start only adds load. It holds starts and
 resumes while the load is over the hold threshold and releases below the release threshold. Memory
 and load log under their own strings ("host memory: ..." / "host load: ...").

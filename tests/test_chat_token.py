@@ -87,7 +87,7 @@ class Token(unittest.TestCase):
 
 
     def test_slow_issue_does_not_hold_the_turn(self):
-        """A session-token call that hangs (the 30 s gap before `plan` of turn ec202e35) is waited
+        """A session-token call that hangs is waited
         for first_wait only; the file lands when the call returns."""
         self.client.start(self.turn["turn_id"], self.turn["claim_token"])
         release, real = threading.Event(), self.client.session_token

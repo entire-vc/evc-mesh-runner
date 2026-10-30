@@ -22,6 +22,11 @@ from .selection import CLOSED, StatusCategories, _read_elsewhere, parse_time, sa
 log = logging.getLogger("mesh_runner")
 
 PIPELINE_DONE = {"success", "failed", "canceled", "cancelled", "skipped", "manual"}
+# A job's final states (``manual``: it starts only by hand) and every state GitLab gives a job.
+JOB_FINAL = frozenset({"success", "failed", "canceled", "skipped", "manual"})
+JOB_STATES = JOB_FINAL | {"cancelled", "created", "pending", "running", "preparing",
+                          "waiting_for_resource", "scheduled", "canceling", "waiting_for_callback"}
+JOB_PAGES = 10                 # 1000 jobs: past that a pipeline is not one a wait names jobs in
 # Queue and run states of an unfinished pipeline. For ``until=change`` they are ONE phase: a hop
 # between them on the same commit and pipeline (pending -> running) is not news to an agent that
 # waits for the pipeline to settle or to move to another commit/pipeline.
@@ -148,6 +153,22 @@ class GitLab:
         project, pid = target.rsplit("#", 1)
         scopes = "&".join(f"scope[]={s}" for s in sorted(PIPELINE_IN_PROGRESS))
         return bool(self.get(f"projects/{self.project(project)}/pipelines/{pid}/jobs?{scopes}&per_page=1"))
+
+    def pipeline_jobs(self, target: str) -> list[dict]:
+        """The jobs of pipeline ``target`` (the latest try of each; GitLab leaves retried ones out).
+        A GitHub run has no per-job reads here: a ``jobs=`` wait on one is refused."""
+        if self.github_owns(target):
+            raise ValueError("jobs= waits read GitLab pipeline jobs; a GitHub run has none")
+        project, pid = target.rsplit("#", 1)
+        rows: list[dict] = []
+        for page in range(1, JOB_PAGES + 1):
+            batch = self.get(f"projects/{self.project(project)}/pipelines/{pid}/jobs?per_page=100&page={page}")
+            if not isinstance(batch, list):
+                raise ValueError("pipeline jobs unreadable")
+            rows += batch
+            if len(batch) < 100:
+                break
+        return rows
 
     def newer_pipeline(self, target: str, row: dict | None = None) -> dict | None:
         """The latest pipeline of the same ref that is newer than ``target``, or None (always None
@@ -549,10 +570,50 @@ def _hours(d: dt.timedelta) -> str:
     return f"{h:.0f}h" if h >= 1 else f"{d.total_seconds() // 60:.0f} min"
 
 
-def ci_delivery_key(target: str, pipeline: int) -> str:
-    # MR and pipeline spellings of the same project's observation share memory.
+def ci_delivery_key(target: str, pipeline: int, jobs: tuple[str, ...] | list[str] = ()) -> str:
+    # MR and pipeline spellings of the same project's observation share memory. A wait on named
+    # jobs is a different observation of the same pipeline: it never shares the pipeline's mark.
     project = re.split(r"[!#]", target)[0]
-    return "ci_delivery:" + hashlib.sha256(f"{project}#{pipeline}".encode()).hexdigest()
+    ident = f"{project}#{pipeline}" + (f" jobs={','.join(jobs)}" if jobs else "")
+    return "ci_delivery:" + hashlib.sha256(ident.encode()).hexdigest()
+
+
+class UnknownJobs(ValueError):
+    """A ``jobs=`` wait names jobs the pipeline does not have: it could never complete."""
+    def __init__(self, pipeline: int, names: list[str]):
+        super().__init__(f"pipeline {pipeline} has no job named {', '.join(names)}")
+        self.pipeline, self.names = pipeline, names
+
+
+def target_jobs_state(gitlab, target: str, pipeline: int, names) -> tuple[str, str]:
+    """(status, identity) of the named jobs of ``pipeline``. Status: ``running`` while any of them
+    is not final, else ``success`` when all succeeded, else the worst final status among them
+    (failed, canceled, skipped, manual). Jobs outside ``names`` (manual siblings included) are not
+    read. Identity names each job's id, so a retried job is a new observation. Raises
+    ``UnknownJobs`` for a name the pipeline has no job for; anything unreadable raises too."""
+    project = re.split(r"[!#]", target)[0]
+    latest: dict[str, dict] = {}
+    for job in gitlab.pipeline_jobs(f"{project}#{pipeline}"):
+        if not isinstance(job, dict) or type(job.get("id")) is not int or not isinstance(job.get("name"), str):
+            continue
+        if job["name"] not in latest or job["id"] > latest[job["name"]]["id"]:
+            latest[job["name"]] = job
+    missing = [n for n in names if n not in latest]
+    if missing:
+        raise UnknownJobs(pipeline, missing)
+    statuses = []
+    for n in names:
+        status = latest[n].get("status")
+        if not isinstance(status, str) or status not in JOB_STATES:
+            raise ValueError("job status unavailable")
+        statuses.append("canceled" if status == "cancelled" else status)
+    identity = ",".join(f"{n}={latest[n]['id']}" for n in names)
+    if any(st not in JOB_FINAL for st in statuses):
+        return "running", identity
+    for st in ("failed", "canceled", "skipped", "manual"):
+        if st in statuses:
+            return st, identity
+    return "success", identity
 
 
 class Delivered(str):
@@ -744,6 +805,9 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
     runs a merge gate for ``merge:`` waits, so owner notices may point at one.
     """
     sha, pid, status, generation = ci_observation_gen(gitlab, kind, target)
+    if contract.get("jobs"):
+        return _jobs_event(gitlab, kind, target, contract, sha, pid, delivered, observation,
+                           allow_action_required)
     if allow_action_required and kind == "pipeline" and contract["predicate"] == "success":
         # A pipeline ID is immutable: a different SHA is not evidence about the
         # exact requested pipeline. Never diagnose an unbound/stale observation.
@@ -798,6 +862,48 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
     if observation is not None:
         observation.update(key=key, value=fingerprint)
     return f"{kind} {target}: changed CI {sha[:8]} pipeline {pid} {status} ({contract['predicate']})"
+
+
+def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: int, delivered,
+                observation, allow_action_required: bool) -> str:
+    """``ci_change_event`` for a wait on named jobs (``jobs=[...]``): the predicate is read from
+    those jobs, never from the aggregate pipeline status, so a pipeline left ``manual`` by an
+    unstarted sibling does not hold back a target job that has finished. Once every named job is
+    final the wait wakes: ``until=change`` on any final result, ``until=success`` when all
+    succeeded; a non-success result under ``until=success`` wakes once as an owner notice. A
+    retried job (new id) is a new observation. An MR wait reads the jobs of its current head."""
+    if kind == "pipeline" and (sha != contract["sha"] or pid != contract["pipeline"]):
+        raise ValueError("CI pipeline baseline identity mismatch")
+    jobs = tuple(contract["jobs"])
+    names = ",".join(jobs)
+    try:
+        status, identity = target_jobs_state(gitlab, target, pid, jobs)
+    except UnknownJobs as e:
+        # an MR head can move to a pipeline without the job; it would never wake by itself
+        if not allow_action_required or _owner_action_once(
+                target, sha, pid, f"jobs[{names}]:missing", delivered, observation) is None:
+            return ""
+        return (f"action required: {kind} {target} pipeline {pid} on {sha[:8]}: {e}, so this wait cannot "
+                "complete. Wait on jobs this pipeline has, or on the pipeline itself.")
+    if status == "running":
+        return ""
+    if contract["predicate"] == "success" and status != "success":
+        if not allow_action_required or _owner_action_once(
+                target, sha, pid, f"jobs[{names}]:{status}", delivered, observation, identity) is None:
+            return ""
+        return (f"action required: {kind} {target} pipeline {pid} on {sha[:8]}: job(s) {names} finished: "
+                f"{status}; the success predicate is not met. Inspect the job, fix and push or retry it "
+                "once, then wait on the new result. Do not run sibling jobs or skip a project gate "
+                "automatically.")
+    key = ci_delivery_key(target, pid, jobs)
+    fingerprint = f"{sha}:{pid}:{identity}:{status}"
+    previous = delivered(key) if callable(delivered) else delivered
+    if fingerprint == previous:
+        return ""
+    if observation is not None:
+        observation.update(key=key, value=fingerprint)
+    return (f"{kind} {target}: job(s) {names} finished: {status} (pipeline {pid}, {sha[:8]}, "
+            f"{contract['predicate']}); other jobs of the pipeline were not considered")
 
 
 def _owner_action_once(target: str, sha: str, pid: int, status: str, delivered, observation,

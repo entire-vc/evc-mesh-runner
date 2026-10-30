@@ -14,7 +14,7 @@ win without it (a private link where nothing else reaches the port). ``workspace
 well. After install every request is signed with the stored secret; a different secret is refused
 with 409 until the operator removes the secret file or sets ``allow_rekey``.
 
-Events only wake the poll loop of the runner; they carry no work of their own.
+Events only wake the poll loop of the agent they are about; they carry no work of their own.
 """
 from __future__ import annotations
 
@@ -135,7 +135,7 @@ def rotate_token(token: ExtensionToken, client) -> bool:
 
 
 class ExtensionService:
-    def __init__(self, state_dir: Path, wake: Callable[[], None], workspace_id: str,
+    def __init__(self, state_dir: Path, wake: Callable[[str, dict], object], workspace_id: str,
                  expected_secret: str = "", trust_first_install: bool = False,
                  extension_id: str = "agent-runner", allow_rekey: bool = False, tolerance: float = TOLERANCE_SECONDS,
                  clock: Callable[[], float] = time.time):
@@ -201,7 +201,11 @@ class ExtensionService:
         # Mesh sends the event type in the X-Mesh-Event header; a type in the body is only a fallback
         kind = headers.get("X-Mesh-Event") or (event.get("event") or event.get("type") if isinstance(event, dict) else None)
         if kind in WAKE_EVENTS:
-            self.wake()
+            payload = event if isinstance(event, dict) else {}
+            for key in ("payload", "data"):               # the fields may sit one level down
+                if isinstance(payload.get(key), dict):
+                    payload = dict(payload, **payload[key])
+            self.wake(kind, payload)
             return 202, {"status": "wake"}
         return 202, {"status": "ignored"}
 
