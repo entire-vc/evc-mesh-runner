@@ -452,6 +452,23 @@ Optional hooks per agent:
 - `on_limit_command = ["..."]` runs when the harness reports a usage limit;
   exit 0 means it moved the agent to another account and the turn is retried.
 
+- `on_auth_command = ["..."]` is an explicit opt-in routing policy for an exact
+  held Claude authentication profile, after the writer stops and its checkout and
+  admission reservation are released. It receives `MESH_RUNNER_AGENT/TASK/MODE`
+  and `MESH_RUNNER_AUTH_PROFILE` (a fingerprint, never credentials). Exit 0 means
+  the next turn may read a changed route; it still passes normal admission and
+  checkpoint restoration. Exit 78 holds a proven policy/configuration refusal.
+  Other failures and timeouts retry the routing hook with durable exponential
+  backoff from two minutes to at most one probe per 15 minutes per lane/profile.
+  A routing probe creates no provider turn. Auth remains held until explicitly
+  repaired and cleared; switching never clears it. Task-specific QA/capacity or
+  transport refusals should return 75, so they cannot permanently hold the lane.
+  With no hook configured, authentication retains its existing operator hold.
+  An alternate harness must be configured in `[agents.alt]`. Cross-harness turns
+  start a fresh session with the task's workspaces and checkpoint context; native
+  model/effort overrides are preserved for restoration and do not override the
+  alternate harness profile.
+
 - `start_gate_command = ["..."]` is the operator's admission control (routing,
   capacity reservations). It runs in phases, `MESH_RUNNER_PHASE` =
   `reserve` (before a session starts or resumes), `admit` (the Mesh checkout is

@@ -76,6 +76,8 @@ RELEASE_PENDING = "release_pending"     # store mark: the lease of a release who
 RELEASE_RETRY_SECONDS = (30, 120, 300)  # backoff between retries of a pending release; the last step repeats
 TURN_CAP_WINDOW = 10                # turn_cap_continue_on_progress: how many recent outcomes are looked at
 CAP_WAIT = "cap_wait"                # store mark: a capped task waiting for new input (requeue_on_cap)
+HANDBACK_WAIT = "handback_wait"      # store mark: the WAIT a review session handed the task back with
+VCS_CAP_WAITS = ("pipeline", "mr", "merge")   # declared waits a cap evaluates instead of "any link change"
 LOOP_COMMENT_MIN = 40               # loop guard: shortest gist (characters) of a comment that counts as news
 LOOP_WINDOW = 50                    # loop guard: signatures / comment gists remembered within one window
 LOOP_COMMENT_NOISE = (              # loop guard: what _comment_gist removes, in this order
@@ -618,6 +620,15 @@ class AgentRunner:
         assignee = task.get("assignee_id") or (task.get("assignee") or {}).get("id")
         return assignee == self.agent_id and self.cats.category(task) in (REVIEWING if mode == "review" else WORKING)
 
+    def _handed_back(self, task: dict | None) -> bool:
+        """The attempt ended with the task in the work statuses for this agent: assigned to it, or
+        with no assignee at all (a move_task to todo without assignee_id clears it, measured on
+        #b7d5a574). A task assigned to another agent is not a hand-back."""
+        if not task:
+            return False
+        assignee = task.get("assignee_id") or (task.get("assignee") or {}).get("id")
+        return assignee in (self.agent_id, None, "") and self.cats.category(task) in WORKING
+
     def _comments(self, task_id: str) -> list[dict]:
         try:
             return self.mesh.comments(task_id)
@@ -861,7 +872,7 @@ class AgentRunner:
         profile = auth.profile_id(env, self.agent.profile_dir) if routed == "claude" else ""
         blocked = self._auth_blocked(a, env)
         if blocked:
-            self._auth_hold_attempt(a, blocked)
+            self._authentication_failed(a, blocked)
             return False
         if routed != a.harness and (routed == self.agent.harness or routed in self.alt_adapters):
             if resume and a.session_id:
@@ -870,8 +881,10 @@ class AgentRunner:
                 # a session cannot move between harnesses: the task continues in a new one
                 log.info("%s: #%s moves %s -> %s; new session", self.agent.name, a.task8, a.harness, routed)
                 self.store.event(a.id, "harness_switch", f"{a.harness}->{routed}")
+                previous_wake = a.wake_text
                 self.store.update(a, harness=routed, session_id="")
-                resume, prompt_text = False, first_prompt()
+                resume, prompt_text = False, (first_prompt() + "\n\n[runner] Continue the existing task after a harness switch. "
+                    + "Inspect the existing workspaces and preserve completed work.\n" + previous_wake)
             else:
                 self.store.update(a, harness=routed)
             a = self.store.get(a.id) or a
@@ -884,10 +897,15 @@ class AgentRunner:
             argv = (adapter.resume_argv if resume else adapter.start_argv)(
                 sid, self.agent.profile_dir, workspaces)
             model = self.store.mark(self.agent.name, a.task_id, "model")
-            if model and model[0]:
+            scope = self.store.mark(self.agent.name, a.task_id, "override_harness")
+            # Pre-upgrade Claude overrides can exist on a native Codex lane routed to Claude.
+            legacy_claude = bool(model and (model[0] in ("opus", "sonnet", "haiku")
+                                           or model[0].startswith("claude-")))
+            override_harness = scope[0] if scope and scope[0] else ("claude" if legacy_claude else self.agent.harness)
+            if model and model[0] and a.harness == override_harness:
                 argv = adapter.with_model(argv, model[0])
             effort = self.store.mark(self.agent.name, a.task_id, "effort")
-            if effort and effort[0]:
+            if effort and effort[0] and a.harness == override_harness:
                 argv = adapter.with_effort(argv, effort[0])
             return argv
 
@@ -1068,6 +1086,10 @@ class AgentRunner:
 
     def _authentication_failed(self, a: Attempt, profile: str) -> None:
         self._auth_hold_attempt(a, profile)
+        if self._switch_on_auth(a, profile):
+            self._resume_hold.pop(a.id, None)  # next turn re-runs every admission/checkpoint gate
+            self.store.update(a, note="authentication held; routed to another profile")
+            return
         log.warning("%s: #%s authentication held; profile %s; repair authentication then use clear-auth-hold",
                     self.agent.name, a.task8, profile)
 
@@ -1273,6 +1295,8 @@ class AgentRunner:
             # changed before settle. Record it before releasing this attempt.
             auth_profile = self._record_authentication_failure(a, result.auth_only)
         if not self._still_ours(task, a.mode):
+            if auth_profile is None and self._handed_back(task):
+                self._keep_handback_wait(a, result)
             done = bool(task) and self.cats.category(task) in ("done", "review", "cancelled")
             # A terminal auth failure is operational evidence, not completion
             # evidence for this task; do not write a completion comment onto a
@@ -1566,7 +1590,7 @@ class AgentRunner:
         # Save the structured target and baseline before a cap finishes this attempt.
         # A finished attempt releases its worktrees: recovery must use a normal new
         # start, never resume paths which the pool may have leased to another writer.
-        observable = wait["kind"] in ("pipeline", "mr", "card")
+        observable = wait["kind"] in ("pipeline", "mr", "card", "merge")
         if observable:
             self.store.update(a, wait=wait)
         self.store.mark(self.agent.name, a.task_id, "cap_observation", a.id if observable else "")
@@ -2010,12 +2034,64 @@ class AgentRunner:
         self._comment(a.task_id, text + " Repeated invalid/unverified recipient; released until a new comment or the failure cooldown passes.")
         return ""
 
+    def _switch_on_auth(self, a: Attempt, profile: str) -> bool:
+        """Optional policy: transient routing probes back off to once per 15 minutes.
+
+        Exit 78 is a permanent policy/config hold; all other failures are transient.
+        No probe clears authentication or creates a provider turn.
+        """
+        if not self.agent.on_auth_command or not auth.held(self.store, profile):
+            return False
+        if self.agent.harness != "codex" and "codex" not in self.alt_adapters:
+            return False                       # no runnable fallback adapter
+        unknown = self.store.mark(self.agent.name, a.task_id, "auth_unknown")
+        try:
+            unknown = json.loads(unknown[0]) if unknown and unknown[0] else {}
+        except ValueError:
+            unknown = {}
+        if isinstance(unknown, dict) and unknown.get("attempt") == a.id and unknown.get("profile") == profile:
+            return False                       # cannot attribute a pre-upgrade failure
+        key = auth.PREFIX + profile
+        mark = self.store.mark(self.agent.name, key, "auth_route_attempt")
+        try:
+            prior = json.loads(mark[0]) if mark and mark[0] else {}
+        except ValueError:
+            prior = {"routed": True}   # old once-only marker remains conservative
+        if prior.get("routed") or prior.get("permanent") or prior.get("retry_at", 0) > time.time():
+            if not prior.get("routed"):
+                suffix = "permanent routing hold" if prior.get("permanent") else "routing retry after backoff"
+                self.store.update(a, note=f"authentication held; fallback attempt {prior.get('tries', 0)}; {suffix}")
+            return False
+        tries = prior.get("tries", 0) + 1
+        state = {"tries": tries, "retry_at": time.time() + min(900, GATE_HOLD_SECONDS * 2 ** min(tries - 1, 4))}
+        self.store.mark(self.agent.name, key, "auth_route_attempt", json.dumps(state))
+        env = dict(os.environ, MESH_RUNNER_AGENT=self.agent.name, MESH_RUNNER_TASK=a.task_id,
+                   MESH_RUNNER_AUTH_PROFILE=profile, MESH_RUNNER_MODE=a.mode)
+        try:
+            res = subprocess.run(self.agent.on_auth_command, capture_output=True, text=True, timeout=120, env=env)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("%s: on-auth command failed: %s", self.agent.name, type(exc).__name__)
+            self.store.event(a.id, "auth_switch", "command_failed")
+            self.store.update(a, note=f"authentication held; fallback {type(exc).__name__}; attempt {tries}")
+            return False
+        self.store.event(a.id, "auth_switch", f"rc={res.returncode}")
+        if res.returncode == 0:
+            state["routed"] = True
+            self.store.mark(self.agent.name, key, "auth_route_attempt", json.dumps(state))
+            log.info("%s: #%s authentication held; operator routed next turn", self.agent.name, a.task8)
+        else:
+            state["permanent"] = res.returncode == 78
+            self.store.mark(self.agent.name, key, "auth_route_attempt", json.dumps(state))
+            suffix = "permanent routing hold" if state["permanent"] else "routing retry after backoff"
+            self.store.update(a, note=f"authentication held; fallback rc={res.returncode}; attempt {tries}; {suffix}")
+        return res.returncode == 0
+
     def _switch_on_limit(self, a: Attempt) -> bool:
         """Ask the operator's command to move the agent to another account or
         profile. Exit 0 means it did; the next spawn reads the new environment."""
         if not self.agent.on_limit_command:
             return False
-        env = dict(os.environ, MESH_RUNNER_AGENT=self.agent.name, MESH_RUNNER_TASK=a.task_id)
+        env = dict(os.environ, MESH_RUNNER_AGENT=self.agent.name, MESH_RUNNER_TASK=a.task_id, MESH_RUNNER_MODE=a.mode)
         try:
             res = subprocess.run(self.agent.on_limit_command, capture_output=True, text=True, timeout=120, env=env)
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -2128,26 +2204,94 @@ class AgentRunner:
     def _input_fingerprint(self, task: dict) -> dict:
         return inputs.fingerprint(self.mesh, self.cats, self.agent_id, task)
 
-    def _declared_vcs_wait(self, a: Attempt | None) -> dict | None:
-        """The pipeline / merge request wait the capped attempt had just declared, or None.
+    def _keep_handback_wait(self, a: Attempt, result: TurnResult) -> None:
+        """A review session that moved the task back into the work statuses, still assigned to this
+        agent, and ended with a WAIT: the review attempt ends here, but the wait is the work's next
+        step. It is kept for the next start of the task, so a start cap there waits on it instead
+        of on "new input" (measured: a reviewer's ``WAIT merge:`` after its own hand-back was lost,
+        and the start cap held the task with nothing that could ever wake it)."""
+        try:
+            outcome, at = self._read_outcome(a, result, self._comments(a.task_id))
+        except MeshError:
+            return
+        if outcome is None or outcome.kind not in VCS_CAP_WAITS or not outcome.target:
+            return
+        wait = {"kind": outcome.kind, "target": outcome.target, "handle": outcome.handle,
+                "line": outcome.line[:400], "until": outcome.until.isoformat() if outcome.until else "",
+                "since": at, "started": iso(), "note": outcome.note}
+        for key in ("ci_change", "mr_state"):
+            if outcome.extra.get(key):
+                wait[key] = outcome.extra[key]
+        if outcome.kind == "merge":
+            wait["merge"] = {**outcome.extra["merge"], "runs": 0}
+        self.store.mark(self.agent.name, a.task_id, HANDBACK_WAIT, json.dumps({"attempt": a.id, "wait": wait}))
+        log.info("%s: #%s review handed the task back with %s %s; kept for its next start",
+                 self.agent.name, a.task8, outcome.kind, outcome.target)
+
+    def _handback_wait(self, task_id: str) -> dict | None:
+        mark = self.store.mark(self.agent.name, task_id, HANDBACK_WAIT)
+        if not mark or not mark[0]:
+            return None
+        try:
+            rec = json.loads(mark[0])
+        except ValueError:
+            return None
+        wait = rec.get("wait") if isinstance(rec, dict) else None
+        return wait if isinstance(wait, dict) and wait.get("kind") in VCS_CAP_WAITS and wait.get("target") else None
+
+    def _declared_vcs_wait(self, a: Attempt | None, task_id: str = "") -> dict | None:
+        """The pipeline / merge request / merge wait the capped attempt had just declared, or None.
 
         Only a wait saved by this very attempt counts (``cap_observation`` names it): the stored
-        wait of an attempt whose last outcome was something else is an older declaration."""
+        wait of an attempt whose last outcome was something else is an older declaration. A cap
+        with no attempt (a start cap) takes the wait a review session handed the task back with,
+        if no work attempt started since (``_keep_handback_wait``)."""
         if a is None:
-            return None
+            wait = self._handback_wait(task_id) if task_id else None
+            return copy.deepcopy(wait) if wait else None
         mark = self.store.mark(self.agent.name, a.task_id, "cap_observation")
         cur = self.store.get(a.id)
         if not (mark and mark[0] == a.id and cur and cur.wait):
             return None
         wait = cur.wait
-        if wait.get("kind") not in ("pipeline", "mr") or not wait.get("target"):
+        if wait.get("kind") not in VCS_CAP_WAITS or not wait.get("target"):
             return None
         return copy.deepcopy(wait)
+
+    def _merge_cap_event(self, wait: dict) -> str:
+        """Event text for a declared ``merge`` wait of a capped task, '' while it cannot be told.
+
+        The merge gate runs only from a waiting session, so nothing outside can move a merge request
+        that is open at the reviewed head: that state is itself the reason to start (once, as an
+        informed start). Merged, closed or a moved head are news as well. A read that fails is not."""
+        target = str(wait.get("target") or "")
+        sha = str((wait.get("merge") or {}).get("sha") or "")
+        if "!" not in target:
+            return ""
+        try:
+            mr = self.gitlab.get_mr(target)
+        except Exception:                      # noqa: BLE001 - an unreadable MR is not news
+            return ""
+        state = mr.get("state") if isinstance(mr, dict) else None
+        if state == "merged":
+            return f"MR {target} merged"
+        if state == "closed":
+            return f"MR {target} was closed without merge"
+        if state != "opened":
+            return ""                          # locked (being merged now) or unreadable
+        head = str(mr.get("sha") or "")
+        if sha and head and head != sha:
+            return f"MR {target}: the head moved to {head[:12]} (the wait was on {sha[:12]})"
+        if head and (not sha or head == sha):
+            return f"MR {target} is open at the reviewed head; only a waiting session runs the merge gate"
+        return ""
 
     def _declared_wait_event(self, task: dict, wait: dict) -> str:
         """Event text when the declared pipeline / merge request wait is satisfied now, else ''.
         The same evaluator the wake of a waiting attempt uses, without comments (a comment is a
         separate input) and without any age re-check. A read that fails is not news."""
+        if wait.get("kind") == "merge":
+            return self._merge_cap_event(wait)
         check = copy.deepcopy(wait)
         check.update(started=iso(), rechecks=0)
         check.pop("ci_observation", None)
@@ -2179,9 +2323,14 @@ class AgentRunner:
             return "a blocking dependency closed"
         if current.get("assignee") != old.get("assignee"):
             return "new assignee"
+        wait = rec.get("wait")
+        if isinstance(wait, dict) and wait.get("kind") == "merge" and self.gitlab is not None:
+            # a merge wait is not advanced by a link change: the gate that would advance it runs
+            # only from a waiting session (see ``_merge_cap_event``)
+            event = self._declared_wait_event(task, wait)
+            return f"declared wait satisfied: {event[:160]}" if event else ""
         if current.get("links") == old.get("links"):
             return ""
-        wait = rec.get("wait")
         if not isinstance(wait, dict):
             return "linked merge request or pipeline changed"
         if self.gitlab is None:                  # nothing can observe the declared wait: not satisfied
@@ -2359,9 +2508,10 @@ class AgentRunner:
         self._task_backoff.pop(tid, None)
         self._budget_backoff.pop(tid, None)
         record = {"kind": kind, "fp": fp, "at": iso()}
-        declared = self._declared_vcs_wait(a)
+        declared = self._declared_vcs_wait(a, tid)
         if declared:
             record["wait"] = declared
+        self.store.mark(self.agent.name, tid, HANDBACK_WAIT, "")
         self.store.mark(self.agent.name, tid, CAP_WAIT, "" if moved_to else json.dumps(record))
         self._input_checked.pop(tid, None)
         note = f"cap: requeued ({kind})" + (f"; reassigned to {moved_to}" if moved_to else "")
@@ -3884,7 +4034,7 @@ class AgentRunner:
             env = self._fresh_env()
             blocked = self._auth_blocked(a, env)
             if blocked:
-                self._auth_hold_attempt(a, blocked)
+                self._authentication_failed(a, blocked)
                 return
             if prior_scope:
                 task = self._task(a.task_id)  # the checkout may have changed the request scope
@@ -5295,6 +5445,8 @@ class AgentRunner:
             self._turn_end(task["id"], mode, None, gate, "not-started")
             return False
         self._remember_gate(a, gate)
+        if mode == "work":
+            self.store.mark(self.agent.name, task["id"], HANDBACK_WAIT, "")   # this start supersedes it
         if news:
             self.store.event(a.id, "informed_start", news)       # not a start of the daily_start_cap
         if self.cfg.requeue_on_cap:
@@ -5326,6 +5478,10 @@ class AgentRunner:
             env = self._fresh_env()
             blocked = self._auth_blocked(a, env)
             if blocked:
+                if self.agent.on_auth_command:
+                    self._authentication_failed(a, blocked)
+                    self._start_held = True
+                    return False
                 self._finish(a, "aborted", f"authentication held for profile {blocked}; no turn started")
                 self._task_backoff[task["id"]] = time.monotonic() + GATE_HOLD_SECONDS
                 self._start_held = True
@@ -5396,6 +5552,8 @@ class AgentRunner:
             model = ""
         if model or self.store.mark(self.agent.name, task["id"], "model"):
             self.store.mark(self.agent.name, task["id"], "model", model)
+        self.store.mark(self.agent.name, task["id"], "override_harness",
+                        self._routed_harness)
         # an `effort:<level>` label sets the reasoning effort the same way
         effort = next((str(l)[7:].strip().lower() for l in task.get("labels") or []
                        if str(l).startswith("effort:")), "")
