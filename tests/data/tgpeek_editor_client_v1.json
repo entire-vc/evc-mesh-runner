@@ -1,0 +1,574 @@
+{
+ "client_public_key": "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+ "config_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+ "endpoint": "https://bridge.invalid/v1/tgpeek/editor-jobs",
+ "exchanges": [
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"6d4468a80979cb27bcd19e026aa52ac91a631ad3afe752464893f87d39b9d3e1\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-1\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [],
+   "case": "attempt_1",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"6d4468a80979cb27bcd19e026aa52ac91a631ad3afe752464893f87d39b9d3e1\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"54edee1bf7112895f2cfa376b6e1827b90b39d854e5488dd65275a534428df68\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"TJYim8r7m+IGkhYziDE5Dr+8W1RKmC1WmXP83pvX2IRTsJ94g87b16XX0dxhsXznvBuQsX4YB1B0bFnKtxFAAg==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "54edee1bf7112895f2cfa376b6e1827b90b39d854e5488dd65275a534428df68",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"6d4468a80979cb27bcd19e026aa52ac91a631ad3afe752464893f87d39b9d3e1\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"54edee1bf7112895f2cfa376b6e1827b90b39d854e5488dd65275a534428df68\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"TJYim8r7m+IGkhYziDE5Dr+8W1RKmC1WmXP83pvX2IRTsJ94g87b16XX0dxhsXznvBuQsX4YB1B0bFnKtxFAAg==\"}",
+   "status": 200,
+   "tamper": null,
+   "verdict": "accept"
+  },
+  {
+   "body": "{\"attempt\":2,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"6139fa71b352b3ec7e5dab4b9dcda371b13ab5f1d21b5046d9731c55af67fdde\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[{\"attempt\":1,\"reason\":\"schema_invalid\"}],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"b031994364143ae872fe945dbf86a67ab2c593efdf88653717b8f5ab696690db\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-1\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [],
+   "case": "attempt_2",
+   "delivered": "{\"bindings\": {\"attempt\": 2, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"6139fa71b352b3ec7e5dab4b9dcda371b13ab5f1d21b5046d9731c55af67fdde\", \"payload_hash\": \"b031994364143ae872fe945dbf86a67ab2c593efdf88653717b8f5ab696690db\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"ba2ee661a868b1594c95e2344c4029cc9d4ce5f52d773c04dc0c7e634cbfdc8f\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"bE8Tkk7FhrUyCKnQeFp47ntAODpHD4Qww9fpqKIj7WI7eNsiEe0r1GqCHRPjm+WChBsznnvqL7GVnbLoVzppCA==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "ba2ee661a868b1594c95e2344c4029cc9d4ce5f52d773c04dc0c7e634cbfdc8f",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 2, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"6139fa71b352b3ec7e5dab4b9dcda371b13ab5f1d21b5046d9731c55af67fdde\", \"payload_hash\": \"b031994364143ae872fe945dbf86a67ab2c593efdf88653717b8f5ab696690db\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"ba2ee661a868b1594c95e2344c4029cc9d4ce5f52d773c04dc0c7e634cbfdc8f\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"bE8Tkk7FhrUyCKnQeFp47ntAODpHD4Qww9fpqKIj7WI7eNsiEe0r1GqCHRPjm+WChBsznnvqL7GVnbLoVzppCA==\"}",
+   "status": 200,
+   "tamper": null,
+   "verdict": "accept"
+  },
+  {
+   "body": "{\"attempt\":3,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"454d38d65e3c791ac9744835abd22ab533ab54f08307b817456417cec825dc01\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[{\"attempt\":1,\"reason\":\"schema_invalid\"},{\"attempt\":2,\"reason\":\"schema_invalid\"}],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"a297dbf04fe311080b4dce8824eef448b9f3729f9ae693b930a2c4f9253c043c\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-1\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [],
+   "case": "attempt_3",
+   "delivered": "{\"bindings\": {\"attempt\": 3, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"454d38d65e3c791ac9744835abd22ab533ab54f08307b817456417cec825dc01\", \"payload_hash\": \"a297dbf04fe311080b4dce8824eef448b9f3729f9ae693b930a2c4f9253c043c\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"f82a1a1cb59eaa70150e666050de493e48dfb2ae5837b2cfdacf7b87450a4d3d\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"O+npJ8GpS2kTQD3Hy2Hd+ODlTQRjycu2x+c9wdLfwl65bJNwbLZC3FG71nim804DA5reSB0MhlAnhUlaFKnqCw==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "f82a1a1cb59eaa70150e666050de493e48dfb2ae5837b2cfdacf7b87450a4d3d",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 3, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"454d38d65e3c791ac9744835abd22ab533ab54f08307b817456417cec825dc01\", \"payload_hash\": \"a297dbf04fe311080b4dce8824eef448b9f3729f9ae693b930a2c4f9253c043c\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"f82a1a1cb59eaa70150e666050de493e48dfb2ae5837b2cfdacf7b87450a4d3d\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"O+npJ8GpS2kTQD3Hy2Hd+ODlTQRjycu2x+c9wdLfwl65bJNwbLZC3FG71nim804DA5reSB0MhlAnhUlaFKnqCw==\"}",
+   "status": 200,
+   "tamper": null,
+   "verdict": "accept"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"bfd24c4167a4882f91b61bf5e894d357f95f0a229b2e56d7c444da2872cb90c3\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t0\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/7835921979660e293d4bd3e18820a995bfa6f57c15a0d0c0f14eda2379458ce1",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_signature_bit_flip",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"bfd24c4167a4882f91b61bf5e894d357f95f0a229b2e56d7c444da2872cb90c3\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t0\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"7835921979660e293d4bd3e18820a995bfa6f57c15a0d0c0f14eda2379458ce1\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"CV3LhayqQemSotQpIgF2mmKRIjeBl9VtEeFAdhFoTp4OYm0b012QxuuW8y9+SEoKSpyhYs+nHlXwnGIyovddBw==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "7835921979660e293d4bd3e18820a995bfa6f57c15a0d0c0f14eda2379458ce1",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"bfd24c4167a4882f91b61bf5e894d357f95f0a229b2e56d7c444da2872cb90c3\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t0\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"7835921979660e293d4bd3e18820a995bfa6f57c15a0d0c0f14eda2379458ce1\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"CF3LhayqQemSotQpIgF2mmKRIjeBl9VtEeFAdhFoTp4OYm0b012QxuuW8y9+SEoKSpyhYs+nHlXwnGIyovddBw==\"}",
+   "status": 200,
+   "tamper": "signature_bit_flip",
+   "verdict": "reject:model_unavailable"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"ba999710bcb8af22f7f500cb5736582ff9db544c7baffb662f378d3e5f8c90c5\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t1\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/9ed78dcb4effdf2f4688052f510d099c9e4d5b7246d18431de9b50c456d4a525",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_signed_by_another_key",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"ba999710bcb8af22f7f500cb5736582ff9db544c7baffb662f378d3e5f8c90c5\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"9ed78dcb4effdf2f4688052f510d099c9e4d5b7246d18431de9b50c456d4a525\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"JUCPS/YTnH0/3qzjwKaIMpfrqfGpQIUkc2iUOhlAtnfSFYM4lg1WP39oeaht8FMLGoh0ZUTTvMwVqIs46jtRAQ==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "9ed78dcb4effdf2f4688052f510d099c9e4d5b7246d18431de9b50c456d4a525",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"ba999710bcb8af22f7f500cb5736582ff9db544c7baffb662f378d3e5f8c90c5\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t1\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"9ed78dcb4effdf2f4688052f510d099c9e4d5b7246d18431de9b50c456d4a525\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"q6jnzR9YVeSiZl5MqEQc64mG773XviBAZy7TCZ9OKrBDflaZPikOeQUluev0sBFW09yS6l2sU9+OrXnPHcyrBQ==\"}",
+   "status": 200,
+   "tamper": "signed_by_another_key",
+   "verdict": "reject:model_unavailable"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"cf20d84d95f5f0ae12edb5df6fa8da5d82b8d691638b405df40426fb3628825e\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t2\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/5adf3a5a77499cdcb617782a99b1bb9902584d0c07dca537a37fc8621fc50024",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_binding_attempt",
+   "delivered": "{\"bindings\": {\"attempt\": 2, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"cf20d84d95f5f0ae12edb5df6fa8da5d82b8d691638b405df40426fb3628825e\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t2\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"5adf3a5a77499cdcb617782a99b1bb9902584d0c07dca537a37fc8621fc50024\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"/Q1pHbLFkPAU3ygH2wPbdjmhuAfCoAy71pkW61GXdxDe0qvuV+1eY46/zzTXRfrK6iCxW/T4vKUrQVb01m8kCg==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "5adf3a5a77499cdcb617782a99b1bb9902584d0c07dca537a37fc8621fc50024",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"cf20d84d95f5f0ae12edb5df6fa8da5d82b8d691638b405df40426fb3628825e\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t2\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"5adf3a5a77499cdcb617782a99b1bb9902584d0c07dca537a37fc8621fc50024\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"Z46tq5vJkvZ+R+Pw38zdvdhGYTF6yRFBq9BuxDPTePoLG1AWrU+IReKGkmoC7WrhG8hsghZohawEILTEO4gMAw==\"}",
+   "status": 200,
+   "tamper": "binding_attempt",
+   "verdict": "reject:bridge_binding_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"32e128e9a298f0462bbe348932f6f474cadd260972d40c8e8617a9e3b4e593aa\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t3\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/4ff4f7e4222f05c8f6084074e44eb4ef0f461af55e0012b3e4913122069a45bb",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_binding_commit_sha",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"32e128e9a298f0462bbe348932f6f474cadd260972d40c8e8617a9e3b4e593aa\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t3\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"4ff4f7e4222f05c8f6084074e44eb4ef0f461af55e0012b3e4913122069a45bb\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"WtibbyFQrSkcyvLHdiNEnioD6j25rbuT20KfrKQX1qMzBtaJahw5N/grlVbIU19W1h6xEDXHG/t3oSyuTiwNBA==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "4ff4f7e4222f05c8f6084074e44eb4ef0f461af55e0012b3e4913122069a45bb",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"32e128e9a298f0462bbe348932f6f474cadd260972d40c8e8617a9e3b4e593aa\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t3\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"4ff4f7e4222f05c8f6084074e44eb4ef0f461af55e0012b3e4913122069a45bb\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"wOYzphrToE3h9Le8MuF2QXgBhBAC3DO8Y6eiRuKDisAWkxWVVyGSDJiqsOIpa9xWGA3Q90DOHC8vtlnRDOL2Cg==\"}",
+   "status": 200,
+   "tamper": "binding_commit_sha",
+   "verdict": "reject:bridge_binding_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"a324dea119cf1e7b39f51034b9dd11b0f870dd44bd943d947cffe2c1a6802e4e\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t4\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/d72a57274983e7fabdb294cdc4214deea8cc3e7a789023ff867291b9d4cc8b58",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_binding_deadline",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000046000, \"input_hash\": \"a324dea119cf1e7b39f51034b9dd11b0f870dd44bd943d947cffe2c1a6802e4e\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t4\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"d72a57274983e7fabdb294cdc4214deea8cc3e7a789023ff867291b9d4cc8b58\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"f35KfE91zx/SCMojYQi52hkaMpWyOeXUtbgsrEFPAoegR/TLS5mP5cxJiyhasMzN465q7l1kcNqsqehq0J8dDw==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "d72a57274983e7fabdb294cdc4214deea8cc3e7a789023ff867291b9d4cc8b58",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"a324dea119cf1e7b39f51034b9dd11b0f870dd44bd943d947cffe2c1a6802e4e\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t4\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"d72a57274983e7fabdb294cdc4214deea8cc3e7a789023ff867291b9d4cc8b58\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"nuKEomL0SBQp/Hj4EPSY6LIXxqS1EjHfBfDwPQan3SdqlrYLl/Dqy8n1KraUb3y5OxaQPNfTyxaPhHDCafQ3DQ==\"}",
+   "status": 200,
+   "tamper": "binding_deadline",
+   "verdict": "reject:bridge_binding_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"154e405e1ee3d1d219fa203131bfe83539fc675034945833e5b6adc7c5289413\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t5\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/1501997e0e9bce19d13f945b471a4b691d0b8ee48983c35bb8855210c76c5638",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_binding_input_hash",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t5\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"1501997e0e9bce19d13f945b471a4b691d0b8ee48983c35bb8855210c76c5638\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"LR7CzPl8u3R0F7Q56zXfr4wz3UTs5ctVUIhMlSQt2hnO4RChfpZSNpw2ZVrlpKdeEtnHUlOdcOj0xhdmnSc2Aw==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "1501997e0e9bce19d13f945b471a4b691d0b8ee48983c35bb8855210c76c5638",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"154e405e1ee3d1d219fa203131bfe83539fc675034945833e5b6adc7c5289413\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t5\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"1501997e0e9bce19d13f945b471a4b691d0b8ee48983c35bb8855210c76c5638\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"79TeyFLH3V1r8ss6Xfw4aEF1jqcqN/j6tWYbcCtGDubwJ6Lz4N9LIvVCWpwS6p6dszTHibO2wq6zTPMzKEIxDA==\"}",
+   "status": 200,
+   "tamper": "binding_input_hash",
+   "verdict": "reject:bridge_binding_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"654cac88af87e15a1af1482f684be8499a9e55413408f72bb1d9308894768a71\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t6\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/d5415e0e16fc8d16d7d75fe5947f4d11d2c6b0f87b812cee401a9cf657192601",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_job_id",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"654cac88af87e15a1af1482f684be8499a9e55413408f72bb1d9308894768a71\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t6\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"/lGerfAe2PnzDpJIY+46Gf/8LAQOkngWfqiOsKn9VQ9R5p1fNlIhdsHzzjFqqR46W01/yhWMBddp8B9jLHBYAQ==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "d5415e0e16fc8d16d7d75fe5947f4d11d2c6b0f87b812cee401a9cf657192601",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"654cac88af87e15a1af1482f684be8499a9e55413408f72bb1d9308894768a71\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t6\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"d5415e0e16fc8d16d7d75fe5947f4d11d2c6b0f87b812cee401a9cf657192601\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"ISlcmKSUVGFmwl9AbI+X+Z2qdgK6n7BXeJPTV5HHmuPn1/OXQvOKuG4R3ArKMDL4egI4rsG7Esl5196aKzumCQ==\"}",
+   "status": 200,
+   "tamper": "job_id",
+   "verdict": "reject:bridge_binding_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"11772789cf2c6104b2d723cf21cc7d8db3a2dc37fee3108ceea7af273ad24381\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t7\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/621c735fe4e8012df4812aea05b1867ee90f2473572a34500ac58e0d0c7650bc",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_identity_version",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"11772789cf2c6104b2d723cf21cc7d8db3a2dc37fee3108ceea7af273ad24381\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t7\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"621c735fe4e8012df4812aea05b1867ee90f2473572a34500ac58e0d0c7650bc\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-other\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"j1cDqE7lBA6oZIHXh2k1zEeyheLSLtrmnP35HwEuQl0NPyKNmLa4HjA2wZ0ONCOrazkOZ7lWEfdtkofB9J6pCQ==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "621c735fe4e8012df4812aea05b1867ee90f2473572a34500ac58e0d0c7650bc",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"11772789cf2c6104b2d723cf21cc7d8db3a2dc37fee3108ceea7af273ad24381\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t7\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"621c735fe4e8012df4812aea05b1867ee90f2473572a34500ac58e0d0c7650bc\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"YDz4VfPOkBDF2x0ncP9EhWQXBAnZ9g1UdgQjFHnwZ4/NmsutHvY31IQfOgZ8WgxCwG1UzgpyekRvp+ey/uasCw==\"}",
+   "status": 200,
+   "tamper": "identity_version",
+   "verdict": "reject:model_identity_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"989a932c7d4388d1ed61504c77fda6abf2cd275394131db61059dddcebee15bd\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t8\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/c80ee6f942979196b0aba2861d8a2acdffab7c68462edf711a0de3c6625945e8",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_status_failed",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"989a932c7d4388d1ed61504c77fda6abf2cd275394131db61059dddcebee15bd\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t8\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"c80ee6f942979196b0aba2861d8a2acdffab7c68462edf711a0de3c6625945e8\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"failed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"JalBxs+UZq0+x9XStQe9h4EcC5Sf5ceHwWfnc43N8ttKV/9VbtJeddeZuENxg4Xw0ACfEjfy+ftXV+Zt+IN0Bg==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "c80ee6f942979196b0aba2861d8a2acdffab7c68462edf711a0de3c6625945e8",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"989a932c7d4388d1ed61504c77fda6abf2cd275394131db61059dddcebee15bd\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t8\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"c80ee6f942979196b0aba2861d8a2acdffab7c68462edf711a0de3c6625945e8\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"LzYbv8A/G4o3dZuYT3ptAJtildfvXrXwRjNiviuPJw6LHxCtUR7bUNDY46s0P76jsvr5oeDP8vHrRXFCEFewAg==\"}",
+   "status": 200,
+   "tamper": "status_failed",
+   "verdict": "reject:incomplete_output"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"f59f45b02ff8c4e5888f7cf5b145777f33af4323c9dd9353b4d10076f4a5a7fb\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t9\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/c47d67e68c9ebb832855e1de608ac95efb4e012ee920a3da01319a14b75d2a28",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_receipt_config_digest",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"f59f45b02ff8c4e5888f7cf5b145777f33af4323c9dd9353b4d10076f4a5a7fb\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t9\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"c47d67e68c9ebb832855e1de608ac95efb4e012ee920a3da01319a14b75d2a28\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"qn5JRHharF9rVtJPq87xjxqUM1/hO7tcvBgck86xkF9H/JLLnAAJC2SURkgUi3GS1zLQeIZUcPLA2LOC+A5FDg==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "c47d67e68c9ebb832855e1de608ac95efb4e012ee920a3da01319a14b75d2a28",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"f59f45b02ff8c4e5888f7cf5b145777f33af4323c9dd9353b4d10076f4a5a7fb\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t9\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"c47d67e68c9ebb832855e1de608ac95efb4e012ee920a3da01319a14b75d2a28\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"i3azPmIvoqb/JHw6AVOTWo5CZARQQz6I7ZcbNvXVTAbTijnToxz0US/8g8P9pnML8LVRTSeTb3LYtCWa3Fh8CQ==\"}",
+   "status": 200,
+   "tamper": "receipt_config_digest",
+   "verdict": "reject:bridge_receipt_invalid"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"ab902898837a4b7b791c44d356e1ba76f4f741308f8bb968526ebbdb3a0c1a0a\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t10\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/16bb8eecadb08d8094f0f9413915cb41b98a6ffecb3390106db7b573e881b9e4",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_receipt_finished_in_future",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"ab902898837a4b7b791c44d356e1ba76f4f741308f8bb968526ebbdb3a0c1a0a\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t10\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"16bb8eecadb08d8094f0f9413915cb41b98a6ffecb3390106db7b573e881b9e4\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000001, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"rMz94w3/MRtdGtQQaqFYRFU3FFXpPVOqtAKXqvi031eFkIPI4YhFiHJ0gjEGenwGDC55uEGVPo8AImJynojgBQ==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "16bb8eecadb08d8094f0f9413915cb41b98a6ffecb3390106db7b573e881b9e4",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"ab902898837a4b7b791c44d356e1ba76f4f741308f8bb968526ebbdb3a0c1a0a\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t10\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"16bb8eecadb08d8094f0f9413915cb41b98a6ffecb3390106db7b573e881b9e4\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"faC/DpsI8147+hYL9xe7AsDZqIEwgdfP4ZNpiOhdugC5Nq+RYetiUaIUDDvSndEj6XVNaeGzhV9pRnSIx6h7Dw==\"}",
+   "status": 200,
+   "tamper": "receipt_finished_in_future",
+   "verdict": "reject:bridge_receipt_invalid"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"11047a30559bc1aa20ace8635ac8a3190f451845267b8e57793788bf31806f69\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t11\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/49c8daf67d865005a3af34cebd04d9a9f8a5d4da6508f3b1c154bdce110912e1",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_receipt_tools_used",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"11047a30559bc1aa20ace8635ac8a3190f451845267b8e57793788bf31806f69\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t11\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"49c8daf67d865005a3af34cebd04d9a9f8a5d4da6508f3b1c154bdce110912e1\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": [\"shell\"]}, \"signature\": \"T3AZVUDlOXlWZGd+7zYRW0jSoH/cPBZvmIokzd4aZpiLrPZChquhI1Qky9N4ulhks3+8DHGl3K7RZDuqKHNtDA==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "49c8daf67d865005a3af34cebd04d9a9f8a5d4da6508f3b1c154bdce110912e1",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"11047a30559bc1aa20ace8635ac8a3190f451845267b8e57793788bf31806f69\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t11\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"49c8daf67d865005a3af34cebd04d9a9f8a5d4da6508f3b1c154bdce110912e1\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"gNwHn3Xh6ZFLYltL3/WsVuE41Uvgk8VwROa2A1Yob7uY0lAxypO1GuCZ41Id2rFR4cOZoy1ZudKI/BuMbC8+DQ==\"}",
+   "status": 200,
+   "tamper": "receipt_tools_used",
+   "verdict": "reject:tools_forbidden"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"c810ab40c702da97d08884daf474a4f54816c12d06c7cbe2cb716ee40c792309\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t12\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/70bb1fcfa5203da6bedf8c2ec5f674fa522451b4193a3a69f182fd426121c42b",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_receipt_isolation",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"c810ab40c702da97d08884daf474a4f54816c12d06c7cbe2cb716ee40c792309\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t12\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"70bb1fcfa5203da6bedf8c2ec5f674fa522451b4193a3a69f182fd426121c42b\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"none\", \"tools_used\": []}, \"signature\": \"8nJ1kFBqCVoPsG01w7JCbuOShTecDd+hLYaryb8b3O/7S1k5+QYRT/VEIHv4na2oo8Gdb/8b0rP4gQXXXp78Ag==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "70bb1fcfa5203da6bedf8c2ec5f674fa522451b4193a3a69f182fd426121c42b",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"c810ab40c702da97d08884daf474a4f54816c12d06c7cbe2cb716ee40c792309\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t12\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"70bb1fcfa5203da6bedf8c2ec5f674fa522451b4193a3a69f182fd426121c42b\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"YR9lcSFmsqlmJfO8QGC9P7OCWtBpZAOv+OOnmjbyOFwVwiI8FuXf6mlmRjs0gb3HwuXRrt12jwW8CMzVuJPHCQ==\"}",
+   "status": 200,
+   "tamper": "receipt_isolation",
+   "verdict": "reject:tools_forbidden"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"4be4433c41fe5e5ec4781410fcf7ad53cb5412a0000cf12ebc2f57292af3cd69\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t13\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/888203b030f1b6a583d1af4c9491cedfa384c65dc3a28e8161159ba7703dc6c8",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_result_hash",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"4be4433c41fe5e5ec4781410fcf7ad53cb5412a0000cf12ebc2f57292af3cd69\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t13\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"888203b030f1b6a583d1af4c9491cedfa384c65dc3a28e8161159ba7703dc6c8\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"0000000000000000000000000000000000000000000000000000000000000000\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"pgDmgm34f5uYbvyPaPJO+PDoNIMGWTiHckqOmeeLPEVTcl5UKed6ANTXFd7sFhmBHLjkzRiNRr+0BY45yTgkCw==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "888203b030f1b6a583d1af4c9491cedfa384c65dc3a28e8161159ba7703dc6c8",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"4be4433c41fe5e5ec4781410fcf7ad53cb5412a0000cf12ebc2f57292af3cd69\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t13\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"888203b030f1b6a583d1af4c9491cedfa384c65dc3a28e8161159ba7703dc6c8\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"Gt5w6SUCAWkQt0ZAITCw/Q6FO5RueHfUgb8v9tMLCVot9P0Rz0OeQPO/vcHJ6BwI+RL7KrpvlF7Pw7fPziIVDg==\"}",
+   "status": 200,
+   "tamper": "result_hash",
+   "verdict": "reject:bridge_binding_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"2f050f7728923b1046b42823c22cf3d6374eac3a02d02324ed5ef19c82d60ff7\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t14\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/f6e8d945beafd804af889a805780e8a39390ba64bb229e964f8eb6295d8aeb40",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_text_changed_hash_kept",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"2f050f7728923b1046b42823c22cf3d6374eac3a02d02324ed5ef19c82d60ff7\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t14\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"f6e8d945beafd804af889a805780e8a39390ba64bb229e964f8eb6295d8aeb40\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\":[],\\\"limitations\\\":[\\\"x\\\"]}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"3UWVNr+UEoQzuZC6eklinHU/6zoEa9PsUr5M+Yi9/KF0Hp+zmZeHPc3V33bNroEhBgwXuDTnnTcLJ0FNah6XBQ==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "f6e8d945beafd804af889a805780e8a39390ba64bb229e964f8eb6295d8aeb40",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"2f050f7728923b1046b42823c22cf3d6374eac3a02d02324ed5ef19c82d60ff7\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t14\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"f6e8d945beafd804af889a805780e8a39390ba64bb229e964f8eb6295d8aeb40\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"MCP3gHrgA0Eq9AP5B1uwQtDmOPrhlhswIrfmgAYCbs/wiNlClTCtSp+qG5lFbzUeWxtCZ5bm32hajIv8CLqXAg==\"}",
+   "status": 200,
+   "tamper": "text_changed_hash_kept",
+   "verdict": "reject:bridge_binding_mismatch"
+  },
+  {
+   "body": "{\"attempt\":1,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"41bf44fd99900cb58608111da461691cca2d8bd00bfab02081e2f90862e6c3b8\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-t15\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/5045e0febc50e18eedd4b5bd2005f3a42809461a517040c1aae78a2d56ded55a",
+     "response": "{\"state\": \"completed\"}",
+     "status": 200
+    }
+   ],
+   "case": "tamper_unknown_response_key",
+   "delivered": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"41bf44fd99900cb58608111da461691cca2d8bd00bfab02081e2f90862e6c3b8\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t15\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"5045e0febc50e18eedd4b5bd2005f3a42809461a517040c1aae78a2d56ded55a\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"extra\": 1, \"signature\": \"mPwxCJE8nGzhXVgPS+7SgyuxO+u12w8tJEn/t7aIllRRAkFUxqhxWDdYPHTUtLZUdd1M9+pLDOctpop7pTf/Dg==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "5045e0febc50e18eedd4b5bd2005f3a42809461a517040c1aae78a2d56ded55a",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 1, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"41bf44fd99900cb58608111da461691cca2d8bd00bfab02081e2f90862e6c3b8\", \"payload_hash\": \"43586f4975d7cdf6d87c754bbcc4dcc14c841ed5b04e8f1c7187d966a8d204b9\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-t15\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"5045e0febc50e18eedd4b5bd2005f3a42809461a517040c1aae78a2d56ded55a\", \"identity\": {\"principal\": \"tgpeek-editor\", \"family\": \"openai\", \"model\": \"gpt-6.1-sol\", \"version\": \"gpt-6.1-sol-2026-10-01\"}, \"status\": \"completed\", \"text\": \"{\\\"claims\\\": [], \\\"limitations\\\": []}\", \"result_hash\": \"88faf0c1852e235f0d22b6f8b56ebe18e2904858aa961485e79c6e9c1ceeb29f\", \"executor_receipt\": {\"executor_id\": \"tgpeek-editor\", \"config_digest\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\", \"started_at\": 1800000000000, \"finished_at\": 1800000000000, \"isolation\": \"tools-disabled-v1\", \"tools_used\": []}, \"signature\": \"VRh0sKO4e+ELTKdlLATyQnCt5JDahHtacTLk9iRl7VIK1qqAWAKp2/mMza6ttRtZl8mLDRhNO64Y5rLvF0noAw==\"}",
+   "status": 200,
+   "tamper": "unknown_response_key",
+   "verdict": "reject:invalid_model_output"
+  },
+  {
+   "body": "{\"attempt\":3,\"ci_job_id\":123,\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contract_digest\":\"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\",\"deadline_at\":1800000045000,\"input_hash\":\"555dafd5a48d2a31f7fa94688070b1eff31e1e66f73a1bad18a0c10f287b4fb9\",\"payload\":{\"claim_markers\":{\"provenance\":{\"case_id\":null,\"collected_at\":null,\"observed_at\":null,\"source_id\":null,\"source_type\":null},\"synthetic\":true,\"test_only\":true},\"claim_schema\":{\"additionalProperties\":false,\"type\":\"object\"},\"corrections\":[{\"attempt\":1,\"reason\":\"schema_invalid\"},{\"attempt\":2,\"reason\":\"schema_invalid\"}],\"evidence\":[{\"id\":\"e1\",\"kind\":\"transcript\",\"text\":\"synthetic transcript\"}],\"fixture\":{\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"id\":\"f\",\"input\":\"synthetic\",\"version\":1},\"locale\":\"en\",\"observations\":[{\"evidence_id\":\"e1\",\"id\":\"o1\",\"knowledge\":\"k\",\"observed_at\":\"2026-01-01\",\"value\":\"v\"}],\"run\":{\"conditions\":[\"c\"],\"outcome\":\"ok\",\"stop_reason\":null},\"scenario\":{\"hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"id\":\"s\",\"rubric\":[\"r\"],\"version\":1}},\"payload_hash\":\"a297dbf04fe311080b4dce8824eef448b9f3729f9ae693b930a2c4f9253c043c\",\"pipeline_id\":456,\"project_id\":86,\"protocol_version\":\"tgpeek-editor-bridge-v1\",\"publication_id\":\"pub-ooo\",\"publication_version\":1,\"schema_hash\":\"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\",\"system_hash\":\"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}",
+   "cancels": [
+    {
+     "body": null,
+     "headers": {
+      "job-token": "disposable-capability-control"
+     },
+     "method": "DELETE",
+     "path": "/v1/tgpeek/editor-jobs/2019734f4d46b7df3050b9496bcefc52a3342a52cb619c748af97a4682fbf3cf",
+     "response": "{\"error\": \"not_found\"}",
+     "status": 404
+    }
+   ],
+   "case": "out_of_order_attempt",
+   "delivered": "{\"bindings\": {\"attempt\": 3, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"555dafd5a48d2a31f7fa94688070b1eff31e1e66f73a1bad18a0c10f287b4fb9\", \"payload_hash\": \"a297dbf04fe311080b4dce8824eef448b9f3729f9ae693b930a2c4f9253c043c\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-ooo\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"2019734f4d46b7df3050b9496bcefc52a3342a52cb619c748af97a4682fbf3cf\", \"identity\": null, \"status\": \"rejected\", \"text\": null, \"result_hash\": null, \"executor_receipt\": null, \"signature\": \"wmvu+MegVZxWw6yDjbcvQfoVnMIHr8uTMvMs3shLhIK32wuRmXXQC1JlBpubGxJGPuwXfcnRxBR9W/RvsRSTDg==\"}",
+   "headers": {
+    "content-type": "application/json",
+    "idempotency-key": "2019734f4d46b7df3050b9496bcefc52a3342a52cb619c748af97a4682fbf3cf",
+    "job-token": "disposable-capability-control"
+   },
+   "method": "POST",
+   "path": "/v1/tgpeek/editor-jobs",
+   "response": "{\"bindings\": {\"attempt\": 3, \"ci_job_id\": 123, \"commit_sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"contract_digest\": \"8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3\", \"deadline_at\": 1800000045000, \"input_hash\": \"555dafd5a48d2a31f7fa94688070b1eff31e1e66f73a1bad18a0c10f287b4fb9\", \"payload_hash\": \"a297dbf04fe311080b4dce8824eef448b9f3729f9ae693b930a2c4f9253c043c\", \"pipeline_id\": 456, \"project_id\": 86, \"protocol_version\": \"tgpeek-editor-bridge-v1\", \"publication_id\": \"pub-ooo\", \"publication_version\": 1, \"schema_hash\": \"cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e\", \"system_hash\": \"07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20\"}, \"job_id\": \"2019734f4d46b7df3050b9496bcefc52a3342a52cb619c748af97a4682fbf3cf\", \"identity\": null, \"status\": \"rejected\", \"text\": null, \"result_hash\": null, \"executor_receipt\": null, \"signature\": \"wmvu+MegVZxWw6yDjbcvQfoVnMIHr8uTMvMs3shLhIK32wuRmXXQC1JlBpubGxJGPuwXfcnRxBR9W/RvsRSTDg==\"}",
+   "status": 200,
+   "tamper": null,
+   "verdict": "reject:model_identity_mismatch"
+  }
+ ],
+ "frozen_time": 1800000000.0,
+ "identity": {
+  "family": "openai",
+  "model": "gpt-6.1-sol",
+  "principal": "tgpeek-editor",
+  "version": "gpt-6.1-sol-2026-10-01"
+ },
+ "pins": {
+  "contract": {
+   "config_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+   "identity": {
+    "family": "openai",
+    "model": "gpt-6.1-sol",
+    "principal": "tgpeek-editor",
+    "version": "gpt-6.1-sol-2026-10-01"
+   },
+   "isolation": "tools-disabled-v1",
+   "max_input": 8388608,
+   "max_output": 128000,
+   "protocol_version": "tgpeek-editor-bridge-v1",
+   "public_key_hash": "93c5d0f7f77ba6f306128539f124e5a0aee488cccd79195a1d541ebd693bce01",
+   "schema_hash": "cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e",
+   "system_hash": "07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20"
+  },
+  "contract_digest": "8f721f1decc1b5275587bd752fe9a949a42cef8504fca3947a6e1bab5f7e8fb3",
+  "schema_hash": "cd1a463c46d6264134447db17a8c3c7abe5b9a2488c6d759fea66da1f96b133e",
+  "system_hash": "07b37b38a959bafbf2918e858d82b1a8e6645590ae292032a7773b21b3db4c20"
+ },
+ "source": {
+  "commit": "566b8c1eb374d0203f065d3958657b1e20073f2a",
+  "files": {
+   "editorial.py": "84bb842417c6e253b092180df826fa047b0acf2266d2c20e9a20aeb68cdb0e9f",
+   "editorial_bridge.py": "f6fe56dc48efaf68fb269cfc4265dbdc640a9d7df4552b6c4acc3fd73603dea2",
+   "editorial_contract.py": "ac8629d0eef418463cafe282091da12d3422b18a9a6103fd6db09a734050f121",
+   "editorial_models.py": "a6dac6da573825c8984de87d1502d4f5293f68f16f7b44640f1525f84da4c02f",
+   "editorial_wire.py": "a366236d88dfebbca3befae04bb62db328d9003908bf93fd2483b90b2afb1ffc"
+  },
+  "repo": "venturecrew/tgpeek"
+ },
+ "synthetic_seed_hex": "0707070707070707070707070707070707070707070707070707070707070707"
+}

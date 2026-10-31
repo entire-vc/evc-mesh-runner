@@ -1,0 +1,34 @@
+Live-client run of tests/test_editor_job_client_contract.py (LiveClient + GoldenReplay) against the pinned product client.
+Pinned source: venturecrew/tgpeek commit 566b8c1eb374d0203f065d3958657b1e20073f2a, services/worker/src/tgpeek_worker
+Source extracted with: git archive 566b8c1eb374d0203f065d3958657b1e20073f2a services/worker/src
+Command: TGPEEK_CLIENT_SRC=<extracted>/services/worker/src PYTHONPATH=src:tests python3 -m unittest -v test_editor_job_client_contract
+LiveClient asserts source_hashes(src) == fixture source.files (below) and that regenerating the fixture with the real client equals the stored fixture.
+
+editorial_bridge.py git-blob 9cd2aba036139f09da418bf3db9292196f8cc159
+editorial_contract.py git-blob 095943f9b48fcc5bbccb462c32bde665f875737f
+editorial_wire.py git-blob b90516528e4e47b41ddf3b9ea792de10709ee873
+editorial.py git-blob 35fcbfd4a0f091ea51584a38168810920e15bfde
+editorial_models.py git-blob 17bd7f063d49b33bef20744f3edd76af4ead9efc
+
+editorial.py sha256 84bb842417c6e253b092180df826fa047b0acf2266d2c20e9a20aeb68cdb0e9f
+editorial_bridge.py sha256 f6fe56dc48efaf68fb269cfc4265dbdc640a9d7df4552b6c4acc3fd73603dea2
+editorial_contract.py sha256 ac8629d0eef418463cafe282091da12d3422b18a9a6103fd6db09a734050f121
+editorial_models.py sha256 a6dac6da573825c8984de87d1502d4f5293f68f16f7b44640f1525f84da4c02f
+editorial_wire.py sha256 a366236d88dfebbca3befae04bb62db328d9003908bf93fd2483b90b2afb1ffc
+
+test_every_request_of_the_real_client_is_accepted_and_answered_byte_for_byte (test_editor_job_client_contract.GoldenReplay.test_every_request_of_the_real_client_is_accepted_and_answered_byte_for_byte) ... ok
+test_every_tampered_response_was_rejected_by_the_client_with_its_own_code_and_cancelled (test_editor_job_client_contract.GoldenReplay.test_every_tampered_response_was_rejected_by_the_client_with_its_own_code_and_cancelled) ... ok
+test_fixture_is_bound_to_the_reviewed_client (test_editor_job_client_contract.GoldenReplay.test_fixture_is_bound_to_the_reviewed_client) ... ok
+test_genuine_responses_are_accepted_by_the_client (test_editor_job_client_contract.GoldenReplay.test_genuine_responses_are_accepted_by_the_client) ... ok
+test_positive_control_a_resigned_but_unmodified_response_is_not_a_tamper (test_editor_job_client_contract.GoldenReplay.test_positive_control_a_resigned_but_unmodified_response_is_not_a_tamper) ... ok
+test_replay_of_a_completed_key_never_reruns_the_executor (test_editor_job_client_contract.GoldenReplay.test_replay_of_a_completed_key_never_reruns_the_executor) ... ok
+test_the_wire_the_client_sent_is_the_reviewed_scalar_form (test_editor_job_client_contract.GoldenReplay.test_the_wire_the_client_sent_is_the_reviewed_scalar_form) ... ok
+test_third_attempt_is_served_and_a_skipped_attempt_is_refused (test_editor_job_client_contract.GoldenReplay.test_third_attempt_is_served_and_a_skipped_attempt_is_refused) ... ok
+test_pinned_source_and_regenerated_fixture_equal_the_stored_one (test_editor_job_client_contract.LiveClient.test_pinned_source_and_regenerated_fixture_equal_the_stored_one) ... /opt/homebrew/Cellar/python@3.14/3.14.4_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 404: 'refused'>
+  _warnings.warn(self.warn_message, ResourceWarning)
+ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 5.081s
+
+OK

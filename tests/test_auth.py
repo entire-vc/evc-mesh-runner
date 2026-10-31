@@ -362,7 +362,8 @@ class AuthLoop(Bench):
         self.assertEqual(mesh.task(second["id"])["status_id"], original_status)
         self.assertFalse(mesh.checkouts)
         self.assertEqual(len(calls(self.calls)), 1)
-        self.assertIsNone(r.store.open_for_task(self.agent.name, second["id"]))
+        held = r.store.open_for_task(self.agent.name, second["id"])
+        self.assertEqual((held.state, held.turns), ("ready", 0))
 
     def test_ownership_change_while_auth_held_does_not_restart_or_hand_up(self):
         r, mesh, t, a, profile = self.expire()
@@ -382,6 +383,84 @@ class AuthLoop(Bench):
         def complete(mesh, t):
             mesh.set_category(t["id"], "done")
         self.settle_auth_after_task_change(complete)
+
+
+class VerificationRequired(Bench):
+    def terminal(self, reason, *, work=False, subtype="error_during_execution", error=True):
+        lines = []
+        if work:
+            lines.append(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "work"}}]}}))
+        lines.append(json.dumps({"type": "result", "session_id": "s", "subtype": subtype,
+                                 "is_error": error, "result": reason, "usage": {}}))
+        path = self.root / "verification.jsonl"
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_only_the_exact_terminal_envelope_is_verification_required(self):
+        cases = [("verification_required", True, True), ("verification_required\n", True, True),
+                 ("verification_required", False, False),
+                 ("The report quotes verification_required", True, False),
+                 ("verification_required: try again", True, False), ("API Error: 500", True, False)]
+        for reason, error, expected in cases:
+            with self.subTest(reason=reason, error=error):
+                res = ClaudeAdapter().parse(self.terminal(reason, error=error,
+                                                          subtype="error_during_execution" if error else "success"))
+                self.assertEqual(res.verification_required, expected)
+                self.assertFalse(res.auth_failed)
+        quoted = self.root / "quoted.jsonl"
+        quoted.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "verification_required"}]}}) + "\n")
+        self.assertFalse(ClaudeAdapter().parse(quoted).verification_required)
+        self.assertTrue(ClaudeAdapter().parse(self.terminal("verification_required")).auth_only)
+        self.assertFalse(ClaudeAdapter().parse(self.terminal("verification_required", work=True)).auth_only)
+
+    def test_errors_list_entry_must_match_exactly_too(self):
+        path = self.root / "errors.jsonl"
+        for errs, expected in ((["noise", "verification_required"], True),
+                               (["verification_required"], True),
+                               (["verification_required: try again"], False),
+                               (["see verification_required docs"], False)):
+            with self.subTest(errors=errs):
+                path.write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                            "is_error": True, "errors": errs}) + "\n")
+                res = ClaudeAdapter().parse(path)
+                self.assertEqual((res.verification_required, res.auth_failed), (expected, False))
+
+    def settle(self, reason, *, turns=4, failures=3, work=False):
+        t = task(32)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.refresh_me()
+        a = r.store.create(self.agent.name, t["id"], "claude")
+        profile = auth.profile_id(r._fresh_env(), self.agent.profile_dir)
+        r.store.mark(self.agent.name, t["id"], "auth_launch",
+                     json.dumps({"attempt": a.id, "turn": turns, "profile": profile}))
+        r.store.update(a, state="running", turns=turns, no_outcome=failures,
+                       log_path=str(self.terminal(reason, work=work)))
+        r._hand_up = lambda *args, **kwargs: self.fail("must not hand the card up")
+        r.settle(r.store.get(a.id))
+        return r, mesh, a, profile
+
+    def test_holds_profile_without_spending_a_turn_or_handing_up(self):
+        r, mesh, a, profile = self.settle("verification_required")
+        held = r.store.get(a.id)
+        self.assertEqual((held.state, held.no_outcome, held.turns), ("ready", 3, 4))
+        self.assertEqual(r.store.auth_turns(a.id), 1)
+        self.assertTrue(auth.held(r.store, profile))
+        self.assertIn("verification_required", [e[1] for e in r.store.events(a.id)])
+        self.assertEqual(mesh.comment_log, {})
+
+    def test_turn_with_real_work_still_spends_the_turn(self):
+        r, mesh, a, profile = self.settle("verification_required", work=True)
+        self.assertEqual(r.store.auth_turns(a.id), 0)
+        self.assertTrue(auth.held(r.store, profile))
+
+    def test_ordinary_transient_failure_still_counts_and_is_not_held(self):
+        r, mesh, a, profile = self.settle("API Error: 500 upstream hiccup", turns=1, failures=0)
+        self.assertFalse(auth.held(r.store, profile))
+        self.assertEqual(r.store.get(a.id).no_outcome, 1)
+        self.assertNotIn("verification_required", [e[1] for e in r.store.events(a.id)])
 
 
 class ClearCommand(unittest.TestCase):
@@ -495,6 +574,7 @@ class AuthRouting(Bench):
         self.route_to_codex(r, rc=1)
         second = task(2)
         mesh.tasks[second["id"]] = second
+        before_task = dict(second)
         self.assertFalse(r._start_one(second))
         held = r.store.open_for_task(self.agent.name, second["id"])
         self.assertIsNotNone(held)
@@ -505,6 +585,36 @@ class AuthRouting(Bench):
         self.assertEqual(r.store.open_for_task(self.agent.name, second["id"]).id, held.id)
         self.assertEqual(len(calls(self.calls)), 1)
         self.assertFalse(mesh.checkouts)
+
+    def test_held_without_fallback_keeps_one_attempt_across_restart_then_clear_runs(self):
+        r, mesh, t, a, profile = self.expire()
+        self.assertFalse(self.agent.on_auth_command)
+        second = task(2)
+        mesh.tasks[second["id"]] = second
+        before_task = dict(second)
+        self.assertFalse(r._start_one(second))
+        held = r.store.open_for_task(self.agent.name, second["id"])
+        self.assertIsNotNone(held)
+        self.assertEqual((held.state, held.turns, held.workspaces), ("ready", 0, []))
+        before = r.store.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+        r = self.runner(mesh)
+        for _ in range(3):
+            r._resume_hold.clear()
+            r.tick()
+        self.assertEqual(r.store.open_for_task(self.agent.name, second["id"]).id, held.id)
+        self.assertEqual(r.store.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], before)
+        self.assertEqual(len(calls(self.calls)), 1)
+        self.assertFalse(mesh.checkouts)
+        self.assertFalse(any(row["attempt"] == held.id for row in r.pool.rows()))
+        self.assertEqual(mesh.tasks[second["id"]], before_task)
+        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 first",
+                                     second["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 second"})
+        self.assertTrue(auth.clear(r.store, profile))
+        r._resume_hold.clear()
+        r.tick()
+        self.settle_all(r)
+        self.assertEqual(r.store.get(held.id).turns, 1)
+        self.assertEqual(r.store.get(held.id).state, "waiting")
 
     def test_missing_alt_adapter_never_runs_the_auth_command(self):
         r, mesh, t, a, profile = self.expire()
