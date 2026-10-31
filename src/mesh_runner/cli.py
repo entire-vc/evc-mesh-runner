@@ -8,11 +8,13 @@
     mesh-runner free-slot --config runner.toml --path <slot>   # return a held slot if it is safe now
     mesh-runner free-slot --config runner.toml --path <slot> --archive   # save uncommitted work on a ref, then return it
     mesh-runner asks classify --config runner.toml [--json]   # read-only: open human gates, hard or soft
+    mesh-runner reviewer-merge --config runner.toml --agent <lane> --task <uuid> --mr group/project!iid --sha <full sha> [--apply]   # opt-in reviewer merge-only handoff; dry-run unless --apply
     mesh-runner pool   --config runner.toml [--prune-ignored [--ignored-idle-hours H]] [--prune-checkpoints [--checkpoint-grace-hours H]] [--compact-checkpoints] [--evict [--apply] --idle-hours H --keep N --max-evictions M]
 """
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import json
 import logging
 import math
@@ -21,6 +23,7 @@ import sys
 import threading
 
 from . import config as config_mod
+from . import repo_admission
 from . import workspace_requests
 from . import auth
 from .runner import AlreadyRunning, Runner
@@ -61,12 +64,100 @@ def _asks(argv: list[str]) -> int:
     return 0
 
 
+def _reviewer_merge(argv: list[str]) -> int:
+    """`reviewer-merge`: dry-run by default (reads only); --apply creates the one merge-only card."""
+    from . import reviewer_merge
+    from .mesh import MeshClient
+    from .wake import GitLab
+    p = argparse.ArgumentParser(prog="mesh-runner reviewer-merge")
+    p.add_argument("--config", required=True)
+    p.add_argument("--agent", required=True, help="lane whose Mesh key is used to read and create")
+    p.add_argument("--task", required=True, help="product card, full UUID")
+    p.add_argument("--mr", required=True, help="group/project!iid")
+    p.add_argument("--sha", required=True, help="full expected head sha")
+    p.add_argument("--apply", action="store_true")
+    args = p.parse_args(argv)
+    cfg = config_mod.load(args.config)
+    agent = next((a for a in cfg.agents if a.name == args.agent), None)
+    if agent is None:
+        p.error("--agent must name a configured lane")
+    mesh = MeshClient(cfg.mesh_url, agent.key, basic_auth=cfg.mesh_basic_auth)
+    try:
+        ws = (mesh.me() or {}).get("workspace_id", "")
+        ids = {str(r.get("name")): r["id"] for r in mesh.workspace_agents(ws) if r.get("id") and r.get("name")}
+        out = reviewer_merge.request(
+            mesh=mesh, gitlab=GitLab(cfg.gitlab_url, cfg.gitlab_token), source_id=args.task, target=args.mr,
+            sha=args.sha, selector_argv=list(cfg.reviewer_select_command), agent_ids=ids, apply=args.apply, lock_dir=str(cfg.state_dir / "reviewer-merge"),
+            usernames={a.name: a.gitlab_username for a in cfg.agents if a.gitlab_username})
+    except reviewer_merge.Refused as e:
+        out = {"mode": "apply" if args.apply else "dry-run", "ready": False, "refusals": [str(e)],
+               "request": None, "created": False, "card": None}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0 if out["ready"] else 1
+
+
+def _editor_control(argv: list[str]) -> int:
+    """`editor-control`: the operator's signed call to the running runner's editor lifecycle (loopback only)."""
+    import secrets
+    import time
+    import urllib.error
+    import urllib.request
+    from . import editor_control as ec
+    p = argparse.ArgumentParser(prog="mesh-runner editor-control")
+    p.add_argument("action", choices=ec.ACTIONS)
+    p.add_argument("--config", required=True)
+    p.add_argument("--expected-generation", type=int, help="generation from `status`; required for every change")
+    p.add_argument("--expected-pid", type=int, help="pid from `status`; required for every change")
+    p.add_argument("--expected-started-at", type=int, help="started_at from `status`; required for every change")
+    p.add_argument("--expected-instance", help="instance from `status`; required for every change")
+    p.add_argument("--expected-digest", help="applied_digest from `status`; required while an editor is applied")
+    args = p.parse_args(argv)
+    cfg = config_mod.load(args.config)
+    if not cfg.tgpeek_editor_control_secret_file or not cfg.extension_enabled:
+        print(json.dumps({"error": "operator_control_disabled"}))
+        return 2
+    try:
+        secret = Path(cfg.tgpeek_editor_control_secret_file).read_text().strip()
+    except OSError:
+        print(json.dumps({"error": "secret_unreadable"}))
+        return 2
+    req = {"request_id": secrets.token_hex(16)}
+    if args.expected_generation is not None:
+        req["expected_generation"] = args.expected_generation
+    for key, value in (("expected_pid", args.expected_pid), ("expected_started_at", args.expected_started_at)):
+        if value is not None:
+            req[key] = value
+    if args.expected_instance:
+        req["expected_instance"] = args.expected_instance
+    if args.expected_digest:
+        req["expected_digest"] = args.expected_digest
+    body = json.dumps(req).encode()
+    path, ts = ec.PREFIX + args.action, str(int(time.time()))
+    host = "127.0.0.1" if cfg.extension_host in ("", "0.0.0.0", "::") else cfg.extension_host
+    http_req = urllib.request.Request(f"http://{host}:{cfg.extension_port}{path}", data=body, method="POST", headers={
+        "X-Mesh-Timestamp": ts, "X-Operator-Signature": ec.sign_request(secret, ts, path, body), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(http_req, timeout=60) as resp:
+            status, out = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, out = e.code, e.read()
+    except OSError:
+        print(json.dumps({"error": "runner_unreachable"}))
+        return 2
+    print(out.decode(errors="replace"))
+    return 0 if 200 <= status < 300 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args_in = sys.argv[1:] if argv is None else argv
+    if args_in and args_in[0] == "reviewer-merge":
+        return _reviewer_merge(args_in[1:])
+    if args_in and args_in[0] == "editor-control":
+        return _editor_control(args_in[1:])
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
-    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "pool", "suspend-wait-workspace", "clear-auth-hold", "rearm-cap"])
+    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "pool", "suspend-wait-workspace", "admit-workspace-repo", "clear-auth-hold", "rearm-cap"])
     p.add_argument("--config", required=True)
     p.add_argument("--path", help="slot path for free-slot")
     p.add_argument("--archive", action="store_true",
@@ -79,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reason")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--wait-generation")
+    p.add_argument("--repo", help="admit-workspace-repo: name of the newly configured repository")
     p.add_argument("--request-id")
     p.add_argument("--evict", action="store_true", help="pool: preview (or with --apply, perform) eviction")
     p.add_argument("--apply", action="store_true", help="pool --evict: remove slots; needs the exclusive runner lock")
@@ -142,6 +234,25 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = workspace_requests.submit(cfg.state_dir, args.agent, args.task,
                 args.attempt, args.wait_generation, args.request_id, args.ttl_seconds)
+        except (ValueError, OSError):
+            print("request rejected (identity, deadline or private spool)", file=sys.stderr)
+            return 2
+        print(json.dumps(result, sort_keys=True))
+        return 0
+
+    if args.command == "admit-workspace-repo":
+        cfg = config_mod.load(args.config)       # the fresh config is the source of the pinned spec
+        agent = next((x for x in cfg.agents if x.name == args.agent), None)
+        if agent is None:
+            p.error("--agent must name a configured agent")
+        if not all((args.task, args.attempt, args.wait_generation, args.request_id, args.repo)):
+            p.error("exact --task, --attempt, --wait-generation, --request-id and --repo required")
+        spec = next((r for r in agent.repos if r.name == args.repo), None)
+        if spec is None:
+            p.error("--repo must be configured for --agent in the fresh config")
+        try:
+            result = repo_admission.submit(cfg.state_dir, args.agent, args.task, args.attempt,
+                                           args.wait_generation, args.request_id, spec, args.ttl_seconds)
         except (ValueError, OSError):
             print("request rejected (identity, deadline or private spool)", file=sys.stderr)
             return 2

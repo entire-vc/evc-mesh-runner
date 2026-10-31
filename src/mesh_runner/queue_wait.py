@@ -29,8 +29,13 @@ def stamp(value):
 
 
 def contract(value):
-    if (not isinstance(value, dict) or set(value) != {'version', 'targets', 'observed_at'}
-            or type(value['version']) is not int or value['version'] != 1
+    """v1: every target must recover. v2 names its mode (`any` | `all`) and demands a unit
+    that became ready after `observed_at`; the observer is the other half of this wire."""
+    version = value.get('version') if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or type(version) is not int
+            or set(value) != ({'version', 'targets', 'observed_at'} if version == 1
+                              else {'version', 'mode', 'targets', 'observed_at'} if version == 2 else None)
+            or (version == 2 and value['mode'] not in ('any', 'all'))
             or type(value['observed_at']) is not int
             or not stamp(value['observed_at']) or not isinstance(value['targets'], list)
             or not 1 <= len(value['targets']) <= 16):
@@ -43,11 +48,25 @@ def contract(value):
             raise ValueError('unknown queue target')
         targets.append(dict(agent_id=str(UUID(target['agent_id'])),
                             project_id=str(UUID(target['project_id'])), lane=target['lane']))
-    clean = dict(version=1, observed_at=value['observed_at'],
-                 targets=sorted(targets, key=lambda t: (t['agent_id'], t['project_id'])))
+    ordered = sorted(targets, key=lambda t: (t['agent_id'], t['project_id']))
+    clean = (dict(version=1, observed_at=value['observed_at'], targets=ordered) if version == 1
+             else dict(version=2, mode=value['mode'], observed_at=value['observed_at'], targets=ordered))
     if clean != value or len({(t['agent_id'], t['project_id']) for t in targets}) != len(targets):
         raise ValueError('noncanonical queue contract')
     return clean
+
+
+def as_any(value):
+    """The explicit `WAIT queue:` event: retry the permitted pick on ANY fresh ready unit."""
+    value = contract(value)
+    return contract(dict(version=2, mode='any', observed_at=value['observed_at'], targets=value['targets']))
+
+
+def served(store, a, owner, value):
+    """Source already delivered/withdrawn under either wire version: it cannot wake again."""
+    value = contract(value)
+    v1 = dict(version=1, observed_at=value['observed_at'], targets=value['targets'])
+    return consumed(store, a, owner, v1) or consumed(store, a, owner, as_any(v1))
 
 
 def request(value):

@@ -51,7 +51,7 @@ class DecisionMetadataProducer(Bench):
 
             def my_tasks(inner, cat):
                 return [dict(t) for t in inner.tasks.values()
-                        if t.get('assignee_id') == RECIPIENT and inner.category(t) == cat]
+                        if t.get('assignee_id') == RECIPIENT and inner.category(t) in cat.split(',')]
 
         self.agent.name = 'coordinator'
         self.agent.repos[0] = replace(self.agent.repos[0], max_slots=1)
