@@ -644,7 +644,8 @@ class Driver:
     def make_room(self) -> bool:
         """At most max_sessions runner windows on this host, chats included: close the
         card window idle longest. A chat window counts against the cap but is never closed from here,
-        it is the chat pool's (idle minutes, per-agent and host limits).
+        it is the chat pool's (idle minutes, per-agent and host limits). Editor-job leases count against the cap too
+        (see host_admission), so a window start and an editor admission cannot both take the last slot.
 
         The tmux server is shared by every runner instance on the host (the fleet runner, test runners),
         and each keeps its window metadata under its own state root. A window is a candidate only when
@@ -652,30 +653,9 @@ class Driver:
         it is busy. A window without readable metadata is unknown (another runner's, possibly mid-turn)
         and is never closed, it only counts against the cap. False when the cap is reached and no window
         of ours is provably idle."""
-        listed = self.tmux.all_windows()
-        windows = [(se, w) for se, w in listed if not w.startswith(CHAT_PREFIX)]
-        if self.max_sessions <= 0 or len(listed) < self.max_sessions:
-            return True
-        root = self.dir.parent
-        idle = []
-        for session, window in windows:
-            directory = root / session[len("mr-"):]
-            meta = read_own_meta(directory, window)
-            if meta is None:                             # not provably ours: unknown, never closed
-                continue
-            if pid_alive(int(meta.get("busy_pid") or 0)) or window == self.key:
-                continue
-            idle.append((float(meta.get("last_end") or 0), session, window, directory))
-        need = len(listed) - self.max_sessions + 1
-        if len(idle) < need:
-            return False
-        for last_end, session, window, directory in sorted(idle)[:need]:
-            print(f"INFO make_room: closed idle window agent={session[len('mr-'):]} window={window} "
-                  f"last_end={last_end:.0f} (host windows {len(listed)}, cap {self.max_sessions})",
-                  file=sys.stderr, flush=True)
-            self.tmux.kill_window(session, window)
-            forget(directory, window)
-        return True
+        from mesh_runner.host_admission import make_room
+        return make_room(self.tmux, self.dir.parent, self.max_sessions, own_key=self.key, read_own_meta=read_own_meta,
+                         pid_alive=pid_alive, forget=forget, chat_prefix=CHAT_PREFIX)
 
     def new_window(self, command: list[str]) -> None:
         """Create the window; a session another driver creates or kills meanwhile is retried."""

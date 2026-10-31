@@ -30,6 +30,7 @@ import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -37,8 +38,10 @@ import uuid
 from pathlib import Path
 
 from . import asks
+from . import reviewer_merge
 from . import inputs
 from . import prompt as prompts
+from . import repo_admission
 from . import workspace_requests
 from . import auth
 from . import interactive
@@ -47,20 +50,21 @@ from .adapters.base import Adapter, Launch, TurnResult, group_alive, interrupt_g
 from .adapters.claude import ClaudeAdapter
 from .adapters.codex import CodexAdapter
 from . import queue_wait
+from . import config as config_mod
 from .config import AgentConfig, RunnerConfig, read_env_file
 from .effects import (BACKLOG_BLOCKER, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SKIP_EVERY, Effects, own_schedule,
                       skip_state)
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
-from .outcome import TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
+from .outcome import QUEUE_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
 from .selection import CLOSED, StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from .wake import (GitHub, GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign, target_jobs_state, UnknownJobs)
-from .workspace import DIRTY_HOLD_NOTE, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, git
+from .workspace import DIRTY_HOLD_NOTE, RepoSpec, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, git
 from .workspace_scope import (RECEIPT_KEY, metadata_instructions, metadata_only, metadata_receipt,
                               read_only, recorded_scope)
 
@@ -403,6 +407,7 @@ class AgentRunner:
         self._chat_due = 0.0
         self._chat_error = ""
         self._chat_hold = ""
+        self._chat_harness = agent.harness
         if agent.chat.get("session"):
             c = agent.chat
             command = list(c.get("command") or [])
@@ -410,6 +415,9 @@ class AgentRunner:
                 if agent.harness != "claude":
                     raise ChatConfigError(f"{agent.name}: chat.command is required for harness {agent.harness}")
                 command = [agent.binary or "claude", *agent.args]
+            # the harness the standing session runs: its own command's binary, else the base harness
+            self._chat_harness = next((h for h in ("claude", "codex")
+                                       if os.path.basename(str(command[0])) == h), agent.harness)
             self.chat = ChatKeeper(ChatSpec(session=str(c["session"]), command=command,
                                             idle_command=list(c.get("idle_command") or []),
                                             max_age_hours=float(c.get("max_age_hours", 0)),
@@ -580,11 +588,70 @@ class AgentRunner:
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
         return d
 
+    @staticmethod
+    def _permission_signature(path: str) -> list:
+        """Path metadata and ACLs can wake a hold; unrelated file activity cannot."""
+        current = Path(path).absolute()
+        paths = list((*reversed(current.parents), current))
+        try:
+            resolved = current.resolve(strict=False)
+            paths.extend(part for part in (*reversed(resolved.parents), resolved) if part not in paths)
+        except (OSError, RuntimeError):
+            pass
+        rows = []
+        for part in paths:
+            try:
+                st = part.lstat()
+                row = [str(part), st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_mode]
+                if sys.platform == "darwin":
+                    acl = subprocess.run(["/bin/ls", "-lde", str(part)], capture_output=True,
+                                         text=True, timeout=5)
+                    # Ignore ls's timestamp/size header; only ACL entries are repair evidence.
+                    row.append([line.strip() for line in acl.stdout.splitlines()
+                                if re.match(r"^\s*\d+: ", line)])
+                elif hasattr(os, "getxattr"):
+                    try:
+                        row.append(os.getxattr(part, "system.posix_acl_access").hex())
+                    except OSError:
+                        row.append("")
+                rows.append(row)
+            except OSError as exc:
+                rows.append([str(part), exc.errno])
+            except subprocess.SubprocessError as exc:
+                rows.append([str(part), type(exc).__name__])
+        return rows
+
+    def _permission_blocked(self, a: Attempt, what: str) -> bool:
+        key = "permission_hold:" + what
+        mark = self.store.mark(a.agent, a.task_id, key)
+        if not mark or not mark[0]:
+            return False
+        try:
+            held = json.loads(mark[0])
+            if (not isinstance(held, dict) or not isinstance(held.get("path"), str)
+                    or not held["path"] or "\x00" in held["path"]
+                    or not isinstance(held.get("signature"), list)):
+                raise ValueError("invalid permission hold")
+        except (TypeError, ValueError):
+            # Legacy/corrupt metadata must not break the per-attempt error boundary.
+            self.store.mark(a.agent, a.task_id, key, "")
+            return False
+        if held.get("attempt") != a.id:
+            return False
+        if self._permission_signature(held["path"]) == held["signature"]:
+            return True
+        # A changed path permits one normal retry, not a claim that recovery succeeded.
+        self.store.mark(a.agent, a.task_id, key, "")
+        self.store.event(a.id, "permission_path_changed", what)
+        return False
+
     def _guard(self, a: Attempt, what: str, fn) -> None:
         """Error boundary per attempt and step. Repeated failures quarantine the
         step for a growing while (15m, 30m, 1h ... 4h) instead of failing every
         tick (and starving the others); a success clears only its own step."""
         key = (a.id, what)
+        if what in ("resume", "ready-workspace-suspend") and self._permission_blocked(a, what):
+            return
         if time.monotonic() < self._quarantine.get(key, 0):
             return
         try:
@@ -592,6 +659,15 @@ class AgentRunner:
             self._errors.pop(key, None)
             self._strikes.pop(key, None)
         except Exception as e:
+            if (what in ("resume", "ready-workspace-suspend")
+                    and isinstance(e, PermissionError) and e.filename):
+                path = str(Path(e.filename).absolute())
+                held = {"attempt": a.id, "path": path, "signature": self._permission_signature(path)}
+                self.store.mark(a.agent, a.task_id, "permission_hold:" + what, json.dumps(held))
+                self.store.update(a, note=f"workspace permission held ({what}): {path}"[:500])
+                self.store.event(a.id, "workspace_permission_hold", f"{what}: {path}"[:500])
+                log.warning("%s: %s #%s permission held; repair exact path %s", self.agent.name, what, a.task8, path)
+                return
             n = self._errors.get(key, 0) + 1
             self._errors[key] = n
             log.warning("%s: %s #%s failed (%d): %s", self.agent.name, what, a.task8, n, e)
@@ -869,9 +945,53 @@ class AgentRunner:
         return (unrecorded if routed == "claude" and unrecorded and auth.held(self.store, unrecorded) else
                 profile if profile and auth.held(self.store, profile) else "")
 
+    def _writer_launch_env(self, a: Attempt, env: dict[str, str],
+                           expect: tuple[str, ...]) -> dict[str, str]:
+        """Export a non-secret carrier of this attempt's checked-out writer.
+
+        Caller/profile environment is never authority. The publisher must still
+        verify the live Mesh checkout and its own identity before any write.
+        Read after the pre-spawn fence; a released/replaced local checkout must
+        not leak an earlier writer into a later turn.
+        """
+        env = {k: v for k, v in env.items()
+               if k not in ("MESH_RUNNER_TASK", "MESH_RUNNER_LANE")
+               and not k.startswith("MESH_RUNNER_CHECKOUT_")}
+        current = self.store.get(a.id)
+        if (not current or current.agent != self.agent.name or a.agent != current.agent
+                or current.task_id != a.task_id or current.state not in expect
+                or current.checkout != a.checkout):
+            return env
+        co = current.checkout or {}
+        generation = co.get("generation")
+        if (not isinstance(co.get("token"), str) or not co["token"]
+                or type(generation) is not int or generation < 1
+                or any(not isinstance(co.get(k), str) or not co[k]
+                       for k in ("request_id", "session_id"))):
+            return env
+        env.update(MESH_RUNNER_TASK=current.task_id, MESH_RUNNER_LANE=self.agent.name,
+                   MESH_RUNNER_CHECKOUT_GENERATION=str(generation),
+                   MESH_RUNNER_CHECKOUT_REQUEST=co["request_id"],
+                   MESH_RUNNER_CHECKOUT_SESSION=co["session_id"])
+        return env
+
     def _spawn(self, a: Attempt, prompt_text: str, resume: bool, expect: tuple[str, ...],
                first_prompt=None, before_spawn=None, env=None) -> bool:
-        workspaces = [Path(p) for p in a.workspaces]
+        try:
+            issued = [self.pool.issue(a.id, p) for p in a.workspaces]
+        except WorkspaceError as exc:
+            log.warning("%s: #%s workspace issue refused: %s", self.agent.name, a.task8, exc)
+            self._release_gate(a, "workspace-issue-held")
+            self._release_checkout(a)
+            self.store.update(a, pid=0, stamp="", note=str(exc)[:200])
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            return False
+        workspaces = [Path(p) for p in issued]
+        if resume and issued != list(a.workspaces):
+            prompt_text += ("\n[runner] The sole writable checkout(s) for this task are now "
+                            + json.dumps(issued) + ". Use only these physical paths; the earlier paths "
+                            + json.dumps([p for p, i in zip(a.workspaces, issued) if p != i])
+                            + " are aliases of them and are not available to you.\n")
         # ONE environment build per spawn: a resume prepares it before restoring
         # checkpoints, so a held profile never leases their worktrees prematurely.
         env = self._fresh_env() if env is None else env
@@ -974,7 +1094,8 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "auth_launch",
                             json.dumps({"attempt": a.id, "turn": a.turns + 1, "profile": profile}))
         self.store.mark(self.agent.name, a.task_id, "turn_work", self._work_digest(a))
-        proc = adapter.spawn(Launch(argv, self.agent.profile_dir, env, prompt_text), log_path)
+        proc = adapter.spawn(Launch(argv, self.agent.profile_dir,
+                                   self._writer_launch_env(a, env, expect), prompt_text), log_path)
         self.procs[a.id] = proc
         delivery = (a.wait or {}).get("ci_delivery") or {}
         marks = {delivery["key"]: delivery["value"]} if delivery else {}
@@ -1021,7 +1142,7 @@ class AgentRunner:
         self._release_checkout(a)
         self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
 
-    def _record_authentication_failure(self, a: Attempt, auth_only: bool) -> str:
+    def _record_authentication_failure(self, a: Attempt, auth_only: bool, verification: bool = False) -> str:
         """Record the exact profile that produced the terminal auth failure.
 
         This is deliberately separate from holding the attempt: the task may
@@ -1044,6 +1165,8 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "auth_unknown", json.dumps({"attempt": a.id, "profile": profile}))
         auth.hold(self.store, profile)
         self.store.event(a.id, "auth_failed", str(a.turns))
+        if verification:
+            self.store.event(a.id, "verification_required", str(a.turns))
         if auth_only:
             self.store.event(a.id, "auth_only_turn", str(a.turns))
         return profile
@@ -1312,10 +1435,10 @@ class AgentRunner:
         self.procs.pop(a.id, None)
         task = self._task(a.task_id)
         auth_profile = None
-        if a.harness == "claude" and result.auth_failed:
+        if a.harness == "claude" and (result.auth_failed or result.verification_required):
             # The process's exact profile is evidence even if ownership/status
             # changed before settle. Record it before releasing this attempt.
-            auth_profile = self._record_authentication_failure(a, result.auth_only)
+            auth_profile = self._record_authentication_failure(a, result.auth_only, result.verification_required)
         if not self._still_ours(task, a.mode):
             if auth_profile is None and self._handed_back(task):
                 self._keep_handback_wait(a, result)
@@ -1413,13 +1536,19 @@ class AgentRunner:
         end_digest = self._work_digest(a) if self.cfg.loop_streak_limit > 0 else None
         sent_back = lambda: self._loop_guard(a, task, outcome, comments, end_digest, bounced=True)
         queue_contract = None
-        if self.cfg.queue_wait_freshness_v1 and a.mode == "work" and outcome.kind == "time":
+        if self.cfg.queue_wait_freshness_v1 and a.mode == "work" and outcome.kind in ("time", "queue"):
             try:
                 queue_contract = self._queue_source(task, time.time())
-                if queue_contract and queue_wait.consumed(self.store, a, self.agent_id, queue_contract):
+                if queue_contract and outcome.kind == "queue":
+                    queue_contract = queue_wait.as_any(queue_contract)
+                if queue_contract and queue_wait.served(self.store, a, self.agent_id, queue_contract):
                     queue_contract = None
             except MeshError:
                 return  # retry settlement, without another turn or a stale source
+        if outcome.kind == "queue" and (queue_contract is None or outcome.target != a.task8):
+            # No typed source, an already served one, or another card's id: nothing to observe.
+            self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=QUEUE_WAIT_GUIDANCE))
+            return
         missing = self._missing_pipeline_wait(a, outcome)
         if missing:
             if sent_back():
@@ -3495,6 +3624,133 @@ class AgentRunner:
             return
         self._suspend_waiting(a, requested=True)
 
+    ADMISSION_NOTICE = "repo_admission_notice"
+
+    def _admission_drift(self, repo_name: str) -> "tuple[str, RepoSpec | None]":
+        """Fresh canonical config vs. the one this process runs. Only the requested repo may differ;
+        credentials are not compared (rotation is not drift)."""
+        if self.cfg.source is None:
+            return "no config source", None
+        try:
+            fresh = config_mod.load(self.cfg.source)
+        except Exception:
+            return "config unreadable", None
+
+        def plain(agent):
+            # Names always count; values only for non-credential variables (PATH etc. are config).
+            env = {k: ("" if re.search(r"KEY|TOKEN|SECRET|PASS|AUTH|CRED", k, re.I) else v)
+                   for k, v in agent.env.items()}
+            return dataclasses.replace(agent, repos=[], env=env, key="")
+
+        def top(cfg):
+            skip = {f.name for f in dataclasses.fields(cfg) if any(w in f.name for w in ("token", "secret", "key", "auth", "credential"))}
+            return dataclasses.replace(cfg, agents=[], **{n: "" for n in skip})
+
+        if top(fresh) != top(self.cfg):
+            return "runner config drift", None
+        mine = {x.name: x for x in self.cfg.agents}
+        theirs = {x.name: x for x in fresh.agents}
+        if mine.keys() != theirs.keys() or any(plain(mine[n]) != plain(theirs[n]) for n in mine):
+            return "agent config drift", None
+        for n in mine:
+            if n != self.agent.name and mine[n].repos != theirs[n].repos:
+                return "agent config drift", None
+        have = [r for r in self.agent.repos if r.name != repo_name]
+        want = [r for r in theirs[self.agent.name].repos if r.name != repo_name]
+        if have != want:
+            return "repository config drift", None
+        spec = next((r for r in theirs[self.agent.name].repos if r.name == repo_name), None)
+        return ("" if spec else "repository not configured"), spec
+
+    def _repo_admission_request(self, request: dict) -> str:
+        """Attach one newly configured repo to a waiting attempt. Existing leases, session and
+        checkpoint are untouched; intent mark + lease + commit make a crash at any point retryable."""
+        a = self.store.get(request['attempt'])
+        if (a is None or a.agent != self.agent.name or a.task_id != request['task']
+                or a.state != 'waiting'):
+            return 'rejected_identity_or_state'
+        if workspace_requests.generation(a) != request['generation']:
+            return 'rejected_wait_generation'
+        repo = request['repo']
+        key = f'repo_admission:{a.id}:{repo}'      # per attempt+repo: a new request id adopts a crashed one's lease
+        try:
+            saved = self.store.mark(a.agent, a.task_id, key)
+            journal = json.loads(saved[0]) if saved and saved[0] else None
+            finished = bool(journal and journal.get('phase') == 'done')
+            if journal is None and request['expires'] <= int(time.time()):
+                return 'expired'
+            if a.pid and group_alive(a.pid, a.stamp):
+                return 'rejected_active_writer'
+            if self.pool._checkpoint_rows(a.id):
+                return 'rejected_checkpointed'
+            if not a.workspaces:
+                return 'rejected_no_workspaces'
+            if not self._still_ours(self._task(a.task_id), a.mode):
+                return 'rejected_ownership'
+            reason, spec = self._admission_drift(repo)
+            if reason:
+                return 'rejected_config'
+            if repo_admission.spec_digest(spec) != request['spec']:
+                return 'rejected_spec_mismatch'
+            pool_name = self.pool._pool(repo)
+            rows = [r for r in self.pool.rows() if r['attempt'] == a.id]
+            target = [r for r in rows if r['pool'] == pool_name]
+            others = [r for r in rows if r['pool'] != pool_name]
+            if target and all(r['path'] in a.workspaces for r in target):
+                # Idempotent success only for a consistent inventory: every lease still ours.
+                if any(r['state'] != 'leased' for r in rows) or sorted(r['path'] for r in rows) != sorted(a.workspaces):
+                    return 'rejected_foreign_lease'
+                return 'admitted' if finished else 'already_admitted'
+            if finished:
+                return 'rejected_foreign_lease'      # journal says attached, leases/workspaces disagree
+            if (any(r['state'] != 'leased' for r in rows) or len(target) > 1
+                    or sorted(r['path'] for r in others) != sorted(a.workspaces)
+                    or (target and journal is None)):
+                return 'rejected_foreign_lease'
+            registered = repo not in self.pool.repos
+            if registered:
+                if any(r.name == repo for r in self.agent.repos):
+                    return 'rejected_config'
+                if self.pool.disk_hold():
+                    return 'rejected_disk'
+                self.pool.repos[repo] = spec
+                if self.pool.full(repo):
+                    del self.pool.repos[repo]
+                    return 'rejected_pool_full'
+            if journal is None:
+                self.store.mark(a.agent, a.task_id, key, json.dumps({'phase': 'intent', 'attempt': a.id, 'repo': repo}))
+            try:
+                path = str(target[0]['path']) if target else str(self.pool.lease(a.id, repo))
+            except Exception:
+                if not any(r['attempt'] == a.id and r['pool'] == pool_name for r in self.pool.rows()):
+                    self.pool.repos.pop(repo, None)
+                    self.store.mark(a.agent, a.task_id, key, '')
+                raise
+            if not any(r.name == repo for r in self.agent.repos):
+                self.agent.repos.append(spec)
+            notice = json.dumps({'attempt': a.id, 'repo': repo, 'path': path})
+            if not self.store.update_with_marks(
+                    a, {key: json.dumps({'phase': 'done', 'attempt': a.id, 'repo': repo, 'path': path}),
+                        self.ADMISSION_NOTICE: notice},
+                    expect='waiting', expect_wait=a.wait, workspaces=list(a.workspaces) + [path]):
+                return 'failed_preserved'
+            self.emit('workspace', a, event=f'repository {repo} admitted')
+            return 'admitted'
+        except Exception:
+            log.warning('repo admission failed for attempt %s; intent mark and leases are the journal', a.id)
+            return 'failed_preserved'
+
+    def _admission_notice(self, a: Attempt) -> str:
+        saved = self.store.mark(a.agent, a.task_id, self.ADMISSION_NOTICE)
+        try:
+            n = json.loads(saved[0]) if saved and saved[0] else {}
+        except ValueError:
+            return ""
+        if n.get('attempt') != a.id:
+            return ""
+        return ("\n[runner] Repository " + str(n.get('repo')) + " was added to this task; its leased workspace is "
+                + str(n.get('path')) + ". Existing workspaces are unchanged.")
+
     def _workspace_request(self, request: dict) -> str:
         a = self.store.get(request['attempt'])
         if (a is None or a.agent != self.agent.name or a.task_id != request['task']
@@ -3586,6 +3842,8 @@ class AgentRunner:
             source = self._queue_source(task, current_time)
         except MeshError:
             return
+        if source and req["contract"].get("mode") == "any":
+            source = queue_wait.as_any(source)  # an explicit `WAIT queue:` keeps its event meaning
         if source != req["contract"]:
             # A new machine demand supersedes this identity without waking an LLM.
             if source and source["observed_at"] > req["contract"]["observed_at"]:
@@ -3898,6 +4156,11 @@ class AgentRunner:
                 return f"cannot run the merge gate for MR {wait['target']}: {str(e)[:200]}"
             return ""
         m.pop("env_errors", None)
+        refusal = self._merge_only_refusal(a, wait, m, env)
+        if refusal is None:
+            return ""                          # the card could not be read just now: try again later
+        if refusal:
+            return refusal
         m["runs"], m["last_run"] = runs + 1, iso()
         m.setdefault("first_run", m["last_run"])
         m["obs"] = self._merge_obs(mr, m.get("pipeline"), m.get("obs"))
@@ -3914,6 +4177,48 @@ class AgentRunner:
         self._merge_jobs[a.id] = job
         job["thread"].start()
         log.info("%s: #%s merge gate run %s for %s", self.agent.name, a.task8, m["runs"], wait["target"])
+        return ""
+
+    def _merge_only_refusal(self, a: Attempt, wait: dict, m: dict, env: dict) -> str | None:
+        """A merge-only card (reviewer_merge) runs the gate only for the head it names and only
+        under the reviewer it names: the lane's /user is read with the same fresh env the gate
+        gets, before anything is merged. '' = not such a card, or all matches; None = the card
+        could not be read yet (retry)."""
+        try:
+            task = self.mesh.task(a.task_id)
+            task = task.get("task", task) if isinstance(task, dict) else None
+            if (not isinstance(task, dict) or task.get("id") != a.task_id or not isinstance(task.get("labels"), list)
+                    or not isinstance(task.get("description"), (str, type(None))) or "description" not in task):
+                raise ValueError("card unavailable")      # absent, foreign or partial answer: unreadable, never "ordinary"
+        except Exception as e:                 # noqa: BLE001
+            # Not a refusal: an ordinary merge wait must not depend on this read. The run is only
+            # deferred (the card might be merge-only, and then its identity is checked first);
+            # a read that keeps failing wakes the agent like an unbuildable env does.
+            m["task_errors"] = int(m.get("task_errors", 0)) + 1
+            if m["task_errors"] >= MERGE_ENV_RETRIES:
+                return f"cannot read the card to check the merge request ({type(e).__name__}); not merging"
+            return None
+        m.pop("task_errors", None)
+        labelled = reviewer_merge.LABEL in [str(l.get("name") if isinstance(l, dict) else l) for l in task.get("labels") or []]
+        if not labelled and reviewer_merge.MARKER not in str(task.get("description") or ""):
+            return ""
+        if not labelled:
+            return "merge-only request block without the merge-only label; not merging"
+        req = reviewer_merge.parse_request(task.get("description"))
+        if req is None:
+            return "merge-only card without a valid request block; not merging"
+        if f"{req['project']}!{req['iid']}" != wait["target"] or req["sha"] != m["sha"]:
+            return (f"merge-only card is for {req['project']}!{req['iid']} @{req['sha'][:12]}, "
+                    f"the wait names {wait['target']} @{str(m['sha'])[:12]}; not merging")
+        if str(req["reviewer_lane"]).casefold() != self.agent.name.casefold():
+            return f"merge-only card names reviewer {req['reviewer_lane']}, this lane is {self.agent.name}; not merging"
+        expected = self.agent.gitlab_username      # the lane's own config, never the card's editable copy
+        if not expected or str(req["reviewer_username"]).casefold() != expected.casefold():
+            return "merge-only request names a GitLab user other than this lane's configured one; not merging"
+        try:
+            reviewer_merge.check_identity(env, {**req, "reviewer_username": expected}, self.cfg.gitlab_url)
+        except reviewer_merge.Refused as e:
+            return f"merge-only identity check failed ({e}); not merging"
         return ""
 
     def _merge_argv(self, target: str, sha: str) -> list[str]:
@@ -4192,7 +4497,7 @@ class AgentRunner:
             raise
         self._clear_hold_log(a.task8)                 # resumed: every hold episode of this task is over
         def first():
-            text = self._first_prompt(task, a.mode, a.workspaces)
+            text = self._first_prompt(task, a.mode, a.workspaces, attempt_id=a.id)
             if restored:
                 context = [{"previous_session": m["metadata"].get("session_id", ""),
                             "previous_workspaces": m["metadata"].get("workspaces", []),
@@ -4207,12 +4512,14 @@ class AgentRunner:
             if not a.session_id:
                 started = self._spawn(a, first(), resume=False, expect=("ready",), env=env)
             else:
-                text = (a.wake_text or prompts.wake_prompt(task, "resumed")) + self._news_since_last_turn(a)
+                text = ((a.wake_text or prompts.wake_prompt(task, "resumed")) + self._news_since_last_turn(a)
+                        + self._admission_notice(a))
                 started = self._spawn(a, text, resume=True, expect=("ready",), first_prompt=first, env=env)
             if started:
                 # A passing start gate alone does not end the hold: fresh human,
                 # auth and workspace admission can still refuse the same attempt.
                 self.store.mark(a.agent, a.task_id, "workspace_ready_hold", "")
+                self.store.mark(a.agent, a.task_id, self.ADMISSION_NOTICE, "")
         except BaseException:
             cur = self.store.get(a.id)
             if not (cur and cur.pid):              # the turn did not start: nothing will settle it
@@ -4259,7 +4566,18 @@ class AgentRunner:
         except MeshError:
             return True
 
-    def _first_prompt(self, task: dict, mode: str, paths: list[str], changed: dict | None = None) -> str:
+    def _issued_paths(self, attempt_id: str, paths: list[str]) -> list[str]:
+        """Paths as the session must see them. A refusal keeps the recorded path in the text only:
+        _spawn refuses the same slot before any process starts."""
+        try:
+            return [self.pool.issue(attempt_id, p) for p in paths]
+        except WorkspaceError:
+            return list(paths)
+
+    def _first_prompt(self, task: dict, mode: str, paths: list[str], changed: dict | None = None,
+                      attempt_id: str = "") -> str:
+        if attempt_id:
+            paths = self._issued_paths(attempt_id, paths)
         comments = self._comments(task["id"])
         if mode == "review":
             protocol = prompts.load_preamble(self.agent.review_prompt_file) if self.agent.review_prompt_file else ""
@@ -5385,14 +5703,40 @@ class AgentRunner:
         ids = ", ".join(b["id"][:8] for b in parked + [b for b in blockers if b not in parked])
         return (BACKLOG_BLOCKER if parked else "blocked by ") + ids
 
+    def _feed(self, cats: tuple[str, ...]) -> dict[str, list[dict]]:
+        """The agent's tasks per category from ONE request (``status_category=a,b,c``) instead of
+        one per category: 66 agents polling three times each kept Mesh's database busy. An API
+        that does not take a list (HTTP 400), or a status that cannot be classified, falls back
+        to the request per category; any other error (429, 5xx) propagates, a retry storm would
+        add load while Mesh is already failing."""
+        try:
+            tasks = self.mesh.my_tasks(",".join(cats))
+        except MeshError as e:
+            if e.status != 400:
+                raise
+            return {c: self.mesh.my_tasks(c) for c in cats}
+        got = {c: [] for c in cats}
+        for t in tasks:
+            try:
+                cat = self.cats.category(t)
+            except MeshError as e:
+                if e.status not in (403, 404):
+                    raise
+                cat = ""
+            if cat not in got:               # unknown status: dropping it would hide a task
+                return {c: self.mesh.my_tasks(c) for c in cats}
+            got[cat].append(t)
+        return got
+
     def candidates(self) -> list[dict]:
         held = {a.task_id for a in self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))}
         out = []
+        feed = self._feed(("review", "in_progress", "todo") if self.agent.feed_review else ("in_progress", "todo"))
         if self.agent.feed_review:
-            out += [dict(t, _mode="review") for t in order(self.mesh.my_tasks("review")) if t.get("id") not in held]
+            out += [dict(t, _mode="review") for t in order(feed["review"]) if t.get("id") not in held]
         work = []
         for cat in ("in_progress", "todo"):
-            work += [t for t in self.mesh.my_tasks(cat) if t.get("id") not in held]
+            work += [t for t in feed[cat] if t.get("id") not in held]
         out += [dict(t, _mode="work") for t in self._work_order(work)]
         for task in out:
             self._gate_event(task)
@@ -5575,12 +5919,10 @@ class AgentRunner:
             env = self._fresh_env()
             blocked = self._auth_blocked(a, env)
             if blocked:
-                if self.agent.on_auth_command:
-                    self._authentication_failed(a, blocked)
-                    self._start_held = True
-                    return False
-                self._finish(a, "aborted", f"authentication held for profile {blocked}; no turn started")
-                self._task_backoff[task["id"]] = time.monotonic() + GATE_HOLD_SECONDS
+                # A profile hold is durable even without a fallback policy. Keep
+                # one ready attempt so a restart or the next feed tick cannot
+                # create another aborted start against the same held profile.
+                self._authentication_failed(a, blocked)
                 self._start_held = True
                 return False
             # Labels can change between listing and checkout. Only a fresh,
@@ -5666,7 +6008,7 @@ class AgentRunner:
         if changed and changed.get("ci_delivery"):
             self.store.update(a, wait={**(a.wait or {}), "ci_delivery": changed["ci_delivery"]})
         observed = self._cap_observation(task["id"])
-        prompt = self._first_prompt(task, mode, paths, changed)
+        prompt = self._first_prompt(task, mode, paths, changed, attempt_id=a.id)
         before_spawn = None
         if observed and observed.wait.get("cap_wake"):
             wait = dict(observed.wait)
@@ -5825,10 +6167,13 @@ class AgentRunner:
         self._chat_due = time.monotonic() + CHAT_CHECK_SECONDS
 
         def env_of():
-            env = self._fresh_env()
-            if self._routed_harness != self.agent.harness:
-                return env, None              # the chat runs the configured harness: no routing compare now
-            return env, env_digest({**env, "MESH_RUNNER_PROFILE": str(getattr(self.adapter, "profile", ""))})
+            # the chat routes by its own command's harness; nothing shared (adapter, agent.env, pool.env)
+            # is written: a card turn's route stays what the card set
+            env, harness, profile = self._route_env(self._read_env())
+            env = session_env(env)
+            if harness != self._chat_harness:
+                return env, None              # routed to a harness this session cannot run: held, no foreign env
+            return env, env_digest({**env, "MESH_RUNNER_PROFILE": str(profile or "")})
         try:
             reason, _ = self._gate("transport", "", "chat")
             if reason:
@@ -5851,6 +6196,7 @@ class AgentRunner:
         self.reap_interactive()
         self.check_wakes()
         workspace_requests.consume(self.cfg.state_dir, self.agent.name, self._workspace_request)
+        repo_admission.consume(self.cfg.state_dir, self.agent.name, self._repo_admission_request)
         self.deliver_mentions()
         room = self.cap() - self.store.active_count(self.agent.name)
         room = self.resume_ready(room)
@@ -5903,9 +6249,10 @@ class AgentRunner:
         held = {a.task_id: a.state for a in self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))}
         active = self.store.active_count(self.agent.name)
         rows = []
-        tasks = ([dict(t, _mode="review") for t in self.mesh.my_tasks("review")] if self.agent.feed_review else [])
+        feed = self._feed(("review", "in_progress", "todo") if self.agent.feed_review else ("in_progress", "todo"))
+        tasks = ([dict(t, _mode="review") for t in feed["review"]] if self.agent.feed_review else [])
         for cat in ("in_progress", "todo"):
-            tasks += [dict(t, _mode="work") for t in self.mesh.my_tasks(cat)]
+            tasks += [dict(t, _mode="work") for t in feed[cat]]
         for t in tasks:
             reason = held.get(t["id"]) and f"attempt {held[t['id']]}"
             reason = reason or self.hold_reason(t, t["_mode"], log_change=False)
@@ -6299,6 +6646,28 @@ class Runner:
                                        expected_secret=cfg.extension_secret,
                                        trust_first_install=cfg.extension_trust_first_install, allow_rekey=cfg.extension_allow_rekey,
                                        tolerance=cfg.extension_tolerance_seconds)
+            from .host_admission import HostAdmission
+            from .interactive import Tmux, state_root
+
+            def admission():
+                # one host cap with the card and chat windows: the same lock and count the tui driver uses
+                return HostAdmission(state_root(cfg.state_dir), cfg.interactive_max_sessions, Tmux(cfg.tmux_binary))
+            bridge = None
+            if cfg.tgpeek_editor is not None:
+                from .editor_job import build_bridge
+                bridge = service.editor = build_bridge(cfg.tgpeek_editor, admission=admission())
+                log.info("tgpeek editor-job routes on (executor %s)", "configured" if cfg.tgpeek_editor.argv else "unprovisioned")
+            if cfg.tgpeek_editor_control_secret_file and cfg.config_path:
+                import tomllib
+                from .editor_control import EditorController
+                path = cfg.config_path
+
+                def section() -> dict:
+                    return tomllib.loads(Path(path).read_text()).get("tgpeek_editor") or {}
+                service.controller = EditorController(service, cfg.state_dir, cfg.tgpeek_editor_control_secret_file, section,
+                                                      admission=admission, source=path)
+                service.controller.adopt(bridge, cfg.tgpeek_editor)
+                log.info("operator editor lifecycle on (loopback, signed)")
             service.serve(cfg.extension_host, cfg.extension_port)
             log.info("extension endpoint on %s:%s", cfg.extension_host, cfg.extension_port)
         token = cfg.extension_token
@@ -6317,10 +6686,10 @@ class Runner:
         self._started = time.time()
         threads = [threading.Thread(target=self._agent_loop, args=(ar, stop), name=f"agent-{ar.agent.name}",
                                     daemon=True) for ar in self.agents]
+        self._start_catalog(stop)
         for t in threads:
             t.start()
         self._start_announce(stop)
-        self._start_catalog(stop)
         self._start_chat(stop)
         service = self._start_extension(stop)
         try:

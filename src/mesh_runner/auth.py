@@ -29,6 +29,11 @@ def is_auth_banner(text: str) -> bool:
     return bool(AUTH_BANNER.fullmatch(text.strip()))
 
 
+def is_verification_required(text: str) -> bool:
+    # The provider's whole terminal reason, nothing else: quoted prose or a longer message is not it.
+    return text.strip() == "verification_required"
+
+
 def profile_id(env: dict[str, str], cwd: Path) -> str:
     """Fingerprint the Claude profile actually passed to spawn, across lanes.
 

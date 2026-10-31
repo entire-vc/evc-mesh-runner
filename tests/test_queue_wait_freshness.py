@@ -954,3 +954,85 @@ class FirstMove(QueueWait):
         r.mesh.comment_log[t['id']] = []
         r.mesh.tasks[t['id']]['description'] = description(older)
         self.assertIsNone(r._queue_source(r.mesh.tasks[t['id']], NOW))
+
+
+class ExplicitQueueWait(Bench):
+    """`⏳ WAIT queue:#<card>`: an event wait on the card's own machine source, no timer."""
+    def setUp(self):
+        Bench.setUp(self)
+        self.cfg.queue_wait_freshness_v1 = True
+        clock = mock.patch('mesh_runner.runner.time.time', return_value=NOW)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    setup_wait = QueueWait.setup_wait
+    mark_delivered = QueueWait.mark_delivered
+    receipt = QueueWait.receipt
+
+    def settle_line(self, line, **changes):
+        r, a, t = self.setup_wait(**changes)
+        r.store.update(a, state='waiting', wait={})
+        path = self.root / 'queue-line.jsonl'
+        path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
+                                        result=line, session_id='s')) + '\n')
+        r.store.update(a, state='running', log_path=str(path), turns=1)
+        r.settle(a)
+        return r, r.store.get(a.id), t
+
+    def test_declared_queue_wait_becomes_v2_any_request_without_time(self):
+        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8])
+        self.assertEqual((a.state, a.wait['kind'], a.wait['until']), ('waiting', 'queue', ''))
+        wire = a.wait['queue_request']['contract']
+        self.assertEqual((wire['version'], wire['mode'], wire['observed_at']), (2, 'any', VALUE['observed_at']))
+        self.assertEqual(q.request(a.wait['queue_request'])['task_id'], t['id'])
+        self.assertEqual(json.loads(r.store.mark(a.agent, a.task_id, q.key(a.wait['queue_request']))[0])['state'], 'pending')
+
+    def sent_back(self, line, flag=True, **changes):
+        self.cfg.queue_wait_freshness_v1 = flag
+        r, a, t = self.settle_line(line, **changes)
+        self.assertNotEqual(a.wait.get('kind'), 'queue')
+        self.assertFalse(r.store.db.execute("SELECT 1 FROM marks WHERE key LIKE 'queue_wait:%'").fetchall())
+
+    def test_no_typed_source_is_sent_back(self):
+        self.sent_back('⏳ WAIT queue:#' + task(1)['id'][:8], description='plain')
+
+    def test_other_card_id_is_sent_back(self):
+        self.sent_back('⏳ WAIT queue:#abcdef12')
+
+    def test_flag_off_is_sent_back(self):
+        self.sent_back('⏳ WAIT queue:#' + task(1)['id'][:8], flag=False)
+
+    def test_served_source_cannot_be_waited_again(self):
+        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8])
+        req = a.wait['queue_request']
+        r.store.mark(a.agent, a.task_id, q.consumed_key(r.agent_id, req['contract']), 'withdrawn')
+        self.assertTrue(q.served(r.store, a, r.agent_id, req['contract']))
+        v1 = dict(VALUE)
+        self.assertTrue(q.served(r.store, a, r.agent_id, v1))
+        newer = dict(VALUE, observed_at=VALUE['observed_at'] + 1)
+        self.assertFalse(q.served(r.store, a, r.agent_id, newer))
+
+    def test_v2_proof_for_exact_request_wakes_once(self):
+        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8])
+        self.mark_delivered(r, a)
+        q.publish(r.store, self.cfg.state_dir / 'queue-wait-requests.json',
+                  self.cfg.state_dir / 'queue-wait-receipts.json')
+        self.receipt(a)
+        r._wake_one(a)
+        self.assertEqual(a.state, 'ready')
+        self.assertEqual(json.loads(r.store.mark(a.agent, a.task_id, q.key(a.wait['queue_request']))[0])['state'], 'complete')
+
+    def test_v2_wire_rejects_unknown_mode_and_missing_mode(self):
+        base = dict(version=2, mode='any', observed_at=NOW, targets=VALUE['targets'])
+        self.assertEqual(q.contract(base), base)
+        for bad in (dict(base, mode='some'), {k: v for k, v in base.items() if k != 'mode'},
+                    dict(base, version=3), dict(VALUE, mode='any')):
+            with self.assertRaises(ValueError):
+                q.contract(bad)
+
+    def test_explicit_wait_normalizes_a_v2_all_source_to_any(self):
+        every = dict(version=2, mode='all', observed_at=VALUE['observed_at'], targets=VALUE['targets'])
+        self.assertEqual(q.as_any(every)['mode'], 'any')
+        self.assertEqual(q.as_any(VALUE)['mode'], 'any')
+        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8], description=description(every))
+        self.assertEqual(a.wait['queue_request']['contract']['mode'], 'any')

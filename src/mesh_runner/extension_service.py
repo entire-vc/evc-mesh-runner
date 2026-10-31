@@ -144,6 +144,8 @@ class ExtensionService:
         self.allow_rekey, self.tolerance, self.clock = allow_rekey, tolerance, clock
         self.expected_secret, self.trust_first_install = expected_secret, trust_first_install
         self.server: ThreadingHTTPServer | None = None
+        self.editor = None          # EditorBridge when [tgpeek_editor] is enabled; its routes are 404 otherwise
+        self.controller = None      # EditorController when [tgpeek_editor_control] is configured: the only owner of ``editor``
 
     # ------------------------------------------------------------------ handlers; each returns (status, json)
     def healthz(self) -> tuple[int, dict]:
@@ -231,7 +233,63 @@ class ExtensionService:
                 else:
                     self._send(404, {"error": "not found"})
 
+            def _editor(self, method: str) -> bool:
+                """The bounded editor-job routes; True when the request was answered here."""
+                from .editor_job import DELETE_PREFIX, MAX_BODY as EDITOR_BODY, POST_PATH
+                editor = svc.editor              # read once: a control disable may detach it at any moment
+                if editor is None or not (self.path == POST_PATH or self.path.startswith(DELETE_PREFIX)):
+                    return False
+                body = b""
+                if method == "POST":
+                    try:
+                        length = int(self.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        self._send(400, {"error": "bad length"})
+                        return True
+                    if length < 0 or length > EDITOR_BODY:
+                        self._send(413, {"error": "body_too_large"})
+                        return True
+                    body = self.rfile.read(length)
+                try:
+                    res = editor.handle(method, self.path, self.headers, body)
+                except Exception as e:
+                    log.warning("editor endpoint failed: %s", type(e).__name__)
+                    res = (500, {"error": "internal"})
+                self._send(*(res or (404, {"error": "not found"})))
+                return True
+
+            def _operator(self, method: str) -> bool:
+                """``/operator/editor/*``: signed, loopback-only lifecycle of the editor bridge (see editor_control)."""
+                from .editor_control import PREFIX
+                if not self.path.startswith(PREFIX):
+                    return False
+                if svc.controller is None:
+                    self._send(403, {"error": "operator_control_disabled"})
+                    return True
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    self._send(400, {"error": "bad length"})
+                    return True
+                if length < 0 or length > 4096:
+                    self._send(413, {"error": "body_too_large"})
+                    return True
+                body = self.rfile.read(length) if method == "POST" else b""
+                try:
+                    res = svc.controller.handle(method, self.path, self.headers, body, self.client_address[0])
+                except Exception as e:
+                    log.warning("operator endpoint failed: %s", type(e).__name__)
+                    res = (500, {"error": "internal"})
+                self._send(*res)
+                return True
+
+            def do_DELETE(self):
+                if not self._editor("DELETE"):
+                    self._send(404, {"error": "not found"})
+
             def do_POST(self):
+                if self._operator("POST") or self._editor("POST"):
+                    return
                 handler = {"/mesh/install": svc.install, "/mesh/events": svc.events}.get(self.path)
                 if handler is None:
                     return self._send(404, {"error": "not found"})
@@ -254,6 +312,16 @@ class ExtensionService:
         return self.server
 
     def shutdown(self) -> None:
+        """Supported stop: the editor bridge first (admission closed, queued jobs woken, running ones killed and drained,
+        bounded by ``DRAIN_TIMEOUT``), then the listener. Idempotent."""
+        guard = self.controller.lock if self.controller is not None else threading.Lock()
+        with guard:                                      # a control operation in flight finishes first; none starts after
+            editor = self.editor
+            if editor is not None:
+                try:
+                    editor.close()
+                except Exception as e:                   # the listener must still stop
+                    log.warning("editor drain failed: %s", type(e).__name__)
         if self.server:
             self.server.shutdown()
             self.server.server_close()
