@@ -56,6 +56,7 @@ _MERGE = re.compile(
     r"\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64})" + _EXPLANATION)
 _MERGE_HEAD = re.compile(_WAIT_HEAD + r"merge:")
 _CARD = re.compile(_WAIT_HEAD + r"card:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
+_QUEUE = re.compile(_WAIT_HEAD + r"queue:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _DECISION = re.compile(_WAIT_HEAD + r"decision:@(?P<handle>[\w.\-]+)" + _EXPLANATION)
 # Time is a structured assertion about a specific external schedule, not a retry interval.
 # Any other WAIT is a time wait: `2h`, `tomorrow`, `in 2 hours`, `poll:` all get the time guidance.
@@ -97,7 +98,7 @@ class Outcome:
 
     @property
     def is_wait(self) -> bool:
-        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time"}
+        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue"}
 
 
 def _explicit_wait_problem(line: str) -> str:
@@ -195,6 +196,9 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         if self_task8 and m["id"] == self_task8:
             return Outcome("unparsed", note="a task cannot wait for itself", line=line)
         return Outcome("card", m["id"], note=note(m), line=line)
+    if m := _QUEUE.match(line):
+        # Event wait on this card's own machine queue request; runner validates the source.
+        return Outcome("queue", m["id"], note=note(m), line=line)
     if m := _DECISION.match(line):
         return Outcome("decision", handle=m["handle"], note=note(m), line=line)
     if m := _EXTERNAL_TIME.match(line):
@@ -247,6 +251,15 @@ def _parse_when(value: str) -> dt.datetime | None:
     return when
 
 
+QUEUE_WAIT_GUIDANCE = (
+    "invalid queue wait: `⏳ WAIT queue:#<this-card-8hex>` is accepted only on a card whose thread holds a "
+    "current, not yet served `[fleet queue-request:...]` machine source, with the queue flag on. It wakes you "
+    "once when ANY independent unit becomes ready for the listed targets after that source; it is not "
+    "availability and grants no access. An unchanged or already served source has no event to wait for: "
+    "declare another condition (card, mr, pipeline, decision) or finish the card."
+)
+
+
 DECISION_WAIT_GUIDANCE = """\
 If the condition is an unanswered question to another agent, end with
   ⏳ WAIT decision:@<recipient>: <same question>
@@ -265,6 +278,7 @@ When you stop working on this task, post ONE comment on it whose last line decla
   ⏳ WAIT mr:<group>/<project>!<iid>        — a merge request must change
   ⏳ WAIT card:#<8hex>                      — another task must close
   ⏳ WAIT decision:@<agent>: <question>     — another agent must answer
+  ⏳ WAIT queue:#<this-card-8hex>           — a fresh ready unit after the card's queue-request source
   ⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
       — only a specific external event with a known timestamp and cited source
 After observing a known CI result, wait for a NEW observation explicitly:

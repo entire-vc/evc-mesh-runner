@@ -25,6 +25,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # hard_ask_patterns = [...]        # replaces the keyword list (see asks.py); hard_ask_labels likewise
     # unanswerable_users = ["example"]    # test or service users nobody answers for
     # merge_command = ["merge-gate", "{iid}", "{project}", "--expected-sha", "{sha}"]   # enables `WAIT merge:`
+    # reviewer_select_command = ["python3", "select-reviewer.py", "{project_id}", "{author}"]   # enables `reviewer-merge`
     # merge_command_cwd = "~/tools"    # working directory of merge_command
     # merge_timeout_minutes = 15       # one run of merge_command
     # merge_rerun_minutes = 5          # re-run a queued merge at least this often even if nothing changed
@@ -243,6 +244,14 @@ def _catalog(raw, state_dir: Path) -> CatalogConfig:
     c = raw or {}
     if not isinstance(c, dict):
         raise ConfigError("[catalog] must be a table")
+    if "execution_observations" in c:
+        # this package ships no execution publisher: the key is only parsed so that no value can look accepted
+        observe = c["execution_observations"]
+        if not isinstance(observe, bool):
+            raise ConfigError(f"[catalog] execution_observations must be false or absent, got {observe!r}")
+        if observe:
+            raise ConfigError("[catalog] execution_observations = true is not supported: this runner build has no "
+                              "execution publisher")
     if c.get("enabled", False) is not True:
         return CatalogConfig()
     if c.get("controller_ref", RUNNER_NAME) != RUNNER_NAME:
@@ -469,6 +478,9 @@ class RunnerConfig:
     extension_tolerance_seconds: int = 300
     extension_token: object = field(default=None, repr=False)   # ExtensionToken: file or env name, never a value
     extension_rotate_days: float = 0.0          # self-rotate the token this often; 0 = never
+    tgpeek_editor: object = None                # EditorConfig of [tgpeek_editor]; None = the editor-job routes are off
+    tgpeek_editor_control_secret_file: str = ""  # [tgpeek_editor_control] secret_file; empty = operator editor lifecycle off
+    config_path: str = ""                       # the file this config was read from (the source of an operator reconfigure)
     # A task that hits START CAP, TURN CAP or COMPACTION CAP goes back to todo with the same assignee
     # (or to a free peer of its pool) and restarts on new input, never on a clock. False: the task goes
     # to the lead, or waits for the next UTC day without one (RUNNER GAVE UP is not a cap and always
@@ -498,11 +510,13 @@ class RunnerConfig:
     # Placeholders: {target} {project} {iid} {sha}. Empty = merge waits are rejected.
     merge_command: tuple = ()
     merge_command_cwd: Path | None = None
+    reviewer_select_command: tuple = ()      # router adapter for `reviewer-merge`: JSON {lane, reason, username}
     merge_timeout_minutes: float = 15.0
     merge_rerun_minutes: float = 5.0
     merge_max_runs: int = 30
     merge_queue_hours: float = 24.0
     merge_follow_head: bool = False
+    source: Path | None = field(default=None, compare=False, repr=False)   # file this was loaded from
 
     @property
     def pool_root(self) -> Path:
@@ -569,6 +583,18 @@ def _merge_command(value) -> tuple:
             if name not in MERGE_PLACEHOLDERS:
                 raise ConfigError(f"merge_command: unknown placeholder {{{name}}}; "
                                   f"use {', '.join('{' + n + '}' for n in MERGE_PLACEHOLDERS)}")
+    return tuple(value)
+
+
+def _reviewer_select_command(value) -> tuple:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or any(not isinstance(v, str) or not v for v in value):
+        raise ConfigError("reviewer_select_command must be a list of non-empty strings")
+    for part in value:
+        for name in re.findall(r"\{([^{}]*)\}", part):
+            if name not in ("project_id", "author"):
+                raise ConfigError(f"reviewer_select_command: unknown placeholder {{{name}}}; use {{project_id}}, {{author}}")
     return tuple(value)
 
 
@@ -649,6 +675,12 @@ def load(path: str | Path) -> RunnerConfig:
             mode = ext_token.file.stat().st_mode & 0o077
             if mode:
                 raise ConfigError(f"extension token: {ext_token.file} is readable by group/others; chmod 600")
+    from .editor_job import parse_config as _editor_config
+    tgpeek_editor = _editor_config(raw.get("tgpeek_editor") or {}, _path(r.get("state_dir") or _default_state_dir()), ConfigError)
+    control = raw.get("tgpeek_editor_control") or {}
+    control_secret_file = str(control.get("secret_file") or "")
+    if control_secret_file and not os.path.isabs(control_secret_file):
+        raise ConfigError("[tgpeek_editor_control] secret_file must be an absolute path")
     ext_ws = str(ext.get("workspace_id") or "")
     if ext.get("enabled", False) is True and not re.fullmatch(
             r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", ext_ws):
@@ -816,6 +848,9 @@ def load(path: str | Path) -> RunnerConfig:
         extension_tolerance_seconds=_positive(ext.get("tolerance_seconds", 300), "tolerance_seconds", integer=True),
         extension_token=ext_token,
         extension_rotate_days=float(ext.get("rotate_days", 0.0)),
+        tgpeek_editor=tgpeek_editor,
+        tgpeek_editor_control_secret_file=control_secret_file,
+        config_path=str(Path(path).resolve()),
         requeue_on_cap=r.get("requeue_on_cap", False) is True,
         cap_wake_next_day=r.get("cap_wake_next_day", False) is True,
         soft_person_asks_to_lead=r.get("soft_person_asks_to_lead", False) is True,
@@ -827,6 +862,7 @@ def load(path: str | Path) -> RunnerConfig:
                                                                     "unanswerable_users", ())),
         merge_command=_merge_command(r.get("merge_command")),
         merge_command_cwd=_path(r.get("merge_command_cwd")),
+        reviewer_select_command=_reviewer_select_command(r.get("reviewer_select_command")),
         merge_timeout_minutes=_positive(r.get("merge_timeout_minutes", 15.0), "merge_timeout_minutes"),
         merge_rerun_minutes=_positive(r.get("merge_rerun_minutes", 5.0), "merge_rerun_minutes"),
         merge_max_runs=_positive(r.get("merge_max_runs", 30), "merge_max_runs", integer=True),
@@ -856,4 +892,5 @@ def load(path: str | Path) -> RunnerConfig:
                                  (raw.get("github") or {}).get("token_env"), "github token")
         if (raw.get("github") or {}).get("token_file") or (raw.get("github") or {}).get("token_env") else "",
         github_api_url=str((raw.get("github") or {}).get("api_url") or "https://api.github.com"),
+        source=Path(path).resolve(),
     )

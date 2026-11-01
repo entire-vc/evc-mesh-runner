@@ -34,6 +34,7 @@ class TurnResult:
     error_details: str = field(default="", repr=False)  # full local-only cause, never a display summary
     auth_failed: bool = False       # an adapter-verified terminal authentication banner
     auth_only: bool = False         # no assistant/tool work preceded that banner
+    verification_required: bool = False  # the exact terminal provider envelope `verification_required`
 
 
 @dataclass
@@ -70,6 +71,12 @@ class Adapter:
 
     def parse(self, log_path: Path) -> TurnResult:
         raise NotImplementedError
+
+    def observed_context(self, session_id: str, env: dict) -> dict:
+        """What the harness itself recorded for its latest turn: ``{"model", "effort", "at"}`` (any may
+        be missing). Only evidence the harness wrote counts; a configured or default value never does.
+        A harness without such a record returns {} and stays unknown."""
+        return {}
 
     def with_effort(self, argv: list[str], effort: str) -> list[str]:
         """argv with the reasoning effort set for this session; a harness without

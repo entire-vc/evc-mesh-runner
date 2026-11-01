@@ -9,6 +9,7 @@ first event (``thread.started``); the runner stores it as the session id.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from pathlib import Path
 
 from .base import Adapter, TurnResult, read_events
 
+ROLLOUT_SCAN = 1 << 20          # how much of the rollout's end is searched for the latest turn_context
 _MODEL_LINE = re.compile(r'^\s*model\s*=\s*"([^"]+)"', re.M)
 
 
@@ -129,6 +131,39 @@ class CodexAdapter(Adapter):
             if m:
                 return m.group(1)
         return ""
+
+    def observed_context(self, session_id: str, env: dict) -> dict:
+        """The model and effort Codex wrote in the ``turn_context`` record of its latest turn (the
+        session rollout). Only those two fields and the record's time are read: the record also holds
+        the cwd, sandbox and permission policy, which never leave this function."""
+        if not session_id or not re.fullmatch(r"[0-9A-Za-z-]{8,64}", session_id):
+            return {}
+        home = env.get("CODEX_HOME") or os.path.join(env.get("HOME") or str(Path.home()), ".codex")
+        found = glob.glob(os.path.join(home, "sessions", "**", f"rollout-*{session_id}*.jsonl"), recursive=True)
+        if not found:
+            return {}
+        try:
+            path = max(found, key=os.path.getmtime)
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - ROLLOUT_SCAN))
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            return {}
+        last = {}
+        for line in tail.splitlines():
+            if '"turn_context"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            payload = ev.get("payload") if isinstance(ev, dict) and ev.get("type") == "turn_context" else None
+            if isinstance(payload, dict):
+                last = {"model": payload.get("model"), "effort": payload.get("effort"),
+                        "at": ev.get("timestamp")}
+        return {k: v for k, v in last.items() if isinstance(v, str) and v}
 
     def with_effort(self, argv: list[str], effort: str) -> list[str]:
         return [argv[0], "-c", f'model_reasoning_effort="{effort}"', *argv[1:]]

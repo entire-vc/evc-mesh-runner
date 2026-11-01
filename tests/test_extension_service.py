@@ -329,7 +329,8 @@ class WakeAndConfigTest(unittest.TestCase):
         owners.set("gone", "a"), owners.set("other", "b")
         ar.agent, ar.owners = NS(name="a", feed_review=False), owners
         ar.store = NS(by_state=lambda *a: [NS(task_id="held")])
-        ar.mesh = NS(my_tasks=lambda cat: [{"id": "t9"}] if cat == "todo" else [])
+        ar.mesh = NS(my_tasks=lambda cat: [{"id": "t9"}] if "todo" in cat.split(",") else [])
+        ar.cats = NS(category=lambda t: "todo")
         ar._work_order, ar._gate_event = (lambda w: w), (lambda t: None)
         ar.candidates()
         self.assertEqual(ar.owners.as_dict(), {"other": "b", "held": "a", "t9": "a"})

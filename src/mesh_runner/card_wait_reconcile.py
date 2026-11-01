@@ -1,0 +1,105 @@
+"""Conservative owner intent reconciliation; no remote effects or wake decisions."""
+from __future__ import annotations
+
+import datetime as dt
+import re
+from dataclasses import dataclass
+
+from .outcome import declaration_lines, parse_line
+from .selection import parse_time
+
+
+@dataclass(frozen=True)
+class Intent:
+    target: str
+    comment_id: str
+    created_at: str
+    line: str
+    note: str
+
+
+def latest_intent(wait: dict, comments: list[dict], agent_id: str,
+                  task_id: str, now: dt.datetime) -> tuple[bool, Intent | None]:
+    """(handled, intent). A newer ambiguous card declaration holds the old wait.
+
+    Only the newest own comment can supersede a wait. Historical examples,
+    edited old comments, multiple declarations and fenced snippets are not intent.
+    A bounded newest-comments window need not contain every historical comment.
+    """
+    own = [c for c in comments if (c.get('author_id') or (c.get('author') or {}).get('id')) == agent_id]
+    if not own:
+        return False, None
+    times = [parse_time(c.get('created_at')) for c in own]
+    if any(t is None for t in times):
+        return True, None
+    latest = max(own, key=lambda c: parse_time(c['created_at']))
+    since, created = parse_time(wait.get('since')), parse_time(latest.get('created_at'))
+    newest = [c for c, timestamp in zip(own, times) if timestamp == created]
+    # A prose comment must not hide a simultaneous newer card declaration.
+    # Tied prose alone leaves the ordinary observer unchanged.
+    if (len(newest) > 1 and (since is None or created > since)
+            and any(re.match(r'^\s*⏳\s*WAIT\s+card:', line)
+                    for c in newest for line in declaration_lines(c.get('body') or ''))):
+        return True, None
+    body = latest.get('body') or ''
+    lines = declaration_lines(body)
+    if not any(re.match(r'^\s*⏳\s*WAIT\s+card:', line) for line in lines):
+        return False, None
+    if since is None or created is None:
+        return True, None
+    if created <= since:
+        return False, None
+    if (created > now or not latest.get('id') or len(lines) != 1 or '```' in body or '~~~' in body
+            or len([t for t in times if t == created]) != 1
+            or body.rstrip().splitlines()[-1].strip() != lines[0].strip()):
+        return True, None
+    outcome = parse_line(lines[0], now, task_id[:8])
+    if outcome.kind != 'card':
+        return True, None
+    if outcome.target == wait.get('target'):
+        return False, None
+    return True, Intent(outcome.target, latest['id'], latest['created_at'], outcome.line, outcome.note)
+
+
+def sole_dependency(rows: dict, task_id: str, target: str, *, allow_satisfied: bool = False) -> dict | None:
+    """Require one fully known outgoing edge; do not infer default conditions."""
+    if not isinstance(rows, dict) or not isinstance(rows.get('outgoing'), list):
+        return None
+    edges = rows['outgoing']
+    if len(edges) != 1 or not isinstance(edges[0], dict):
+        return None
+    edge = edges[0]
+    destination = edge.get('depends_on_task_id')
+    if (not edge.get('id') or edge.get('task_id') != task_id
+            or edge.get('dependency_type') != 'blocks' or edge.get('condition') != 'task_done'
+            or type(edge.get('condition_satisfied')) is not bool
+            or (not allow_satisfied and edge['condition_satisfied'])
+            or not isinstance(destination, str)
+            or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', destination)
+            or destination == task_id or destination[:8] != target
+            or rows.get('has_more') or rows.get('next')):
+        return None
+    return edge
+
+
+def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
+    """An absent newer declaration grants no authority to ignore formal edges.
+
+    Do not pick an older marker. A known empty dependency set or one fully
+    known edge to the current target may use the ordinary observer; a different
+    target, unsupported shape or ambiguity preserves WAIT for the owner.
+    """
+    if (not isinstance(rows, dict) or not isinstance(rows.get('outgoing'), list)
+            or rows.get('has_more') or rows.get('next')):
+        return True
+    edges = rows['outgoing']
+    if not edges:
+        return False
+    if len(edges) != 1 or not isinstance(edges[0], dict):
+        return True
+    edge = edges[0]
+    if type(edge.get('condition_satisfied')) is not bool:
+        return True
+    # The guard accepts a satisfied edge to the current target too; the normal
+    # observer still decides whether that awaited event has actually occurred.
+    return sole_dependency(rows, task_id, target, allow_satisfied=True) is None

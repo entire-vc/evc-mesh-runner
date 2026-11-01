@@ -31,7 +31,7 @@ CAT_TO_STATUS = {s["category"]: s["id"] for s in STATUSES}
 def task(n: int, priority: str = "medium", cat: str = "todo", **extra) -> dict:
     tid = f"{n:08x}-0000-4000-8000-{n:012x}"
     return {"id": tid, "title": f"task {n}", "priority": priority, "project_id": "p1",
-            "status_id": CAT_TO_STATUS[cat], "assignee_id": AGENT_ID, "labels": [],
+            "status_id": CAT_TO_STATUS[cat], "assignee_id": AGENT_ID, "labels": [], "description": "",
             "created_at": f"2026-10-01T00:00:{n:02d}Z", **extra}
 
 
@@ -149,8 +149,10 @@ class FakeMesh:
         return [dict(t) for t in self.tasks.values() if t.get("parent_task_id") == tid]
 
     def my_tasks(self, cat):
+        self.my_tasks_calls = getattr(self, "my_tasks_calls", []) + [cat]
+        cats = cat.split(",")
         return [dict(t) for t in self.tasks.values()
-                if t.get("assignee_id") == AGENT_ID and self.category(t) == cat]
+                if t.get("assignee_id") == AGENT_ID and self.category(t) in cats]
 
     def category(self, t):
         return next(s["category"] for s in STATUSES if s["id"] == t["status_id"])

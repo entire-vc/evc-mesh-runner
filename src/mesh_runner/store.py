@@ -152,6 +152,12 @@ class Store:
             (agent, task_id, key, value, iso()))
         return cur.rowcount == 1
 
+    def compare_mark(self, agent: str, task_id: str, key: str, expected: str, value: str) -> bool:
+        """Fenced single-statement update; an old event cannot clear a newer hold."""
+        return self.db.execute(
+            "UPDATE marks SET value=?, at=? WHERE agent=? AND task_id=? AND key=? AND value=?",
+            (value, iso(), agent, task_id, key, expected)).rowcount == 1
+
     def clear_marks(self, agent: str, key: str) -> None:
         """Empty ``key`` on every task of ``agent`` (a streak that a hold of the whole runner broke)."""
         self.db.execute("UPDATE marks SET value='' WHERE agent=? AND key=? AND value!=''", (agent, key))
