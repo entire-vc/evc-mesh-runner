@@ -293,6 +293,8 @@ class RunnerConfig:
     agents: list[AgentConfig]
     poll_seconds: int = 20
     wake_poll_seconds: int = 120
+    # one shared deadline for every read and backoff of a single WAIT observation (docs/wait-observation-budget.md)
+    wake_budget_seconds: float = 45.0
     heartbeat_seconds: int = 300
     checkout_ttl_minutes: int = 120
     max_no_outcome: int = 1            # immediate corrections (same session) after an unreadable outcome
@@ -463,6 +465,8 @@ class RunnerConfig:
     load_hold_per_cpu: float = 4.0
     load_release_per_cpu: float = 0.0
     tmux_binary: str = "tmux"               # standing chat sessions and interactive turns
+    # strict existing-session readonly_metadata receiver (meta_delivery.Settings); None = off
+    session_metadata: object = field(default=None, repr=False)
     # how turns run: "interactive" (the harness's interactive program in tmux, fed by a driver;
     # what a subscription covers) or "headless" (claude -p / codex exec, billed per token)
     launch_mode: str = "interactive"
@@ -632,6 +636,14 @@ def _exclude_names(value) -> tuple:
     return tuple(value)
 
 
+def _session_metadata(section):
+    from .meta_delivery import parse_settings
+    try:
+        return parse_settings(section or {}, read_secret)
+    except ValueError as e:
+        raise ConfigError(str(e)) from None
+
+
 def _chat_workspace(value) -> str:
     if value not in ("none", "read", "write"):
         raise ConfigError('[chat] chat_workspace must be "none", "read" or "write"')
@@ -769,6 +781,7 @@ def load(path: str | Path) -> RunnerConfig:
         agents=agents,
         poll_seconds=int(r.get("poll_seconds", 20)),
         wake_poll_seconds=int(r.get("wake_poll_seconds", 120)),
+        wake_budget_seconds=max(_positive(r.get("wake_budget_seconds", 45), "[runner] wake_budget_seconds"), 1.0),
         heartbeat_seconds=int(r.get("heartbeat_seconds", 300)),
         checkout_ttl_minutes=int(r.get("checkout_ttl_minutes", 120)),
         max_no_outcome=int(r.get("max_no_outcome", 1)),
@@ -882,6 +895,7 @@ def load(path: str | Path) -> RunnerConfig:
         load_hold_per_cpu=_idle_hours(r.get("load_hold_per_cpu", 4.0), "load_hold_per_cpu"),
         load_release_per_cpu=_idle_hours(r.get("load_release_per_cpu", 0.0), "load_release_per_cpu"),
         announce_controllers=r.get("announce_controllers", False) is True,
+        session_metadata=_session_metadata(raw.get("session_metadata")),
         chat_enabled=chat.get("enabled", False) is True,
         chat_agents=tuple(_string_list(chat.get("agents"), "[chat] agents", ())),
         chat_credential=read_secret(chat.get("credential_file"), chat.get("credential_env"), "chat credential")

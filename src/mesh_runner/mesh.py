@@ -20,6 +20,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from . import observation_budget as budget
+
 DEFAULT_TIMEOUT = 30
 # a GET is safe to repeat: a lone transport failure (timeout, TLS handshake, DNS) is retried
 # before the tick is failed; writes are never repeated here
@@ -50,13 +52,16 @@ def _parse_retry_after(value: Any) -> float | None:
 
 class MeshError(Exception):
     def __init__(self, status: int, message: str, body: Any = None, retry_after: float | None = None,
-                 endpoint: str = ""):
+                 endpoint: str = "", kind: str = "", stage: str = ""):
         super().__init__(f"HTTP {status}: {message}" + (f" [{endpoint}]" if endpoint else "")
                          + (f" retry-after={retry_after:g}s" if retry_after is not None else ""))
         self.status = status
         self.body = body
         self.retry_after = retry_after
         self.endpoint = endpoint
+        # timeout/transport/parse/http; a status-0 error without a named cause is a transport fault
+        self.kind = kind or ("http" if status else "transport")
+        self.stage = stage
 
 
 @dataclass
@@ -100,11 +105,20 @@ class MeshClient:
                     limited += 1
                     wait = e.retry_after if e.retry_after is not None else RATE_LIMIT_DEFAULT_SLEEP
                     wait = min(wait, RATE_LIMIT_MAX_SLEEP)
-                    time.sleep(wait + random.uniform(0, 0.5 + wait * 0.1))
+                    pause = wait + random.uniform(0, 0.5 + wait * 0.1)
+                    if not budget.sleep_allowed(pause):
+                        raise                      # the last real cause, not a synthetic timeout
+                    time.sleep(pause)
                 elif e.status == 0 and delays:
+                    if not budget.sleep_allowed(delays[0]):
+                        raise
                     time.sleep(delays.pop(0))
                 else:
                     raise
+
+    @staticmethod
+    def _spent(method: str, path: str) -> "MeshError":
+        return MeshError(0, "observation budget spent", kind="timeout", stage=budget.stage_of(method, path))
 
     def bounded_get(self, path: str, *, timeout: float) -> Any:
         """One diagnostic GET, never transport/429 retries or sleeps.
@@ -180,12 +194,19 @@ class MeshClient:
             **({"Content-Type": "application/json"} if data is not None else {}),
         })
         try:
-            with self._open(req, timeout=self.timeout if timeout is None else timeout) as resp:
-                raw = resp.read() if max_bytes is None else resp.read(max_bytes + 1)
+            allowed = budget.cap(self.timeout if timeout is None else timeout, method, path)
+        except budget.Exhausted:
+            raise self._spent(method, path) from None
+        try:
+            with self._open(req, timeout=allowed) as resp:
+                raw = budget.read(resp, None if max_bytes is None else max_bytes + 1)
                 if max_bytes is not None and len(raw) > max_bytes:
                     raise MeshError(0, "diagnostic response bound")
         except urllib.error.HTTPError as e:
-            raw = (e.read() if max_bytes is None else e.read(max_bytes + 1)) or b""
+            try:
+                raw = budget.read(e, None if max_bytes is None else max_bytes + 1) or b""
+            except budget.Exhausted:
+                raise self._spent(method, path) from None
             try:
                 parsed = json.loads(raw)
             except ValueError:
@@ -194,14 +215,18 @@ class MeshClient:
             retry_after = _parse_retry_after(e.headers.get("Retry-After") if e.headers else None)
             raise MeshError(e.code, msg or e.reason, parsed, retry_after=retry_after,
                             endpoint=f"{method} {path}") from None
+        except budget.Exhausted:
+            raise self._spent(method, path) from None
         except (OSError, ValueError) as e:      # URLError, timeouts, resets
-            raise MeshError(0, f"{type(e).__name__}: {str(e)[:200]}") from None
+            raise MeshError(0, f"{type(e).__name__}: {str(e)[:200]}", kind=budget.classify(e) or "parse",
+                            stage=budget.stage_of(method, path)) from None
         if not raw:
             return None
         try:
             return json.loads(raw)
         except ValueError:
-            raise MeshError(0, "response is not JSON") from None
+            raise MeshError(0, "response is not JSON", kind="parse",
+                            stage=budget.stage_of(method, path)) from None
 
     # -- agent -------------------------------------------------------------------
     def me(self) -> dict:

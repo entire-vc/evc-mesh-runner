@@ -3,12 +3,14 @@ import copy
 import datetime as dt
 import json
 import os
+import pathlib
 import threading
 from unittest import mock
 from uuid import UUID
 
 from mesh_runner import queue_wait as q
 from mesh_runner.store import Store, iso
+from mesh_runner.selection import parse_time
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import Runner
 from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT
@@ -898,6 +900,63 @@ class FirstMove(QueueWait):
         self.assertFalse(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
         self.at(r, a)
         self.assertEqual(a.state, 'ready')
+
+    def spawn_then_settle(self, spawn_clock=None, comments=None, spawn_error=None):
+        """The real _spawn records the spawn evidence; the turn then ends in a time WAIT."""
+        r, a, t = self.setup_wait()
+        if comments is not None:
+            for body, at in comments:
+                r.mesh.add_comment(t['id'], body, at=at)
+        real_iso = iso
+        at = dt.datetime.fromtimestamp(spawn_clock, dt.timezone.utc) if spawn_clock is not None else None
+
+        def clock(*args):
+            if at is not None and not args:
+                return real_iso(at)
+            return real_iso(*args)
+
+        proc = mock.Mock(pid=99999999)
+        with mock.patch.object(r.adapter, 'spawn', return_value=proc, side_effect=spawn_error), \
+                mock.patch('mesh_runner.runner.iso', side_effect=clock), \
+                mock.patch('mesh_runner.runner.now', side_effect=lambda: at or dt.datetime.now(dt.timezone.utc)):
+            if spawn_error:
+                with self.assertRaises(type(spawn_error)):
+                    r._spawn(a, 'prompt', False, ('waiting',))
+                return r, r.store.get(a.id)
+            self.assertTrue(r._spawn(a, 'prompt', False, ('waiting',)))
+        a = r.store.get(a.id)
+        pathlib.Path(a.log_path).write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
+            result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
+        r.settle(a)
+        return r, r.store.get(a.id)
+
+    def test_spawn_records_read_evidence_and_description_source_gets_no_refill(self):
+        # description-only source, no comments: the comment cursor is now()-2min, older than nothing
+        # relevant; the request (NOW-600) predates the real spawn, so the turn did read it
+        r, a = self.spawn_then_settle()
+        self.assertTrue(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
+        self.at(r, a)
+        self.assertEqual(a.state, 'waiting')
+
+    def test_spawn_then_source_newer_than_the_spawn_gets_exactly_one_refill(self):
+        r, a = self.spawn_then_settle(spawn_clock=NOW - 1200)   # spawned before the request (NOW-600)
+        self.assertFalse(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
+        self.at(r, a)
+        self.assertEqual(a.state, 'ready')
+        self.assertIn('queue refill', a.wake_text)
+
+    def test_failed_spawn_leaves_no_read_evidence(self):
+        r, a = self.spawn_then_settle(spawn_error=OSError('not started'))
+        self.assertEqual(getattr(a, 'source_read_at', ''), '')
+        self.assertEqual(a.state, 'waiting')
+
+    def test_skewed_old_comment_does_not_hide_the_spawn_evidence(self):
+        # Mesh's newest comment is an hour old (skew-safe cursor stays on Mesh's clock);
+        # the spawn evidence still marks the description source as read
+        old = dt.datetime.fromtimestamp(NOW - 3600, dt.timezone.utc)
+        r, a = self.spawn_then_settle(comments=[('old', old)])
+        self.assertEqual(parse_time(a.turn_started_at), old)
+        self.assertTrue(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
 
     def test_turn_that_read_the_request_is_the_first_move(self):
         r, a = self.settle_wait(NOW - 10)          # started after the request was observed

@@ -87,30 +87,30 @@ class CardWaitReconcile(Bench):
         desired = runtime_state(saved, 'test')
         self.assertEqual((desired['kind'], desired['ref']), ('waiting', 'card:#' + target['id'][:8]))
 
-    def test_recorded_990_stale_installed_wait_shape(self):
-        # Whitelisted fields from the read-only 2026-10-31 17:51Z receipt.
-        # The installed registry retained 66accdaf while the own marker and
-        # sole task_done dependency both already named 1d7adc21.
+    def test_synthetic_stale_installed_wait_shape(self):
+        # Whitelisted fields from the synthetic receipt shape.
+        # The installed registry retained 22222222 while the own marker and
+        # sole task_done dependency both already named 11111111.
         r, a, t, _, edge, c = self.flow()
-        source = '990dc14d-8986-4971-b3f7-3bfb5e09cd77'
-        destination = '1d7adc21-5ff5-4b54-a79c-b60b522a98e7'
+        source = '00000000-0000-4000-8000-000000000011'
+        destination = '11111111-1111-4111-8111-111111111111'
         t['id'] = source
         r.mesh.tasks[source] = t
-        c.update(id='3a2f64da-3d57-4e15-bf07-7ce566fcfc97',
-                 created_at='2026-10-31T17:16:43.993731Z', body='Owner correction.\n⏳ WAIT card:#1d7adc21')
-        edge.update(id='b9bd496f-da7e-4b8c-b1fa-b0eca34ba4c9', task_id=source,
+        c.update(id='00000000-0000-4000-8000-000000000033',
+                 created_at='2026-10-04T00:00:00Z', body='Owner correction.\n⏳ WAIT card:#11111111')
+        edge.update(id='00000000-0000-4000-8000-000000000044', task_id=source,
                     depends_on_task_id=destination)
         r.mesh.deps[source] = [edge]
         r.mesh.comment_log[source] = [c]
-        wait = dict(self.oldwait, target='66accdaf', since='2026-10-31T06:27:36.625721Z')
+        wait = dict(self.oldwait, target='22222222', since='2026-10-03T00:00:00Z')
         r.store.update(a, task_id=source, wait=wait)
         r._wake_one(a)
         saved = r.store.get(a.id)
-        self.assertEqual((saved.state, saved.wait['target']), ('waiting', '1d7adc21'))
+        self.assertEqual((saved.state, saved.wait['target']), ('waiting', '11111111'))
         receipt = saved.wait['card_reconcile']
         self.assertEqual((receipt['old_target'], receipt['comment_id'], receipt['dependency_id']),
-                         ('66accdaf', c['id'], edge['id']))
-        self.assertEqual(runtime_state(saved, 'riker')['ref'], 'card:#1d7adc21')
+                         ('22222222', c['id'], edge['id']))
+        self.assertEqual(runtime_state(saved, 'agent-a')['ref'], 'card:#11111111')
         self.assertEqual(r.mesh.deps[source], [edge])
         self.assertFalse(self.calls.exists())
 

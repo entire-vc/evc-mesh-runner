@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.24
+
+- WAIT observation runs under one shared deadline (`wake_budget_seconds`, default 45); a failed read keeps
+  the wait untouched and records `wake_read_failed` with kind, stage, elapsed and retries. See
+  `docs/wait-observation-budget.md`.
+
 ## 0.1.23
 
 - Repo admission compares the declared agent env, not the session env a turn applied, so a normal turn no longer causes a false `rejected_config`.
