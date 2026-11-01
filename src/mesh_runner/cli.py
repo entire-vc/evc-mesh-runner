@@ -148,6 +148,48 @@ def _editor_control(argv: list[str]) -> int:
     return 0 if 200 <= status < 300 else 1
 
 
+def _receipt_wait(argv: list[str]) -> int:
+    """`receipt-wait`: the operator's arm / inspect / disarm / rebaseline of one card's receipt
+    registration, written through Runner's own store API (never by hand into its database)."""
+    import time
+    from . import receipt_wait as rw
+    p = argparse.ArgumentParser(prog="mesh-runner receipt-wait")
+    p.add_argument("action", choices=["arm", "inspect", "disarm", "rebaseline"])
+    p.add_argument("--config", required=True)
+    p.add_argument("--agent", required=True, help="the lane that owns the source card")
+    p.add_argument("--task", required=True, help="full UUID of the source card (the card that will wait)")
+    p.add_argument("--owner-id", help="arm: Mesh agent id of that lane; must match at declaration and wake")
+    p.add_argument("--journal", action="append", default=[], metavar="NAME=/abs/path/telegram-receipts.jsonl",
+                   help="arm: repeatable; a journal that does not exist yet is registered as absent")
+    p.add_argument("--name", help="rebaseline: the registered journal name")
+    args = p.parse_args(argv)
+    cfg = config_mod.load(args.config)
+    if not cfg.receipt_wait_v1:
+        print(json.dumps({"error": "receipt_wait_v1 is off in this config"}))
+        return 2
+    if args.agent not in {a.name for a in cfg.agents}:
+        p.error("--agent must name an exact configured lane")
+    store = Store(cfg.state_dir / "runner.sqlite")
+    try:
+        if args.action == "arm":
+            journals = dict(j.split("=", 1) for j in args.journal if "=" in j)
+            if not args.owner_id or not journals or len(journals) != len(args.journal):
+                p.error("arm needs --owner-id and at least one NAME=PATH --journal")
+            rw.arm(store, args.agent, args.task, args.owner_id, journals, time.time())
+        elif args.action == "disarm":
+            rw.disarm(store, args.agent, args.task)
+        elif args.action == "rebaseline":
+            if not args.name:
+                p.error("rebaseline needs --name")
+            rw.rebaseline(store, args.agent, args.task, args.name)
+        out = rw.inspect(store, args.agent, args.task)
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"error": str(exc)[:200]}))
+        return 1
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args_in = sys.argv[1:] if argv is None else argv
     if args_in and args_in[0] == "reviewer-merge":
@@ -155,11 +197,19 @@ def main(argv: list[str] | None = None) -> int:
     if args_in and args_in[0] == "notify-access-change":
         from .access_recovery import notify_command
         return notify_command(args_in[1:])
+    if args_in and args_in[0] == "notify-auth-change":
+        from .auth_recovery import notify_command
+        return notify_command(args_in[1:])
+    if args_in and args_in[0] == "recheck-auth":
+        from .auth_recovery import command
+        return command(args_in[1:])
     if args_in and args_in[0] == "recheck-access":
         from .access_recovery import command
         return command(args_in[1:])
     if args_in and args_in[0] == "editor-control":
         return _editor_control(args_in[1:])
+    if args_in and args_in[0] == "receipt-wait":
+        return _receipt_wait(args_in[1:])
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
@@ -226,6 +276,11 @@ def main(argv: list[str] | None = None) -> int:
             p.error("--profile must be the exact fingerprint from status/plan")
         cfg = config_mod.load(args.config)
         store = Store(cfg.state_dir / "runner.sqlite")
+        if args.dry_run:
+            would = auth.held(store, args.profile)
+            print(json.dumps({"profile": args.profile, "dry_run": True, "would_clear": would,
+                              "note": "dry run: nothing was cleared; rerun without --dry-run to clear"}))
+            return 0 if would else 1
         cleared = auth.clear(store, args.profile)
         print(json.dumps({"profile": args.profile, "cleared": cleared,
                           "note": "normal admission still applies; this command does not repair authentication"}))

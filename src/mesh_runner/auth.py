@@ -1,7 +1,7 @@
 """Local circuit holds for a harness profile whose authentication failed.
 
-This is not an account health authority or a rotation policy. Only the operator
-clears a hold after repairing authentication; normal admission still applies.
+This is not an account health authority or a rotation policy. An operator or a
+fresh proof bound to this hold's generation can clear it; normal admission applies.
 No credential file or keychain is read here.
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import uuid
 from pathlib import Path
 
 from .store import Store, iso
@@ -49,8 +50,18 @@ def profile_id(env: dict[str, str], cwd: Path) -> str:
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
 
 
-def hold(store: Store, profile: str) -> None:
-    store.mark(OWNER, PREFIX + profile, KEY, iso())
+def hold(store: Store, profile: str, verification: bool = False) -> None:
+    generation = iso()
+    store.db.execute("SAVEPOINT auth_hold")
+    try:
+        store.mark(OWNER, PREFIX + profile, KEY, generation)
+        store.mark(OWNER, PREFIX + profile, "auth_hold_scope", generation + ":" + uuid.uuid4().hex +
+                   (":verification_required" if verification else ":authentication"))
+        store.db.execute("RELEASE auth_hold")
+    except Exception:
+        store.db.execute("ROLLBACK TO auth_hold")
+        store.db.execute("RELEASE auth_hold")
+        raise
 
 
 def held(store: Store, profile: str) -> bool:

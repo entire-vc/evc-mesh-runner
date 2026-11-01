@@ -874,15 +874,30 @@ class FirstMove(QueueWait):
         self.assertEqual(a.state, 'ready')
         self.assertTrue(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
 
-    def settle_wait(self, turn_started):
+    def settle_wait(self, turn_started, source_read=None):
         r, a, t = self.setup_wait()
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
                                         result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
+        extra = {} if source_read is None else dict(
+            source_read_at=iso(dt.datetime.fromtimestamp(source_read, dt.timezone.utc)))
         r.store.update(a, state='running', log_path=str(path), turns=1,
-                       turn_started_at=iso(dt.datetime.fromtimestamp(turn_started, dt.timezone.utc)))
+                       turn_started_at=iso(dt.datetime.fromtimestamp(turn_started, dt.timezone.utc)), **extra)
         r.settle(a)
         return r, a
+
+    def test_description_source_read_by_the_spawned_turn_is_the_first_move(self):
+        # no comment in the thread: the comment cursor is old, the spawn evidence is after the request
+        r, a = self.settle_wait(NOW - 3600, source_read=NOW - 10)
+        self.assertTrue(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
+        self.at(r, a)
+        self.assertEqual(a.state, 'waiting')
+
+    def test_source_newer_than_both_cursors_still_gets_one_refill(self):
+        r, a = self.settle_wait(NOW - 3600, source_read=NOW - 1200)   # request observed at NOW-600
+        self.assertFalse(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
+        self.at(r, a)
+        self.assertEqual(a.state, 'ready')
 
     def test_turn_that_read_the_request_is_the_first_move(self):
         r, a = self.settle_wait(NOW - 10)          # started after the request was observed

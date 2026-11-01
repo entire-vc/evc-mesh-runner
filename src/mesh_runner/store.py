@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     turns INTEGER NOT NULL DEFAULT 0,
     no_outcome INTEGER NOT NULL DEFAULT 0,
     turn_started_at TEXT NOT NULL DEFAULT '',
+    source_read_at TEXT NOT NULL DEFAULT '',
     stamp TEXT NOT NULL DEFAULT '',
     leader_done_at TEXT NOT NULL DEFAULT '',
     mode TEXT NOT NULL DEFAULT 'work',
@@ -95,6 +96,7 @@ class Attempt:
     turns: int = 0
     no_outcome: int = 0
     turn_started_at: str = ""
+    source_read_at: str = ""            # when the spawned turn could first read the task body (spawn evidence)
     stamp: str = ""
     leader_done_at: str = ""
     mode: str = "work"                  # work: todo/in_progress task; review: a task in review
@@ -119,7 +121,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(attempts)")}
-        for col, default in (("stamp", ""), ("leader_done_at", ""), ("mode", "work")):
+        for col, default in (("stamp", ""), ("leader_done_at", ""), ("mode", "work"), ("source_read_at", "")):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE attempts ADD COLUMN {col} TEXT NOT NULL DEFAULT '{default}'")
 

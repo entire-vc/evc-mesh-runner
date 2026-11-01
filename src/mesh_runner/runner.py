@@ -45,12 +45,15 @@ from . import prompt as prompts
 from . import repo_admission
 from . import workspace_requests
 from . import auth
+from . import launch_readiness
 from . import interactive
 from . import watchdog
-from .adapters.base import Adapter, Launch, TurnResult, group_alive, interrupt_group, pid_reused, proc_stamp
+from .adapters.base import Adapter, Launch, LaunchExecError, TurnResult, group_alive, interrupt_group, pid_reused, proc_stamp
 from .adapters.claude import ClaudeAdapter
 from .adapters.codex import CodexAdapter
 from . import queue_wait
+from . import receipt_wait
+from . import config_receipt
 from . import config as config_mod
 from .config import AgentConfig, RunnerConfig, read_env_file
 from .effects import (BACKLOG_BLOCKER, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SKIP_EVERY, Effects, own_schedule,
@@ -704,6 +707,81 @@ class AgentRunner:
         assignee = task.get("assignee_id") or (task.get("assignee") or {}).get("id")
         return assignee == self.agent_id and self.cats.category(task) in (REVIEWING if mode == "review" else WORKING)
 
+    def _record_launch(self, a: Attempt, resume: bool) -> None:
+        """Attribution event for every launched turn (``a`` already carries this turn's count): the actual intent, the restart reason (a
+        separate axis) and the assignee observed at launch. A foreign assignee is only
+        ``unknown`` here: the runner has no proof of a read-only mention. No secrets or prompts."""
+        try:
+            task = self._task(a.task_id)
+            holder = (task.get("assignee_id") or (task.get("assignee") or {}).get("id") or "") if task else ""
+        except Exception:
+            task, holder = None, ""
+        reason = ""
+        if not resume:
+            # the latest cause recorded since the previous launch of this attempt (durable events)
+            reason = "first_start" if a.turns <= 1 else "session_missing"
+            for _, kind, detail in self.store.events(a.id):
+                if kind == "launch":
+                    reason = "session_missing"
+                elif kind == "restore_session":
+                    reason = json.loads(detail).get("reason", reason)
+                elif kind == "ownership_return":
+                    reason = json.loads(detail).get("restart_reason") or reason
+                elif kind in ("session_missing", "harness_switch", "session_restart"):
+                    reason = kind if kind != "session_restart" else (detail or "session_missing")
+        self.store.event(a.id, "launch", json.dumps({
+            "task": a.task_id, "lane": self.agent.name, "attempt": a.id, "turn": a.turns,
+            "intent": "resume" if resume else "start", "restart_reason": reason,
+            "workspace_id": (self.me or {}).get("workspace_id") or "",
+            "observed_assignee": holder,
+            "classification": "owned" if holder and holder == self.agent_id else "unknown",
+            "source": "runner_admission"}))
+
+    OWNERSHIP_LOSS = "ownership_loss"
+
+    def _note_ownership_loss(self, a: Attempt, task: dict | None) -> None:
+        """The attempt ends because the card left this lane: keep what a later return of the card to
+        this same lane needs to decide, with a stated reason, whether the native session may be kept
+        (``_ownership_return_verdict``). Only ids and observed state, no prompts or tokens."""
+        if not a.turns:
+            return                        # never ran a turn: nothing to carry or explain
+        holder = (task.get("assignee_id") or (task.get("assignee") or {}).get("id") or "") if task else ""
+        status = self.cats.category(task) if task else ""
+        note = {"task": a.task_id, "lane": self.agent.name, "attempt": a.id, "turn": a.turns,
+                "session_id": a.session_id, "harness": a.harness, "cwd": str(self.agent.profile_dir),
+                "workspaces": list(a.workspaces), "observed_assignee": holder, "observed_status": status,
+                "source": "runner_settle"}
+        self.store.mark(self.agent.name, a.task_id, self.OWNERSHIP_LOSS, json.dumps(note))
+        self.store.event(a.id, self.OWNERSHIP_LOSS, json.dumps({k: v for k, v in note.items() if k != "session_id"}))
+
+    def _ownership_return_verdict(self, a: Attempt, task: dict) -> tuple[str, str, dict]:
+        """(session to keep or "", reason, loss note) for the first turn of an attempt admitted after
+        this lane's previous attempt on the card ended by ownership/status loss. No record: a real
+        first start ("" , ""). The session is kept only for a status-only roundtrip (nobody else was
+        the assignee when the attempt ended and the card was not done/cancelled) with the same harness,
+        native root and writable paths; every other case starts fresh with its own reason."""
+        raw = self.store.mark(self.agent.name, a.task_id, self.OWNERSHIP_LOSS)
+        try:
+            note = json.loads(raw[0]) if raw and raw[0] else {}
+        except ValueError:
+            note = {}
+        if not isinstance(note, dict) or not note.get("attempt") or note.get("attempt") == a.id:
+            return "", "", {}
+        prev = self.store.get(note["attempt"])
+        if prev is None or prev.state != "completed" or prev.task_id != a.task_id or prev.agent != a.agent:
+            return "", "ownership_return", note
+        sid = note.get("session_id") or ""
+        if not sid:
+            return "", "session_missing", note
+        if note.get("harness") != a.harness or note.get("cwd") != str(self.agent.profile_dir):
+            return "", "cwd_or_harness_changed", note
+        if note.get("observed_assignee") not in ("", self.agent_id) or note.get("observed_status") in (
+                "done", "cancelled"):
+            return "", "ownership_return", note                # another owner or a terminal card in between
+        if sorted(a.workspaces) != sorted(note.get("workspaces") or []):
+            return "", "path_changed", note
+        return sid, "ownership_return_same_lane", note
+
     def _handed_back(self, task: dict | None) -> bool:
         """The attempt ended with the task in the work statuses for this agent: assigned to it, or
         with no assignee at all (a move_task to todo without assignee_id clears it).
@@ -976,8 +1054,63 @@ class AgentRunner:
                    MESH_RUNNER_CHECKOUT_SESSION=co["session_id"])
         return env
 
+    def _launch_ready(self, a: Attempt, env: dict[str, str], expect: tuple[str, ...]) -> bool:
+        """Filesystem observation only; no child, provider call or new attempt on a hold."""
+        adapter = self.adapter_for(self._routed_harness)
+        binary = adapter.binary
+        additional_binaries = ()
+        required_files = ()
+        if isinstance(adapter, interactive.InteractiveAdapter):
+            # argv[0] is the Python driver; it later execs tmux and the wrapped harness.
+            binary = adapter.python
+            additional_binaries = (adapter.base.binary, adapter.tmux)
+            required_files = (interactive.DRIVER,)
+        observation = launch_readiness.check(
+            binary, self.agent.profile_dir, env,
+            additional_binaries=additional_binaries, required_files=required_files)
+        key = "launch_readiness_hold"
+        previous = self.store.mark(self.agent.name, a.task_id, key)
+        if observation.state in ("ready", "exec-required"):
+            if previous and previous[0]:
+                try:
+                    held = json.loads(previous[0])
+                except (ValueError, TypeError):
+                    held = {}
+                if held.get("state") == "exec-denied":
+                    # Static success cannot erase an authoritative exec refusal.
+                    # Only changed executable/cwd facts permit one ordinary retry.
+                    if held.get("fingerprint") == observation.fingerprint:
+                        self._release_gate(a, "launch-readiness-held")
+                        self._release_checkout(a)
+                        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                        return False
+                    return True  # clear only after the actual Popen succeeds
+                self.store.mark(self.agent.name, a.task_id, key, "")
+                self.store.event(a.id, "launch_readiness_restored", observation.fingerprint)
+            return True
+        return self._hold_launch_readiness(a, observation, expect)
+
+    def _hold_launch_readiness(self, a, observation, expect):
+        key = "launch_readiness_hold"
+        previous = self.store.mark(self.agent.name, a.task_id, key)
+        value = json.dumps(dataclasses.asdict(observation), sort_keys=True)
+        note = "launch readiness " + observation.state + ": " + observation.reason
+        # An unchanged local hold writes no repeated state/event on normal admission.
+        if not previous or previous[0] != value or a.state != "ready" or a.note != note:
+            if not self.store.update_with_marks(a, {key: value}, expect=expect,
+                                               state="ready", pid=0, stamp="", note=note):
+                return False
+            self.store.event(a.id, "launch_readiness_held", observation.state + ":" + observation.reason)
+        self._release_gate(a, "launch-readiness-held")
+        self._release_checkout(a)
+        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        return False
+
     def _spawn(self, a: Attempt, prompt_text: str, resume: bool, expect: tuple[str, ...],
                first_prompt=None, before_spawn=None, env=None) -> bool:
+        env = self._fresh_env() if env is None else env
+        if not self._launch_ready(a, env, expect):
+            return False
         try:
             issued = [self.pool.issue(a.id, p) for p in a.workspaces]
         except WorkspaceError as exc:
@@ -1019,6 +1152,8 @@ class AgentRunner:
         adapter = self.adapter_for(a.harness)
         log_path = self.log_dir() / f"{a.id}.turn{a.turns + 1}.{a.harness}.jsonl"
         sid = a.session_id or (str(uuid.uuid4()) if adapter.session_id_known_upfront else "")
+        # taken before the snapshot: a source that lands between the read and the spawn is not 'read'
+        source_read_at = iso()
         anchor = self._anchor(self._comments(a.task_id))
 
         def build_argv() -> list[str]:
@@ -1095,8 +1230,22 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "auth_launch",
                             json.dumps({"attempt": a.id, "turn": a.turns + 1, "profile": profile}))
         self.store.mark(self.agent.name, a.task_id, "turn_work", self._work_digest(a))
-        proc = adapter.spawn(Launch(argv, self.agent.profile_dir,
-                                   self._writer_launch_env(a, env, expect), prompt_text), log_path)
+        try:
+            proc = adapter.spawn(Launch(argv, self.agent.profile_dir,
+                                       self._writer_launch_env(a, env, expect), prompt_text), log_path)
+        except LaunchExecError as exc:
+            # Re-observe after failure so a late permission loss is held until repair.
+            if not isinstance(adapter, interactive.InteractiveAdapter):
+                observation = launch_readiness.check(adapter.binary, self.agent.profile_dir, env)
+            else:
+                observation = launch_readiness.check(adapter.python, self.agent.profile_dir, env,
+                    additional_binaries=(adapter.base.binary, adapter.tmux), required_files=(interactive.DRIVER,))
+            return self._hold_launch_readiness(a, launch_readiness.Observation(
+                "exec-denied", f"intended-exec-failed:{exc.errno}", observation.fingerprint), expect)
+        previous = self.store.mark(self.agent.name, a.task_id, "launch_readiness_hold")
+        if previous and previous[0]:
+            self.store.mark(self.agent.name, a.task_id, "launch_readiness_hold", "")
+            self.store.event(a.id, "launch_readiness_restored", "intended-exec-succeeded")
         self.procs[a.id] = proc
         delivery = (a.wait or {}).get("ci_delivery") or {}
         marks = {delivery["key"]: delivery["value"]} if delivery else {}
@@ -1115,7 +1264,8 @@ class AgentRunner:
             ok = self.store.update_with_marks(a, marks, expect=expect, state="running", wait=spawn_wait,
                                    pid=proc.pid, stamp=proc_stamp(proc.pid),
                                    log_path=str(log_path), session_id=sid, turns=a.turns + 1,
-                                   turn_started_at=anchor, wake_text="", leader_done_at="", note="")
+                                   turn_started_at=anchor, source_read_at=source_read_at, wake_text="", leader_done_at="",
+                                   note="")
         except Exception:
             interrupt_group(proc.pid, signal.SIGTERM)
             self.procs.pop(a.id, None)
@@ -1125,6 +1275,7 @@ class AgentRunner:
             self.procs.pop(a.id, None)
             raise RuntimeError("attempt state changed while starting; session stopped")
         self._last_beat[a.id] = time.monotonic()
+        self._record_launch(a, resume)
         self.emit("resume" if resume else "start", a, title=a.title[:120], session=sid)
         log.info("%s: %s #%s (%s) pid %s", self.agent.name, "resumed" if resume else "started",
                  a.task8, a.title[:60], proc.pid)
@@ -1164,7 +1315,7 @@ class AgentRunner:
             # never quarantine a guessed/current account in its place.
             profile = hashlib.sha256(f"unrecorded:{a.id}".encode()).hexdigest()[:32]
             self.store.mark(self.agent.name, a.task_id, "auth_unknown", json.dumps({"attempt": a.id, "profile": profile}))
-        auth.hold(self.store, profile)
+        auth.hold(self.store, profile, verification=verification)
         self.store.event(a.id, "auth_failed", str(a.turns))
         if verification:
             self.store.event(a.id, "verification_required", str(a.turns))
@@ -1444,6 +1595,8 @@ class AgentRunner:
             if auth_profile is None and self._handed_back(task):
                 self._keep_handback_wait(a, result)
             done = bool(task) and self.cats.category(task) in ("done", "review", "cancelled")
+            if auth_profile is None:
+                self._note_ownership_loss(a, task)
             # A terminal auth failure is operational evidence, not completion
             # evidence for this task; do not write a completion comment onto a
             # card that has moved to another owner/status.
@@ -1477,6 +1630,7 @@ class AgentRunner:
             # result, not only on stderr): start the task over, same worktrees; once per
             # attempt, so an error text that merely looks like this cannot loop
             self.store.mark(self.agent.name, a.task_id, "session_restart", a.id)
+            self.store.event(a.id, "session_restart", "resume_unsupported" if unsupported else "session_missing")
             self.store.update(a, state="ready", session_id="", wake_text="")
             return
         if (not result.finished and not result.is_error and not result.final_text
@@ -1550,6 +1704,12 @@ class AgentRunner:
             # No typed source, an already served one, or another card's id: nothing to observe.
             self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=QUEUE_WAIT_GUIDANCE))
             return
+        receipt_reg = None
+        if outcome.kind == "receipt":
+            receipt_reg = self._receipt_registration(a, outcome)
+            if receipt_reg is None:
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=receipt_wait.WAIT_GUIDANCE))
+                return
         missing = self._missing_pipeline_wait(a, outcome)
         if missing:
             if sent_back():
@@ -1705,6 +1865,8 @@ class AgentRunner:
                 "note": outcome.note}
         if queue_contract:
             wait.update(kind="queue", until="", queue_request=queue_wait.new_request(a.task_id, queue_contract))
+        if receipt_reg:
+            wait["receipt_reg"] = receipt_reg["reg_id"]
         for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time"):
             if outcome.extra.get(key):
                 wait[key] = outcome.extra[key]
@@ -1807,8 +1969,10 @@ class AgentRunner:
             req = wait["queue_request"]
             mark = queue_wait.intent(a, req, self.agent_id, time.time())
             marks = {queue_wait.key(req): json.dumps(mark)}
-            started = parse_time(a.turn_started_at)
-            if started is not None and started.timestamp() >= req["contract"]["observed_at"]:
+            # turn_started_at is the comment cursor (newest comment's created_at); a source in the
+            # task description has no comment, so the spawn time is the evidence the turn read it.
+            read = [t for t in (parse_time(a.turn_started_at), parse_time(a.source_read_at)) if t is not None]
+            if read and max(read).timestamp() >= req["contract"]["observed_at"]:
                 # The turn that just ended read the thread with this request in it: it is
                 # the owner's first move, so it is not woken a second time for it.
                 marks[queue_wait.delivered_key(self.agent_id, req["contract"])] = "delivered"
@@ -3502,6 +3666,7 @@ class AgentRunner:
                 continue
             self._last_wake_check[a.id] = mono
             self._guard(a, "cap-event", self._check_cap_event)
+        self._scan_receipts()
         waiting = self.store.by_state(self.agent.name, ("waiting",))
         for key in [k for k, j in self._merge_jobs.items()
                     if j["result"] is not None and k not in {w.id for w in waiting}]:
@@ -3639,9 +3804,12 @@ class AgentRunner:
 
         def plain(agent):
             # Names always count; values only for non-credential variables (PATH etc. are config).
-            env = {k: ("" if re.search(r"KEY|TOKEN|SECRET|PASS|AUTH|CRED", k, re.I) else v)
-                   for k, v in agent.env.items()}
-            return dataclasses.replace(agent, repos=[], env=env, key="")
+            def scrub(values):
+                return {k: ("" if re.search(r"KEY|TOKEN|SECRET|PASS|AUTH|CRED", k, re.I) else v)
+                        for k, v in (values or {}).items()}
+            env = scrub(agent.declared_env)
+            return dataclasses.replace(agent, repos=[], env=env, declared_env=env,
+                                       inline_env=scrub(agent.inline_env), key="")
 
         def top(cfg):
             skip = {f.name for f in dataclasses.fields(cfg) if any(w in f.name for w in ("token", "secret", "key", "auth", "credential"))}
@@ -3781,6 +3949,58 @@ class AgentRunner:
             # external response bodies. Existing checkpoint journal is the proof.
             log.warning('workspace request failed for attempt %s; inspect checkpoint journal', a.id)
             return 'failed_preserved'
+
+    def _receipt_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
+        """The live, undelivered registration this card's ``WAIT receipt:`` may bind to, else None."""
+        if not self.cfg.receipt_wait_v1 or a.mode != "work" or outcome.target != a.task8:
+            return None
+        try:
+            reg = receipt_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return None
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or receipt_wait.delivered(self.store, a.agent, a.task_id, reg["reg_id"])):
+            return None
+        return reg
+
+    def _scan_receipts(self) -> None:
+        """Advance every armed receipt registration of this agent, waiting or not: a receipt that
+        lands between arming and the source's declaration stays pending, never lost."""
+        if not self.cfg.receipt_wait_v1:
+            return
+        for task_id in self.store.marked(self.agent.name, receipt_wait.REG_KEY):
+            try:
+                receipt_wait.scan(self.store, self.agent.name, task_id)
+            except Exception as e:             # noqa: BLE001 - an observer fault must not stop the lane
+                log.warning("%s: receipt scan failed: %s", self.agent.name, type(e).__name__)
+
+    def _wake_receipt(self, a: Attempt, task: dict) -> None:
+        """Wake on pending receipt evidence of the exact registration this wait declared. The
+        ready transition and the one-shot delivered mark commit together; ready + wake text is the
+        outbox, so an admission refusal or a crash keeps the event and a repeat cannot add one."""
+        if not self.cfg.receipt_wait_v1 or a.mode != "work":
+            return
+        try:
+            reg = receipt_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or reg["reg_id"] != a.wait.get("receipt_reg") or a.wait.get("target") != a.task8):
+            return                              # another generation or owner: never wakes this attempt
+        reg_id = reg["reg_id"]
+        evidence = receipt_wait.scan(self.store, a.agent, a.task_id)
+        if (not evidence or evidence.get("reg_id") != reg_id
+                or receipt_wait.delivered(self.store, a.agent, a.task_id, reg_id)):
+            return
+        # validate() runs after the delivered mark is written in the same transaction: it only
+        # re-reads that the evidence and this registration are still the ones being delivered
+        still = lambda: (receipt_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None  # noqa: E731
+                         and receipt_wait.registration(self.store, a.agent, a.task_id)["state"] == "armed")
+        event = receipt_wait.event_text(evidence)
+        if self.store.update_with_marks(a, {receipt_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                                        expect="waiting", expect_wait=a.wait, validate=still,
+                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+            self.emit("wake", a, event="receipt delivered")
 
     def _wake_queue(self, a: Attempt, task: dict) -> None:
         # Queue demand never falls through to age/recheck/error-budget wakes.
@@ -3963,6 +4183,7 @@ class AgentRunner:
         task = self._task(a.task_id)
         if not self._still_ours(task, a.mode):
             queue_wait.cancel(self.store, a)
+            self._note_ownership_loss(a, task)
             self._finish(a, "completed", "task left the agent while waiting")
             return
         comments = None
@@ -3995,6 +4216,9 @@ class AgentRunner:
                 return
         if a.wait.get("kind") == "queue":
             self._wake_queue(a, task)
+            return
+        if a.wait.get("kind") == "receipt":
+            self._wake_receipt(a, task)
             return
         # Observers mutate nested seen state. Keep both the live attempt and
         # its CAS baseline isolated from the working observation/effects copy.
@@ -4382,6 +4606,7 @@ class AgentRunner:
     def _resume_one(self, a: Attempt) -> None:
         task = self._task(a.task_id)
         if not self._still_ours(task, a.mode):
+            self._note_ownership_loss(a, task)
             self._finish(a, "completed", "task left the agent before resuming")
             return
         scope = self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY)
@@ -4419,6 +4644,9 @@ class AgentRunner:
             self._suspend_held_ready(a)
             self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
             return                               # the gate keeps refusing this review: noticed, not retried
+        env = self._fresh_env()
+        if not self._launch_ready(a, env, ("ready",)):
+            return
         reason, gate = self._gate("reserve", a.task_id, a.mode, a)
         if not reason:
             if not a.checkout.get("token") and not self._acquire(a):
@@ -4442,8 +4670,9 @@ class AgentRunner:
         self._clear_hold_log(a.task8, "resume")
         self._remember_gate(a, gate)
         restored = []
+        fresh_paths: list[str] = []
+        prior_workspaces = list(a.workspaces)
         try:
-            env = self._fresh_env()
             blocked = self._auth_blocked(a, env)
             if blocked:
                 self._authentication_failed(a, blocked)
@@ -4451,6 +4680,7 @@ class AgentRunner:
             if prior_scope:
                 task = self._task(a.task_id)  # the checkout may have changed the request scope
                 if not self._still_ours(task, a.mode):
+                    self._note_ownership_loss(a, task)
                     self._finish(a, "completed", "task left the agent before resuming")
                     return
                 if self.agent.policy.human_gate and task.get("human_gate"):
@@ -4468,6 +4698,23 @@ class AgentRunner:
                     self._give_up(a, task, f"stopped after {a.turns} turns on this task")
                 return
             journal = self.pool._checkpoint_rows(a.id)
+            normal_rows = self.pool.rows() if not journal else []
+            normal_leased_rows = [r for r in normal_rows
+                                  if r["attempt"] == a.id and r["state"] == "leased"]
+            normal_leased_paths = {r["path"] for r in normal_leased_rows}
+            normal_held_paths = {r["path"] for r in normal_rows
+                                 if r["attempt"] == a.id and r["state"] == "held"}
+            normal_leased_repos = {r["pool"].split("/", 1)[1] for r in normal_leased_rows}
+            normal_configured_repos = {r.name for r in self.agent.repos}
+            needs_normal_admission = (
+                not a.workspaces
+                or bool(normal_held_paths.intersection(a.workspaces))
+                or (bool(normal_held_paths) and (
+                    set(a.workspaces) != normal_leased_paths
+                    or normal_leased_repos != normal_configured_repos
+                    or len(normal_leased_rows) != len(normal_configured_repos)
+                ))
+            )
             if journal and any(r["phase"] != "active" for r in journal):
                 # Finish an interrupted release even below the disk floor: verified
                 # checkpoints make returning source slots safe and may free space.
@@ -4504,23 +4751,40 @@ class AgentRunner:
                     self._log_hold("resume", a.task8, "no free worktree", episode="resume workspace")
                     return
                 paths, restored = self.pool.restore(a.id, expected_repos=expected_repos)
-                # Native sessions cannot promise cwd migration, even when a slot path happens
-                # to be reused. Start fresh and explicitly carry the old context into prompt.
-                self.store.update(a, workspaces=paths, session_id="", pid=0, stamp="")
+                # Native sessions cannot promise cwd migration. Only a proven same-path restore
+                # of this attempt's own session keeps it (the spawn still checks that the
+                # harness knows the session); anything else starts fresh with the old context
+                # carried into the prompt, and the reason is recorded.
+                keep, reason = self._restore_session_verdict(a, paths, restored)
+                self.store.event(a.id, "restore_session", json.dumps(
+                    {"task": a.task_id, "lane": self.agent.name, "attempt": a.id, "turn": a.turns + 1,
+                     "intent": "resume" if keep else "start", "reason": reason,
+                     "workspaces": len(paths)}))
+                self.store.update(a, workspaces=paths, session_id=a.session_id if keep else "",
+                                  pid=0, stamp="")
                 self.store.db.execute("UPDATE workspace_checkpoints SET phase='active' "
                                       "WHERE owner=? AND attempt=?", (self.pool.owner, a.id))
-            elif not a.workspaces and not journal:
+            elif not journal and needs_normal_admission:
                 owned = [r for r in self.pool.rows() if r["attempt"] == a.id]
                 if not (was_metadata and metadata_only(task, a.mode) and not owned):
                     # Fence the code transition before the first lease. A crash or
                     # label toggle cannot turn partially leased work back into metadata.
                     self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY,
                                     json.dumps({"attempt": a.id, "scope": "workspace"}))
-                    by_repo = {r["pool"].split("/", 1)[1]: r for r in owned}
+                    held_paths = {r["path"] for r in owned if r["state"] == "held"}
+                    leased = [r for r in owned if r["state"] == "leased"]
+                    by_repo = {r["pool"].split("/", 1)[1]: r for r in leased}
                     configured = {r.name for r in self.agent.repos}
-                    if (len(by_repo) != len(owned) or set(by_repo) - configured
-                            or any(r["state"] != "leased" for r in owned)):
+                    listed = set(a.workspaces)
+                    active_paths = {r["path"] for r in leased}
+                    if (len(by_repo) != len(leased) or set(by_repo) - configured
+                            or any(r["state"] not in ("leased", "held") for r in owned)
+                            or listed - active_paths - held_paths):
                         raise WorkspaceError("workspace transition: existing leases require operator review")
+                    # Held paths remain ledger evidence, never admitted workspaces.
+                    if listed & held_paths:
+                        self.store.update(a, workspaces=sorted(listed - held_paths))
+                        a = self.store.get(a.id)
                     if (self.pool.disk_hold() or any(self.pool.full(r.name) for r in self.agent.repos
                                                     if r.name not in by_repo)):
                         self._release_gate(a, "workspace-admission-held")
@@ -4528,8 +4792,14 @@ class AgentRunner:
                         self.store.update(a, pid=0, stamp="")
                         self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
                         return
-                    paths = [by_repo[r.name]["path"] if r.name in by_repo
-                             else str(self.pool.lease(a.id, r.name)) for r in self.agent.repos]
+                    paths = []
+                    for repo in self.agent.repos:
+                        if repo.name in by_repo:
+                            paths.append(by_repo[repo.name]["path"])
+                        else:
+                            path = str(self.pool.lease(a.id, repo.name))
+                            paths.append(path)
+                            fresh_paths.append(path)
                     self.store.update(a, workspaces=paths, pid=0, stamp="",
                                       wake_text=a.wake_text + "\n[runner] Normal repository admission "
                                       "completed. Use only these leased workspaces for code: "
@@ -4552,8 +4822,12 @@ class AgentRunner:
             self._resume_hold[a.id] = time.monotonic() + delay
             raise
         self._clear_hold_log(a.task8)                 # resumed: every hold episode of this task is over
+        first_start = a.turns == 0 and not a.session_id
+        before_spawn = observed = None
+        first_text = None
         def first():
-            text = self._first_prompt(task, a.mode, a.workspaces, attempt_id=a.id)
+            text = (first_text if first_text is not None else
+                    self._first_prompt(task, a.mode, a.workspaces, attempt_id=a.id))
             if restored:
                 context = [{"previous_session": m["metadata"].get("session_id", ""),
                             "previous_workspaces": m["metadata"].get("workspaces", []),
@@ -4565,13 +4839,28 @@ class AgentRunner:
             return text
    # noqa: E731
         try:
+            if first_start:
+                first_text, before_spawn, observed = self._prepare_first_start(a, task)
             if not a.session_id:
-                started = self._spawn(a, first(), resume=False, expect=("ready",), env=env)
+                started = self._spawn(a, first(), resume=False, expect=("ready",), env=env,
+                                      **({"before_spawn": before_spawn} if before_spawn else {}))
             else:
                 text = ((a.wake_text or prompts.wake_prompt(task, "resumed")) + self._news_since_last_turn(a)
                         + self._admission_notice(a))
                 started = self._spawn(a, text, resume=True, expect=("ready",), first_prompt=first, env=env)
+            if not started and fresh_paths:
+                current = self.store.get(a.id)
+                if (current and current.state == "ready" and current.pid == 0
+                        and current.note.startswith("launch readiness ")):
+                    # Only leases allocated by this recovery attempt may be returned.
+                    # release() still holds dirty/non-repository-clean slots for inspection.
+                    self.pool.release(a.id, paths=fresh_paths)
+                    self.store.update(current, workspaces=prior_workspaces)
+                    self.store.event(a.id, "resume_readiness_fresh_slots_reconciled",
+                                     json.dumps({"count": len(fresh_paths)}))
             if started:
+                if first_start:
+                    self._first_start_succeeded(a, task, observed)
                 # A passing start gate alone does not end the hold: fresh human,
                 # auth and workspace admission can still refuse the same attempt.
                 self.store.mark(a.agent, a.task_id, "workspace_ready_hold", "")
@@ -4581,6 +4870,23 @@ class AgentRunner:
             if not (cur and cur.pid):              # the turn did not start: nothing will settle it
                 self._release_gate(a, "not-started")
             raise
+
+    def _restore_session_verdict(self, a: Attempt, paths: list[str], restored: list[dict]) -> tuple[bool, str]:
+        """(keep the native session, reason) after a checkpoint restore of this attempt.
+
+        Kept only when every restored workspace is at the very path the session ran in, the
+        checkpoint recorded this attempt's own session/harness/cwd, and nothing changed since.
+        """
+        if not a.session_id:
+            return False, "session_missing"
+        meta = [m.get("metadata", {}) for m in restored]
+        if not meta or any(m.get("session_id") != a.session_id for m in meta):
+            return False, "session_unverified"
+        if any(m.get("harness") != a.harness or m.get("cwd") != str(self.agent.profile_dir) for m in meta):
+            return False, "cwd_or_harness_changed"
+        if sorted(paths) != sorted(a.workspaces) or any(sorted(m.get("workspaces", [])) != sorted(paths) for m in meta):
+            return False, "path_changed"
+        return True, "workspace_restore_same_path"
 
     def _news_since_last_turn(self, a: Attempt) -> str:
         since = parse_time(a.turn_started_at)
@@ -5973,15 +6279,23 @@ class AgentRunner:
         return started
 
     def _start_attempt(self, task: dict, mode: str, a: Attempt, backoff: float) -> bool:
-        if not self._acquire(a):
-            self.store.update(a, state="aborted", note="checkout refused")
-            self._task_backoff[task["id"]] = backoff
-            return False
+        # Cold readiness holds must retain the requested scope across restart.
+        # This is not admission: checkout, ownership and fresh scope are still
+        # checked below, and recovery revalidates the request before any lease.
+        self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY,
+                        json.dumps({"attempt": a.id, "scope":
+                                    "metadata-only" if metadata_only(task, mode) else "workspace"}))
         try:
+            env = self._fresh_env()
+            if not self._launch_ready(a, env, ("starting",)):
+                return False
+            if not self._acquire(a):
+                self.store.update(a, state="aborted", note="checkout refused")
+                self._task_backoff[task["id"]] = backoff
+                return False
             # The pool fetches with the agent's own identity. Reject a known auth
             # hold before taking worktrees or changing product status, including
             # tasks that have never run (and therefore have no progress to park).
-            env = self._fresh_env()
             blocked = self._auth_blocked(a, env)
             if blocked:
                 # A profile hold is durable even without a fallback policy. Keep
@@ -6004,9 +6318,10 @@ class AgentRunner:
                 self._finish(a, "aborted", "workspace admission held after scope refresh")
                 self._task_backoff[a.task_id] = time.monotonic() + GATE_HOLD_SECONDS
                 return False
-            if no_workspace:
-                self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY,
-                                json.dumps({"attempt": a.id, "scope": "metadata-only"}))
+            self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY,
+                            json.dumps({"attempt": a.id, "scope":
+                                        "metadata-only" if no_workspace else "workspace"}))
+            had_workspaces = bool(self.pool.leased_to(a.id))
             paths = [] if no_workspace else [str(self.pool.lease(a.id, r.name)) for r in self.agent.repos]
         except MeshError:
             self._finish(a, "aborted", "task unreadable after checkout; no turn started")
@@ -6049,6 +6364,51 @@ class AgentRunner:
                 self._review_gate_refused(task, reason)
             return False
         self._clear_hold_log(a.task8)                 # started: every hold episode of this task is over
+        prompt, before_spawn, observed = self._prepare_first_start(a, task)
+        keep, why, loss = self._ownership_return_verdict(a, task) if mode == "work" else ("", "", {})
+        if why:
+            self.store.event(a.id, "ownership_return", json.dumps({
+                "task": a.task_id, "lane": self.agent.name, "attempt": a.id, "turn": a.turns + 1,
+                "previous_attempt": loss.get("attempt", ""), "intent": "resume" if keep else "start",
+                "reason": why, "restart_reason": "" if keep else why,
+                "observed_assignee": loss.get("observed_assignee", ""),
+                "observed_status": loss.get("observed_status", ""),
+                "source": "runner_admission"}))
+        if keep:
+            # spawn keeps the fallback: a harness that does not know the session starts fresh in this turn
+            self.store.update(a, session_id=keep)
+            a = self.store.get(a.id) or a
+            first = prompt
+            prompt += ("\n\n[runner] The card returned to this lane after a status roundtrip; this is your "
+                       "own earlier session. Re-read the card's latest comments before continuing.\n")
+        if not self._spawn(a, prompt, resume=bool(keep), expect=("starting",), env=env,
+                           **({"first_prompt": (lambda: first)} if keep else {}),
+                           **({"before_spawn": before_spawn} if before_spawn else {})):
+            # Routing may reload the Attempt inside _spawn; the Store owns state.
+            a = self.store.get(a.id) or a
+            if a.state == "ready" and a.note.startswith("launch readiness "):
+                # Only this cold start's fresh leases may be returned. Resume
+                # holds retain progress; unsafe fresh slots are held by release().
+                if not had_workspaces:
+                    try:
+                        self.pool.release(a.id)
+                    except WorkspaceError:
+                        self.store.event(a.id, "launch_readiness_cleanup_held", "workspace release refused")
+                    self.store.update(a, workspaces=self.pool.leased_paths(a.id))
+                return False
+            # A sibling could have established the hold after our preflight.
+            # Nothing ran, so return these fresh leases instead of filling the pool.
+            self._finish(a, "aborted", a.note)
+            self._task_backoff[task["id"]] = time.monotonic() + GATE_HOLD_SECONDS
+            return False
+        if why:
+            self.store.mark(self.agent.name, a.task_id, self.OWNERSHIP_LOSS, "")   # the verdict is spent by a real launch
+        self._first_start_succeeded(a, task, observed)
+        return True
+
+    def _prepare_first_start(self, a: Attempt, task: dict) -> tuple:
+        """Prepare the first real turn, including recovery before any turn ran."""
+        mode, paths = a.mode, a.workspaces
         # a `model:<name>` label picks the model for every turn of this task
         model = next((str(l)[6:].strip() for l in task.get("labels") or [] if str(l).startswith("model:")), "")
         if model and not MODEL_NAME.fullmatch(model):
@@ -6093,13 +6453,10 @@ class AgentRunner:
             else:
                 prompt += "\n\n" + prompts.wake_prompt(task, event)
             self.store.update(a, wait={**(a.wait or {}), **wait})
-        if not self._spawn(a, prompt, resume=False, expect=("starting",),
-                           **({"before_spawn": before_spawn} if before_spawn else {})):
-            # A sibling could have established the hold after our preflight.
-            # Nothing ran, so return these fresh leases instead of filling the pool.
-            self._finish(a, "aborted", a.note)
-            self._task_backoff[task["id"]] = time.monotonic() + GATE_HOLD_SECONDS
-            return False
+        return prompt, before_spawn, observed
+
+    def _first_start_succeeded(self, a: Attempt, task: dict, observed) -> None:
+        mode = a.mode
         if observed:
             self.store.mark(self.agent.name, task["id"], "cap_observation", "")
         # marks only once the session really started: a failed start must not hold the task
@@ -6112,7 +6469,6 @@ class AgentRunner:
         elif int(task.get("subtask_count") or 0):
             self._remember_children(task)
         self._hold_cache.pop(task["id"], None)
-        return True
 
     def _remember_children(self, task: dict) -> None:
         try:
@@ -6436,13 +6792,19 @@ class Runner:
         """Wake only the agents a Mesh event is about: the assignee in the payload, or the agent known to
         hold ``task_id``. An event nobody can be named for wakes no one: the regular poll finds its
         work. An agent's own comment never wakes it (the runner's own writes must not feed back)."""
-        if kind == "access.restored":
-            from . import access_recovery
+        if kind in ("access.restored", "auth.recheck"):
+            from . import access_recovery, auth_recovery
             try:
-                names = access_recovery.consume(self, payload)
+                consumer = auth_recovery if kind == "auth.recheck" else access_recovery
+                names = consumer.consume(self, payload)
+                if kind == "auth.recheck":
+                    # Invalid/replayed events never drain somebody else's work.
+                    # An interrupted CAS delivery is recovered by the lane loop.
+                    ar = next((ar for ar in self.agents if ar.agent.name in names), None)
+                    return auth_recovery.deliver(self, ar) if ar else []
             except Exception as exc:
                 # A probe/store outage retains the hold; never echo API/hook data.
-                log.warning("access recovery unavailable: %s", type(exc).__name__)
+                log.warning("%s recovery unavailable: %s", kind, type(exc).__name__)
                 return []
             self.wake(names)
             return names
@@ -6494,6 +6856,12 @@ class Runner:
             from .pool_ops import summary
             pool = summary(self.store, self.cfg.pool_root)
             status = {"at": iso(), "unix": stamp, "agents": out, "pool": pool}
+            try:                # bound to this snapshot; a failure never carries a (stale) digest
+                status["receipt"] = config_receipt.build(self.cfg, stamp)
+            except Exception as e:
+                log.warning("config receipt: %s", type(e).__name__)
+                status["receipt"] = {"schema": config_receipt.SCHEMA, "pid": os.getpid(),
+                                     "status_unix": stamp, "error": type(e).__name__}
             if getattr(self, "checkpoint_bytes", None) is not None:
                 status["checkpoints"] = {"bytes": self.checkpoint_bytes,
                                          "budget_bytes": int(self.cfg.checkpoint_budget_gb * 1024 ** 3)}
@@ -6623,8 +6991,20 @@ class Runner:
         try:
             while not stop.is_set():
                 started = time.monotonic()
+                from . import auth_recovery
+                try:
+                    auth_recovery.deliver(self, ar)
+                    pending_auth = auth_recovery.pending(self, ar)
+                except Exception as exc:
+                    log.warning("auth wake delivery unavailable: %s", type(exc).__name__)
+                    pending_auth = {}
                 gen = self._wake_gen.get(ar.agent.name, 0)
-                self._tick_agent(ar)
+                result = self._tick_agent(ar)
+                if "error" not in result and pending_auth:
+                    try:
+                        auth_recovery.acknowledge(self, ar, pending_auth)
+                    except Exception as exc:
+                        log.warning("auth wake acknowledgement unavailable: %s", type(exc).__name__)
                 self._sleep(stop, max(MIN_SLEEP_SECONDS, self.cfg.poll_seconds - (time.monotonic() - started)),
                             ar.agent.name, gen, not_before=started + WAKE_DEBOUNCE_SECONDS)
         except BaseException as e:       # a dead loop must show at once, not as a stale healthy row

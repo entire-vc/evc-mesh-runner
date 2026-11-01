@@ -1,5 +1,6 @@
 """A lane moved to another Claude account must not resume a conversation that account does not hold:
 resuming it would fail with "No conversation found with session ID"."""
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +57,9 @@ class AccountChange(Loop):
         self.assertEqual(a.no_outcome, 0)                                # not a failed turn
         self.assertEqual(a.session_id, done[1]["sid"])
         self.assertIn("session_missing", [k for _, k, _ in r.store.events(a.id)])
+        launches = [json.loads(d) for _, k, d in r.store.events(a.id) if k == "launch"]
+        self.assertEqual([(l["intent"], l["restart_reason"]) for l in launches],
+                         [("start", "first_start"), ("start", "session_missing")])
 
     def test_same_account_resumes_as_before(self):
         t, mesh, r = self.wake_after_wait(True)

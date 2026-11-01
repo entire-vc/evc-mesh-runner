@@ -11,6 +11,7 @@ occupied instead of racing the next writer.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -43,6 +44,20 @@ class Launch:
     cwd: Path
     env: dict[str, str]
     prompt: str
+
+
+# Native loader failures differ by host (Darwin has distinct Mach-O errors).
+_EXEC_ERRNOS = {getattr(errno, name) for name in (
+    "ENOEXEC", "EACCES", "EPERM", "ENOENT", "ENOTDIR", "ELOOP",
+    "EBADARCH", "EBADEXEC", "EBADMACHO", "ELIBBAD") if hasattr(errno, name)}
+
+
+class LaunchExecError(Exception):
+    """The intended Popen failed before returning a process or sending a prompt."""
+
+    def __init__(self, error: OSError):
+        self.errno = error.errno
+        super().__init__(f"intended-exec-failed:{error.errno}")
 
 
 class Adapter:
@@ -123,9 +138,14 @@ class Adapter:
         out = open(log_path, "ab")
         err = open(log_path.with_suffix(".stderr"), "ab")
         try:
-            proc = subprocess.Popen(launch.argv, cwd=str(launch.cwd), env=launch.env,
-                                    stdin=subprocess.PIPE, stdout=out, stderr=err,
-                                    start_new_session=True)
+            try:
+                proc = subprocess.Popen(launch.argv, cwd=str(launch.cwd), env=launch.env,
+                                        stdin=subprocess.PIPE, stdout=out, stderr=err,
+                                        start_new_session=True)
+            except OSError as exc:
+                if exc.errno not in _EXEC_ERRNOS:
+                    raise
+                raise LaunchExecError(exc) from exc
         finally:
             out.close()
             err.close()

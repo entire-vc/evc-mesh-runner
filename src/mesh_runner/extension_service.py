@@ -32,7 +32,7 @@ from typing import Callable
 log = logging.getLogger("mesh_runner")
 
 SECRET_FILE = "extension-signing-secret.json"
-WAKE_EVENTS = frozenset({"task.assigned", "task.updated", "comment.created", "access.restored"})
+WAKE_EVENTS = frozenset({"task.assigned", "task.updated", "comment.created", "access.restored", "auth.recheck"})
 MAX_BODY = 1 << 20
 TOLERANCE_SECONDS = 300
 
@@ -207,7 +207,7 @@ class ExtensionService:
             for key in ("payload", "data"):               # the fields may sit one level down
                 if isinstance(payload.get(key), dict):
                     payload = dict(payload, **payload[key])
-            if kind == "access.restored" and payload.get("workspace_id") != have.get("workspace_id"):
+            if kind in ("access.restored", "auth.recheck") and payload.get("workspace_id") != have.get("workspace_id"):
                 return 403, {"error": "workspace mismatch"}
             self.wake(kind, payload)
             return 202, {"status": "wake"}

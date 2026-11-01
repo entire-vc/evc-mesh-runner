@@ -34,11 +34,18 @@ class PhysicalCheckout(Bench):
         self.assertEqual(r.pool.leased_to(a.id), [recorded])      # lease identity unchanged
         self.assertEqual(r._issued_paths(a.id, [recorded]), [issued])
 
-    def test_plain_path_unchanged_without_checks(self):
-        r, (a,) = self.parked()
-        p = os.path.realpath(r.store.get(a.id).workspaces[0])
-        with patch.object(r.pool, "rows", side_effect=AssertionError("no lookup for a plain path")):
-            self.assertEqual(r.pool.issue(a.id, p), p)
+    def test_alias_physical_path_requires_recorded_live_lease_ownership(self):
+        r, a, _ = self.aliased()
+        p = r.store.get(a.id).workspaces[0]
+        physical = os.path.realpath(p)
+        self.assertNotEqual(p, physical)  # distinguish the alias from its target
+        self.assertEqual(r.pool.issue(a.id, p), physical)
+        # The physical target is not the recorded lease identity and cannot be supplied directly.
+        with self.assertRaisesRegex(WorkspaceError, "not leased to this attempt"):
+            r.pool.issue(a.id, physical)
+        r.pool._set(Path(p), "app", "held", note="preserve as evidence")
+        with self.assertRaisesRegex(WorkspaceError, "not leased to this attempt"):
+            r.pool.issue(a.id, p)
 
     def test_foreign_attempt_refused(self):
         r, a, real = self.aliased()

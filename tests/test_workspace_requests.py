@@ -80,13 +80,36 @@ class WorkspaceRequests(Bench):
         r.mesh.set_category(dependency['id'], 'done')
         r.tick()  # ordinary check_wakes -> ready -> admission -> checkpoint restore
         restored = r.store.get(a.id)
-        self.assertNotEqual(restored.session_id, old_session)
+        # Same slot path, same attempt session: the restore resumes it instead of a fresh start.
+        self.assertEqual(restored.workspaces, a.workspaces)
+        self.assertEqual(restored.session_id, old_session)
+        ev = [json.loads(d) for _, k, d in r.store.events(a.id) if k == 'restore_session']
+        self.assertEqual([(e['intent'], e['reason'], e['task'], e['attempt']) for e in ev],
+                         [('resume', 'workspace_restore_same_path', a.task_id, a.id)])
+        self.settle_all(r)
+        launches = [json.loads(d) for _, k, d in r.store.events(a.id) if k == 'launch']
+        self.assertTrue(launches and launches[-1]['intent'] == 'resume' and launches[-1]['restart_reason'] == ''
+                        and launches[-1]['task'] == a.task_id and launches[-1]['classification'] in ('owned', 'unknown'))
         target = Path(restored.workspaces[0])
         self.assertEqual((target / 'README').read_text(), 'unstaged checkpoint\n')
         self.assertEqual((target / 'private-ignored').read_text(), 'fixture untracked\n')
         self.assertFalse((target / 'cache' / 'ignored').exists())     # git-ignored data is regenerable: not snapshotted
         self.assertEqual(git(target, 'ls-files', '--stage'), staged)
         self.settle_all(r)
+
+    def test_restore_session_verdict_guards_fresh_start(self):
+        r, (a,) = self.parked()
+        paths = list(a.workspaces)
+        meta = {'session_id': a.session_id, 'harness': a.harness, 'cwd': str(self.agent.profile_dir),
+                'workspaces': paths}
+        verdict = lambda att, ps, m: r._restore_session_verdict(att, ps, [{'metadata': m}])
+        self.assertEqual(verdict(a, paths, meta), (True, 'workspace_restore_same_path'))
+        self.assertEqual(verdict(a, ['/elsewhere/slot-9'], meta), (False, 'path_changed'))
+        self.assertEqual(verdict(a, paths, dict(meta, session_id='foreign')), (False, 'session_unverified'))
+        self.assertEqual(verdict(a, paths, dict(meta, cwd='/old/cwd')), (False, 'cwd_or_harness_changed'))
+        self.assertEqual(verdict(a, paths, dict(meta, harness='codex')), (False, 'cwd_or_harness_changed'))
+        self.assertEqual(verdict(replace(a, session_id=''), paths, meta), (False, 'session_missing'))
+        self.assertEqual(r._restore_session_verdict(a, paths, []), (False, 'session_unverified'))
 
     def test_fencing_expiry_and_identity_reject_without_releasing(self):
         for kind in ('expired', 'generation', 'state', 'agent', 'task'):

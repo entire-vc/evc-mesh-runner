@@ -9,7 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from mesh_runner import auth
+from mesh_runner import auth, auth_recovery
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.cli import main
 from mesh_runner.store import Store
@@ -265,8 +265,9 @@ class AuthLoop(Bench):
     def test_held_profile_does_not_restore_suspended_checkpoint_or_lose_its_context(self):
         r, mesh, t, a, profile = self.expire()
         original_session = a.session_id
+        # a changed cwd: the restore starts a fresh session and carries the context in the prompt
         metadata = {"session_id": a.session_id, "harness": a.harness,
-                    "cwd": str(self.agent.profile_dir), "workspaces": a.workspaces, "wait": {"kind": "card"}}
+                    "cwd": "/old/cwd", "workspaces": a.workspaces, "wait": {"kind": "card"}}
         r.pool.suspend(a.id, metadata, writer_stopped=True)
         r.store.update(a, state="ready", wake_text="dependency finished; keep this context")
         r._resume_hold.clear()
@@ -481,6 +482,65 @@ class ClearCommand(unittest.TestCase):
                 self.assertEqual(main(["clear-auth-hold", "--config", str(cfg), "--profile", a]), 0)
             self.assertFalse(auth.held(store, a))
             self.assertTrue(auth.held(store, b))
+
+    def _state(self, store):
+        return {t: store.db.execute(f"SELECT * FROM {t} ORDER BY 1,2,3").fetchall()
+                for (t,) in store.db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")}
+
+    def _setup(self, root):
+        cfg = Path(root) / "runner.toml"
+        cfg.write_text(f'[runner]\nmesh_url="http://unused"\nstate_dir={json.dumps(root)}\n')
+        store = Store(Path(root) / "runner.sqlite")
+        a = "a" * 32
+        auth.hold(store, a)
+        store.mark("auth-route", auth.PREFIX + a, "auth_route_attempt", "attempt-1")
+        # control records the preview must not touch: wake outbox, an unrelated profile hold, an open attempt
+        store.mark(auth.OWNER, "c" * 32, auth_recovery.OUTBOX, json.dumps({"wake": "pending"}))
+        auth.hold(store, "d" * 32)
+        store.create("Khan", "e" * 32, "claude")
+        return cfg, store, a
+
+    def test_dry_run_previews_without_touching_hold_route_mark_or_other_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg, store, a = self._setup(root)
+            before = self._state(store)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = main(["clear-auth-hold", "--config", str(cfg), "--profile", a, "--dry-run"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(auth.held(store, a))
+            self.assertEqual(self._state(store), before)
+            got = json.loads(out.getvalue())
+            self.assertTrue(got["dry_run"])
+            self.assertTrue(got["would_clear"])
+            self.assertNotIn("cleared", got)
+
+    def test_dry_run_on_absent_hold_reports_nothing_to_clear_and_exits_1(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg, store, a = self._setup(root)
+            before = self._state(store)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = main(["clear-auth-hold", "--config", str(cfg), "--profile", "b" * 32, "--dry-run"])
+            self.assertEqual(rc, 1)
+            self.assertFalse(json.loads(out.getvalue())["would_clear"])
+            self.assertEqual(self._state(store), before)
+
+    def test_explicit_clear_removes_hold_and_route_mark_and_repeat_exits_1(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg, store, a = self._setup(root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["clear-auth-hold", "--config", str(cfg), "--profile", a]), 0)
+                self.assertEqual(main(["clear-auth-hold", "--config", str(cfg), "--profile", a]), 1)
+            self.assertFalse(auth.held(store, a))
+            self.assertIsNone(store.mark("auth-route", auth.PREFIX + a, "auth_route_attempt"))
+
+    def test_malformed_profile_is_rejected_even_with_dry_run(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg, store, a = self._setup(root)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main(["clear-auth-hold", "--config", str(cfg), "--profile", "nope", "--dry-run"])
+            self.assertTrue(auth.held(store, a))
 
 
 class AuthRouting(Bench):
