@@ -178,10 +178,9 @@ class AcceptedWaitsAreNeutral(LoopBench):
 
     def test_a_recheck_that_ends_in_a_different_wait_is_progress(self):
         r = self.start("↻ NEXT")
-        r.tick()
         for _ in range(4):
-            self.finish_turn(r)
-            r.tick()
+            # one turn at a time: the reply file is written before the turn starts, never under a running harness
+            self.assertEqual(self.step(r, "↻ NEXT").state, "ready")
         self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor").state, "waiting")    # a different wait: reset
         self.assertEqual(json.loads(r.store.mark(self.agent.name, self.t["id"], LOOP_STREAK)[0])["log"], [])
 

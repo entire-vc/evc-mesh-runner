@@ -28,9 +28,9 @@ def generation(a) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def directory(state: Path, agent: str) -> Path:
+def directory(state: Path, agent: str, spool: str = 'workspace-requests') -> Path:
     # Agent names are not paths. Hashing also supports existing Unicode names.
-    parent = state / 'workspace-requests'
+    parent = state / spool
     root = parent / hashlib.sha256(agent.encode()).hexdigest()
     for path in (parent, root):
         if path.is_symlink():
@@ -133,18 +133,18 @@ def submit(state: Path, agent: str, task: str, attempt: str, token: str,
     return {'request': r, 'receipt': _read(receipt) if receipt.exists() else None}
 
 
-def consume(state: Path, agent: str, handler) -> None:
+def consume(state: Path, agent: str, handler, spool: str = 'workspace-requests', check=None) -> None:
     try:
-        _consume(state, agent, handler)
+        _consume(state, agent, handler, spool, check or validate)
     except (OSError, ValueError):
         # A full/unavailable spool must not stop normal admission. If release
         # preceded receipt failure, the next tick reconciles its durable journal.
         return
 
 
-def _consume(state: Path, agent: str, handler) -> None:
+def _consume(state: Path, agent: str, handler, spool: str, check) -> None:
     try:
-        root = directory(state, agent)
+        root = directory(state, agent, spool)
     except (ValueError, OSError):
         return
     if not root.exists() or root.is_symlink():
@@ -165,7 +165,7 @@ def _consume(state: Path, agent: str, handler) -> None:
             continue
         try:
             r = _read(path)
-            validate(r, agent)
+            check(r, agent)
             if name != r['request_id'] + '.request.json':
                 raise ValueError('filename identity mismatch')
             moment = int(time.time())

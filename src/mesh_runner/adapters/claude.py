@@ -14,7 +14,7 @@ import shutil
 from pathlib import Path
 
 from .base import Adapter, TurnResult, read_events
-from ..auth import is_auth_banner
+from ..auth import is_auth_banner, is_verification_required
 
 
 class ClaudeAdapter(Adapter):
@@ -191,8 +191,12 @@ class ClaudeAdapter(Adapter):
                     "source": "claude.StopFailure", "code": "authentication_failed"})
                 r.auth_failed = r.is_error and (hook_auth or any(is_auth_banner(str(part))
                     for part in [reason, *(errs if isinstance(errs, list) else [])]))
+                # the provider wants an account check no retry can satisfy: same profile hold as auth,
+                # but only the exact terminal reason, never assistant text or a longer message
+                r.verification_required = r.is_error and any(is_verification_required(str(part))
+                    for part in [reason, *(errs if isinstance(errs, list) else [])])
                 output = (ev.get("usage") or {}).get("output_tokens", 0)
-                r.auth_only = r.auth_failed and not had_work and not (isinstance(output, (int, float)) and output > 0)
+                r.auth_only = (r.auth_failed or r.verification_required) and not had_work and not (isinstance(output, (int, float)) and output > 0)
                 parts = [x for x in (reason, errors) if x]
                 if subtype and subtype != "success":
                     parts.insert(0, subtype)

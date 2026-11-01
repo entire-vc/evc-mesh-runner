@@ -323,6 +323,34 @@ class CatalogConfigTest(unittest.TestCase):
         self.assertEqual(ws.home, self.dir / "state" / "catalog" / WS)
         self.assertNotIn("reporter-key", repr(c))
 
+    def observations_cfg(self, value=None):
+        line = "" if value is None else f"execution_observations = {value}"
+        return self.cfg(f"""
+            [catalog]
+            enabled = true
+            manifest = "{self.dir}/accounts.json"
+            {line}
+            [[catalog.workspace]]
+            id = "{WS}"
+            reporter_key_file = "{self.key}"
+        """).catalog
+
+    def test_execution_observations_absent_or_false_is_accepted_and_true_is_refused(self):
+        self.assertTrue(self.observations_cfg().enabled)
+        self.assertTrue(self.observations_cfg("false").enabled)
+        with self.assertRaises(ConfigError):
+            self.observations_cfg("true")
+
+    def test_execution_observations_wrong_type_is_refused_not_enabled(self):
+        for bad in ('"true"', '"false"', "1", "0", "[true]"):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                self.observations_cfg(bad)
+
+    def test_execution_observations_wrong_type_is_refused_even_when_catalog_is_disabled(self):
+        for head in ("[catalog]\nenabled = false", "[catalog]"):
+            with self.subTest(head=head), self.assertRaises(ConfigError):
+                self.cfg(head + '\nexecution_observations = "true"\n')
+
     def test_controller_ref_cannot_differ_from_the_runner_name(self):
         with self.assertRaises(ConfigError):
             self.cfg(f"""
