@@ -492,12 +492,15 @@ class WorkspacePool:
                 continue
             log.info("%s: removed leftover staging worktree %s", self.owner, leftover)
 
-    def release(self, attempt_id: str) -> list[tuple[str, str]]:
-        """Return the attempt's slots. Unsafe slots are held, never wiped.
+    def release(self, attempt_id: str, *, paths: list[str] | None = None) -> list[tuple[str, str]]:
+        """Return owned slots, optionally limited to exact paths. Unsafe slots are held, never wiped.
         Returns [(path, reason)] for slots that were held."""
         kept = []
         rows = [dict(r) for r in self.store.db.execute(
             "SELECT * FROM slots WHERE attempt=? AND state='leased'", (attempt_id,))]
+        if paths is not None:
+            allowed = {str(Path(path)) for path in paths}
+            rows = [row for row in rows if str(Path(row["path"])) in allowed]
         for slot in rows:
             repo_name = slot["pool"].split("/", 1)[1]
             path, repo = Path(slot["path"]), self.repos.get(repo_name)
@@ -902,15 +905,15 @@ class WorkspacePool:
         Inventory and leases keep the recorded identity. When it is a symlink alias of the real directory
         (a parent such as ``worktrees/<lane>`` pointing at a volume), the harness policy of the lane may
         allow only the physical path, so that one is issued, once the slot is proven to be this attempt's
-        own leased worktree. A plain path is returned unchanged without any check. Raises WorkspaceError
-        (fail closed, nothing is modified) for a foreign or stale slot, an unsafe target or a changed
-        admin link."""
-        real = os.path.realpath(path)
-        if real == path:
-            return path
+        own leased worktree. A plain path is returned unchanged only after the same lease check. Raises
+        WorkspaceError (fail closed, nothing is modified) for a foreign or stale slot, an unsafe target
+        or a changed admin link."""
         rows = [r for r in self.rows() if r["path"] == path]
         if len(rows) != 1 or rows[0]["state"] != "leased" or rows[0]["attempt"] != attempt_id:
             raise WorkspaceError(f"issue {path}: slot is not leased to this attempt")
+        real = os.path.realpath(path)
+        if real == path:
+            return path
         # every owner's slots count: the physical target must belong to this one row and nobody else's
         if any(r[0] != path and os.path.realpath(r[0]) == real
                for r in self.store.db.execute("SELECT path FROM slots")):
@@ -941,6 +944,11 @@ class WorkspacePool:
     def leased_to(self, attempt_id: str) -> list[str]:
         return [r[0] for r in self.store.db.execute(
             "SELECT path FROM slots WHERE attempt=? AND state IN ('leased','held')", (attempt_id,))]
+
+    def leased_paths(self, attempt_id: str) -> list[str]:
+        """Paths this attempt may still issue; held slots remain evidence only."""
+        return [r[0] for r in self.store.db.execute(
+            "SELECT path FROM slots WHERE attempt=? AND state='leased' ORDER BY path", (attempt_id,))]
 
     def leased_path(self, attempt_id: str) -> Path | None:
         """The slot ``attempt_id`` holds in the leased state (a held one is no longer its to use)."""

@@ -77,3 +77,16 @@ class LegacyAdminCollision(unittest.TestCase):
                     self.pool.issue("attempt-one", str(self.recorded))
                 renamed.rename(original)
                 (self.physical / ".git").write_text(f"gitdir: {original}\n")
+
+    def test_second_collision_counter_accepted_with_reciprocal_proof(self):
+        renamed = self.admin.with_name("slot-12")
+        self.admin.rename(renamed)
+        (self.physical / ".git").write_text(f"gitdir: {renamed}\n")
+        self.assertEqual(self.pool.issue("attempt-one", str(self.recorded)), str(self.physical))
+
+    def test_physical_target_of_another_owner_refused(self):
+        # the alias leads to Linus's slot-1: same basename and legacy-shaped admin, but another owner's tree
+        self.pool.root.unlink()
+        self.pool.root.symlink_to(self.other.parent.parent, target_is_directory=True)
+        with self.assertRaisesRegex(WorkspaceError, "unsafe physical target|belongs to another worktree"):
+            self.pool.issue("attempt-one", str(self.recorded))

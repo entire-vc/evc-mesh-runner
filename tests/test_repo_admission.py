@@ -1,6 +1,7 @@
 """Scoped additive repo admission: new repo attached, existing state preserved, fail closed."""
 import copy
 import json
+import os
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -89,8 +90,10 @@ class RepoAdmission(Bench):
         self.assertEqual(len(r.store.get(a.id).workspaces), 2)
         self.assertEqual(len(r.pool.leased_to(a.id)), 2)
 
-    def reject(self, want, **kw):
+    def reject(self, want, session_env=None, **kw):
         r, (a,) = self.parked()
+        if session_env:
+            r._apply_env({**os.environ, **session_env})
         snapshot = (r.store.get(a.id).workspaces, sorted(r.pool.leased_to(a.id)))
         _, status = self.ask(r, a, **kw)
         self.assertEqual(status, want)
@@ -110,15 +113,49 @@ class RepoAdmission(Bench):
 
     def test_agent_env_credential_rotation_ok_but_runtime_env_change_is_drift(self):
         r, (a,) = self.parked()
-        self.agent.env['API_TOKEN'] = 'old'
+        self.agent.env['API_TOKEN'] = self.agent.declared_env['API_TOKEN'] = 'old'
         rotated = self.fresh()
-        rotated.agents[0].env = {**self.agent.env, 'API_TOKEN': 'new'}
+        rotated.agents[0].env = rotated.agents[0].declared_env = {**self.agent.env, 'API_TOKEN': 'new'}
         self.assertEqual(self.ask(r, a, fresh=rotated)[1], 'admitted')
+
+    def test_inline_credential_rotation_is_not_drift(self):
+        r, (a,) = self.parked()
+        self.agent.inline_env = {'API_TOKEN': 'old'}
+        rotated = self.fresh()
+        rotated.agents[0].inline_env = {'API_TOKEN': 'new'}
+        self.assertEqual(self.ask(r, a, fresh=rotated)[1], 'admitted')
+
+    def test_inline_path_change_rejected(self):
+        changed = self.fresh()
+        changed.agents[0].inline_env = {'PATH': '/other'}
+        self.reject('rejected_config', fresh=changed)
 
     def test_runtime_env_change_rejected(self):
         changed = self.fresh()
-        changed.agents[0].env = {**self.agent.env, 'PATH': '/other'}
+        changed.agents[0].env = changed.agents[0].declared_env = {**self.agent.env, 'PATH': '/other'}
         self.reject('rejected_config', fresh=changed)
+
+    def test_session_env_applied_by_a_turn_is_not_drift(self):
+        # the real parser path: env command output -> _read_env -> _apply_env mutates agent.env
+        r, (a,) = self.parked()
+        out = f'PATH={os.environ["PATH"]}:/routed/bin\nCLAUDE_CONFIG_DIR=/acct\nHTTPS_PROXY=http://p\nMESH_RUNNER_LANE=x\n'
+        done = type('P', (), {'returncode': 0, 'stdout': out, 'stderr': ''})()
+        declared = dict(r.agent.env)             # what a reload of the config file declares
+        r.agent.env_command = ['env-cmd']
+        with patch('mesh_runner.runner.subprocess.run', return_value=done):
+            r._fresh_env()
+        self.assertTrue(r.agent.env['PATH'].endswith('/routed/bin'))
+        before = list(r.store.get(a.id).workspaces)
+        fresh = self.fresh(env_command=['env-cmd'])
+        fresh.agents[0].env = declared
+        _, status = self.ask(r, a, fresh=fresh)
+        self.assertEqual(status, 'admitted')
+        self.assertEqual(r.store.get(a.id).workspaces[:1], before)
+
+    def test_session_env_still_leaves_declared_drift_rejected(self):
+        changed = self.fresh()
+        changed.agents[0].env = changed.agents[0].declared_env = {**self.agent.declared_env, 'PATH': '/other'}
+        self.reject('rejected_config', fresh=changed, session_env={'PATH': '/routed/bin'})
 
     def test_unreviewed_spec_rejected(self):
         self.reject('rejected_spec_mismatch', spec=replace(self.extra, max_slots=3))

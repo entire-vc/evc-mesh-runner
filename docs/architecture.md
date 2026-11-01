@@ -93,6 +93,7 @@ dir missing, or reused by another worktree after it disappeared) is held with
 `worktree admin link requires operator inspection` and is never leased, snapshotted,
 restored into, cleaned or evicted; the periodic slot pass also checks free slots and logs
 one warning per slot with the admin dir and listing timestamps.
+Legacy `git worktree add` appended a decimal collision counter to the slot basename (`slot-1` -> `slot-11`, `slot-12`); `WorkspacePool.issue` accepts that unprefixed spelling only after the reciprocal `commondir`/`gitdir` proof above, the lease check and the same owner/repo/slot tail. A foreign repo, foreign back-pointer, other owner's tree, shared physical target or a non-numeric suffix is refused. No migration is needed: nothing on disk is renamed, and the runner release carrying this check is the whole recovery (rollback = the previous release).
 
 ## What the runner does not do
 

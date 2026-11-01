@@ -864,6 +864,11 @@ class ReviewFindings(Bench):
         self.settle_all(r)
         self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True, False])
         self.assertEqual(self.states(r)[t["id"][:8]], "waiting")
+        a = r.store.by_state("builder", ("waiting",))[0]
+        launches = [json.loads(d) for _, k, d in r.store.events(a.id) if k == "launch"]
+        # the harness reported the missing session during the resumed turn: the later fresh launch says so
+        self.assertEqual([(l["intent"], l["restart_reason"]) for l in launches],
+                         [("start", "first_start"), ("resume", ""), ("start", "session_missing")])
 
     def test_no_session_restart_happens_once_per_attempt(self):
         t = task(1)
@@ -3726,7 +3731,7 @@ if __name__ == "__main__":
 
 
 class WaitWorkspaceCheckpoint(Bench):
-    def test_wait_returns_workspace_and_wake_uses_fresh_session(self):
+    def test_wait_returns_workspace_and_wake_resumes_session_on_same_path(self):
         t = task(71)
         self.cfg.workspace_wait_release_minutes = 30
         write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
@@ -3748,9 +3753,175 @@ class WaitWorkspaceCheckpoint(Bench):
         r._resume_one(a)
         current = r.store.get(a.id)
         self.assertEqual(current.state, 'running')
-        self.assertNotEqual(current.session_id, old_sid)
+        self.assertEqual(current.session_id, old_sid)       # same slot path: the native session is kept
         self.assertEqual(Path(current.workspaces[0]).joinpath('README').read_text(), 'checkpoint work')
         self.settle_all(r)
+
+    def test_same_path_restore_with_unknown_native_session_records_session_missing(self):
+        t = task(74)
+        self.cfg.workspace_wait_release_minutes = 30
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.settle_all(r)
+        a = r.store.by_state('builder', ('waiting',))[0]
+        wait = dict(a.wait)
+        wait['started'] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+        r.store.update(a, wait=wait)
+        r._suspend_waiting(a)
+        r.store.update(a, state='ready', wake_text='dependency met')
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        self.adapter.sessions_known = False        # the checkpoint matches, the harness no longer holds the session
+        r._resume_one(a)
+        self.settle_all(r)
+        ev = [(k, json.loads(d)) for _, k, d in r.store.events(a.id) if k in ('restore_session', 'launch')]
+        self.assertEqual(ev[-2][1]['intent'], 'resume')                       # restore verdict said keep
+        self.assertEqual((ev[-1][0], ev[-1][1]['intent'], ev[-1][1]['restart_reason']),
+                         ('launch', 'start', 'session_missing'))              # the launch says why it was fresh
+
+    def test_same_path_restore_then_harness_reports_missing_session_records_session_missing(self):
+        t = task(75)
+        self.cfg.workspace_wait_release_minutes = 30
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.settle_all(r)
+        a = r.store.by_state('builder', ('waiting',))[0]
+        wait = dict(a.wait)
+        wait['started'] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+        r.store.update(a, wait=wait)
+        r._suspend_waiting(a)
+        r.store.update(a, state='ready', wake_text='dependency met')
+        write_replies(self.replies, {t['id'][:8] + ':resume': 'ERROR:No conversation found with session ID: x',
+                                     t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r._resume_one(a)                  # restore keeps the session; the resumed turn then reports it missing
+        self.settle_all(r)
+        r.tick()
+        self.settle_all(r)
+        evs = [(k, json.loads(d) if k in ('launch', 'restore_session') else d)
+               for _, k, d in r.store.events(a.id) if k in ('restore_session', 'launch', 'session_restart')]
+        self.assertEqual([e['intent'] for k, e in evs if k == 'restore_session'], ['resume'])
+        self.assertEqual([(l['intent'], l['restart_reason']) for k, l in evs if k == 'launch'][-2:],
+                         [('resume', ''), ('start', 'session_missing')])
+
+    def test_ownership_return_starts_new_attempt_without_foreign_session(self):
+        t = task(73)
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.settle_all(r)
+        first = r.store.by_state('builder', ('waiting',))[0]
+        # Another agent works the card meanwhile: this lane's attempt ends, its session is not carried back.
+        r.mesh.tasks[t['id']]['assignee_id'] = 'agent-lead'
+        r.tick()
+        self.assertEqual(r.store.get(first.id).state, 'completed')
+        r.mesh.tasks[t['id']]['assignee_id'] = AGENT_ID
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        r.tick()
+        self.settle_all(r)
+        later = [x for x in r.store.by_state('builder', ('waiting', 'running', 'starting', 'ready', 'completed'))
+                 if x.task_id == t['id'] and x.id != first.id]
+        self.assertTrue(later, 'ownership return admitted no new attempt')
+        launches = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'launch']
+        self.assertEqual([(l['intent'], l['restart_reason'], l['attempt']) for l in launches[:1]],
+                         [('start', 'ownership_return', later[0].id)])   # explicit reason, not first_start
+        self.assertEqual(launches[0]['turn'], 1)
+        self.assertNotEqual(later[0].session_id, first.session_id)
+        loss = [json.loads(d) for _, k, d in r.store.events(first.id) if k == 'ownership_loss']
+        self.assertEqual((loss[0]['observed_assignee'], loss[0]['task']), ('agent-lead', t['id']))
+        self.assertNotIn('session_id', loss[0])
+        ret = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'ownership_return']
+        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['previous_attempt'], ret[0]['observed_assignee']),
+                         ('start', 'ownership_return', first.id, 'agent-lead'))
+
+    def _return_roundtrip(self, n, holder=None, mutate=None):
+        t = task(n)
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.settle_all(r)
+        first = r.store.by_state('builder', ('waiting',))[0]
+        r.mesh.tasks[t['id']]['assignee_id'] = holder          # status-only roundtrip: nobody else took the card
+        r.tick()
+        self.assertEqual(r.store.get(first.id).state, 'completed')
+        if mutate:
+            mutate(r)
+        r.mesh.tasks[t['id']]['assignee_id'] = AGENT_ID
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        r.tick()
+        self.settle_all(r)
+        later = [x for x in r.store.by_state('builder', ('waiting', 'running', 'starting', 'ready', 'completed'))
+                 if x.task_id == t['id'] and x.id != first.id]
+        self.assertTrue(later, 'ownership return admitted no new attempt')
+        ret = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'ownership_return']
+        launches = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'launch']
+        return r, first, later[0], ret, launches
+
+    def test_status_only_ownership_return_keeps_own_session(self):
+        r, first, later, ret, launches = self._return_roundtrip(76, holder='')
+        self.assertEqual(later.session_id, first.session_id)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason']),
+                         ('resume', 'ownership_return_same_lane', ''))
+        self.assertEqual((ret[0]['task'], ret[0]['lane'], ret[0]['attempt'], ret[0]['turn'], ret[0]['previous_attempt']),
+                         (first.task_id, 'builder', later.id, 1, first.id))
+        self.assertEqual((launches[0]['intent'], launches[0]['restart_reason']), ('resume', ''))
+        self.assertEqual(r.store.mark('builder', first.task_id, 'ownership_loss')[0], '')   # spent by the launch
+
+    def test_ownership_return_incompatible_root_or_paths_start_fresh_with_reason(self):
+        def move_cwd(r):
+            note = json.loads(r.store.mark('builder', task(77)['id'], 'ownership_loss')[0])
+            note['cwd'] = '/another/native/root'
+            r.store.mark('builder', task(77)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(77, holder='', mutate=move_cwd)
+        self.assertNotEqual(later.session_id, first.session_id)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'cwd_or_harness_changed'))
+        self.assertEqual((launches[0]['intent'], launches[0]['restart_reason']), ('start', 'cwd_or_harness_changed'))
+
+        def other_paths(r):
+            note = json.loads(r.store.mark('builder', first_task, 'ownership_loss')[0])
+            note['workspaces'] = ['/elsewhere']
+            r.store.mark('builder', first_task, 'ownership_loss', json.dumps(note))
+        first_task = task(78)['id']
+        r, first, later, ret, launches = self._return_roundtrip(78, holder='', mutate=other_paths)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'path_changed'))
+
+    def test_ownership_return_after_review_roundtrip_keeps_own_session(self):
+        def reviewed(r):
+            note = json.loads(r.store.mark('builder', task(80)['id'], 'ownership_loss')[0])
+            note['observed_status'] = 'review'
+            r.store.mark('builder', task(80)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(80, holder='', mutate=reviewed)
+        self.assertEqual((ret[0]['intent'], ret[0]['observed_status']), ('resume', 'review'))
+
+    def test_ownership_return_without_recorded_session_says_session_missing(self):
+        def no_session(r):
+            note = json.loads(r.store.mark('builder', task(81)['id'], 'ownership_loss')[0])
+            note['session_id'] = ''
+            r.store.mark('builder', task(81)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(81, holder='', mutate=no_session)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'session_missing'))
+        self.assertEqual(launches[0]['restart_reason'], 'session_missing')
+
+    def test_ownership_loss_is_recorded_even_when_attempt_has_no_session_id(self):
+        t = task(82)
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.settle_all(r)
+        first = r.store.by_state('builder', ('waiting',))[0]
+        r.store.update(first, session_id='')
+        r.mesh.tasks[t['id']]['assignee_id'] = ''
+        r.tick()
+        loss = [json.loads(d) for _, k, d in r.store.events(first.id) if k == 'ownership_loss']
+        self.assertEqual(len(loss), 1)
+
+    def test_ownership_return_to_terminal_card_does_not_borrow_session(self):
+        def terminal(r):
+            note = json.loads(r.store.mark('builder', task(79)['id'], 'ownership_loss')[0])
+            note['observed_status'] = 'done'
+            r.store.mark('builder', task(79)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(79, holder='', mutate=terminal)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'ownership_return'))
 
     def test_wait_never_releases_live_writer_group(self):
         from unittest.mock import patch

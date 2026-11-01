@@ -33,6 +33,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # merge_follow_head = false        # a moved head (server rebase) runs the gate on it instead of waking the author;
     #                                  # the gate alone decides whether the review carries over (fail-closed)
     # merge_queue_hours = 24           # a wait that stays queued this long wakes the agent too
+    # receipt_wait_v1 = false          # enables `WAIT receipt:#<card8>` on an operator-armed receipt registration (docs/receipt-wait.md)
 
     [catalog]                     # optional: apply the runtime catalog and report on it (off by default)
     enabled = false
@@ -208,8 +209,13 @@ class AgentConfig:
     # None = the agent name lower-cased; '' = off (only links and the task id decide).
     gitlab_username: str | None = None
     policy: Policy = field(default_factory=Policy)
+    # ``env`` as declared at load, before any session env is applied to it; repo admission compares
+    # this one, so a normal turn (``_apply_env`` rewrites ``env``) is not config drift.
+    declared_env: dict[str, str] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.declared_env is None:
+            self.declared_env = dict(self.env)
         if self.gitlab_username is None:
             self.gitlab_username = self.name.lower()
         # Built in code with only `env`: those values are the inline ones.
@@ -340,6 +346,7 @@ class RunnerConfig:
     # Directory names a WAIT snapshot leaves out (when nothing under them is tracked): build caches.
     checkpoint_exclude_names: tuple = (".gocache", "node_modules", "target", ".venv", "__pycache__", "var")
     queue_wait_freshness_v1: bool = False  # machine refill WAIT only; shared state_dir protocol files
+    receipt_wait_v1: bool = False      # `WAIT receipt:#<card8>` on an operator-armed Telegram receipt registration
     max_wait_hours: float = 6.0
     # Which comments by other agents end a pipeline/MR/time/decision/card/merge wait early. "all":
     # every foreign comment. "addressed": only an @-mention of the waiting agent, a person's comment,
@@ -804,6 +811,7 @@ def load(path: str | Path) -> RunnerConfig:
         checkpoint_budget_gb=_idle_hours(r.get("checkpoint_budget_gb", 4.0), "checkpoint_budget_gb"),
         checkpoint_exclude_names=_exclude_names(r.get("checkpoint_exclude_names")),
         queue_wait_freshness_v1=r.get("queue_wait_freshness_v1") is True,
+        receipt_wait_v1=r.get("receipt_wait_v1") is True,
         max_wait_hours=float(r.get("max_wait_hours", 6.0)),
         time_wait_reason_after_minutes=float(r.get("time_wait_reason_after_minutes", 60.0)),
         short_time_wait_series=int(r.get("short_time_wait_series", 3)),
