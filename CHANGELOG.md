@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.1.30
+
+- Add opt-in durable native-result delivery with enrolled source lineage, exact receiver ACK,
+  restart-safe cursors, explicit terminal ownership and guarded receiver rebinding.
+- Keep native-result observation disabled until an operator enrolls the source and receiver.
+
+## 0.1.29
+
+- Durable launch intent: the exact prompt and refs to mandatory events are journaled and persisted before any native
+  process exists (journal first, then the DB intent). PID, birth and turn are registered before stdin; a CAS or commit
+  refusal keeps the native behind the EOF gate. Queues and wake are consumed only on a matched acknowledgement.
+- A native prompt accepted before the driver died is recovered from native hooks/transcript bound to session, turn and
+  the exact prompt (exact text compare: paste wrapper, line endings and edges only). No new paste, no second writer;
+  an unprovable state stays UNKNOWN (`prompt_delivery_unknown`) with a resolution owner. A fresh Codex session, which
+  has no id before its first input, is bound to the journal at the exact native acceptance.
+- Equivalent headless contract for both harnesses (`headless_acceptance`, `spawn_gate`), `mesh-runner recheck-delivery`.
+- Upgrade/rollback guard `mesh-runner-guarded-launch` (`launch_guard`): the service must start through it; it refuses a
+  target without the capability and any target/config/tree change while a pending intent or UNKNOWN row exists.
+  README "Updating the runner" lists the supported launch path; an unguarded old binary is unsupported.
+
+## 0.1.28
+
+- `reviewer-merge --apply`: the merge-only card is created with the live Todo `status_id` read from the project's
+  statuses (every status row is validated: id, known category; any malformed row refuses before the POST). The status
+  list is read only on the create path, so a repeat apply or a repair of an existing card does not depend on it.
+  New in this version: `docs/reviewer-merge.md` "Positive check after install" (dry-run, apply, same-id repeat).
+
+## 0.1.27
+
+- `archive_root` / `archive_require_mount`: slot archives go to an explicit root on a mounted volume (fail closed
+  when the volume is not the mounted one, no fallback to the internal disk); source files move by same-device atomic
+  rename into a durable quarantine with manifest and restore, no auto-purge. See README "External archive root".
+
+## 0.1.26
+
+- `session-receiver`: opt-in `transport = "iterm"` for a native producer already running in iTerm2: exact terminal session
+  (`unique id` + tty) and producer pid/start/foreground group proved before each injection, bound with host/runner/session
+  ids into the ledger pin and admission record; fail closed, one injector, tmux unchanged. See `docs/session-receiver.md`.
+
+## 0.1.25
+
+- `mesh-runner session-receiver`: the existing-session metadata receiver as a separate opt-in process (pinned producer,
+  shared ledger and lock with the controller receiver, fail closed). See `docs/session-receiver.md`.
+- `session-receiver revoke`: disable/rollback revokes only this receiver's own recorded admission (`DELETE /receivers/:id`),
+  fail closed on unknown/mismatched identity, never reports a failed revoke as success; ledger and producer untouched.
+
 ## 0.1.24
 
 - WAIT observation runs under one shared deadline (`wake_budget_seconds`, default 45); a failed read keeps

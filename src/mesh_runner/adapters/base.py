@@ -19,6 +19,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass
@@ -44,6 +45,8 @@ class Launch:
     cwd: Path
     env: dict[str, str]
     prompt: str
+    on_created: Callable[[subprocess.Popen], None] | None = None
+    gate_path: Path | None = None
 
 
 # Native loader failures differ by host (Darwin has distinct Mach-O errors).
@@ -53,7 +56,7 @@ _EXEC_ERRNOS = {getattr(errno, name) for name in (
 
 
 class LaunchExecError(Exception):
-    """The intended Popen failed before returning a process or sending a prompt."""
+    """The intended native exec failed before the program could accept input."""
 
     def __init__(self, error: OSError):
         self.errno = error.errno
@@ -137,24 +140,61 @@ class Adapter:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         out = open(log_path, "ab")
         err = open(log_path.with_suffix(".stderr"), "ab")
+        status_read = status_write = None
+        argv = launch.argv
+        if launch.gate_path is not None:
+            status_read, status_write = os.pipe()
+            gate = Path(__file__).resolve().parent.parent / 'spawn_gate.py'
+            argv = [sys.executable, str(gate), str(launch.gate_path),
+                    launch.env['_MESH_RUNNER_PROMPT_INTENT'], launch.env['_MESH_RUNNER_PROMPT_SHA256'],
+                    str(status_write), '--', *argv]
         try:
             try:
-                proc = subprocess.Popen(launch.argv, cwd=str(launch.cwd), env=launch.env,
+                proc = subprocess.Popen(argv, cwd=str(launch.cwd), env=launch.env,
                                         stdin=subprocess.PIPE, stdout=out, stderr=err,
-                                        start_new_session=True)
-            except OSError as exc:
-                if exc.errno not in _EXEC_ERRNOS:
-                    raise
-                raise LaunchExecError(exc) from exc
+                                        start_new_session=True,
+                                        pass_fds=() if status_write is None else (status_write,))
+            except BaseException as exc:
+                if status_read is not None:
+                    os.close(status_read)
+                    status_read = None
+                if isinstance(exc, OSError) and exc.errno in _EXEC_ERRNOS:
+                    raise LaunchExecError(exc) from exc
+                raise
         finally:
             out.close()
             err.close()
+            if status_write is not None:
+                os.close(status_write)
         assert proc.stdin is not None
         try:
-            proc.stdin.write(launch.prompt.encode())
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass                       # the process died at once; settle reads its stream
+            try:
+                if launch.on_created is not None:
+                    launch.on_created(proc)  # no native work before registration and complete input
+                proc.stdin.write(launch.prompt.encode())
+            except BrokenPipeError:
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if status_read is not None:
+                with os.fdopen(status_read, 'rb') as status:
+                    status_read = None
+                    result = status.readline(4096)
+                try:
+                    result = json.loads(result)
+                except ValueError:
+                    raise RuntimeError('native-exec-handoff-unconfirmed') from None
+                if result.get('errno') in _EXEC_ERRNOS:
+                    proc.wait(timeout=10)
+                    raise LaunchExecError(OSError(result['errno'], 'native-exec-denied'))
+                if result != {'exec_confirmed': True}:
+                    raise RuntimeError('native-exec-handoff-unconfirmed')
+        finally:
+            if status_read is not None:
+                os.close(status_read)
         return proc
 
 

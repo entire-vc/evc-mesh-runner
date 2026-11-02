@@ -558,7 +558,7 @@ class AuthRouting(Bench):
         self.agent.env_command = [sys.executable, "-c",
             f"from pathlib import Path; print('MESH_RUNNER_HARNESS=codex') if Path({str(route)!r}).exists() else None;"
             "print('MESH_RUNNER_PROFILE=builder')"]
-        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "builder")}
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "builder", native="codex")}
         return route, count
 
     def test_auth_route_preserves_uuid_verified_checkpoint_and_context_without_claude_override(self):
@@ -602,7 +602,7 @@ class AuthRouting(Bench):
         r._authentication_failed(a, profile)
         r = self.runner(mesh)             # no in-memory retry guard survives
         from fakes import FakeProfileAdapter
-        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "builder")}
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "builder", native="codex")}
         for _ in range(3):
             r._resume_hold.clear()
             r.tick()
@@ -735,7 +735,7 @@ class AuthRouting(Bench):
         r, mesh, t, a, profile = self.expire()
         from fakes import FakeProfileAdapter
         self.agent.harness = "codex"
-        r.adapter = FakeProfileAdapter(self.adapter.script, "builder")
+        r.adapter = FakeProfileAdapter(self.adapter.script, "builder", native="codex")
         r.alt_adapters = {"claude": self.adapter}
         r.store.mark(self.agent.name, t["id"], "model", "opus")
         r.store.mark(self.agent.name, t["id"], "effort", "low")

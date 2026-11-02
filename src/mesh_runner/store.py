@@ -120,6 +120,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        from .maintenance import SCHEMA as MAINTENANCE_SCHEMA
+        self.db.executescript(MAINTENANCE_SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(attempts)")}
         for col, default in (("stamp", ""), ("leader_done_at", ""), ("mode", "work"), ("source_read_at", "")):
             if col not in cols:

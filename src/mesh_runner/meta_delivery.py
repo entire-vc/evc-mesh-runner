@@ -199,7 +199,9 @@ class MetaClient:
         def open_with_headers(req, timeout=None):
             req.add_header("X-Agent-Key", self._credential)
             req.add_header("X-Runner-Token", self._token)
-            return real(req, timeout=timeout)
+            resp = real(req, timeout=timeout)
+            self._last_status = getattr(resp, "status", None)         # the revoke must see the exact 204, not "no error"
+            return resp
         self._mesh = MeshClient(base_url, "", timeout=timeout, opener=open_with_headers)
         self._mesh.base = base_url.rstrip("/") + "/api/v1/runner/existing-session"
 
@@ -215,9 +217,20 @@ class MetaClient:
         rev = got.get("admission_revision")
         if not isinstance(rev, int) or isinstance(rev, bool):
             raise MeshError(0, "registration answer has no admission_revision")
+        if not is_uuid(got.get("receiver_id")):                    # an admission that cannot be named cannot be revoked
+            raise MeshError(0, "registration answer has no valid receiver_id")
         self.admission_revision = rev
         self.receiver_id = got.get("receiver_id")
         return got
+
+    def revoke(self, receiver_id: str) -> None:
+        """Frozen ``DELETE /receivers/:receiver_id`` (204): revokes exactly that admission. Any other answer raises."""
+        if not is_uuid(receiver_id):
+            raise MeshError(0, "receiver_id is not a uuid")
+        self._last_status = None
+        self._mesh._request("DELETE", f"/receivers/{receiver_id}")
+        if self._last_status != 204:
+            raise MeshError(self._last_status or 0, "revoke was not answered with 204")
 
     def pending(self, identity: Identity) -> list[dict]:
         out = self._mesh._request("GET", "/deliveries", None, {"host_id": identity.fields["host_id"],

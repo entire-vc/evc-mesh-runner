@@ -149,38 +149,41 @@ class TypedCI(Bench):
         r._wake_one(a)
         self.assertEqual(a.state,'ready')
 
-    def test_review_delivery_ack_only_after_successful_spawn(self):
-        from types import SimpleNamespace
+    def test_review_delivery_ack_only_after_native_ack(self):
         r,a,t,gl=self.setup_wait()
         key=ci_delivery_key(a.wait['target'],14845)
         r.store.update(a,wait={**a.wait,'ci_delivery':{'key':key,'value':'fresh'}})
-        with mock.patch.object(r.adapter,'spawn',side_effect=OSError('spawn failed')):
-            with self.assertRaises(OSError):
-                r._spawn(a,'prompt',False,('waiting',))
+        self.refused_spawn(r, a, ('waiting',))
         self.assertIsNone(r.store.mark(self.agent.name,t['id'],key))
-        with mock.patch.object(r.adapter,'spawn',return_value=SimpleNamespace(pid=99999999)):
-            self.assertTrue(r._spawn(a,'prompt',False,('waiting',)))
+        self.assertEqual(a.wait['ci_delivery']['value'], 'fresh')
+        self.native_delivery(r, a)
         self.assertEqual(r.store.mark(self.agent.name,t['id'],key)[0],'fresh')
         self.assertNotIn('ci_delivery',a.wait)
         self.assertEqual(a.state,'running')
 
-    def test_receipt_failure_after_spawn_stops_untracked_writer(self):
-        from types import SimpleNamespace
+    def test_receipt_failure_after_native_ack_retains_durable_outbox(self):
         r,a,t,gl=self.setup_wait()
         key=ci_delivery_key(a.wait['target'],14845)
         r.store.update(a,wait={**a.wait,'ci_delivery':{'key':key,'value':'fresh'}})
-        with mock.patch.object(r.adapter,'spawn',return_value=SimpleNamespace(pid=99999999)), \
-             mock.patch.object(r.store,'mark',side_effect=RuntimeError('receipt failure')), \
-             mock.patch('mesh_runner.runner.interrupt_group') as stop:
-            # auth lookup also reads marks; fail only the transactional receipt write.
-            original=Store.mark.__get__(r.store)
-            r.store.mark.side_effect=lambda *args: (_ for _ in ()).throw(RuntimeError('receipt failure')) if len(args)==4 and args[2]==key else original(*args)
+        write_replies(self.replies, {})
+        self.assertTrue(r._spawn(a, 'prompt', False, ('waiting',)))
+        self.assertIsNone(r.store.mark(a.agent, a.task_id, key))
+        self.assertEqual(r.procs[a.id].wait(timeout=10), 0)
+        original=r.store.mark
+        with mock.patch.object(r.store,'mark',side_effect=lambda *args: (
+                (_ for _ in ()).throw(RuntimeError('receipt failure'))
+                if len(args)==4 and args[2]==key else original(*args))):
             with self.assertRaises(RuntimeError):
-                r._spawn(a,'prompt',False,('waiting',))
-            stop.assert_called_once()
-        self.assertEqual(r.store.get(a.id).state,'waiting')
-        self.assertNotIn(a.id,r.procs)
-        self.assertIsNone(r.store.mark(self.agent.name,t['id'],key))
+                r._reconcile_interactive_prompt(a)
+        kept = r.store.get(a.id)
+        self.assertEqual(kept.state, 'running')
+        self.assertIn('ci_delivery', kept.wait)
+        self.assertIn('interactive_prompt_intent', kept.wait)
+        self.assertIsNone(r.store.mark(a.agent, a.task_id, key))
+        restarted = self.runner(r.mesh, gl)
+        self.assertTrue(restarted._reconcile_interactive_prompt(restarted.store.get(a.id)))
+        self.assertEqual(restarted.store.mark(a.agent, a.task_id, key)[0], 'fresh')
+        self.assertNotIn('interactive_prompt_intent', restarted.store.get(a.id).wait)
 
     def test_other_pipeline_delivery_does_not_reenable_an_old_alias(self):
         r,a,t,gl=self.setup_wait(marker(status='running'))

@@ -49,3 +49,16 @@ class DeliveryByKind(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExactPromptMatch(unittest.TestCase):
+    def test_inner_whitespace_is_part_of_the_prompt(self):
+        from mesh_runner.tui_driver import _exact
+        self.assertNotEqual(_exact('do this'), _exact('dothis'))
+        self.assertNotEqual(_exact('a b'), _exact('a  b'))
+        self.assertNotEqual(_exact('line one\nline two'), _exact('line oneline two'))
+
+    def test_only_edges_and_line_endings_may_differ(self):
+        from mesh_runner.tui_driver import _exact
+        self.assertEqual(_exact('  do this\n'), _exact('do this'))
+        self.assertEqual(_exact('a\r\nb\rc'), _exact('a\nb\nc'))

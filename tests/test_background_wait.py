@@ -293,8 +293,10 @@ class Config(unittest.TestCase):
             tui_driver.main(["--harness", "claude", "--agent", "a", "--state", os.devnull, "--cwd", "/w",
                              "--key", "k", "--background-wait-minutes", "12.5", "--", "claude"])
             self.assertEqual(seen["wait"], 750.0)
-            tui_driver.main(["--harness", "claude", "--agent", "a", "--state", os.devnull, "--cwd", "/w",
-                             "--key", "k", "--", "claude"])
+            # Each driver invocation receives a fresh, complete stdin prompt.
+            with patch.object(sys, "stdin", io.StringIO("p")):
+                tui_driver.main(["--harness", "claude", "--agent", "a", "--state", os.devnull, "--cwd", "/w",
+                                 "--key", "k", "--", "claude"])
             self.assertEqual(seen["wait"], 45 * 60)
 
 

@@ -56,6 +56,7 @@ _MERGE = re.compile(
     r"\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64})" + _EXPLANATION)
 _MERGE_HEAD = re.compile(_WAIT_HEAD + r"merge:")
 _RECEIPT = re.compile(_WAIT_HEAD + r"receipt:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
+_NATIVE = re.compile(_WAIT_HEAD + r"native:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
 _CARD = re.compile(_WAIT_HEAD + r"card:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _QUEUE = re.compile(_WAIT_HEAD + r"queue:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _DECISION = re.compile(_WAIT_HEAD + r"decision:@(?P<handle>[\w.\-]+)" + _EXPLANATION)
@@ -99,7 +100,7 @@ class Outcome:
 
     @property
     def is_wait(self) -> bool:
-        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt"}
+        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "native"}
 
 
 def _explicit_wait_problem(line: str) -> str:
@@ -193,6 +194,10 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         return Outcome("pipeline", f"{m['project']}#{m['id']}", note=note(m), line=line)
     if m := _MR.match(line):
         return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line)
+    if m := _NATIVE.match(line):
+        return Outcome("native", m["id"], note=note(m), line=line)
+    if re.match(_WAIT_HEAD + r"native:", line):
+        return Outcome("unparsed", note="native WAIT requires an exact 64-hex registration", line=line)
     if m := _CARD.match(line):
         if self_task8 and m["id"] == self_task8:
             return Outcome("unparsed", note="a task cannot wait for itself", line=line)

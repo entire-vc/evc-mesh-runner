@@ -13,7 +13,7 @@ from mesh_runner.store import Store, iso
 from mesh_runner.selection import parse_time
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import Runner
-from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT
+from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT, write_replies
 from test_runner import Bench
 
 NOW = 1792500000
@@ -800,6 +800,10 @@ class FirstMove(QueueWait):
         r.resume_ready(1)
         a = r.store.get(a.id)
         self.assertEqual(a.state, 'running')
+        self.assertFalse(q.delivered(r.store, a, r.agent_id, req['contract']))
+        self.assertIn('queue_delivery', a.wait)
+        self.assertEqual(r.procs[a.id].wait(timeout=10), 0)
+        self.assertTrue(r._reconcile_interactive_prompt(a))
         self.assertTrue(q.delivered(r.store, a, r.agent_id, req['contract']))
         self.assertNotIn('queue_delivery', a.wait)
 
@@ -915,18 +919,14 @@ class FirstMove(QueueWait):
                 return real_iso(at)
             return real_iso(*args)
 
-        proc = mock.Mock(pid=99999999)
-        with mock.patch.object(r.adapter, 'spawn', return_value=proc, side_effect=spawn_error), \
-                mock.patch('mesh_runner.runner.iso', side_effect=clock), \
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window'})
+        with mock.patch('mesh_runner.runner.iso', side_effect=clock), \
                 mock.patch('mesh_runner.runner.now', side_effect=lambda: at or dt.datetime.now(dt.timezone.utc)):
             if spawn_error:
-                with self.assertRaises(type(spawn_error)):
-                    r._spawn(a, 'prompt', False, ('waiting',))
+                self.refused_spawn(r, a, ('waiting',))
                 return r, r.store.get(a.id)
-            self.assertTrue(r._spawn(a, 'prompt', False, ('waiting',)))
+            self.native_delivery(r, a, prompt=f'#{t["id"][:8]} prompt', expect=('waiting',))
         a = r.store.get(a.id)
-        pathlib.Path(a.log_path).write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-            result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
         r.settle(a)
         return r, r.store.get(a.id)
 
@@ -948,7 +948,8 @@ class FirstMove(QueueWait):
     def test_failed_spawn_leaves_no_read_evidence(self):
         r, a = self.spawn_then_settle(spawn_error=OSError('not started'))
         self.assertEqual(getattr(a, 'source_read_at', ''), '')
-        self.assertEqual(a.state, 'waiting')
+        self.assertEqual(a.state, 'ready')
+        self.assertTrue(a.wait['interactive_prompt_intent']['retryable'])
 
     def test_skewed_old_comment_does_not_hide_the_spawn_evidence(self):
         # Mesh's newest comment is an hour old (skew-safe cursor stays on Mesh's clock);
@@ -1000,9 +1001,12 @@ class FirstMove(QueueWait):
         self.assertEqual(a.state, 'ready')
         r.mesh.comment_log[t['id']] = []                     # partial read: only the old description is visible
         r._resume_hold.clear()
-        r.resume_ready(1)                                    # real spawn commits delivery + floor
+        r.resume_ready(1)                                    # registration alone cannot commit delivery
         a = r.store.get(a.id)
         self.assertEqual(a.state, 'running')
+        self.assertEqual(q.floor(r.store, a.agent, a.task_id), 0)
+        self.assertEqual(r.procs[a.id].wait(timeout=10), 0)
+        self.assertTrue(r._reconcile_interactive_prompt(a))
         self.assertEqual(q.floor(r.store, a.agent, a.task_id), NOW + 1)
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,

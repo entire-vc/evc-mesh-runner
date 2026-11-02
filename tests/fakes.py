@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 
 from mesh_runner.adapters.claude import ClaudeAdapter
+from mesh_runner.adapters.codex import CodexAdapter
 from mesh_runner.mesh import Checkout, MeshError
 
 # A moment ahead of the real clock for time-WAIT fixtures: the parser refuses a past or bare
@@ -340,10 +341,35 @@ import json, os, re, subprocess, sys
 args = sys.argv[1:]
 sid = args[args.index("--session-id") + 1] if "--session-id" in args else args[args.index("--resume") + 1]
 prompt = sys.stdin.read()
+# Emit the selected native protocol at the external CLI boundary.
+if "--fixture-codex" in args:
+    original_print = print
+    def print(line):
+        event = json.loads(line)
+        if event.get("type") == "system":
+            pass
+        elif event.get("type") == "result":
+            if event.get("is_error"):
+                original_print(json.dumps({"type": "turn.failed", "error": {"message": event["result"]}}))
+            else:
+                original_print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": event["result"]}}))
+                original_print(json.dumps({"type": "turn.completed", "usage": event.get("usage", {})}))
 replies = json.load(open(os.environ["FAKE_REPLIES"]))
 m = re.search(r"#([0-9a-f]{8})", prompt)
 key = m.group(1) if m else ""
 reply = replies.get(key + (":resume" if "--resume" in args else ""), replies.get(key, ""))
+if not reply.startswith("DIE:"):
+    if "--settings" in args:
+        settings = json.load(open(args[args.index("--settings") + 1]))
+        for group in settings.get("hooks", {}).get("UserPromptSubmit", []):
+            for hook in group["hooks"]:
+                code = subprocess.run(hook["command"], shell=True, input=json.dumps({
+                    "hook_event_name": "UserPromptSubmit", "session_id": sid, "prompt": prompt}), text=True).returncode
+                if code == 2:
+                    sys.exit(1)
+    if "--fixture-codex" in args:
+        original_print(json.dumps({"type": "thread.started", "thread_id": sid}), flush=True)
+        original_print(json.dumps({"type": "turn.started"}), flush=True)
 if reply.startswith("GATE:"):
     import time
     from pathlib import Path
@@ -400,15 +426,21 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
 class FakeProfileAdapter(ClaudeAdapter):
     """Codex-shaped: carries a harness profile on the command line."""
 
-    def __init__(self, script: Path, profile: str):
+    def __init__(self, script: Path, profile: str, *, native="claude"):
         super().__init__(binary=sys.executable)
-        self.script, self.profile = script, profile
+        self.script, self.profile, self.native = script, profile, native
+
+    def parse(self, log_path):
+        return CodexAdapter().parse(log_path) if self.native == "codex" else super().parse(log_path)
+
+    def _native_args(self):
+        return ["--fixture-codex"] if self.native == "codex" else []
 
     def start_argv(self, session_id, cwd, add_dirs):
-        return [sys.executable, str(self.script), "--session-id", session_id, "--profile", self.profile]
+        return [sys.executable, str(self.script), "--session-id", session_id, "--profile", self.profile, *self._native_args()]
 
     def resume_argv(self, session_id, cwd, add_dirs):
-        return [sys.executable, str(self.script), "--resume", session_id, "--profile", self.profile]
+        return [sys.executable, str(self.script), "--resume", session_id, "--profile", self.profile, *self._native_args()]
 
 
 class FakeAdapter(ClaudeAdapter):

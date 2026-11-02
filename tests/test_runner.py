@@ -30,6 +30,7 @@ class Bench(unittest.TestCase):
         script = root / "agent.py"
         script.write_text(FAKE_AGENT)
         self.replies, self.calls = root / "replies.json", root / "calls.jsonl"
+        write_replies(self.replies, {})  # a valid native CLI with an empty default reply
         profile = root / "profile"
         profile.mkdir()
         self.agent = AgentConfig(name="builder", key="k", harness="claude", profile_dir=profile,
@@ -90,6 +91,28 @@ class Bench(unittest.TestCase):
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait(timeout=10)
+
+    def native_delivery(self, r, a, prompt="prompt", expect=("ready",)):
+        """Exercise registration and dead-group native ACK without outcome settling."""
+        if not self.replies.exists():
+            write_replies(self.replies, {})
+        self.assertTrue(r._spawn(a, prompt, False, expect))
+        self.assertIn("interactive_prompt_intent", a.wait)
+        proc = r.procs[a.id]
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertTrue(r._reconcile_interactive_prompt(a))
+        return a
+
+    def refused_spawn(self, r, a, expect):
+        """An external spawn exception leaves a durable reservation, never an ACK."""
+        with mock.patch.object(r.adapter, "spawn", side_effect=OSError("not started")):
+            with self.assertRaises(OSError):
+                r._spawn(a, "prompt", False, expect)
+        self.assertEqual(a.state, "starting")
+        self.assertIn("interactive_prompt_intent", a.wait)
+        self.assertFalse(r._reconcile_interactive_prompt(a))
+        self.assertEqual(a.state, "ready")
+        self.assertTrue(a.wait["interactive_prompt_intent"]["retryable"])
 
     def states(self, r):
         return {a.task8: a.state for a in r.store.by_state(self.agent.name, (
@@ -462,6 +485,12 @@ class ReviewFindings(Bench):
         r.tick()
         a = r.store.by_state("builder", ("starting", "running"))[0]
         pid = a.pid
+        from mesh_runner import headless_acceptance, interactive
+        deadline = time.monotonic() + 10
+        while not headless_acceptance.accepted(interactive.agent_dir(self.cfg.state_dir, self.agent.name),
+                                               a.id, a.wait["interactive_prompt_intent"]):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
         mesh.set_category(t1["id"], "done")        # Mesh auto-closes the card ...
         mesh.checkouts.pop(t1["id"], None)         # ... and the server checkout disappears
         r.tick()                                   # first beat: closed seen, session left alone
@@ -481,6 +510,12 @@ class ReviewFindings(Bench):
         r.tick()
         a = r.store.by_state("builder", ("starting", "running"))[0]
         pid = a.pid
+        from mesh_runner import headless_acceptance, interactive
+        deadline = time.monotonic() + 10
+        while not headless_acceptance.accepted(interactive.agent_dir(self.cfg.state_dir, self.agent.name),
+                                               a.id, a.wait["interactive_prompt_intent"]):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
         mesh.set_category(t1["id"], "done")        # closed, but the checkout still answers
         r.tick()
         os.kill(pid, 0)                            # first observation: left alone
@@ -954,6 +989,10 @@ class ReviewFindings(Bench):
         self.assertNotIn("aborted", self.states(r).values())
         self.assertFalse(any("cannot start" in c["body"] for t in (t1, t2) for c in mesh.comment_log.get(t["id"], [])))
         self.assertIn("worktree pool full: app", r.status()["pool_hold"])
+        # The real child writes its prompt ACK under state; settle it before temp cleanup.
+        self.settle_all(r)
+        self.assertEqual(self.states(r), {t1["id"][:8]: "waiting"})
+        self.assertEqual(len(calls(self.calls)), 1)
 
     def test_full_pool_frees_when_a_waiting_task_returns_its_slot(self):
         t1, t2 = task(1), task(2)
@@ -1030,7 +1069,7 @@ class Operations(Bench):
         self.settle_all(runner.agents[0])
         runner.tick()
         kinds = [json.loads(l)["kind"] for l in (self.cfg.state_dir / "events.jsonl").read_text().splitlines()]
-        self.assertEqual(kinds[:2], ["start", "wait"])
+        self.assertEqual(kinds[:3], ["start", "prompt_native_result_recovered", "wait"])
         self.assertIn('mesh_runner_attempts{agent="builder",state="waiting"} 1', self.cfg.metrics_file.read_text())
         self.assertTrue((self.cfg.state_dir / "status.json").exists())
 
@@ -2291,7 +2330,7 @@ class Hardening(Bench):
         self.agent.alt = {"codex": {"profile": "base"}}
         write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
         r = self.runner(mesh)
-        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base")}
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base", native="codex")}
         r.tick()
         self.settle_all(r)
         a = r.store.by_state("builder", ("waiting",))[0]
@@ -2318,7 +2357,7 @@ class Hardening(Bench):
         self.agent.alt = {"codex": {"profile": "base"}}
         write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
         r = self.runner(mesh)
-        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base")}
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base", native="codex")}
         r.tick()
         self.settle_all(r)
         a = r.store.by_state("builder", ("waiting",))[0]

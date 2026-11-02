@@ -7,6 +7,7 @@ from fakes import FakeGitLab, FakeMesh, task
 from test_merge_wait import MergeBench, SHA, TARGET, mr_row
 
 from mesh_runner import reviewer_merge as rm
+from mesh_runner.mesh import MeshError
 
 PROJECT, IID = "g/app", "56"
 OTHER = "b" * 40
@@ -225,6 +226,99 @@ class Request(MergeBench):
         out = ask(mesh, gl, apply=True, ids={})
         self.assertFalse(out["ready"])
         self.assertEqual(mesh.created, [])
+
+
+# the create contract of the canonical backend (createTaskRequest): a body key outside it is HTTP 400
+CREATE_FIELDS = {"title", "description", "priority", "status_id", "parent_task_id", "assignee_id", "assignee_type",
+                 "reviewer_id", "reviewer_type", "due_date", "start_after", "estimated_hours", "labels",
+                 "custom_fields", "delegation_level", "thread_id", "start_after_origin", "start_after_evidence"}
+TODO_ID = "5f1c0a52-0000-4000-8000-00000000d0d0"
+
+
+class WireMesh(FakeMesh):
+    """FakeMesh whose create_task goes through the real MeshClient to a strict-API fake transport."""
+    def __init__(self, tasks, statuses):
+        super().__init__(tasks)
+        self.status_rows = statuses
+        self.bodies = []
+        from mesh_runner.mesh import MeshClient
+
+        def opener(req, timeout):
+            body = json.loads(req.data)
+            self.bodies.append(body)
+            if set(body) - CREATE_FIELDS:
+                import urllib.error
+                raise urllib.error.HTTPError(req.full_url, 400, "bad", {}, io.BytesIO(
+                    b'{"message":"unknown field in request body"}'))
+            resp = io.BytesIO(json.dumps({"task": {"id": FakeMesh.create_task(self, "p1", {k: v for k, v in body.items()
+                                                    if k != "status_id"})["id"]}}).encode())
+            resp.__enter__ = lambda *_: resp
+            resp.__exit__ = lambda *_: None
+            return resp
+        self.client = MeshClient("http://mesh.test", "k", opener=opener)
+
+    def statuses(self, pid):
+        return self.status_rows
+
+    def create_task(self, pid, fields):
+        return self.client.create_task(pid, fields)
+
+
+class Wire(MergeBench):
+    def apply(self, statuses):
+        mesh = WireMesh([source(project_id="p1")], statuses)
+        gl = world()[1]
+        return mesh, ask(mesh, gl, apply=True)
+
+    def test_card_reaches_the_strict_api_with_the_real_todo_status_id(self):
+        mesh, out = self.apply([{"id": "x", "category": "backlog"}, {"id": TODO_ID, "category": "todo"},
+                                {"id": "c", "category": "cancelled"}, {"id": "t", "category": "triage"}])
+        self.assertTrue(out["created"], out)
+        self.assertEqual(len(mesh.bodies), 1)
+        self.assertEqual(mesh.bodies[0]["status_id"], TODO_ID)
+        self.assertNotIn("status", mesh.bodies[0])
+
+    def test_unknown_ambiguous_or_malformed_todo_creates_nothing(self):
+        for rows, why in (([{"id": "x", "category": "done"}], "todo-status-unknown"),
+                          ([{"id": "a", "category": "todo"}, {"id": "b", "category": "todo"}], "todo-status-ambiguous"),
+                          ([{"category": "todo"}], "todo-status-malformed"),
+                          ([{"id": "a", "category": "todo"}, {}], "todo-status-malformed"),
+                          ([{"id": "a", "category": "todo"}, {"id": "b"}], "todo-status-malformed"),
+                          ([{"id": "a", "category": "todo"}, {"id": "b", "category": "nope"}], "todo-status-malformed"),
+                          ([{"id": "a", "category": "todo"}, {"id": "b", "category": ["todo"]}], "todo-status-malformed"),
+                          ("oops", "todo-status-unreadable"), ([], "todo-status-unknown")):
+            mesh, out = self.apply(rows)
+            self.assertFalse(out["ready"], rows)
+            self.assertEqual(out["refusals"], [why])
+            self.assertEqual(mesh.bodies, [])
+
+    def test_unreadable_status_list_refuses_before_post(self):
+        mesh = WireMesh([source(project_id="p1")], [])
+        def boom(pid):
+            raise MeshError(503, "down")
+        mesh.statuses = boom
+        out = ask(mesh, world()[1], apply=True)
+        self.assertEqual((out["ready"], out["refusals"], mesh.bodies), (False, ["todo-status-unreadable"], []))
+
+    def test_repeat_and_repair_do_not_need_the_status_list(self):
+        mesh = WireMesh([source(project_id="p1")], [{"id": TODO_ID, "category": "todo"}])
+        gl = world()[1]
+        first = ask(mesh, gl, apply=True)
+        self.assertTrue(first["created"])
+        def boom(pid):
+            raise MeshError(503, "down")
+        mesh.statuses = boom
+        again = ask(mesh, gl, apply=True)
+        self.assertEqual((again["ready"], again["created"], again["card"]), (True, False, first["card"]))
+        mesh.tasks[first["card"]]["assignee_id"] = None      # a first apply that died before assign
+        repaired = ask(mesh, gl, apply=True)
+        self.assertTrue(repaired.get("repaired"), repaired)
+        self.assertEqual(len(mesh.bodies), 1)
+
+    def test_dry_run_reports_the_same_refusal(self):
+        mesh = WireMesh([source(project_id="p1")], [{"id": "x", "category": "done"}])
+        out = ask(mesh, world()[1])
+        self.assertEqual((out["ready"], out["refusals"]), (False, ["todo-status-unknown"]))
 
 
 class Identity(MergeBench):

@@ -43,15 +43,21 @@ from . import reviewer_merge
 from . import inputs
 from . import prompt as prompts
 from . import repo_admission
+from . import maintenance
+from . import delivery_requests
+from . import headless_acceptance
 from . import workspace_requests
 from . import auth
 from . import launch_readiness
 from . import interactive
+from . import delivery_recovery
+from . import launch_guard
 from . import watchdog
-from .adapters.base import Adapter, Launch, LaunchExecError, TurnResult, group_alive, interrupt_group, pid_reused, proc_stamp
+from .adapters.base import Adapter, Launch, LaunchExecError, TurnResult, group_alive, interrupt_group, pid_reused, proc_stamp, read_events
 from .adapters.claude import ClaudeAdapter
 from .adapters.codex import CodexAdapter
 from . import queue_wait
+from . import native_result_wait, native_result_resume, native_result_rebind
 from . import receipt_wait
 from . import config_receipt
 from . import config as config_mod
@@ -69,7 +75,7 @@ from .wake import (GitHub, GitLab, red_merge_statuses, wait_generation, changed_
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign, target_jobs_state, UnknownJobs)
-from .workspace import DIRTY_HOLD_NOTE, RepoSpec, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, git
+from .workspace import DIRTY_HOLD_NOTE, base_lock as maintenance_lock, RepoSpec, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, git
 from .workspace_scope import (RECEIPT_KEY, metadata_instructions, metadata_only, metadata_receipt,
                               read_only, recorded_scope)
 
@@ -431,7 +437,9 @@ class AgentRunner:
                                    agent.name, agent.profile_dir, cfg.state_dir)
         self.pool = WorkspacePool(store, cfg.pool_root, agent.repos, agent.identity, env=self.env,
                                   owner=agent.name, min_free_gb=cfg.min_free_gb,
-                                  checkpoint_exclude_names=cfg.checkpoint_exclude_names)
+                                  checkpoint_exclude_names=cfg.checkpoint_exclude_names,
+                                  archive_root=cfg.archive_root,
+                                  archive_require_mount=cfg.archive_require_mount)
         self.cats = StatusCategories(self.mesh)
         self.effects = Effects(self.mesh, self.cats, agent.name, enabled=cfg.mesh_effects, store=store,
                                decision_metadata_recipients=tuple(cfg.decision_request_metadata_only_recipients),
@@ -1060,7 +1068,8 @@ class AgentRunner:
         adapter = self.adapter_for(self._routed_harness)
         binary = adapter.binary
         additional_binaries = ()
-        required_files = ()
+        required_files = (Path(__file__).with_name("spawn_gate.py"),)
+        additional_binaries = (sys.executable,)
         if isinstance(adapter, interactive.InteractiveAdapter):
             # argv[0] is the Python driver; it later execs tmux and the wrapped harness.
             binary = adapter.python
@@ -1108,7 +1117,7 @@ class AgentRunner:
         return False
 
     def _spawn(self, a: Attempt, prompt_text: str, resume: bool, expect: tuple[str, ...],
-               first_prompt=None, before_spawn=None, env=None) -> bool:
+               first_prompt=None, before_spawn=None, env=None, prompt_is_complete=False) -> bool:
         env = self._fresh_env() if env is None else env
         if not self._launch_ready(a, env, expect):
             return False
@@ -1122,7 +1131,7 @@ class AgentRunner:
             self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
             return False
         workspaces = [Path(p) for p in issued]
-        if resume and issued != list(a.workspaces):
+        if resume and issued != list(a.workspaces) and not prompt_is_complete:
             prompt_text += ("\n[runner] The sole writable checkout(s) for this task are now "
                             + json.dumps(issued) + ". Use only these physical paths; the earlier paths "
                             + json.dumps([p for p, i in zip(a.workspaces, issued) if p != i])
@@ -1215,7 +1224,8 @@ class AgentRunner:
                 sandboxed = read_only(self._task(a.task_id))
             except MeshError:
                 sandboxed = True
-            prompt_text += metadata_instructions(sandboxed)
+            if not prompt_is_complete:
+                prompt_text += metadata_instructions(sandboxed)
             if sandboxed:
                 argv = adapter.with_read_only(argv)    # enforced by the harness, not only the prompt
         # Session preparation may have consumed free space.
@@ -1223,21 +1233,90 @@ class AgentRunner:
         if self.pool.disk_hold():
             self._disk_hold_attempt(a)
             return False
-        if before_spawn:
-            before_spawn()         # durable authorization fence at the process-creation boundary
+        interactive_driver = isinstance(adapter, interactive.InteractiveAdapter)
         if profile:
             # Record the actual launch environment, not the lane's later route. A turn
             # can finish after another task has changed the lane's active profile.
             self.store.mark(self.agent.name, a.task_id, "auth_launch",
                             json.dumps({"attempt": a.id, "turn": a.turns + 1, "profile": profile}))
         self.store.mark(self.agent.name, a.task_id, "turn_work", self._work_digest(a))
+        native_grant = None
+        if (a.wait or {}).get("native_packet"):
+            try:
+                if not resume or a.harness != "codex" or sid != a.session_id:
+                    raise native_result_wait.Refused("native receiver requires the exact Codex resume")
+                if self.cfg.native_result_dir is None:
+                    raise native_result_wait.Refused("native_result_dir is not configured")
+                prompt_text, native_grant = native_result_resume.prepare_prompt(
+                    native_result_wait.Ledger(self.cfg.native_result_dir),
+                    dataclasses.asdict(a), self._task(a.task_id), self.agent_id, env,
+                    prompt_text, complete=prompt_is_complete)
+            except (native_result_wait.Refused, OSError) as exc:
+                self._hold_native(a, str(exc))
+                return False
+        pending_wait = dict(a.wait or {})
+        if native_grant is not None:
+            pending_wait["native_grant"] = native_grant
+        # Persist the outbox before any child exists. Registration is not delivery.
+        intent = {"version": 1, "token": uuid.uuid4().hex, "turn": a.turns + 1,
+                  "log_path": str(log_path), "source_read_at": source_read_at,
+                  "sha256": hashlib.sha256(prompt_text.encode()).hexdigest(), "prompt": prompt_text,
+                  "resume": resume, "workspaces": list(a.workspaces), "harness": a.harness,
+                  "kind": "interactive" if interactive_driver else "headless", "session_id": sid,
+                  "prior": {key: getattr(a, key) for key in
+                            ("turns", "session_id", "log_path", "turn_started_at", "source_read_at")}}
+        # Journal first: a crash between the two writes leaves an orphan journal that no intent
+        # names (harmless), never an intent without a journal that recovery cannot classify.
+        interactive.write_delivery(interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id,
+                                   {"version": 1, "token": intent["token"], "sha256": intent["sha256"],
+                                    "phase": "reserved"})
+        if not self.store.update(a, expect=expect, state="starting",
+                                 wait={**pending_wait, "interactive_prompt_intent": intent}):
+            return False
+        expect = ("starting",)
+        if before_spawn:
+            before_spawn()     # reservation may consume input only after the durable outbox exists
+
+        def registered(proc):
+            self.procs[a.id] = proc
+            spawn_wait = dict(a.wait or {})
+            try:
+                ok = self.store.update_with_marks(a, {}, expect=expect, state="running", wait=spawn_wait,
+                                       pid=proc.pid, stamp=proc_stamp(proc.pid),
+                                       log_path=str(log_path), session_id=sid, turns=a.turns + 1,
+                                       turn_started_at=anchor,
+                                       source_read_at="",
+                                       wake_text=a.wake_text, leader_done_at="", note="")
+            except Exception:
+                interrupt_group(proc.pid, signal.SIGTERM)
+                self.procs.pop(a.id, None)
+                raise
+            if not ok:   # the attempt changed under us: do not leave an untracked writer behind
+                interrupt_group(proc.pid, signal.SIGTERM)
+                self.procs.pop(a.id, None)
+                raise RuntimeError("attempt state changed while starting; session stopped")
+
+        launch_env = self._writer_launch_env(a, env, expect)
+        if intent:
+            launch_env["_MESH_RUNNER_PROMPT_INTENT"] = intent["token"]
+            launch_env["_MESH_RUNNER_PROMPT_SHA256"] = intent["sha256"]
+        if not interactive_driver and a.harness == "claude":
+            argv = headless_acceptance.claude_argv(argv,
+                interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent)
         try:
             proc = adapter.spawn(Launch(argv, self.agent.profile_dir,
-                                       self._writer_launch_env(a, env, expect), prompt_text), log_path)
+                                       launch_env, prompt_text,
+                                       registered, None if interactive_driver else interactive.delivery_path(
+                                           interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id)), log_path)
         except LaunchExecError as exc:
+            self.procs.pop(a.id, None)
+            self.store.update(a, expect=a.state, state="starting", wait=pending_wait,
+                              pid=0, stamp="", leader_done_at="", **intent["prior"])
+            expect = ("starting",)
             # Re-observe after failure so a late permission loss is held until repair.
             if not isinstance(adapter, interactive.InteractiveAdapter):
-                observation = launch_readiness.check(adapter.binary, self.agent.profile_dir, env)
+                observation = launch_readiness.check(adapter.binary, self.agent.profile_dir, env,
+                    additional_binaries=(sys.executable,), required_files=(Path(__file__).with_name("spawn_gate.py"),))
             else:
                 observation = launch_readiness.check(adapter.python, self.agent.profile_dir, env,
                     additional_binaries=(adapter.base.binary, adapter.tmux), required_files=(interactive.DRIVER,))
@@ -1247,34 +1326,6 @@ class AgentRunner:
         if previous and previous[0]:
             self.store.mark(self.agent.name, a.task_id, "launch_readiness_hold", "")
             self.store.event(a.id, "launch_readiness_restored", "intended-exec-succeeded")
-        self.procs[a.id] = proc
-        delivery = (a.wait or {}).get("ci_delivery") or {}
-        marks = {delivery["key"]: delivery["value"]} if delivery else {}
-        action = (a.wait or {}).get("ci_action_delivery") or {}
-        if action:
-            marks[action["key"]] = action["value"]
-        first_move = (a.wait or {}).get("queue_delivery") or {}
-        if first_move:
-            marks[first_move["key"]] = first_move["value"]   # delivered only by a real spawn
-            marks[queue_wait.FLOOR_KEY] = first_move["floor"]
-        spawn_wait = dict(a.wait or {})
-        spawn_wait.pop("queue_delivery", None)
-        spawn_wait.pop("ci_delivery", None)
-        spawn_wait.pop("ci_action_delivery", None)
-        try:
-            ok = self.store.update_with_marks(a, marks, expect=expect, state="running", wait=spawn_wait,
-                                   pid=proc.pid, stamp=proc_stamp(proc.pid),
-                                   log_path=str(log_path), session_id=sid, turns=a.turns + 1,
-                                   turn_started_at=anchor, source_read_at=source_read_at, wake_text="", leader_done_at="",
-                                   note="")
-        except Exception:
-            interrupt_group(proc.pid, signal.SIGTERM)
-            self.procs.pop(a.id, None)
-            raise
-        if not ok:   # the attempt changed under us: do not leave an untracked writer behind
-            interrupt_group(proc.pid, signal.SIGTERM)
-            self.procs.pop(a.id, None)
-            raise RuntimeError("attempt state changed while starting; session stopped")
         self._last_beat[a.id] = time.monotonic()
         self._record_launch(a, resume)
         self.emit("resume" if resume else "start", a, title=a.title[:120], session=sid)
@@ -1587,6 +1638,8 @@ class AgentRunner:
         self._report_spend(a, result)
         self.procs.pop(a.id, None)
         task = self._task(a.task_id)
+        if self._still_ours(task, a.mode) and not self._settle_native(a, task):
+            return
         auth_profile = None
         if a.harness == "claude" and (result.auth_failed or result.verification_required):
             # The process's exact profile is evidence even if ownership/status
@@ -1705,6 +1758,30 @@ class AgentRunner:
             # No typed source, an already served one, or another card's id: nothing to observe.
             self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=QUEUE_WAIT_GUIDANCE))
             return
+        native_receiver = None
+        if outcome.kind == "native":
+            try:
+                if self.cfg.native_result_dir is None:
+                    raise native_result_wait.Refused("native_result_dir is not configured")
+                native_receiver = native_result_wait.arm(
+                    native_result_wait.Ledger(self.cfg.native_result_dir), outcome.target,
+                    dataclasses.asdict(a), self._task(a.task_id), self.agent_id)
+            except (native_result_wait.Refused, OSError) as exc:
+                # Invalid registration is not a supported wait or a retry timer.
+                # Preserve the declaration and explicit owner/grounds for repair.
+                blocked = {"owner": self.agent_id, "reason": str(exc)[:512]}
+                if not self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait,
+                    state="unknown", pid=0, stamp="", note="native WAIT registration refused",
+                    wait={"kind": "native", "target": outcome.target,
+                          "native_delivery_failed": blocked}):
+                    return
+                self.emit("native_registration_refused", a, **blocked)
+                self._comment(a.task_id, "[runner] Native WAIT registration refused; owner="
+                    + self.agent_id + ". Reason: " + blocked["reason"]
+                    + ". Explicit integration repair required; no automatic replay.")
+                self._release_gate(a, "native-registration-held")
+                self._release_checkout(a)
+                return
         receipt_reg = None
         if outcome.kind == "receipt":
             receipt_reg = self._receipt_registration(a, outcome)
@@ -1866,6 +1943,8 @@ class AgentRunner:
                 "note": outcome.note}
         if queue_contract:
             wait.update(kind="queue", until="", queue_request=queue_wait.new_request(a.task_id, queue_contract))
+        if native_receiver is not None:
+            wait["native_receiver"] = native_receiver
         if receipt_reg:
             wait["receipt_reg"] = receipt_reg["reg_id"]
         for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time"):
@@ -1963,6 +2042,11 @@ class AgentRunner:
                 self.store.update(a, state="ready", no_outcome=0, wake_text=told)
                 log.info("%s: #%s ask to @%s not raised by Mesh; told the agent", self.agent.name, a.task8,
                          outcome.handle)
+                return
+        if native_receiver is not None:
+            # Save the token-free observation fence BEFORE releasing the lease.
+            if not self.store.update_with_marks(a, {}, expect=a.state,
+                    expect_wait=a.wait, wait=wait):
                 return
         self._release_checkout(a)
         self.effects.on_wait(a, task, wait, self.me)
@@ -3396,7 +3480,9 @@ class AgentRunner:
     # ------------------------------------------------------------------ phases
     def heartbeat(self) -> None:
         mono = time.monotonic()
-        for a in self.store.by_state(self.agent.name, ("running",)):
+        for a in self.store.by_state(self.agent.name, ACTIVE):
+            if a.state != "running" and not (a.wait or {}).get("interactive_prompt_intent"):
+                continue               # only this protocol's pending outbox keeps its existing lease
             if not a.checkout.get("token") or mono - self._last_beat.get(a.id, 0) < self.cfg.heartbeat_seconds:
                 continue
             self._last_beat[a.id] = mono
@@ -3454,8 +3540,171 @@ class AgentRunner:
         except MeshError:
             return None
 
+    def _recover_headless_prompt(self, a: Attempt, intent: dict) -> str:
+        journal = interactive.read_delivery(interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id)
+        if journal.get("token") != intent.get("token") or journal.get("sha256") != intent.get("sha256"):
+            return "identity-mismatch"
+        if journal.get("phase") in ("reserved", "received", "native-exec-error"):
+            return "unsent"                 # native Popen has not succeeded
+        if journal.get("phase") not in ("native-exec-confirmed", "native-exited"):
+            return "headless-exec-unconfirmed"
+        path = Path(intent["log_path"])
+        result = self.adapter_for(a.harness).parse(path)
+        events = read_events(path)
+        accepted = (headless_acceptance.accepted(
+            interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent)
+            if a.harness == "claude" else
+            [e.get("thread_id") for e in events if e.get("type") == "thread.started"] == [result.session_id]
+            and bool(result.session_id)
+            and len([e for e in events if e.get("type") == "turn.started"]) == 1)
+        if not result.finished and not accepted:
+            return "headless-native-result-incomplete"
+        if not result.session_id and accepted and a.harness == "claude":
+            result.session_id = intent["session_id"]
+        if not result.session_id or (intent.get("session_id") and result.session_id != intent["session_id"]):
+            return "headless-native-session-mismatch"
+        # A unique per-turn file is owned by the registered process group. The
+        # whole group is gone before this method is called. A unique, session-bound
+        # native terminal result acknowledges this input, including an error result;
+        # delivery is not task success. Without a terminal, an exact native input
+        # acceptance receipt is required. Ambiguous terminal evidence never ACKs.
+        if a.harness == "claude":
+            terminals = [e for e in events if e.get("type") == "result"]
+            if terminals and (len(terminals) != 1 or terminals[0].get("session_id") != result.session_id):
+                return "headless-native-terminal-mismatch"
+            if not terminals and not accepted:
+                return "headless-native-terminal-mismatch"
+        else:
+            sessions = [e.get("thread_id") for e in events if e.get("type") == "thread.started"]
+            terminals = [e for e in events if e.get("type") in ("turn.completed", "turn.failed")]
+            if sessions != [result.session_id] or len(terminals) > 1 or (not terminals and not accepted):
+                return "headless-native-terminal-mismatch"
+        with path.open("ab") as fh:
+            fh.write(("\n" + json.dumps({"type": "mesh_runner.prompt_ack", "token": intent["token"],
+                      "sha256": intent["sha256"], "recovered_from": "headless.native-accepted" if accepted and not result.finished else "headless.bound-terminal"}) + "\n").encode())
+            fh.flush()
+            os.fsync(fh.fileno())
+        return "completed"
+
+    def _reconcile_interactive_prompt(self, a: Attempt) -> bool:
+        """Only an exact driver acknowledgement consumes the durable prompt outbox.
+
+        No ack is ambiguous, even if the driver exited: keep the pending wake and
+        authority in UNKNOWN rather than retry a possibly accepted prompt.
+        """
+        intent = (a.wait or {}).get("interactive_prompt_intent")
+        if not isinstance(intent, dict):
+            return True                     # attempts predating this protocol are unchanged
+        if intent.get("retryable") and a.state == "unknown":
+            return False                    # normal admission fenced a changed retry scope
+        # A live turn still uses the existing timeout/progress watchdog; its
+        # outbox stays pending until the driver's durable end-of-turn ack.
+        if a.pid and not self._turn_over(a):
+            return False
+        def exact_ack():
+            return any(e.get("type") == "mesh_runner.prompt_ack"
+                       and e.get("token") == intent.get("token")
+                       and e.get("sha256") == intent.get("sha256")
+                       for e in read_events(Path(intent["log_path"])))
+        ack = exact_ack()
+        resolution = "ack-identity-mismatch"
+        if not ack:
+            try:
+                if intent.get("kind") == "headless":
+                    resolution = self._recover_headless_prompt(a, intent)
+                else:
+                    resolution = delivery_recovery.recover(
+                        interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent, self.agent.name, self._tmux)
+            except (OSError, ValueError, KeyError, TypeError):
+                resolution = "native-evidence-unreadable"
+            if resolution == "unsent":
+                # The durable phase precedes every native paste, not an inference
+                # from an empty log. The former driver is gone (or never registered).
+                prior = intent["prior"]
+                retry = {**intent, "retryable": True}
+                wait = {**a.wait, "interactive_prompt_intent": retry}
+                if self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait,
+                         state="ready", wait=wait, pid=0, stamp="", leader_done_at="",
+                         note="native send never began; exact pending prompt will use normal admission", **prior):
+                    self.store.event(a.id, "prompt_unsent_reconciled", intent["token"])
+                    self.emit("prompt_unsent_reconciled", a)
+                return False
+            if resolution == "completed":
+                proof = ("headless.bound-terminal" if intent.get("kind") == "headless" else
+                         "codex.session-turn-notify-rollout" if intent.get("harness") == "codex" else
+                         "claude.session-prompt-id-stop")
+                self.store.event(a.id, "prompt_native_result_recovered", proof)
+                self.emit("prompt_native_result_recovered", a)
+                ack = exact_ack()
+        if ack and a.turns == intent.get("turn") and a.log_path == intent.get("log_path"):
+            wait = dict(a.wait)
+            marks = {}
+            for key in ("ci_delivery", "ci_action_delivery", "queue_delivery"):
+                delivery = wait.pop(key, None)
+                if delivery:
+                    marks[delivery["key"]] = delivery["value"]
+                    if key == "queue_delivery":
+                        marks[queue_wait.FLOOR_KEY] = delivery["floor"]
+            wait.pop("interactive_prompt_intent")
+            return self.store.update_with_marks(a, marks, expect=a.state, expect_wait=a.wait,
+                       state="running", wait=wait, wake_text="", note="",
+                       source_read_at=intent["source_read_at"])
+        if a.state != "unknown" or intent.get("resolution") != resolution:
+            wait = {**a.wait, "interactive_prompt_intent": {**intent, "resolution": resolution}}
+            if self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait, state="unknown", wait=wait,
+                                 note="mandatory delivery pending: " + resolution + "; native evidence or owner resolution required"):
+                self.store.event(a.id, "prompt_delivery_unknown", resolution)
+                stderr_path = Path(intent["log_path"]).with_suffix(".stderr")
+                try:
+                    stderr = stderr_path.read_text(errors="replace")[-2000:]
+                except OSError:
+                    stderr = ""
+                # Diagnose a refused/crashed harness without turning its prose into
+                # delivery evidence or authorizing another writer.
+                diagnostic = ("; " + public_harness_error(stderr)) if stderr.strip() else ""
+                self._comment(a.task_id, "MANDATORY DELIVERY PENDING: " + resolution + diagnostic
+                              + "; native evidence recheck required; automatic replay is held")
+                self.emit("prompt_delivery_unknown", a, pending=True, reason=resolution,
+                          action="native-evidence-reconciliation")
+                log.warning("%s #%s turn %s: mandatory delivery pending: %s; native evidence or owner resolution required",
+                            self.agent.name, a.task8, intent.get("turn"), resolution)
+        return False
+
+    def _delivery_recheck_request(self, request: dict) -> str:
+        if request['expires'] <= int(time.time()):
+            return "rejected_expired"
+        a = self.store.get(request['attempt'])
+        if not a or a.agent != self.agent.name or a.task_id != request['task']:
+            return "rejected_owner"
+        try:
+            expected = delivery_requests.identity(a)
+            if any(request[k] != v for k, v in expected.items()):
+                return "rejected_identity"
+            if delivery_requests.evidence(self.cfg.state_dir, a) != request['evidence_sha256']:
+                return "rejected_evidence_changed"
+        except (OSError, ValueError, KeyError, TypeError):
+            return "unresolved:native-evidence-unreadable"
+        if a.pid and not self._turn_over(a):
+            return "unresolved:whole-process-group-live"
+        # Request has no outcome authority: use the same native validator/CAS as
+        # normal recovery, including durable pre-send phase and exact terminal ACK.
+        self._reconcile_interactive_prompt(a)
+        current = self.store.get(a.id)
+        intent = current.wait.get("interactive_prompt_intent")
+        if not intent:
+            return "resolved:exact-native-terminal-ack"
+        if intent.get("token") != request["token"]:
+            return "unresolved:owner-state-changed"
+        if intent.get("retryable") and current.state == "ready":
+            return "resolved:durable-unsent-normal-admission"
+        return "unresolved:" + intent.get("resolution", "native-proof-incomplete")
+
     def settle_finished(self) -> None:
         for a in self.store.by_state(self.agent.name, ACTIVE):
+            if (a.wait or {}).get("interactive_prompt_intent"):
+                self._guard(a, "prompt-delivery", lambda x:
+                    self._reconcile_interactive_prompt(x) and self._turn_over(x) and self.settle(x))
+                continue
             if not a.pid:
                 created = parse_time(a.created_at)
                 if created and now() - created > dt.timedelta(minutes=5):
@@ -3690,6 +3939,8 @@ class AgentRunner:
             self._guard(a, "ready-workspace-suspend", self._suspend_held_ready)
 
     def _suspend_waiting(self, a: Attempt, *, requested: bool = False) -> None:
+        if self._maintenance_held(a):
+            return
         own = self.agent.workspace_wait_release_minutes
         threshold = self.cfg.workspace_wait_release_minutes if own is None else own
         started = parse_time(a.wait.get("started")) or parse_time(a.updated_at)
@@ -3771,7 +4022,8 @@ class AgentRunner:
         """
         own = self.agent.workspace_wait_release_minutes
         threshold = self.cfg.workspace_wait_release_minutes if own is None else own
-        if threshold <= 0 or a.state != "ready" or not self.pool.leased_to(a.id):
+        if (threshold <= 0 or a.state != "ready" or not self.pool.leased_to(a.id)
+                or self._maintenance_held(a)):
             return
         key = "workspace_ready_hold"
         saved = self.store.mark(a.agent, a.task_id, key)
@@ -3841,6 +4093,8 @@ class AgentRunner:
             return 'rejected_identity_or_state'
         if workspace_requests.generation(a) != request['generation']:
             return 'rejected_wait_generation'
+        if self._maintenance_held(a):
+            return 'rejected_maintenance_hold'
         repo = request['repo']
         key = f'repo_admission:{a.id}:{repo}'      # per attempt+repo: a new request id adopts a crashed one's lease
         try:
@@ -3921,6 +4175,96 @@ class AgentRunner:
         return ("\n[runner] Repository " + str(n.get('repo')) + " was added to this task; its leased workspace is "
                 + str(n.get('path')) + ". Existing workspaces are unchanged.")
 
+    def _maintenance_request(self, request: dict) -> dict:
+        """Open or close the maintenance window of one exact waiting lease. Runs on the owning tick,
+        the same serialization as admission, wake, suspend, capture, restore and free; the hold row is
+        committed before the ready receipt, and a refusal changes no lease, WAIT or data."""
+        def done(status: str, barrier: str, reason: str = '') -> dict:
+            self.store.event(request['attempt'], 'maintenance_' + status, request['window'])
+            self.emit('maintenance', self.store.get(request['attempt']), status=status, barrier=barrier,
+                      window=request['window'], op=request['op'])
+            return maintenance.receipt(request, status, barrier, reason)
+
+        a = self.store.get(request['attempt'])
+        if (a is None or a.agent != self.agent.name or a.task_id != request['task']
+                or a.state != 'waiting'):
+            return done('rejected_identity_or_state', 'none')
+        if workspace_requests.generation(a) != request['generation']:
+            return done('rejected_wait_generation', 'none')
+        win = maintenance.window(self.store, request['window'])
+        same = bool(win and all(win[k] == request[k] for k in
+                                ('agent', 'task', 'attempt', 'generation', 'pool', 'slot', 'lease')))
+        try:
+            if request['op'] == 'acquire':
+                if win is not None:
+                    # A crash between the hold and its receipt replays to the same receipt: never a second window.
+                    if same:
+                        return done('ready' if win['state'] == 'held' else 'rejected_window_closed',
+                                    win['state'])
+                    return done('rejected_duplicate_window', 'none')
+                if maintenance.held(self.store, attempt=a.id, path=request['slot']):
+                    return done('rejected_duplicate_window', 'held')
+                if request['expires'] <= int(time.time()):
+                    return done('expired', 'none')
+                return self._maintenance_acquire(a, request, done)
+            # finish: only the exact open window, with identity proven again
+            if win is None or not same:
+                return done('rejected_foreign_finish', 'held' if win and win['state'] == 'held' else 'none')
+            if win['state'] == 'finished':
+                return done('already_finished', 'finished')
+            if request['expires'] <= int(time.time()):         # a stale queued finish never lifts the hold
+                return done('expired', 'held')
+            reason = self._maintenance_quiet(a, request)
+            if reason:
+                return done('rejected_' + reason, 'held', reason)
+            self.store.db.execute("UPDATE maintenance_windows SET state='finished', closed_at=? "
+                                  "WHERE window=? AND state='held'", (int(time.time()), win['window']))
+            return done('finished', 'finished')
+        except Exception:
+            log.warning('maintenance request failed for attempt %s; the hold row is the journal', a.id)
+            return done('failed_preserved', 'held' if maintenance.held(self.store, attempt=a.id) else 'none')
+
+    def _maintenance_quiet(self, a: Attempt, request: dict) -> str:
+        """'' when the exact lease is still ours and nothing writes, captures or restores it."""
+        row = self.store.db.execute("SELECT * FROM slots WHERE path=?", (request['slot'],)).fetchone()
+        slot = dict(row) if row else None
+        if (slot is None or slot['pool'] != request['pool'] or slot['attempt'] != a.id
+                or slot['state'] != 'leased' or request['slot'] not in a.workspaces):
+            return 'lease_drift'
+        if maintenance.lease_token(slot) != request['lease']:
+            return 'stale_lease'
+        if a.pid and group_alive(a.pid, a.stamp):
+            return 'active_writer'
+        if self.pool._checkpoint_rows(a.id):
+            return 'checkpoint_in_flight'      # any journal row: capture, restore or reconcile has begun
+        return ''
+
+    def _maintenance_acquire(self, a: Attempt, request: dict, done) -> dict:
+        repo_name = request['pool'].split('/', 1)[-1]
+        repo = self.pool.repos.get(repo_name)
+        if repo is None or request['pool'] != self.pool._pool(repo_name):
+            return done('rejected_pool', 'none')
+        if not self._still_ours(self._task(a.task_id), a.mode):
+            return done('rejected_ownership', 'none')
+        # The lock every capture, restore, lease and free of this repository takes: while it is held no
+        # operation is in flight (also none that has not yet written its journal), and the hold row
+        # committed under it is seen by the next one, which checks the barrier after acquiring it.
+        lock = maintenance_lock(repo.base)
+        if not lock.acquire(blocking=False):
+            return done('rejected_operation_in_flight', 'none')
+        try:
+            reason = self._maintenance_quiet(a, request)
+            if reason:
+                return done('rejected_' + reason, 'none', reason)
+            self.store.db.execute(
+                "INSERT INTO maintenance_windows(window,agent,task,attempt,generation,pool,slot,lease,"
+                "state,opened_at) VALUES(?,?,?,?,?,?,?,?,'held',?)",
+                (request['window'], request['agent'], request['task'], request['attempt'],
+                 request['generation'], request['pool'], request['slot'], request['lease'], int(time.time())))
+        finally:
+            lock.release()
+        return done('ready', 'held')
+
     def _workspace_request(self, request: dict) -> str:
         a = self.store.get(request['attempt'])
         if (a is None or a.agent != self.agent.name or a.task_id != request['task']
@@ -3928,6 +4272,8 @@ class AgentRunner:
             return 'rejected_identity_or_state'
         if workspace_requests.generation(a) != request['generation']:
             return 'rejected_wait_generation'
+        if self._maintenance_held(a):
+            return 'rejected_maintenance_hold'
         try:
             rows = self.pool._checkpoint_rows(a.id)
             leases = self.pool.leased_to(a.id)
@@ -4180,6 +4526,10 @@ class AgentRunner:
                       target=intent.target, comment_id=intent.comment_id, dependency_id=edge["id"])
         return True
 
+    def _maintenance_held(self, a: Attempt) -> bool:
+        """An open maintenance window closes wake, suspend, resume and admission of this attempt."""
+        return maintenance.held(self.store, attempt=a.id) is not None
+
     def _wake_budgeted(self, a: Attempt) -> None:
         """One WAIT observation under one shared deadline. A failed read leaves the wait, lease,
         checkpoint and auth hold as they were and is recorded with a safe cause; the next regular
@@ -4194,12 +4544,154 @@ class AgentRunner:
                 log.warning("%s: wake #%s: %s", self.agent.name, a.task8, cause)
                 self.store.event(a.id, "wake_read_failed", cause)
 
+    def _wake_native(self, a: Attempt, task: dict) -> None:
+        # No generic comment, own NEXT, cycle or age observer on this predicate.
+        if a.wait.get("native_delivery_failed"):
+            return  # explicit integration repair, never an automatic agent-turn retry
+        expected = copy.deepcopy(a.wait)
+        wait = copy.deepcopy(expected)
+        try:
+            if self.cfg.native_result_dir is None:
+                raise native_result_wait.Refused("native_result_dir is not configured")
+            ledger = native_result_wait.Ledger(self.cfg.native_result_dir)
+            packet = native_result_wait.observe(ledger, wait.get("target"),
+                dataclasses.asdict(a), task, self.agent_id,
+                channels=self.cfg.native_result_channels_dir)
+        except (native_result_wait.Refused, OSError) as exc:
+            blocked = {"owner": self.agent_id, "reason": str(exc)[:512]}
+            if wait.get("native_integration_blocked") != blocked:
+                wait["native_integration_blocked"] = blocked
+                if self.store.update_with_marks(a, {}, expect="waiting", expect_wait=expected, wait=wait):
+                    self.emit("native_integration_blocked", a, **blocked)
+            return
+        wait.pop("native_integration_blocked", None)
+        if packet is not None:
+            key = "native_delivery:" + packet["registration"]
+            prior = self.store.mark(self.agent.name, a.task_id, key)
+            if not prior or prior[0] != packet["event"]:
+                wait["native_packet"] = packet
+                # READY, pending prompt and duplicate-suppression mark are one
+                # normal Store CAS. Source/outbox cursor remains UNACKNOWLEDGED.
+                if self.store.update_with_marks(a, {key: packet["event"]},
+                        expect="waiting", expect_wait=expected, state="ready", wait=wait,
+                        wake_text=prompts.wake_prompt(task, native_result_wait.wake_text(packet))):
+                    self.emit("wake", a, event="native:" + packet["event"])
+                return
+        if wait != expected:
+            self.store.update_with_marks(a, {}, expect="waiting", expect_wait=expected, wait=wait)
+
+    def _hold_native(self, a: Attempt, reason: str) -> None:
+        wait = copy.deepcopy(a.wait)
+        packet = wait.get("native_packet") or (wait.get("native_grant") or {}).get("packet")
+        if not packet:
+            raise RuntimeError("native delivery hold has no durable packet")
+        blocked = {"owner": self.agent_id, "reason": reason[:512]}
+        wait.update(kind="native", target=packet["registration"], until="",
+                    native_delivery_failed=blocked)
+        # Persist failure grounds before the normal controller release path.
+        if not self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait,
+                wait=wait, note="native transport integration blocked"):
+            return
+        self.emit("native_delivery_failed", a, **blocked)
+        self._comment(a.task_id, "[runner] Native transport integration blocked; "
+            + "owner=" + self.agent_id + " registration=" + packet["registration"]
+            + " event=" + packet["event"] + ". Reason: " + blocked["reason"]
+            + ". Pending transport cursor retained; no timer or automatic agent-turn retry. "
+            + "Repair/rebind the native delivery before rearming its wait.")
+        self._release_gate(a, "native-integration-held")
+        self._release_checkout(a)
+        self.store.update(a, state="waiting", pid=0, stamp="", wake_text="")
+
+    def _settle_native(self, a: Attempt, task: dict) -> bool:
+        grant = (a.wait or {}).get("native_grant")
+        if not grant:
+            return True
+        try:
+            if self.cfg.native_result_dir is None:
+                raise native_result_wait.Refused("native_result_dir is not configured")
+            ledger = native_result_wait.Ledger(self.cfg.native_result_dir)
+            result = native_result_resume.consume(ledger, grant,
+                dataclasses.asdict(a), task, self.agent_id)
+        except (native_result_wait.Refused, OSError) as exc:
+            self._hold_native(a, str(exc))
+            return False
+        if result["ack"] is None:
+            if result["grant"]["source"]["cursor"] != grant["source"]["cursor"]:
+                # Bounded file scan continuation at settle; no new child turn.
+                wait = copy.deepcopy(a.wait)
+                wait["native_grant"] = result["grant"]
+                self.store.update_with_marks(a, {}, expect="running", expect_wait=a.wait, wait=wait)
+            else:
+                self._hold_native(a, "receiver turn ended without source-proven consumption ACK")
+            return False
+        packet = grant["packet"]
+        receipt = {"registration": packet["registration"], "event": packet["event"],
+                   "registered_receiver": packet["receiver"], "resumed_receiver": grant["receiver"],
+                   "source": result["grant"]["source"], "ack": result["ack"]}
+        wait = copy.deepcopy(a.wait)
+        wait.pop("native_grant", None)
+        wait.pop("native_packet", None)
+        # Ledger ACK precedes Store receipt. A crash between them repeats the
+        # source-proven ACK idempotently, without another receiver launch.
+        if not self.store.update_with_marks(a,
+                {"native_ack:" + packet["registration"]: json.dumps(receipt, sort_keys=True)},
+                expect="running", expect_wait=a.wait, wait=wait):
+            return False
+        self.emit("native_ack", a, registration=packet["registration"],
+                  event=packet["event"], duplicate=result["ack"]["duplicate"])
+        return True
+
+    def _native_rebind_request(self, request: dict) -> str:
+        native_result_rebind.validate(request, self.agent.name)
+        a = self.store.get(request["attempt"])
+        if a is None or a.agent != self.agent.name or a.task_id != request["task"]:
+            return "rejected_identity"
+        key = "native_rebind:" + request["request_id"]
+        prior = self.store.mark(a.agent, a.task_id, key)
+        if prior:
+            return "applied" if json.loads(prior[0])["request"] == request else "rejected_request_reuse"
+        if request["expires"] <= int(time.time()):
+            return "expired"
+        if self._maintenance_held(a):
+            return "rejected_maintenance_hold"
+        task = self._task(a.task_id)  # fresh Mesh read; never comment/age-derived authority
+        if not self._still_ours(task, a.mode):
+            return "rejected_ownership"
+        try:
+            if self.cfg.native_result_dir is None:
+                raise native_result_wait.Refused("native_result_dir is not configured")
+            wait, audit = native_result_rebind.plan(
+                native_result_wait.Ledger(self.cfg.native_result_dir), request,
+                dataclasses.asdict(a), task, self.agent_id,
+                channels=self.cfg.native_result_channels_dir)
+        except (ValueError, OSError, TypeError, KeyError):
+            return "rejected_native_rebind_fence"
+        expected = copy.deepcopy(a.wait)
+        def same_receiver():
+            current = self.store.get(a.id)
+            return bool(current and current.agent == self.agent.name
+                        and current.task_id == request["task"]
+                        and current.session_id == request["session"]
+                        and not current.checkout and not current.pid)
+        if not self.store.update_with_marks(a, {key: json.dumps(audit, sort_keys=True)},
+                expect=a.state, expect_wait=expected, validate=same_receiver,
+                state="waiting", wait=wait, wake_text="", note="explicit native rebind"):
+            return "rejected_cas"
+        self.emit("native_rebind", a, request_id=request["request_id"],
+                  registration=request["registration"], old_registration=request["old_registration"])
+        return "applied"
+
     def _wake_one(self, a: Attempt) -> None:
+        if self._maintenance_held(a):
+            return                           # WAIT stays exactly as declared until the owner finishes
         task = self._task(a.task_id)
         if not self._still_ours(task, a.mode):
             queue_wait.cancel(self.store, a)
             self._note_ownership_loss(a, task)
             self._finish(a, "completed", "task left the agent while waiting")
+            return
+        if a.wait.get("kind") == "native":
+            self._wake_native(a, task)
             return
         comments = None
         if a.mode == "work" and a.wait.get("kind") == "card":
@@ -4588,7 +5080,7 @@ class AgentRunner:
                 break
             if time.monotonic() < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold.get(a.id, 0)):
                 continue
-            if self._branch_blocked(a):
+            if self._branch_blocked(a) or self._maintenance_held(a):
                 continue
             before = self.store.active_count(self.agent.name)
             self._guard(a, "resume", self._resume_one)
@@ -4619,6 +5111,8 @@ class AgentRunner:
         self._log_hold("resume", a.task8, str(exc), episode="resume branch")
 
     def _resume_one(self, a: Attempt) -> None:
+        if self._maintenance_held(a):
+            return
         task = self._task(a.task_id)
         if not self._still_ours(task, a.mode):
             self._note_ownership_loss(a, task)
@@ -4854,9 +5348,21 @@ class AgentRunner:
             return text
    # noqa: E731
         try:
-            if first_start:
+            retry = (a.wait or {}).get("interactive_prompt_intent") or {}
+            if retry.get("retryable"):
+                if retry.get("workspaces") != list(a.workspaces) or retry.get("harness") != a.harness:
+                    self.store.update(a, expect="ready", state="unknown",
+                                      note="unsent prompt scope changed; owner resolution required")
+                    self.store.event(a.id, "prompt_retry_scope_changed", "workspaces-or-harness")
+                    self.emit("prompt_retry_scope_changed", a, action="owner-resolution")
+                    return
+                started = self._spawn(a, retry["prompt"], resume=bool(retry.get("resume")),
+                                      expect=("ready",), env=env, prompt_is_complete=True)
+            elif first_start:
                 first_text, before_spawn, observed = self._prepare_first_start(a, task)
-            if not a.session_id:
+                started = self._spawn(a, first(), resume=False, expect=("ready",), env=env,
+                                      **({"before_spawn": before_spawn} if before_spawn else {}))
+            elif not a.session_id:
                 started = self._spawn(a, first(), resume=False, expect=("ready",), env=env,
                                       **({"before_spawn": before_spawn} if before_spawn else {}))
             else:
@@ -6628,11 +7134,15 @@ class AgentRunner:
         self.refresh_me()
         self.heartbeat()
         self.retry_releases()
+        delivery_requests.consume(self.cfg.state_dir, self.agent.name, self._delivery_recheck_request)
         self.settle_finished()
         self.reap_interactive()
         self.check_wakes()
+        workspace_requests.consume(self.cfg.state_dir, self.agent.name, self._native_rebind_request,
+            spool=native_result_rebind.SPOOL, check=native_result_rebind.validate)
         workspace_requests.consume(self.cfg.state_dir, self.agent.name, self._workspace_request)
         repo_admission.consume(self.cfg.state_dir, self.agent.name, self._repo_admission_request)
+        maintenance.consume(self.cfg.state_dir, self.agent.name, self._maintenance_request)
         self.deliver_mentions()
         room = self.cap() - self.store.active_count(self.agent.name)
         room = self.resume_ready(room)
@@ -6710,6 +7220,11 @@ class AgentRunner:
                "attempts": [{"task": a.task8, "task_id": a.task_id, "state": a.state, "title": a.title[:60],
                              "session": a.session_id, "wait": a.wait.get("kind", ""), "harness": a.harness,
                              "turns": a.turns, "since": a.updated_at,
+                             **({"prompt_delivery": {"pending": True,
+                                    "turn": a.wait["interactive_prompt_intent"].get("turn"),
+                                    "resolution_required": a.state == "unknown",
+                                    "reason": a.wait["interactive_prompt_intent"].get("resolution", "") }}
+                                if isinstance(a.wait.get("interactive_prompt_intent"), dict) else {}),
                              **({"wait_observation": a.wait.get("observation_state", "unknown")}
                                 if typed_wait(a.wait) else {})} for a in rows]}
         if self._start_error and time.monotonic() < self._starts_paused_until:
@@ -6771,11 +7286,13 @@ class Runner:
         cfg.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._lock = None
         if lock:
-            self._lock = open(cfg.state_dir / "runner.lock", "w")
-            try:
-                fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise AlreadyRunning(f"another runner owns {cfg.state_dir}") from None
+            self._lock = launch_guard.inherited_lock(cfg)
+            if self._lock is None:
+                self._lock = open(cfg.state_dir / "runner.lock", "w")
+                try:
+                    fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise AlreadyRunning(f"another runner owns {cfg.state_dir}") from None
         self.store = Store(cfg.state_dir / "runner.sqlite")
         github = GitHub(cfg.github_token, cfg.github_api_url, cfg.github_orgs) if cfg.github_orgs else None
         gitlab = GitLab(cfg.gitlab_url, cfg.gitlab_token, github) if (cfg.gitlab_url or github) else None
@@ -7146,6 +7663,19 @@ class Runner:
             return
         client = md.MetaClient(cfg.mesh_url, st.credential, token)
         state = cfg.state_dir / "session_metadata"
+        # one consumer per identity over one ledger: the standalone `session-receiver` takes the same lock
+        from . import session_receiver as sr
+        lock = sr.ConsumerLock(state)
+        if not lock.acquire("controller"):
+            log.warning("session_metadata: another consumer owns the ledger; receiver off")
+            return
+        try:
+            sr.bind_ledger(state, st.identity, adopt_existing=(state / "journal").is_dir())
+        except sr.Refusal as e:
+            lock.release()
+            log.warning("session_metadata: %s; receiver off", e.code)
+            return
+        self._meta_lock = lock                      # held for the life of the process
         receiver = md.MetaReceiver(st.identity, session, md.Journal(state / "journal"), client, state / "acks")
         threading.Thread(target=md.receiver_loop, args=(receiver, stop, st.interval), name="session-metadata",
                          daemon=True).start()

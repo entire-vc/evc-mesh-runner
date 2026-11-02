@@ -175,5 +175,6 @@ def _consume(state: Path, agent: str, handler, spool: str, check) -> None:
                 result = handler(r)
         except (ValueError, OSError, TypeError, KeyError):
             result = 'rejected_schema'
-        _publish(receipt, {'status': result, 'at': int(time.time())})
+        # A handler may return a full bounded receipt (maintenance windows); a plain status otherwise.
+        _publish(receipt, result if isinstance(result, dict) else {'status': result, 'at': int(time.time())})
         return                         # at most one request per agent tick

@@ -31,7 +31,8 @@ if __package__ in (None, ""):                         # run as a file by the run
 from mesh_runner.adapters.base import STAMP_V2, precise_stamp  # noqa: E402
 
 from mesh_runner.interactive import (BACKGROUND_WAIT_MINUTES, CHAT_PREFIX, HOOK, Tmux, forget, pid_alive,  # noqa: E402
-                                     meta_path, read_meta, session_name, write_meta, write_progress)
+                                     meta_path, read_meta, session_name, write_meta, write_progress,
+                                     read_delivery, write_delivery)
 
 def read_own_meta(directory: Path, key: str) -> dict | None:
     """The window's metadata under this runner's state root, or None when the file is absent or
@@ -152,6 +153,12 @@ def _said(text: str) -> str:
     return _squash(PASTE_WRAP_RE.sub("", text or ""))
 
 
+def _exact(text: str) -> str:
+    """The prompt as the harness recorded it, for proof of delivery: only the paste wrapper, line
+    endings (a terminal paste turns LF into CR) and the outer edges may differ. Inner whitespace is kept, so `do this` is not `dothis`."""
+    return PASTE_WRAP_RE.sub("", text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def load_average() -> str:
     """The host's 1-minute load average with the CPU count, for an error message ("?" when unknown)."""
     try:
@@ -196,6 +203,8 @@ class Driver:
         self.sid, self.mode, self.key, self.argv = session_id, mode, key, list(argv)
         self.out = out or sys.stdout
         self.env = {k: v for k, v in dict(os.environ if env is None else env).items() if not SCRUB_ENV.match(k)}
+        self.prompt_intent = self.env.pop("_MESH_RUNNER_PROMPT_INTENT", "")
+        self.prompt_sha256 = self.env.pop("_MESH_RUNNER_PROMPT_SHA256", "")
         self.python = python or sys.executable
         self.clock, self.sleep = clock, sleep
         self.t = {"ready": 180, "accept": 30, "poll": 1.0, "scan": 15, "interrupt": 6, "settle": 1.5,
@@ -227,6 +236,7 @@ class Driver:
         self.scan_from = 0             # first transcript byte not yet searched for a reply
         self.skipping = False          # scan_from is inside a line longer than one read
         self.rollout = ""
+        self.native_bound = False
         self.replied = False           # Codex: a model record was seen since the prompt was accepted
         self.turn_end: dict | None = None   # Codex: the task_complete of our turn, read from the rollout
         self.turn_id = ""              # Codex: the turn our prompt started, from the rollout's task_started
@@ -243,6 +253,41 @@ class Driver:
 
     def save(self) -> None:
         write_meta(self.dir, self.key, self.meta)
+
+    def delivery_phase(self, phase: str, **facts) -> None:
+        if not self.prompt_intent:
+            return
+        journal = read_delivery(self.dir, self.key)
+        if journal.get("token") != self.prompt_intent or journal.get("sha256") != self.prompt_sha256:
+            raise DriverError("interactive delivery journal identity mismatch")
+        write_delivery(self.dir, self.key, {**journal, **facts, "phase": phase})
+
+    def native_binding(self) -> dict:
+        """Facts a fresh Codex session only has once its prompt is taken: the thread id and rollout
+        bind the journal, so a crash before our own ACK can still be proven from native evidence.
+        The rollout may appear after acceptance; the turn loop asks again until both are bound."""
+        if self.harness != "codex" or not self.prompt_intent or self.native_bound:
+            return {}
+        journal = read_delivery(self.dir, self.key)
+        facts = {}
+        thread = self.rollout_thread() or self.meta.get("session_id") or self.sid
+        if thread and not journal.get("session_id"):
+            facts["session_id"] = thread
+        if self.rollout and not journal.get("rollout"):
+            with open(self.rollout, "rb") as fh:
+                facts.update(rollout=self.rollout, rollout_cursor=self.scan_from,
+                             rollout_prefix=hashlib.sha256(fh.read(self.scan_from)).hexdigest())
+        bound = {**journal, **facts}
+        self.native_bound = bool(bound.get("session_id") and bound.get("rollout"))
+        return facts
+
+    def bind_native_late(self) -> None:
+        if self.harness != "codex" or self.native_bound or not self.prompt_intent:
+            return
+        self.progress_size()                    # finds a fresh session's rollout once its prompt is in it
+        facts = self.native_binding()
+        if facts:
+            self.delivery_phase(read_delivery(self.dir, self.key).get("phase", "accepted"), **facts)
 
     def check_cancel(self) -> None:
         if self.cancelled:
@@ -983,6 +1028,17 @@ class Driver:
         before = self.progress_size() if self.harness == "codex" else 0
         cursor = before if self.harness == "codex" and (
             self.rollout or not (self.meta.get("session_id") or self.sid)) else None
+        native = self.read_events()
+        rollout_prefix = ""
+        if self.harness == "codex" and self.rollout and cursor is not None:
+            with open(self.rollout, "rb") as fh:
+                rollout_prefix = hashlib.sha256(fh.read(cursor)).hexdigest()
+        self.delivery_phase("send-intent", harness=self.harness,
+                            session_id=self.meta.get("session_id") or self.sid or self.rollout_thread(),
+                            cwd=str(self.cwd), native_base=len(native),
+                            native_prefix=hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest(),
+                            offset=offset, meta=dict(self.meta), rollout=self.rollout, rollout_cursor=cursor,
+                            rollout_prefix=rollout_prefix, totals=totals)
         self.paste(prompt)
         deadline = self.clock() + self.t["accept"]
         retried = False
@@ -1015,15 +1071,18 @@ class Driver:
                 retried, deadline = True, self.clock() + self.t["accept"]
             self.sleep(self.t["poll"])
         self.prompt_taken = True                         # from here a retry could deliver it twice
-        self.marks["taken"] = self.clock()
         self.sent_size = self.progress_size()
         self.scan_from = self.sent_size if cursor is None else cursor
+        self.delivery_phase("accepted", prompt_id=self.prompt_id, turn_id=self.turn_id,
+                            **self.native_binding())
+        self.marks["taken"] = self.clock()
         self.skipping = False
         self.beat("sent", force=True)
         scan_at, banner_seen, stop_seen = self.clock() + self.t["scan"], "", None
         end_seen = None
         while True:
             self.beat()
+            self.bind_native_late()
             if self.harness == "claude":
                 self.stream_claude()
             if self.cancelled:
@@ -1382,6 +1441,7 @@ class Driver:
                     self.beat("ready", force=True)
                     marks["ready"] = self.clock()
                     done = self.turn(prompt)
+                    self.bind_native_late()      # the rollout exists by now, before any result is emitted
                     marks["stop"] = self.clock()
                     break
                 except DriverError:
@@ -1396,6 +1456,11 @@ class Driver:
                           f"({start + 1}/{BOOTSTRAP_RETRIES}) in {pause:.0f}s: {line[:200]}", file=sys.stderr, flush=True)
                     self.sleep(pause)
             ok = self.emit_claude(done) if self.harness == "claude" else self.emit_codex(done)
+            if self.prompt_intent:
+                # A bound native end-of-turn is stronger than stdin write or a busy screen.
+                self.emit({"type": "mesh_runner.prompt_ack", "token": self.prompt_intent,
+                           "sha256": hashlib.sha256(prompt.encode()).hexdigest()})
+                os.fsync(self.out.fileno())
             marks["emit"] = self.clock()
             self.print_timing(marks)
             # a failed turn (StopFailure, an API error) leaves the session in that state
@@ -1416,7 +1481,10 @@ class Driver:
                 self.save()
             else:
                 self.tmux.run("kill-window", "-t", self.target)
-                forget(self.dir, self.key)
+                if not self.prompt_intent:
+                    forget(self.dir, self.key)
+                # Pending outbox recovery needs the session/cursor/hook evidence even
+                # when the native session closed with an error. The owner can archive it.
         return 0 if ok else 1
 
 
@@ -1454,6 +1522,10 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, interrupt)
     prompt = sys.stdin.read()
+    if not prompt or (driver.prompt_sha256 and hashlib.sha256(prompt.encode()).hexdigest() != driver.prompt_sha256):
+        # Controller died before a complete registered handoff: no native session or prompt work.
+        return 0
+    driver.delivery_phase("received")
     return driver.run(prompt)
 
 

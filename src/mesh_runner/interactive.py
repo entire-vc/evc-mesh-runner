@@ -77,6 +77,35 @@ def write_meta(directory: Path, key: str, meta: dict) -> None:
     tmp.replace(meta_path(directory, key))
 
 
+def delivery_path(directory: Path, key: str) -> Path:
+    return directory / f"{key}.delivery.json"
+
+
+def read_delivery(directory: Path, key: str) -> dict:
+    data = json.loads(delivery_path(directory, key).read_text())
+    if not isinstance(data, dict):
+        raise ValueError("invalid interactive delivery journal")
+    return data
+
+
+def write_delivery(directory: Path, key: str, data: dict) -> None:
+    """Durable before native send: a later phase can never roll back to 'unsent'."""
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = delivery_path(directory, key)
+    tmp = path.with_suffix(f".tmp-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def forget(directory: Path, key: str) -> None:
     """Drop everything the runner kept for one window."""
     for suffix in (".json", ".events.jsonl", ".settings.json", ".env", ".prompt", ".progress.json"):
@@ -284,7 +313,7 @@ class InteractiveAdapter(Adapter):
         key = log_path.name.split(".")[0]
         head, tail = self._split(launch.argv)
         argv = head[:-1] + ["--key", key, "--"] + tail
-        return super().spawn(Launch(argv, launch.cwd, launch.env, launch.prompt), log_path)
+        return super().spawn(Launch(argv, launch.cwd, launch.env, launch.prompt, launch.on_created), log_path)
 
 
 def wrap(base: Adapter, agent: str, mode: str, state_dir: Path, tmux: str, max_sessions: int,
@@ -329,6 +358,8 @@ def reap(tmux: Tmux, store, state_dir: Path, agent: str, idle_minutes: float,
         if pid_alive(int(meta.get("busy_pid") or 0)):
             continue
         a = store.get(window)
+        if a is not None and (a.wait or {}).get("interactive_prompt_intent"):
+            continue                    # preserve native evidence while delivery is unresolved
         if not alive:
             reason = "session exited"
         elif a is None or a.state not in open_states:
@@ -357,7 +388,9 @@ def reap(tmux: Tmux, store, state_dir: Path, agent: str, idle_minutes: float,
             key = f.name[:-len(".json")]
             if "." in key or key.startswith(CHAT_PREFIX):   # settings files; a chat keeps its session id to resume
                 continue
-            if key not in live and not pid_alive(int(read_meta(directory, key).get("busy_pid") or 0)):
+            a = store.get(key)
+            pending = a is not None and (a.wait or {}).get("interactive_prompt_intent")
+            if not pending and key not in live and not pid_alive(int(read_meta(directory, key).get("busy_pid") or 0)):
                 forget(directory, key)
         for f in directory.glob("*.progress.json"):          # a driver that died without cleaning up
             key = f.name[:-len(".progress.json")]
