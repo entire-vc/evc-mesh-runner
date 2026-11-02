@@ -85,9 +85,9 @@ def sole_dependency(rows: dict, task_id: str, target: str, *, allow_satisfied: b
 def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
     """An absent newer declaration grants no authority to ignore formal edges.
 
-    Do not pick an older marker. A known empty dependency set or one fully
-    known edge to the current target may use the ordinary observer; a different
-    target, unsupported shape or ambiguity preserves WAIT for the owner.
+    Do not pick an older marker. A known empty or fully satisfied dependency
+    set may use the ordinary observer, as may one fully known edge to the
+    current target. Unsupported or ambiguous unsatisfied edges preserve WAIT.
     """
     if (not isinstance(rows, dict) or not isinstance(rows.get('outgoing'), list)
             or rows.get('has_more') or rows.get('next')):
@@ -95,9 +95,34 @@ def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
     edges = rows['outgoing']
     if not edges:
         return False
+    # Satisfied formal edges no longer constrain the awaited event. Validate
+    # every edge before allowing the ordinary comment/card observer to decide.
+    seen = set()
+    seen_semantic = set()
+    all_satisfied = True
+    for edge in edges:
+        destination = edge.get("depends_on_task_id") if isinstance(edge, dict) else None
+        if (not isinstance(destination, str)
+                or not isinstance(edge.get("id"), str) or not edge["id"].strip()
+                or edge.get("condition_satisfied") is not True
+                or sole_dependency({"outgoing": [edge]}, task_id, destination[:8],
+                                   allow_satisfied=True) is None
+                or edge["id"] in seen):
+            all_satisfied = False
+            break
+        semantic = (edge["task_id"], destination, edge["dependency_type"], edge["condition"])
+        if semantic in seen_semantic:
+            all_satisfied = False
+            break
+        seen.add(edge["id"])
+        seen_semantic.add(semantic)
+    if all_satisfied:
+        return False
     if len(edges) != 1 or not isinstance(edges[0], dict):
         return True
     edge = edges[0]
+    if not isinstance(edge.get("id"), str) or not edge["id"].strip():
+        return True
     if type(edge.get('condition_satisfied')) is not bool:
         return True
     # The guard accepts a satisfied edge to the current target too; the normal

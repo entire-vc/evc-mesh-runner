@@ -64,6 +64,7 @@ from .mesh import Checkout, MeshClient, MeshError
 from .outcome import QUEUE_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
 from .selection import CLOSED, StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
+from . import observation_budget
 from .wake import (GitHub, GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
@@ -3675,7 +3676,7 @@ class AgentRunner:
             if mono - self._last_wake_check.get(a.id, 0) < self.cfg.wake_poll_seconds:
                 continue
             self._last_wake_check[a.id] = mono
-            self._guard(a, "wake", self._wake_one)
+            self._guard(a, "wake", self._wake_budgeted)
             current = self.store.get(a.id)
             if current and current.state == "waiting":
                 self._guard(current, "workspace-suspend", self._suspend_waiting)
@@ -4178,6 +4179,20 @@ class AgentRunner:
             self.emit("wait_reconciled", a, old_target=receipt["old_target"],
                       target=intent.target, comment_id=intent.comment_id, dependency_id=edge["id"])
         return True
+
+    def _wake_budgeted(self, a: Attempt) -> None:
+        """One WAIT observation under one shared deadline. A failed read leaves the wait, lease,
+        checkpoint and auth hold as they were and is recorded with a safe cause; the next regular
+        check runs again (no quarantine: a slow Mesh is not a fault of this attempt)."""
+        with observation_budget.observe(self.cfg.wake_budget_seconds) as obs:
+            try:
+                self._wake_one(a)
+            except Exception as e:                       # noqa: BLE001 - classified below
+                if not observation_budget.classify(e):
+                    raise
+                cause = observation_budget.describe(e, obs)
+                log.warning("%s: wake #%s: %s", self.agent.name, a.task8, cause)
+                self.store.event(a.id, "wake_read_failed", cause)
 
     def _wake_one(self, a: Attempt) -> None:
         task = self._task(a.task_id)
@@ -7091,6 +7106,51 @@ class Runner:
             threading.Thread(target=host.loop, args=(stop,), name=f"chat-{name}", daemon=True).start()
         log.info("chat serving %s", ", ".join(sorted(ids.values())))
 
+    def _start_meta_receiver(self, stop: threading.Event) -> None:
+        """Strict existing-session metadata receiver (off unless `[session_metadata] enabled`): a thread in this
+        runner, pinned to ONE existing native session; it never starts, resumes or adopts a session."""
+        cfg = self.cfg
+        st = cfg.session_metadata
+        if st is None:
+            return
+        ar = next((a for a in self.agents if a.agent.name == st.agent), None)
+        if ar is None:
+            log.warning("session_metadata: agent %s is not configured; receiver off", st.agent)
+            return
+        from . import meta_delivery as md
+        from .chat_host import pinned, routed
+        from .interactive import InteractiveAdapter, Tmux, session_name
+
+        def known(session_id: str) -> bool:
+            env, harness, profile = routed(ar)
+            adapter = pinned(ar.adapter_for(harness), profile)
+            return isinstance(adapter, InteractiveAdapter) and adapter.session_known(
+                session_id, ar.agent.profile_dir, env)
+        env, harness, profile = routed(ar)
+        adapter = pinned(ar.adapter_for(harness), profile)
+        if not isinstance(adapter, InteractiveAdapter):
+            log.warning("session_metadata: %s runs headless; receiver off", st.agent)
+            return
+        tmux = Tmux(cfg.tmux_binary)
+        session = md.TmuxSession(tmux, session_name(st.agent), adapter.dir, st.identity.fields["session_id"], known)
+        from .chat_protocol import ChatClient, load_runner_credential
+        runner_id = st.identity.fields["runner_id"]
+        plain = ChatClient(cfg.mesh_url, st.credential, runner_id=runner_id)
+        try:
+            rid, token = load_runner_credential(cfg.state_dir, lambda: plain.register_runner("mesh-runner@" + socket.gethostname()), st.agent)
+        except Exception as e:                      # no registered runner token = no receiver
+            log.warning("session_metadata: runner registration failed (%s); receiver off", type(e).__name__)
+            return
+        if rid != runner_id:
+            log.warning("session_metadata: configured runner_id is not this runner's registered id; receiver off")
+            return
+        client = md.MetaClient(cfg.mesh_url, st.credential, token)
+        state = cfg.state_dir / "session_metadata"
+        receiver = md.MetaReceiver(st.identity, session, md.Journal(state / "journal"), client, state / "acks")
+        threading.Thread(target=md.receiver_loop, args=(receiver, stop, st.interval), name="session-metadata",
+                         daemon=True).start()
+        log.info("session metadata receiver on for session %s", st.identity.fields["session_id"][:8])
+
     def _start_extension(self, stop: threading.Event):
         """The Mesh extension endpoint and the extension token's self-rotation (`[extension]`)."""
         cfg = self.cfg
@@ -7146,6 +7206,7 @@ class Runner:
             t.start()
         self._start_announce(stop)
         self._start_chat(stop)
+        self._start_meta_receiver(stop)
         service = self._start_extension(stop)
         try:
             while not stop.is_set():

@@ -16,6 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from .mesh import MeshClient, MeshError
+from . import observation_budget as budget
 from .outcome import declaration_lines
 from .selection import CLOSED, StatusCategories, _read_elsewhere, parse_time, satisfied
 
@@ -69,8 +70,8 @@ class GitHub:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(f"{self.api_url.rstrip('/')}/{path}", headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read())
+        with urllib.request.urlopen(req, timeout=budget.cap(30, "GET", "vcs")) as r:
+            return json.loads(budget.read(r))
 
     def get_mr(self, target: str) -> dict:
         project, number = target.rsplit("!", 1)
@@ -119,8 +120,8 @@ class GitLab:
             raise ValueError("no [gitlab] base_url configured")
         req = urllib.request.Request(f"{self.base_url.rstrip('/')}/api/v4/{path}",
                                      headers={"PRIVATE-TOKEN": self.token})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return json.loads(r.read())
+        with urllib.request.urlopen(req, timeout=budget.cap(30, "GET", "vcs")) as r:
+            return json.loads(budget.read(r))
 
     @staticmethod
     def project(path: str) -> str:
@@ -1235,13 +1236,18 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
                 return (f"re-check: the wait ({kind} {wait.get('target') or ''}) has lasted "
                         f"{_hours(now - started)}; its target is still unreadable")
             return ""
+        if budget.classify(e) in ("timeout", "transport"):
+            # a slow or broken CHANNEL says nothing about the awaited thing: it neither wakes the agent
+            # nor changes the wait; the caller records the safe cause and the next check reads again.
+            # A target-side answer (http/parse) still counts toward the "check it yourself" wake.
+            raise
         wait["errors"] = int(wait.get("errors", 0)) + 1
         if wait.get("mr_state"):
             return ""
         if wait["errors"] >= max_errors:
             if typed_wait(wait):
                 return f"cannot check the {kind} wait (UNKNOWN CI observation); baseline retained"
-            return f"cannot check the {kind} wait ({type(e).__name__}: {str(e)[:120]}); check it yourself"
+            return f"cannot check the {kind} wait ({budget.describe(e) if budget.classify(e) else type(e).__name__}); check it yourself"
         return ""
     wait["errors"] = 0
     if not event:
