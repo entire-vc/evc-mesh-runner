@@ -13,14 +13,19 @@ mesh-runner reviewer-merge --config runner.toml --agent <lane> \
 - Without `--apply` it only reads (card, MR, router) and prints `{ready, refusals, request}`. Dry-run readiness is not a merge.
 - `--apply` creates **one** card `[merge-only] group/project!iid @sha (rm-<key>)`, label `merge-only`, assigned to the reviewer the router chose. The key is `sha256(source|project|iid|sha)`; a second apply or a restart finds the card and creates nothing. A new head is a new request. Creation is serialized per key by a file lock under `state_dir` (one host). Mesh has no uniqueness constraint, so two hosts applying at the same instant can both create; apply re-reads after creating and reports `duplicates`. Run apply from one host; a stray twin is harmless (its gate run on the same head finds the MR merged) and is cancelled by hand.
 - The product card (assignee, checkout, status, deploy, live QA) is not touched.
-- Reviewer choice: `[runner] reviewer_select_command` (`scripts/select-reviewer.py` = the installed fleet router's `review_router.pick_reviewer` with the dispatcher's inputs: project reviewer group, author's current family, fresh pool observations). Only `cross-family` and `same-family: quota` assign; unknown or stale pools, no group, or the author themself refuse.
+- Reviewer choice: `[runner] reviewer_select_command` (the bundled `scripts/select-reviewer.py` adapter requires a compatible separately installed router using the project reviewer group, author's current family and fresh pool observations). Only `cross-family` and `same-family: quota` assign; unknown or stale pools, no group, or the author themself refuse.
 - It refuses on: head drift, MR not open, no `verified-by:` label, a `hold` label, CI not `success`/`manual` on the head, a `verify:<other lane>` label, a human gate, a closed product card. The SHIP receipt is reused; no review is started. The gate re-checks receipt, holds and CI itself.
 
 ### Router dependency
 
-The adapter does not ship the router: it imports `review_router`, `runtime_switch` and
-`fleet-balancer.py` from an installed fleet router and reads its runtime catalog and pool
-observations. Pass both locations in the configured command, there is no default:
+The bundled adapter does not ship its external router dependency. It requires the
+specific compatible module interfaces used in `scripts/select-reviewer.py`, plus
+runtime catalog, active profile and fresh pool observations. An arbitrary router
+checkout is not compatible merely because it accepts these directory options.
+Operators must supply and independently review that dependency, or configure a
+selector implementing the same JSON output contract (`lane`, `reason`, and
+`author_family`) and refusal semantics. For the bundled adapter, pass both
+locations in the configured command; there is no default:
 
 ```
 reviewer_select_command = ["python3", "<release>/scripts/select-reviewer.py", "{project_id}", "{author}",

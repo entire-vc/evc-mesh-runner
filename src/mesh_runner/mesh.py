@@ -266,6 +266,20 @@ class MeshClient:
                 items = _items(page(pages - 1)) + items
         return sorted(items, key=lambda c: c.get("created_at") or "")
 
+    def comments_all(self, task_id: str, page_size: int = 100, max_pages: int = 100) -> list[dict]:
+        """EVERY comment of the card, oldest first (a receipt must be found however old it is)."""
+        items: list[dict] = []
+        page = 1
+        while page <= max_pages:
+            res = self.request("GET", f"/tasks/{task_id}/comments",
+                               query={"limit": page_size, "page_size": page_size, "page": page})
+            res = res if isinstance(res, dict) else {"items": res or []}
+            items += _items(res)
+            if page >= int(res.get("total_pages") or 1):
+                return sorted(items, key=lambda c: c.get("created_at") or "")
+            page += 1
+        raise MeshError(0, "comment history exceeds the page bound")      # fail closed, never a partial read
+
     def add_comment(self, task_id: str, body: str) -> dict:
         return self.request("POST", f"/tasks/{task_id}/comments", {"body": body})
 
@@ -354,6 +368,19 @@ class MeshClient:
         """Cards of a project whose title or description contains ``search`` (any status)."""
         return _items(self.request("GET", f"/projects/{project_id}/tasks",
                                    query={"search": search, "page_size": 50}))
+
+    def find_tasks_all(self, project_id: str, search: str, page_size: int = 50, max_pages: int = 100) -> list[dict]:
+        """EVERY card of a project matching ``search``: follows pagination, fails closed (never a
+        silent partial result) when the result set exceeds the page bound."""
+        items: list[dict] = []
+        for page in range(1, max_pages + 1):
+            res = self.request("GET", f"/projects/{project_id}/tasks",
+                               query={"search": search, "page_size": page_size, "page": page})
+            res = res if isinstance(res, dict) else {"items": res or []}
+            items += _items(res)
+            if page >= int(res.get("total_pages") or 1):
+                return items
+        raise MeshError(0, "search result exceeds the page bound")
 
     def assign(self, task_id: str, agent_id: str) -> None:
         self.request("POST", f"/tasks/{task_id}/assign",

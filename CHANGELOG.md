@@ -1,4 +1,42 @@
+
 # Changelog
+
+## Unreleased
+
+- `host_local_qa_assignment_v1`: the frozen brief/policy/schema bytes are no longer packaged. They stay private and are
+  read only from the explicit local opt-in `bundle_dir`, verified against the unchanged sha256 pins before any registration,
+  credential read or state change (fail closed); absent/empty/`enabled = false` still never reads them. The disable path
+  (`qa-revoke`, `revoke`, `status`) works without the bundle. Only `conformance.json` ships.
+
+## 0.1.34
+
+- Add default-OFF `host_local_qa_assignment_v1` to the existing-session receiver: a separate opt-in section, scoped
+  credential, server-side admission and routes (`/runner/host-local-qa/v1/...`), a strict sender envelope pinned to the
+  frozen `schema.json`/`policy.json`/`brief.txt` bytes, an authoritative backend `/check` before the paste and again before
+  the Enter (iTerm paste is split into stage/submit), and a host-local guard (`session-receiver qa-check`) for the operation
+  owner. One lock, journal and injector with the metadata receiver; legacy routes, admission and ledger are unchanged.
+  See `docs/host-local-qa-assignment.md`.
+
+## 0.1.33
+
+- Add opt-in `stall_wait_v1`: `⏳ WAIT stall:#<this-card-8hex>` on an operator-armed registration
+  (`mesh-runner stall-wait arm|inspect|disarm`) sleeps until the first NEW own-author
+  `[mesh-stall-control:<uuid>]` result comment on that card, with a durable baseline and exactly one
+  wake of the same session. See `docs/stall-wait.md`.
+
+## 0.1.32
+
+- Add opt-in `recovery_wait_v1`: `⏳ WAIT recovery:#<this-card-8hex>` on an operator-armed registration
+  of a FUTURE shared recovery card (marker + project + recovery owner + receipt author). The registration
+  may precede or follow the card; Runner reconciles the actual Mesh cards, binds one, and delivers one
+  wake when it is `done` and carries a `carrier-receipt: <ref>` comment by the registered author. Evidence
+  only, never a security clearance. See `docs/recovery-wait.md`.
+
+## 0.1.31
+
+- Add opt-in `lifecycle_wait_v1`: one bounded wait on the first new, correlated native SessionStart
+  lifecycle event (startup/resume/compact, plus hook failure) of the implementation-pinned profile (`lifecycle_wait.PROFILE`), with durable
+  cursors, dedup and owner/generation-checked delivery. Disabled until an operator arms it.
 
 ## 0.1.30
 

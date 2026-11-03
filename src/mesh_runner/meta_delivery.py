@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.request
 import uuid
 from pathlib import Path
@@ -76,12 +77,21 @@ class Identity:
                 "capability": CAPABILITY, "allowed_sender_agent_ids": list(self.allowed_senders)}
 
 
+_JOURNAL_LOCKS: dict[str, threading.RLock] = {}
+_JOURNAL_LOCKS_GUARD = threading.Lock()
+
+
 class Journal:
-    """Durable per-request record, one 0600 file each, written atomically and fsynced."""
+    """Durable per-request record, one 0600 file each, written atomically and fsynced.
+
+    ``lock`` is one re-entrant lock per ledger directory in this process: every receiver of every capability serialises
+    its read-journal / write-intent / inject sequence on it, so two of them can never both decide to inject a request."""
 
     def __init__(self, directory: Path):
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with _JOURNAL_LOCKS_GUARD:
+            self.lock = _JOURNAL_LOCKS.setdefault(str(self.dir.resolve()), threading.RLock())
 
     def _path(self, request_id: str) -> Path:
         if not is_uuid(request_id):
@@ -285,6 +295,10 @@ class MetaReceiver:
 
     # ------------------------------------------------------------------ one delivery
     def handle(self, d: dict) -> dict:
+        with self.journal.lock:
+            return self._handle(d)
+
+    def _handle(self, d: dict) -> dict:
         rid = d.get("request_id") if isinstance(d, dict) else None
         did = d.get("delivery_id") if isinstance(d, dict) else None
         rid, did = (rid if is_uuid(rid) else None), (did if is_uuid(did) else "")   # untrusted: never a path
@@ -294,6 +308,8 @@ class MetaReceiver:
             return self._fail(d, e.code, rid, did)
         digest, prior = d["text_sha256"], self.journal.get(rid)
         if prior:
+            if prior.get("capability", CAPABILITY) != CAPABILITY:     # a request id is immutable across capabilities
+                return self._fail(d, ERR_CONFLICT, rid, did, persist=False)
             if prior["text_sha256"] != digest or prior["delivery_id"] != did:
                 return self._fail(d, ERR_CONFLICT, rid, did, persist=False)
             if prior["state"] == "injecting":                # crash after a possible paste: never paste again
@@ -345,9 +361,13 @@ class MetaReceiver:
         """Producer answers for received deliveries; leftover ``injecting`` records fail closed."""
         out = []
         for rec in self.journal.open_injections():
+            if rec.get("capability", CAPABILITY) != CAPABILITY:     # another capability's record is settled by its own receiver
+                continue
             out.append(self._report({}, self._settle(rec, uncertain=True)))
         for p in sorted(self.journal.dir.glob("*.json")):
             rec = self.journal.get(p.stem)
+            if rec and rec.get("capability", CAPABILITY) != CAPABILITY:
+                continue
             if rec and rec.get("state") == "received" and self.read_ack(rec):
                 rec.update(state="acknowledged", acknowledged_at=_now())
                 self.journal.put(rec["request_id"], rec)
@@ -412,5 +432,24 @@ def receiver_loop(receiver: MetaReceiver, stop, interval: float) -> None:
             log.warning("metadata receiver: %s", type(e).__name__)
         except Exception as e:
             log.warning("metadata receiver loop: %s", type(e).__name__)
+        if stop.wait(interval):
+            return
+
+
+def serve_loop(receivers: list, stop, interval: float) -> None:
+    """``receiver_loop`` for several receivers (one per capability) in ONE thread, so they can never inject concurrently.
+    Each registers on its own (retried every tick until it succeeds) and a failure of one never stops the others."""
+    registered = [False] * len(receivers)
+    while not stop.is_set():
+        for i, receiver in enumerate(receivers):
+            try:
+                if not registered[i]:
+                    receiver.client.register(receiver.id)
+                    registered[i] = True
+                receiver.step()
+            except (MeshError, OSError) as e:
+                log.warning("receiver %s: %s", type(receiver).__name__, type(e).__name__)
+            except Exception as e:
+                log.warning("receiver %s loop: %s", type(receiver).__name__, type(e).__name__)
         if stop.wait(interval):
             return

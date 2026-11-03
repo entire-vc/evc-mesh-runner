@@ -172,7 +172,10 @@ class CheckpointGC(unittest.TestCase):
         cp = self.suspend(state='completed', ended_hours_ago=8)
         runner = Runner.__new__(Runner)
         runner.cfg = type('C', (), {'ignored_cleanup': False, 'checkpoint_gc': False,
-                                    'checkpoint_gc_grace_hours': 6, 'ignored_cleanup_interval_minutes': 1})()
+                                    'checkpoint_gc_grace_hours': 6, 'ignored_cleanup_interval_minutes': 1,
+                                    # the pass ends with _measure_checkpoints(): without these the worker
+                                    # thread died with AttributeError after the test body had passed
+                                    'pool_root': self.root / 'pool', 'checkpoint_budget_gb': 0})()
         runner._ignored_next = 0.0
         runner.agents = [type('A', (), {'pool': self.pool, 'agent': type('N', (), {'name': 'agent'})()})()]
         runner._prune_ignored_if_due()

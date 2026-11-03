@@ -286,8 +286,8 @@ class ITermReceiverTest(base.SessionReceiverTest):
         self.assertEqual(it._reason(mk("boom")), "iterm_unavailable")
 
     def test_host_matches_is_exact_modulo_case_and_local(self):
-        self.assertTrue(it.host_matches("MacBook-Pro-8.local", "macbook-pro-8"))
-        self.assertFalse(it.host_matches("MacBook-Pro-8.local", "mac-mini"))
+        self.assertTrue(it.host_matches("my-mac.local", "my-mac"))
+        self.assertFalse(it.host_matches("my-mac.local", "mac-mini"))
         self.assertFalse(it.host_matches("", ""))
 
 
