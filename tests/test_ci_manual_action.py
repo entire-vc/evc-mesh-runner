@@ -4,7 +4,7 @@ import datetime as dt
 from types import SimpleNamespace
 from unittest import mock
 
-from fakes import FakeGitLab, FakeMesh, task
+from fakes import FakeGitLab, FakeMesh, task, write_replies
 from mesh_runner.outcome import parse_line
 from mesh_runner.store import iso
 from mesh_runner.wake import ci_delivery_key
@@ -31,8 +31,7 @@ class ManualAction(Bench):
         return r, a, t, gl, wait
 
     def spawn_notice(self, r, a):
-        with mock.patch.object(r.adapter, "spawn", return_value=SimpleNamespace(pid=99999999)):
-            self.assertTrue(r._spawn(a, "prompt", False, ("ready",)))
+        self.native_delivery(r, a)
 
     def test_legacy_nested_observation_keeps_original_and_cas_snapshot_immutable(self):
         for kind in ("pipeline", "mr"):
@@ -194,27 +193,31 @@ class ManualAction(Bench):
         r._wake_one(a)
         self.assertEqual(a.state, "ready")
 
-    def test_spawn_failure_keeps_notice_and_receipt_failure_stops_writer(self):
+    def test_spawn_and_receipt_failure_keep_notice_until_native_ack_commit(self):
         r, a, t, gl, wait = self.setup_wait()
         r._wake_one(a)
         self.assertEqual(a.state, "ready")
         key = a.wait["ci_action_delivery"]["key"]
-        with mock.patch.object(r.adapter, "spawn", side_effect=OSError("not started")):
-            with self.assertRaises(OSError):
-                r._spawn(a, "prompt", False, ("ready",))
-        self.assertEqual(a.state, "ready")
+        self.refused_spawn(r, a, ("ready",))
         self.assertIsNone(r.store.mark(a.agent, a.task_id, key))
+        write_replies(self.replies, {})
+        self.assertTrue(r._spawn(a, "prompt", False, ("ready",)))
+        self.assertIsNone(r.store.mark(a.agent, a.task_id, key))
+        self.assertEqual(r.procs[a.id].wait(timeout=10), 0)
         mark = r.store.mark
-        with mock.patch.object(r.adapter, "spawn", return_value=SimpleNamespace(pid=99999999)), \
-                mock.patch.object(r.store, "mark", side_effect=lambda *args: (
-                    (_ for _ in ()).throw(RuntimeError("receipt failure"))
-                    if len(args) == 4 and args[2] == key else mark(*args))), \
-                mock.patch("mesh_runner.runner.interrupt_group") as stop:
+        with mock.patch.object(r.store, "mark", side_effect=lambda *args: (
+                (_ for _ in ()).throw(RuntimeError("receipt failure"))
+                if len(args) == 4 and args[2] == key else mark(*args))):
             with self.assertRaises(RuntimeError):
-                r._spawn(a, "prompt", False, ("ready",))
-            stop.assert_called_once()
-        self.assertEqual(r.store.get(a.id).state, "ready")
+                r._reconcile_interactive_prompt(a)
+        kept = r.store.get(a.id)
+        self.assertEqual(kept.state, "running")
+        self.assertIn("ci_action_delivery", kept.wait)
+        self.assertIn("interactive_prompt_intent", kept.wait)
         self.assertIsNone(r.store.mark(a.agent, a.task_id, key))
+        restarted = self.runner(r.mesh, gl)
+        self.assertTrue(restarted._reconcile_interactive_prompt(restarted.store.get(a.id)))
+        self.assertIsNotNone(restarted.store.mark(a.agent, a.task_id, key))
 
     def test_unknown_or_stale_identity_preserves_bounded_error_recovery(self):
         for row in ({}, {"id": 5, "sha": "b" * 40, "status": "manual"},

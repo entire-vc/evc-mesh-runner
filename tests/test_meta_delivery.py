@@ -32,6 +32,10 @@ class FakeBackend(BaseHTTPRequestHandler):
     rejected: list = []                   # (path, why) of everything the contract refuses
     registrations: list = []
     states: dict = {}
+    receivers: list = []                  # receiver_ids this backend issued
+    deleted: list = []                    # receiver_ids revoked by an accepted DELETE
+    bad_receiver_id = None                # a registration answer with a malformed receiver_id
+    delete_status: int = 204              # what DELETE answers (a failing backend)
 
     def log_message(self, *a):
         pass
@@ -69,6 +73,22 @@ class FakeBackend(BaseHTTPRequestHandler):
         items, type(self).queued = list(type(self).queued), []
         self._send({"deliveries": items})
 
+    def do_DELETE(self):
+        m = re.fullmatch(re.escape(BASE) + r"/receivers/([0-9a-f-]{36})", self.path)
+        if not m:
+            return self._refuse("unknown_route", 404)
+        if not self._auth():
+            return
+        if m.group(1) not in type(self).receivers:
+            return self._refuse("unknown_receiver", 404)
+        if type(self).delete_status not in (200, 202, 204):
+            return self._refuse("backend_error", type(self).delete_status)
+        if type(self).delete_status in (200, 202):                # a success that is not the frozen 204
+            return self._send({}, type(self).delete_status)
+        type(self).deleted.append(m.group(1))
+        self.send_response(204)
+        self.end_headers()
+
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         body = json.loads(raw or b"{}")
@@ -80,7 +100,11 @@ class FakeBackend(BaseHTTPRequestHandler):
             if body["capability"] != CAPABILITY or not isinstance(body["allowed_sender_agent_ids"], list):
                 return self._refuse("registration_values")
             type(self).registrations.append(body)
-            return self._send({"receiver_id": str(uuid.uuid4()), **{k: IDENT[k] for k in IDENT if k != "hostname"},
+            rid = str(uuid.uuid4())
+            type(self).receivers.append(rid)
+            if type(self).bad_receiver_id is not None:
+                rid = type(self).bad_receiver_id
+            return self._send({"receiver_id": rid, **{k: IDENT[k] for k in IDENT if k != "hostname"},
                                "hostname": body["hostname"], "capability": CAPABILITY, "admission_revision": REV,
                                "allowed_sender_agent_ids": body["allowed_sender_agent_ids"]}, 201)
         m = re.fullmatch(re.escape(BASE) + r"/deliveries/([0-9a-f-]{36})/ack", self.path)

@@ -7,6 +7,8 @@
     mesh-runner slots  --config runner.toml     # worktree pool, with reasons for held slots
     mesh-runner free-slot --config runner.toml --path <slot>   # return a held slot if it is safe now
     mesh-runner free-slot --config runner.toml --path <slot> --archive   # save uncommitted work on a ref, then return it
+    mesh-runner quarantine-list --config runner.toml --path <slot> [--verify]   # archived-source quarantine runs of a slot
+    mesh-runner quarantine-restore --config runner.toml --path <slot> --run <run>   # put a run's entries back
     mesh-runner asks classify --config runner.toml [--json]   # read-only: open human gates, hard or soft
     mesh-runner reviewer-merge --config runner.toml --agent <lane> --task <uuid> --mr group/project!iid --sha <full sha> [--apply]   # opt-in reviewer merge-only handoff; dry-run unless --apply
     mesh-runner pool   --config runner.toml [--prune-ignored [--ignored-idle-hours H]] [--prune-checkpoints [--checkpoint-grace-hours H]] [--compact-checkpoints] [--evict [--apply] --idle-hours H --keep N --max-evictions M]
@@ -18,16 +20,20 @@ from pathlib import Path
 import json
 import logging
 import math
+import os
 import signal
 import sys
 import threading
 
 from . import config as config_mod
+from . import maintenance
 from . import repo_admission
 from . import workspace_requests
+from .native_result_ledger import identity as native_wait_identity
 from . import auth
 from .runner import AlreadyRunning, Runner
 from .store import OPEN, Store
+from .workspace import WorkspaceError
 
 
 def _idle_hours_arg(text: str) -> float:
@@ -192,8 +198,14 @@ def _receipt_wait(argv: list[str]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args_in = sys.argv[1:] if argv is None else argv
+    if args_in and args_in[0] == "recheck-delivery":
+        from .delivery_requests import command
+        return command(args_in[1:])
     if args_in and args_in[0] == "reviewer-merge":
         return _reviewer_merge(args_in[1:])
+    if args_in and args_in[0] == "session-receiver":
+        from .session_receiver import command
+        return command(args_in[1:])
     if args_in and args_in[0] == "notify-access-change":
         from .access_recovery import notify_command
         return notify_command(args_in[1:])
@@ -208,14 +220,19 @@ def main(argv: list[str] | None = None) -> int:
         return command(args_in[1:])
     if args_in and args_in[0] == "editor-control":
         return _editor_control(args_in[1:])
+    if args_in and args_in[0] == "native-rebind":
+        from .native_result_rebind import command
+        return command(args_in[1:])
     if args_in and args_in[0] == "receipt-wait":
         return _receipt_wait(args_in[1:])
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
-    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "pool", "suspend-wait-workspace", "admit-workspace-repo", "clear-auth-hold", "rearm-cap"])
+    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "quarantine-list", "quarantine-restore", "pool", "suspend-wait-workspace", "admit-workspace-repo", "workspace-maintenance", "clear-auth-hold", "rearm-cap"])
     p.add_argument("--config", required=True)
-    p.add_argument("--path", help="slot path for free-slot")
+    p.add_argument("--path", help="slot path for free-slot / quarantine-list / quarantine-restore")
+    p.add_argument("--run", help="quarantine-restore: quarantine run name (see quarantine-list)")
+    p.add_argument("--verify", action="store_true", help="quarantine-list: recompute entry checksums")
     p.add_argument("--archive", action="store_true",
                    help="free-slot: commit a held slot's uncommitted work onto refs/mesh-runner/archive/ "
                         "(never pushed) and then return the slot")
@@ -228,6 +245,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wait-generation")
     p.add_argument("--repo", help="admit-workspace-repo: name of the newly configured repository")
     p.add_argument("--request-id")
+    p.add_argument("--action", choices=["inspect", "acquire", "finish"],
+                   help="workspace-maintenance: inspect (read-only identity + windows + receipt), acquire, finish")
+    p.add_argument("--pool", help="workspace-maintenance: <agent>/<repo> pool of the leased slot")
+    p.add_argument("--slot", help="workspace-maintenance: canonical slot path from inspect")
+    p.add_argument("--lease", help="workspace-maintenance: lease token from inspect")
+    p.add_argument("--window", help="workspace-maintenance finish: request id of the acquire that opened the window")
     p.add_argument("--evict", action="store_true", help="pool: preview (or with --apply, perform) eviction")
     p.add_argument("--apply", action="store_true", help="pool --evict: remove slots; needs the exclusive runner lock")
     p.add_argument("--prune-ignored", action="store_true",
@@ -246,6 +269,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s")
+    if args.command in ("run", "once"):
+        from . import launch_guard
+        if launch_guard.HANDOFF not in os.environ:
+            # Both the installed console and `python -m mesh_runner.cli` use the
+            # supported boundary. The exec child validates the inherited lock.
+            guarded = ["--target-release", str(Path(__file__).resolve().parents[2]),
+                       "--config", args.config, "--log-level", args.log_level]
+            if args.command == "once":
+                guarded.append("--once")
+            return launch_guard.main(guarded)
 
     if args.command == "rearm-cap":
         from . import cap_rearm
@@ -301,6 +334,41 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True))
         return 0
 
+    if args.command == "workspace-maintenance":
+        cfg = config_mod.load(args.config)
+        if args.agent not in {a.name for a in cfg.agents}:
+            p.error("--agent must name a configured agent")
+        if not args.action:
+            p.error("--action required")
+        store = Store(cfg.state_dir / "runner.sqlite")
+        try:
+            if args.action == "inspect":
+                if not args.attempt:
+                    p.error("exact --attempt required")
+                a = store.get(args.attempt)
+                if a is None or a.agent != args.agent:
+                    print("unknown attempt for this agent", file=sys.stderr)
+                    return 2
+                slots = [dict(r) for r in store.db.execute("SELECT * FROM slots WHERE attempt=? AND state='leased'", (a.id,))]
+                out = {"task": a.task_id, "attempt": a.id, "state": a.state,
+                       "wait_generation": workspace_requests.generation(a),
+                       "slots": [{"pool": x["pool"], "slot": x["path"], "lease": maintenance.lease_token(x)} for x in slots],
+                       **maintenance.inspect(cfg.state_dir, store, args.agent, args.request_id or "")}
+                print(json.dumps(out, sort_keys=True))
+                return 0
+            if not all((args.task, args.attempt, args.wait_generation, args.request_id, args.pool, args.slot, args.lease)):
+                p.error("exact --task, --attempt, --wait-generation, --request-id, --pool, --slot and --lease required")
+            if args.action == "finish" and not args.window:
+                p.error("finish requires --window")
+            result = maintenance.submit(cfg.state_dir, args.agent, args.action, args.task, args.attempt,
+                args.wait_generation, args.request_id, args.pool, args.slot, args.lease, args.ttl_seconds,
+                args.window or "")
+        except (ValueError, OSError):
+            print("request rejected (identity, deadline or private spool)", file=sys.stderr)
+            return 2
+        print(json.dumps(result, sort_keys=True))
+        return 0
+
     if args.command == "admit-workspace-repo":
         cfg = config_mod.load(args.config)       # the fresh config is the source of the pinned spec
         agent = next((x for x in cfg.agents if x.name == args.agent), None)
@@ -329,7 +397,16 @@ def main(argv: list[str] | None = None) -> int:
                 out.append({"agent": agent.name, "task": a.task8, "state": a.state, "title": a.title[:70],
                             "task_id": a.task_id, "attempt": a.id, "wait_generation": workspace_requests.generation(a),
                             "wait": a.wait.get("kind", ""), "turns": a.turns, "session": a.session_id,
-                            "workspaces": a.workspaces, "updated": a.updated_at})
+                            "native_rebind_generation": (native_wait_identity(a.wait)
+                                if a.wait.get("kind") == "native" else None),
+                            "native_registration": (a.wait.get("target")
+                                if a.wait.get("kind") == "native" else None),
+                            "workspaces": a.workspaces, "updated": a.updated_at,
+                            **({"prompt_delivery": {"pending": True,
+                                   "turn": a.wait["interactive_prompt_intent"].get("turn"),
+                                   "resolution_required": a.state == "unknown",
+                                   "reason": a.wait["interactive_prompt_intent"].get("resolution", "") }}
+                               if isinstance(a.wait.get("interactive_prompt_intent"), dict) else {})})
         # Keep the existing top-level list and expose durable holds even when no
         # attempt is currently open on the profile.
         out.extend({"auth_hold": row} for row in auth.status(store, args.config))
@@ -351,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         except AlreadyRunning as e:
             print(e, file=sys.stderr)
             return 2
-    elif args.command in ("plan", "slots", "free-slot", "pool"):
+    elif args.command in ("plan", "slots", "free-slot", "quarantine-list", "quarantine-restore", "pool"):
         runner = Runner(cfg, lock=False)          # read-mostly: may run beside the service
         if args.command == "slots":
             json.dump([{"agent": ar.agent.name, "slots": ar.pool.rows()} for ar in runner.agents],
@@ -360,6 +437,27 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "pool":
             return _pool(runner, cfg, args)
+        if args.command in ("quarantine-list", "quarantine-restore"):
+            for ar in runner.agents:
+                if args.path and Path(args.path).is_relative_to(ar.pool.root):
+                    if args.command == "quarantine-restore" and not args.run:
+                        p.error("quarantine-restore needs --run")
+                    try:
+                        if args.command == "quarantine-list":
+                            out = ar.pool.quarantine_inventory(args.path, verify=args.verify)
+                        else:
+                            out = {"restored": ar.pool.quarantine_restore(args.path, args.run)}
+                    except WorkspaceError as e:
+                        print(f"{args.command}: {e}", file=sys.stderr)
+                        return 1
+                    json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
+                    print()
+                    if args.command == "quarantine-list" and any(r["state"] == "unreadable" for r in out):
+                        print(f"{args.command}: a quarantine manifest is unreadable or malformed", file=sys.stderr)
+                        return 1                  # the inventory above is still printed; corruption is not success
+                    return 0
+            print("no agent pool contains that path")
+            return 1
         if args.command == "free-slot":
             for ar in runner.agents:
                 if args.path and args.path.startswith(str(ar.pool.root)):

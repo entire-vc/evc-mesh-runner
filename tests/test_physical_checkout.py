@@ -89,9 +89,11 @@ class PhysicalCheckout(Bench):
             seen["prompt"] = launch.prompt
             raise RuntimeError("stop")
 
+        r.store.update(a, state="ready")  # the normal resume admission state
+        original_resume = self.adapter.resume_argv
         def resume_argv(sid, cwd, add_dirs):
             seen["argv"] = [str(d) for d in add_dirs]
-            return ["x"]
+            return original_resume(sid, cwd, add_dirs)
         with patch.object(self.adapter, "spawn", side_effect=spawn, create=True), \
                 patch.object(self.adapter, "resume_argv", side_effect=resume_argv, create=True):
             with self.assertRaises(Exception):

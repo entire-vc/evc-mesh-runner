@@ -735,18 +735,64 @@ way only:
 
 1. The release is published to the extension catalog (signed artifact, `mesh-extension.json`
    `version` = `mesh_runner.__version__` = `pyproject.toml` `version`).
-2. An instance admin opens **Extensions → Updates** in Mesh and updates Agent Runner
-   (`POST /api/v1/extensions/agent-runner/update`; new permissions ask for consent first). The
-   Installed column now shows the new version.
-3. The operator installs exactly that release on the host: download the artifact, check its
-   sha256 against the catalog entry, unpack it next to the previous one and point the service at
-   it (`PYTHONPATH=<release>/src`), then restart the runner.
+2. Stage the verified artifact next to the previous release. Prepare the service's mandatory
+   guarded launch below, using an absolute config path with an explicit `[runner].state_dir`.
+   Check target capability, config/state and pending delivery before metadata update or rollback;
+   repeat the check under the existing singleton after the controller has drained.
+3. An instance admin updates Agent Runner in **Extensions → Updates**
+   (`POST /api/v1/extensions/agent-runner/update`; new permissions ask for consent first).
+   Activate exactly that artifact through the guarded launch; metadata success alone does not
+   activate code. A race that creates pending delivery stops activation and needs owner reconciliation.
 4. Check: `python3 -c 'import mesh_runner; print(mesh_runner.__version__)'` under the service's
    `PYTHONPATH` equals the Installed version, and the runner's lease in Mesh reports it.
 
 Never update the host from a git checkout or a hand-copied directory: Mesh would keep showing the
-old version. Rollback is the reverse: **Updates → Roll back** in Mesh, then point the service at the
-previous release directory and restart.
+old version. Rollback uses the same capability/pending preflight and guarded launch before
+and after **Updates → Roll back**. Restoring a historical unguarded plist is unsupported.
+
+The service's `ProgramArguments` must invoke a retained capable guard, including on rollback:
+
+```sh
+python3 /absolute/capable-release/src/mesh_runner/launch_guard.py \
+  --target-release /absolute/target-release --config /absolute/runner.toml
+```
+
+`mesh-runner-guarded-launch` is the equivalent installed executable. Both existing
+`mesh-runner run/once` and `python -m mesh_runner.cli run/once` automatically enter this
+guard before opening the registry; the exec child validates the inherited singleton. `--check` performs the
+exclusive preflight without changing the activation binding; it refuses while the controller
+owns `runner.lock`. The launch guard holds that same lock across exec into the normal CLI;
+Runner validates the inherited fd, inode, held lock, config and runtime source tree before opening
+its registry. There is no extra persistent lock. Capability-less or unknown target releases are
+refused. Pending prompt intent or any UNKNOWN row prevents a target/config/tree change, while
+restart of the exact previously activated capable target remains allowed for reconciliation.
+The `activated-release.json` binding is fsynced; do not edit or delete it to force a downgrade.
+
+This guarantee covers the supported launch/update/rollback path. Direct invocation of old code,
+a manual `PYTHONPATH` override or a historical unguarded service definition bypasses that path
+and is unsupported; an old binary does not protect itself. The guard does not retrofit evidence
+for attempts created before durable launch intent existed. Keep the capable release until pending
+attempts have reconciled; never clear queues, set READY or replay a possibly accepted prompt.
+
+A fresh Codex session has no thread id before its first input: the installed CLI (0.159.x) creates
+the rollout together with the first user message (no rollout without a user message in 400 local
+sessions). The launch is therefore registered with PID, birth and turn but an empty session id, and the
+session, rollout path, cursor and prefix digest are bound into the delivery journal as soon as the
+rollout appears, together with the accepted phase. A driver death between stdin and that binding
+stays UNKNOWN (`session-unbound`) with a resolution owner; it is never reported as success and the
+prompt is never pasted again.
+
+For a pending attempt, `mesh-runner recheck-delivery --config /absolute/runner.toml --agent NAME
+--attempt UUID` reads a redacted native-evidence snapshot. Add `--submit --task TASK_UUID
+--token TOKEN --turn TURN --evidence-sha256 SHA --request-id REQUEST_UUID` to request a recheck of
+that exact snapshot. The command writes only an immutable private request. The owning tick
+validates agent/task/attempt/token/turn/prompt digest, expiry, evidence SHA and whole-group death,
+then runs the existing native proof validator. Its durable receipt reports exact terminal ACK,
+proven pre-send retry through normal admission, or `unresolved:<reason>`. A request or an evidence
+hash alone never authorizes delivery. Missing native IDs, unbound sessions and ambiguous native
+send/exec remain pending with their diagnostic reason; this command cannot resolve every UNKNOWN.
+Archive completed request/receipt pairs only when the bounded spool is full; a retry uses a new
+request ID and fresh snapshot, never a renewed deadline for the old request.
 
 ## Runtime catalog
 
@@ -843,6 +889,62 @@ work cannot be saved and verified the slot stays held and the reason is logged.
 
 `mesh-runner free-slot --config runner.toml --path <slot> --archive` does the same for one
 held slot on demand; without `--archive` an unsafe slot is still refused.
+
+### External archive root
+
+Untracked, non-ignored slot files are archived before a slot is freed. By default they go to
+`<state_dir>/slot-archive/<owner>/<UTC stamp>-<slot>`. To keep them off the internal disk:
+
+```toml
+[runner]
+archive_root = "/Volumes/fleet/mesh-runner/slot-archive"   # archive goes to <archive_root>/<owner>/...
+archive_require_mount = "/Volumes/fleet"                   # optional guard, needs archive_root
+```
+
+With `archive_require_mount` the archive is written only if that path is a mounted volume (its
+device differs from its parent's), the archive root resolves inside it, and the volume is not on the
+`state_dir` device. Otherwise (volume missing, check error, destination substituted) the archive raises,
+the slot stays held, the source files stay in the slot, and nothing is created on the internal disk.
+`archive_root` itself is never created by the runner when a mount is required: create it once on the
+volume (an operator step), otherwise slots stay held. Internal logical pool roots with slots
+symlinked onto the SSD work. Without `archive_root` behaviour is unchanged (per-owner directories
+under `<state_dir>/slot-archive`, so existing recovery and inventory by path keep working).
+
+All archive writes (mkdir, create, copy, read-back) go through directory fds opened under the verified
+volume, so a lost or substituted mount can only make an operation fail; the path is never resolved
+again through the internal disk. Before every source rename and before the `complete` receipt the
+configured mount and `archive_root` are re-checked against the held descriptors (still a mount point,
+same device and inode, root path unchanged); an unmount, replacement or check error refuses, returns
+the moved entries to the slot (no replace) and keeps the slot held. The archived copy is read back and compared (bytes, symlink targets,
+tree) before anything in the slot is touched.
+
+Sources are never deleted by the runner. After the read-back each entry is renamed (atomic, same
+device) into a quarantine `<real slot parent>/.quarantine-<slot>/<UTC stamp>-<n>/`, beside the real slot
+directory on the slot's own device. A `manifest.json` is committed first (temp file, fsync, rename,
+directory fsync): slot, owner, attempt, archive reference, and per entry the original relative path,
+type and sha256 / symlink target. It goes `renaming` -> `complete`. Any error leaves the data in the
+slot or in the quarantine and the slot held. A run left in `renaming` is reconciled at the next free:
+every entry must be in the quarantine or still in the slot (it is then archived again), otherwise the
+slot stays held; once accounted for the manifest becomes `recovered`, which is the recovery receipt.
+The quarantine is outside the slot, so it is never re-archived, reset or reused.
+
+```
+mesh-runner quarantine-list --config runner.toml --path <slot> [--verify]
+mesh-runner quarantine-restore --config runner.toml --path <slot> --run <run>
+```
+
+`quarantine-list` prints each run's state, attempt, archive reference and where each entry is now
+(`quarantine` / `slot` / `missing`; `--verify` recomputes the checksums). `quarantine-restore`
+checksum-verifies every entry of a run and moves it back to its original place; an occupied target or a
+mismatch refuses the whole run. Restore works only on a `held` or `free` slot (never a leased one, where an
+agent is writing) and holds the slot row by compare-and-swap while files move. There is no automatic purge and no TTL: retention and deletion of
+quarantines are a separate contract (their bytes stay on the SSD until an operator removes them after
+comparing with the archive). Any external cleaner must leave `.quarantine-*` directories alone.
+
+Guarantee boundary: recoverability when the archive fails or is substituted *during* the operation. It
+is not a cross-device transaction, and the quarantine sits on the same SSD as the slot, so it is not an
+independent backup and does not protect against loss of the SSD or deletion of data after the
+operation succeeded. After a restart an entry copied by an interrupted run may exist twice in the archive.
 
 ### Worktree disk admission
 

@@ -165,12 +165,9 @@ class MRStateWait(Bench):
         delivery = r._review_ci_delivery[t['id']]
         self.assertIsNone(r.store.mark(self.agent.name, t['id'], KEY))
         r.store.update(a, wait={**a.wait, 'ci_delivery': delivery})
-        with mock.patch.object(r.adapter, 'spawn', side_effect=OSError('injected')):
-            with self.assertRaises(OSError):
-                r._spawn(a, 'prompt', False, ('waiting',))
+        self.refused_spawn(r, a, ('waiting',))
         self.assertIsNone(r.store.mark(self.agent.name, t['id'], KEY))
-        with mock.patch.object(r.adapter, 'spawn', return_value=SimpleNamespace(pid=99999999)):
-            self.assertTrue(r._spawn(a, 'prompt', False, ('waiting',)))
+        self.native_delivery(r, a)
         self.assertEqual(r._review_event(t, old, last, []), '')
 
     def test_owner_drift_does_not_deliver(self):

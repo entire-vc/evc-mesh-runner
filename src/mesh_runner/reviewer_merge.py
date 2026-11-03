@@ -22,6 +22,8 @@ import subprocess
 import urllib.request
 from dataclasses import dataclass, field
 
+from .mesh import MeshError
+
 LABEL = "merge-only"
 MARKER = "reviewer-merge:v1"
 BLOCK = re.compile(r"<!-- reviewer-merge:v1 (\{.*?\}) -->", re.S)
@@ -139,7 +141,34 @@ def evaluate(*, source: dict, project: str, iid: str, sha: str, mr: dict, select
         "author_lane": author, "author_family": selection.get("author_family") or ""})
 
 
-def card_fields(req: dict, project_id: str) -> dict:
+# the canonical backend's domain.StatusCategory values; a row outside them is not a status we can reason about
+STATUS_CATEGORIES = frozenset({"backlog", "todo", "in_progress", "review", "done", "cancelled", "triage"})
+
+
+def resolve_todo(statuses) -> str:
+    """The id of the project's one Todo status, from the live status list; anything else refuses.
+
+    The create API takes ``status_id`` only. No hardcoded id, no "first" or default status: the
+    category is the contract, and two Todo-category rows (or none) is not a choice we make for the
+    operator."""
+    if not isinstance(statuses, list) or any(not isinstance(s, dict) for s in statuses):
+        raise Refused("todo-status-unreadable")
+    if any(not isinstance(s.get("id"), str) or not s["id"].strip() or not isinstance(s.get("category"), str)
+           or s["category"] not in STATUS_CATEGORIES
+           for s in statuses):                           # one unreadable row is a list we cannot trust
+        raise Refused("todo-status-malformed")
+    todo = [s for s in statuses if s["category"] == "todo"]
+    if not todo:
+        raise Refused("todo-status-unknown")
+    if len(todo) > 1:
+        raise Refused("todo-status-ambiguous")
+    sid = todo[0].get("id")
+    if not isinstance(sid, str) or not sid.strip():
+        raise Refused("todo-status-malformed")
+    return sid
+
+
+def card_fields(req: dict, project_id: str, status_id: str) -> dict:
     target = f"{req['project']}!{req['iid']}"
     src8 = req["source_task"][:8]
     body = (
@@ -153,7 +182,7 @@ def card_fields(req: dict, project_id: str) -> dict:
         "тогда прокомментируй причину и верни карточку автору.\n\n"
         f"<!-- reviewer-merge:v1 {json.dumps(req, sort_keys=True, separators=(',', ':'))} -->")
     return {"title": f"[merge-only] {target} @{req['sha'][:12]} ({req['key']})", "description": body,
-            "priority": "urgent", "labels": [LABEL, "kind:ops", req["key"]], "status": "todo"}
+            "priority": "urgent", "labels": [LABEL, "kind:ops", req["key"]], "status_id": status_id}
 
 
 def request(*, mesh, gitlab, source_id: str, target: str, sha: str, selector_argv: list[str],
@@ -186,6 +215,16 @@ def request(*, mesh, gitlab, source_id: str, target: str, sha: str, selector_arg
     plan = evaluate(source=source, project=project, iid=iid, sha=sha, mr=mr, selection=selection, author=author)
     if plan.ok and not agent_ids.get(plan.request["reviewer_lane"]):
         plan = Plan(False, ["reviewer-agent-id-unknown"])   # dry-run says what apply would: not ready
+    def todo_status() -> str:
+        return resolve_todo(mesh.statuses(str(source.get("project_id") or "")))
+
+    if plan.ok and not apply:
+        try:                                             # read-only, so a dry-run is as honest as apply
+            todo_status()
+        except Refused as e:
+            plan = Plan(False, [str(e)])
+        except MeshError:
+            plan = Plan(False, ["todo-status-unreadable"])
     out: dict = {"mode": "apply" if apply else "dry-run", "ready": plan.ok, "refusals": plan.refusals,
                  "request": plan.request, "created": False, "card": None}
     if not plan.ok or not apply:
@@ -213,7 +252,15 @@ def request(*, mesh, gitlab, source_id: str, target: str, sha: str, selector_arg
                     out["repaired"] = True
                 break                                    # a repeat or a restart: the one card stays
         else:
-            made = mesh.create_task(source["project_id"], card_fields(req, source["project_id"]))
+            try:                                         # only a new card needs it: a repeat or a repair does not
+                todo_id = todo_status()
+            except Refused as e:
+                out.update(ready=False, refusals=[str(e)])
+                return out
+            except MeshError:
+                out.update(ready=False, refusals=["todo-status-unreadable"])
+                return out
+            made = mesh.create_task(source["project_id"], card_fields(req, source["project_id"], todo_id))
             if not made.get("id"):
                 raise Refused("card-not-created")
             mesh.assign(made["id"], reviewer_id)

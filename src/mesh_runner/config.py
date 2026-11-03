@@ -334,6 +334,11 @@ class RunnerConfig:
     # re-checks do not count against daily_wait_budget.
     wait_first_recheck_hours: float = 2.0
     min_free_gb: float = 0.0           # worktree admission floor in GiB; 0 = off
+    # Where untracked slot files are archived before a slot is freed. None = <state_dir>/slot-archive
+    # (legacy). archive_require_mount: the archive must live on that mounted volume and not on the
+    # state_dir device, else the slot is held (no fallback, nothing deleted).
+    archive_root: Path | None = None
+    archive_require_mount: Path | None = None
     # a held slot of a finished attempt is freed (its uncommitted work saved on a never-pushed ref)
     # when the task is closed or no longer the agent's, or after this many hours without a newer
     # attempt on the task; 0 = only the first two reasons
@@ -521,6 +526,8 @@ class RunnerConfig:
     # Placeholders: {target} {project} {iid} {sha}. Empty = merge waits are rejected.
     merge_command: tuple = ()
     merge_command_cwd: Path | None = None
+    native_result_dir: Path | None = None  # opt-in; private enrolled outbox
+    native_result_channels_dir: Path | None = None  # authenticated observer channels
     reviewer_select_command: tuple = ()      # router adapter for `reviewer-merge`: JSON {lane, reason, username}
     merge_timeout_minutes: float = 15.0
     merge_rerun_minutes: float = 5.0
@@ -666,6 +673,8 @@ def load(path: str | Path) -> RunnerConfig:
     floor = float(r.get("min_free_gb", 0.0))
     if not math.isfinite(floor) or floor < 0:
         raise ConfigError("min_free_gb must be finite and nonnegative")
+    if r.get("archive_require_mount") and not r.get("archive_root"):
+        raise ConfigError("archive_require_mount needs archive_root")
     dead_hours = float(r.get("dead_slot_hours", 24.0))
     if not math.isfinite(dead_hours) or dead_hours < 0:
         raise ConfigError("dead_slot_hours must be finite and nonnegative")
@@ -814,6 +823,8 @@ def load(path: str | Path) -> RunnerConfig:
                                                "turn_external_wait_minutes"),
         wait_first_recheck_hours=float(r.get("wait_first_recheck_hours", 2.0)),
         min_free_gb=float(r.get("min_free_gb", 0.0)),
+        archive_root=_path(r.get("archive_root")),
+        archive_require_mount=_path(r.get("archive_require_mount")),
         dead_slot_hours=dead_hours,
         workspace_wait_release_minutes=float(r.get("workspace_wait_release_minutes", 0.0)),
         ignored_cleanup=r.get("ignored_cleanup", False) is True,
@@ -883,6 +894,8 @@ def load(path: str | Path) -> RunnerConfig:
                                                                     "unanswerable_users", ())),
         merge_command=_merge_command(r.get("merge_command")),
         merge_command_cwd=_path(r.get("merge_command_cwd")),
+        native_result_dir=_path(r.get("native_result_dir")),
+        native_result_channels_dir=_path(r.get("native_result_channels_dir")),
         reviewer_select_command=_reviewer_select_command(r.get("reviewer_select_command")),
         merge_timeout_minutes=_positive(r.get("merge_timeout_minutes", 15.0), "merge_timeout_minutes"),
         merge_rerun_minutes=_positive(r.get("merge_rerun_minutes", 5.0), "merge_rerun_minutes"),

@@ -44,6 +44,24 @@ PYTHONPATH=src python3 scripts/reviewer-canary.py --config runner.toml \
 
 Prints selected lane, reason, lane `gitlab_username` and the `/user` its fresh env resolves to.
 
+## Positive check after install
+
+Run on the installed runtime, with a real open MR that already carries a `verified-by:` label and a green head pipeline
+(the product merge itself is not part of this check). `<sha>` is the full MR head.
+
+1. Version: the installed package reports `0.1.28` or newer.
+2. Dry-run: the command from "Invocation" without `--apply`. Expect `ready: true`, empty `refusals`, and a `request`
+   whose lane is the router's cross-family (or quota same-family) reviewer, not the author.
+3. Canary: `scripts/reviewer-canary.py` for the same project and author. The `/user` it prints must equal that
+   reviewer's `gitlab_username`.
+4. Apply: the same command with `--apply`. Expect one new card `[merge-only] group/project!iid @sha (rm-<key>)` in
+   `todo` (a real Todo status, not backlog), label `merge-only`, assigned to the dry-run's reviewer.
+5. Product card: assignee, checkout and status are the same as before step 4.
+6. Repeat: run step 4 again. Expect the same card id, `created: false`, no second card with that `rm-<key>`.
+7. Rollback: cancel the one merge-only card; nothing else was changed.
+
+A refusal in step 2 is a result, not a reason to bypass the router: fix the named input and rerun.
+
 ## Rollback
 
 Do not run `--apply`; cancel the one merge-only card. Nothing else changes.

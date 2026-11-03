@@ -17,6 +17,7 @@ A release archive must contain, besides the rest of the tree:
 | `scripts/select-reviewer.py` | router adapter; needs an installed fleet router, see `docs/reviewer-merge.md` |
 | `scripts/reviewer-canary.py` | read-only canary |
 | `docs/reviewer-merge.md` | operator contract and rollback |
+| `src/mesh_runner/session_receiver.py`, `docs/session-receiver.md` | the `session-receiver` command and its operator contract |
 
 `tests/test_release_package.py` checks the version sync and, against `git ls-files`, that every
 listed path is tracked (so `git archive` carries it), and that the reviewer files carry no card

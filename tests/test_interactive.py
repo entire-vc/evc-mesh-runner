@@ -48,6 +48,7 @@ for i, a in enumerate(args):
         notify = json.loads(args[i + 1][len("notify="):])
     if a == "resume":
         sid = args[i + 1]
+fresh = not sid                      # a new session has no earlier turn in its rollout
 sid = sid or str(uuid.uuid4())
 said = []
 transcript = os.path.join(root, f"{sid}.jsonl")
@@ -68,8 +69,9 @@ def note(rec):
     with open(rollout, "a") as fh:
         fh.write(json.dumps(rec) + "\n")
 
-if rollout:                                                  # an earlier turn of this thread, already ended
-    note({"type": "session_meta", "payload": {"id": sid}})
+if rollout:
+    note({"type": "session_meta", "payload": {"id": sid, "cwd": os.getcwd()}})
+if rollout and not fresh:                                    # an earlier turn of this thread, already ended
     note({"type": "response_item", "payload": {"type": "message", "role": "assistant"}})
     note({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "old"}})
 
@@ -142,7 +144,8 @@ def say(prompt):
         if rollout:
             time.sleep(1.0)
             note({"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn}})
-            note({"type": "response_item", "payload": {"type": "message", "role": "user"}})
+            note({"type": "response_item", "payload": {"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": prompt}]}})     # Codex records the prompt text
             note({"type": "event_msg", "payload": {"type": "token_count"}})
             quoted_title()
             if os.environ["FAKE_ROLLOUT"] == "empty":      # the task ends with no model record and no notify

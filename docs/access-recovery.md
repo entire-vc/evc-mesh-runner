@@ -1,15 +1,3 @@
----
-created: 2026-10-31T22:55+03:00
-updated: 2026-11-01T03:53+03:00
-author: Codex-Mesh
-status: review
-project: mesh
-type: guide
-tags:
-  - mesh
-  - task-management
----
-
 # Authenticated capability recovery
 
 This source protocol is opt-in through the trusted `start_gate_command`. No
