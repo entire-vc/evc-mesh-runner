@@ -33,6 +33,9 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # merge_follow_head = false        # a moved head (server rebase) runs the gate on it instead of waking the author;
     #                                  # the gate alone decides whether the review carries over (fail-closed)
     # merge_queue_hours = 24           # a wait that stays queued this long wakes the agent too
+    # recovery_wait_v1 = false         # enables `WAIT recovery:#<card8>` on an operator-armed shared recovery card registration (docs/recovery-wait.md)
+    # lifecycle_wait_v1 = false        # enables `WAIT lifecycle:#<card8>` (docs/lifecycle-wait.md)
+    # stall_wait_v1 = false            # enables `WAIT stall:#<card8>` on an operator-armed mesh-stall-control registration (docs/stall-wait.md)
     # receipt_wait_v1 = false          # enables `WAIT receipt:#<card8>` on an operator-armed receipt registration (docs/receipt-wait.md)
 
     [catalog]                     # optional: apply the runtime catalog and report on it (off by default)
@@ -353,6 +356,9 @@ class RunnerConfig:
     # Directory names a WAIT snapshot leaves out (when nothing under them is tracked): build caches.
     checkpoint_exclude_names: tuple = (".gocache", "node_modules", "target", ".venv", "__pycache__", "var")
     queue_wait_freshness_v1: bool = False  # machine refill WAIT only; shared state_dir protocol files
+    recovery_wait_v1: bool = False     # `WAIT recovery:#<card8>` on an operator-armed future shared recovery card (docs/recovery-wait.md)
+    lifecycle_wait_v1: bool = False    # `WAIT lifecycle:#<card8>` on an operator-armed native SessionStart registration (docs/lifecycle-wait.md)
+    stall_wait_v1: bool = False        # `WAIT stall:#<card8>` on an operator-armed mesh-stall-control result registration
     receipt_wait_v1: bool = False      # `WAIT receipt:#<card8>` on an operator-armed Telegram receipt registration
     max_wait_hours: float = 6.0
     # Which comments by other agents end a pipeline/MR/time/decision/card/merge wait early. "all":
@@ -836,6 +842,9 @@ def load(path: str | Path) -> RunnerConfig:
         checkpoint_exclude_names=_exclude_names(r.get("checkpoint_exclude_names")),
         queue_wait_freshness_v1=r.get("queue_wait_freshness_v1") is True,
         receipt_wait_v1=r.get("receipt_wait_v1") is True,
+        stall_wait_v1=r.get("stall_wait_v1") is True,
+        lifecycle_wait_v1=r.get("lifecycle_wait_v1") is True,
+        recovery_wait_v1=r.get("recovery_wait_v1") is True,
         max_wait_hours=float(r.get("max_wait_hours", 6.0)),
         time_wait_reason_after_minutes=float(r.get("time_wait_reason_after_minutes", 60.0)),
         short_time_wait_series=int(r.get("short_time_wait_series", 3)),

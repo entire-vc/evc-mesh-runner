@@ -129,6 +129,9 @@ class FakeMesh:
         return [dict(t) for t in self.tasks.values() if t.get("project_id") == project_id
                 and (search in (t.get("title") or "") or search in (t.get("description") or ""))]
 
+    def find_tasks_all(self, project_id, search):
+        return self.find_tasks(project_id, search)
+
     def assign(self, tid, agent_id):
         if self.tasks[tid].get("pinned"):
             raise MeshError(422, "assignment_pinned")
@@ -182,6 +185,9 @@ class FakeMesh:
 
     def comments(self, tid, limit=20):
         return list(self.comment_log.get(tid, []))[-limit:]
+
+    def comments_all(self, tid):
+        return list(self.comment_log.get(tid, []))
 
     def add_comment(self, tid, body, author=AGENT_ID, at=None):
         c = {"id": str(uuid.uuid4()), "author_id": author, "author_name": author, "body": body,

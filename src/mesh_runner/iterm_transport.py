@@ -106,6 +106,60 @@ end run
 """
 
 
+_PRODUCER_OK = """
+on producerOk(pid, started, tty)
+  set row to do shell script "/bin/ps -o pgid=,tpgid=,tty=,lstart= -p " & (quoted form of pid) & " || true"
+  set AppleScript's text item delimiters to " "
+  set parts to text items of row
+  set AppleScript's text item delimiters to ""
+  set clean to {}
+  repeat with x in parts
+    if (x as text) is not "" then set end of clean to (x as text)
+  end repeat
+  if (count of clean) < 4 then return false
+  if (item 1 of clean) is not (item 2 of clean) then return false
+  if ("/dev/" & (item 3 of clean)) is not tty then return false
+  set AppleScript's text item delimiters to " "
+  set lstart to (items 4 thru -1 of clean) as text
+  set AppleScript's text item delimiters to ""
+  return lstart is started
+end producerOk
+
+"""
+
+# Two-step variant for the host-local QA assignment: STAGE proves the binding and pastes WITHOUT Enter; the caller then
+# asks its authority again (backend check + local binding) and only then runs SUBMIT, which re-proves tty and producer and
+# sends the Enter. argv of both: id, tty, producer pid, producer start; STAGE additionally has the text as argv 5.
+STAGE_SCRIPT = _FIND + _PRODUCER_OK + """
+on run argv
+  set s to findSession(item 1 of argv)
+  set tty0 to item 2 of argv
+  tell application "iTerm"
+    if (tty of s) is not tty0 then error "iterm_tty_changed"
+    if not my producerOk(item 3 of argv, item 4 of argv, tty0) then error "iterm_producer_changed"
+    tell s
+      write text ((ASCII character 27) & "[200~" & (item 5 of argv) & (ASCII character 27) & "[201~") newline NO
+    end tell
+    if (tty of s) is not tty0 then error "iterm_tty_changed_after_paste"
+    if not my producerOk(item 3 of argv, item 4 of argv, tty0) then error "iterm_producer_changed_after_paste"
+  end tell
+  return "ok"
+end run
+"""
+SUBMIT_SCRIPT = _FIND + _PRODUCER_OK + """
+on run argv
+  set s to findSession(item 1 of argv)
+  set tty0 to item 2 of argv
+  tell application "iTerm"
+    if (tty of s) is not tty0 then error "iterm_tty_changed_after_paste"
+    if not my producerOk(item 3 of argv, item 4 of argv, tty0) then error "iterm_producer_changed_after_paste"
+    tell s to write text ""
+  end tell
+  return "ok"
+end run
+"""
+
+
 @dataclass(frozen=True)
 class ITermPin:
     iterm_session_id: str        # iTerm `unique id` of the exact terminal session
@@ -172,6 +226,23 @@ class ITermAPI:
             return False
         return res.stdout.strip() == "ok"
 
+    def stage(self, session_id: str, tty: str, text: str, producer_pid: int, producer_started: str) -> bool:
+        """Paste WITHOUT Enter (inert, unsubmitted text); the Enter is a separate, separately authorised ``submit``."""
+        return self._two_step(STAGE_SCRIPT, [session_id, tty, str(producer_pid), " ".join(producer_started.split()), text])
+
+    def submit(self, session_id: str, tty: str, producer_pid: int, producer_started: str) -> bool:
+        return self._two_step(SUBMIT_SCRIPT, [session_id, tty, str(producer_pid), " ".join(producer_started.split())])
+
+    def _two_step(self, script: str, argv: list[str]) -> bool:
+        try:
+            res = _run([self.osascript, "-e", script, *argv])
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if res.returncode != 0:
+            log.warning("iterm step refused: %s", _reason(res))
+            return False
+        return res.stdout.strip() == "ok"
+
 
 def process_info(pid: int) -> tuple[str, str, str, str]:
     """``(pgid, tpgid, tty, lstart)`` of a pid, ``("", "", "", "")`` when it is gone."""
@@ -185,8 +256,58 @@ def process_info(pid: int) -> tuple[str, str, str, str]:
     return parts[0], parts[1], parts[2], " ".join(parts[3].split())
 
 
+KERN_PROCARGS2 = (1, 49)                                 # CTL_KERN, KERN_PROCARGS2 (macOS)
+
+
+def parse_procargs2(buf: bytes) -> list[str]:
+    """The structured argv out of a ``KERN_PROCARGS2`` buffer: ``int argc``, the exec path, NUL padding, then exactly ``argc``
+    NUL-terminated arguments (the environment that follows is never read). ``[]`` for anything malformed."""
+    if len(buf) < 8:
+        return []
+    argc = int.from_bytes(buf[:4], "little", signed=True)
+    if not 0 < argc <= 4096:
+        return []
+    end = buf.find(b"\0", 4)
+    if end < 0:
+        return []
+    pos = end
+    while pos < len(buf) and buf[pos] == 0:                  # padding after the exec path
+        pos += 1
+    out = []
+    for _ in range(argc):
+        stop = buf.find(b"\0", pos)
+        if stop < 0:
+            return []                                        # truncated: never a partial proof
+        out.append(buf[pos:stop].decode("utf-8", "replace"))
+        pos = stop + 1
+    return out
+
+
+def process_argv(pid: int) -> list[str]:
+    """Structured argv of a pid, read only and never its environment: the kernel's ``KERN_PROCARGS2`` keeps the argument
+    boundaries, which a rendered process-listing command line does not (a prompt argument containing ``--resume <id>`` would
+    look like the flag). ``[]`` when the process is gone, not ours, malformed, or the platform has no such source:
+    unproven, fail closed."""
+    import ctypes
+    import sys
+    if sys.platform != "darwin" or not isinstance(pid, int) or pid <= 0:
+        return []
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        mib = (ctypes.c_int * 3)(KERN_PROCARGS2[0], KERN_PROCARGS2[1], pid)
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or not 0 < size.value <= 1 << 22:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return []
+        return parse_procargs2(buf.raw[:size.value])
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 def host_matches(hostname: str, local: str | None = None) -> bool:
-    """The admitted hostname is this machine (``MacBook-Pro-8.local`` == ``macbook-pro-8``); a different host never matches."""
+    """The admitted hostname is this machine (``my-mac.local`` == ``my-mac``); a different host never matches."""
     norm = lambda h: h.strip().lower().removesuffix(".local")
     return bool(hostname) and norm(hostname) == norm(local if local is not None else socket.gethostname())
 
@@ -245,3 +366,23 @@ class ITermSession:
         if "\x1b" in text or "\x00" in text:
             return False                                           # text must not carry its own paste terminator
         return self.api.write(self.pin.iterm_session_id, self.pin.tty, text, self.pin.producer_pid, self.pin.producer_started)
+
+    def paste_guarded(self, target: str, text: str, guard) -> str:
+        """Two-step injection for an authority that must be asked right before the paste and again right before the Enter.
+
+        ``guard()`` returns "" to allow or a typed reason. Result: ``"submitted"``; ``"refused"`` when nothing was written
+        (the guard or the local binding said no BEFORE the paste); ``"uncertain"`` when text may sit unsubmitted in the
+        terminal (stage failed, authority/binding refused between paste and Enter, or submit failed)."""
+        if target != self.pin.iterm_session_id or not text or "\x1b" in text or "\x00" in text:
+            return "refused"
+        if guard() or check_iterm(self.api, self.pin, self._info):
+            return "refused"
+        if not self.api.stage(self.pin.iterm_session_id, self.pin.tty, text, self.pin.producer_pid, self.pin.producer_started):
+            return "uncertain"
+        reason = guard() or check_iterm(self.api, self.pin, self._info)
+        if reason:
+            log.warning("session receiver: authority/binding changed between paste and Enter (%s); no Enter", reason)
+            return "uncertain"
+        if not self.api.submit(self.pin.iterm_session_id, self.pin.tty, self.pin.producer_pid, self.pin.producer_started):
+            return "uncertain"
+        return "submitted"

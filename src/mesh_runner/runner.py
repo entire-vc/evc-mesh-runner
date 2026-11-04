@@ -59,6 +59,9 @@ from .adapters.codex import CodexAdapter
 from . import queue_wait
 from . import native_result_wait, native_result_resume, native_result_rebind
 from . import receipt_wait
+from . import lifecycle_wait
+from . import recovery_wait
+from . import stall_wait
 from . import config_receipt
 from . import config as config_mod
 from .config import AgentConfig, RunnerConfig, read_env_file
@@ -1788,6 +1791,24 @@ class AgentRunner:
             if receipt_reg is None:
                 self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=receipt_wait.WAIT_GUIDANCE))
                 return
+        recovery_reg = None
+        if outcome.kind == "recovery":
+            recovery_reg = self._recovery_registration(a, outcome)
+            if recovery_reg is None:
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=recovery_wait.WAIT_GUIDANCE))
+                return
+        stall_reg = None
+        if outcome.kind == "stall":
+            stall_reg = self._stall_registration(a, outcome)
+            if stall_reg is None:
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=stall_wait.WAIT_GUIDANCE))
+                return
+        lifecycle_reg = None
+        if outcome.kind == "lifecycle":
+            lifecycle_reg = self._lifecycle_registration(a, outcome)
+            if lifecycle_reg is None:
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=lifecycle_wait.WAIT_GUIDANCE))
+                return
         missing = self._missing_pipeline_wait(a, outcome)
         if missing:
             if sent_back():
@@ -1923,6 +1944,7 @@ class AgentRunner:
         if met and met[0]:
             self.store.mark(self.agent.name, a.task_id, "met_wake", "")
         if outcome.kind == "next":
+            self._stall_consumed_by_next(a)
             before = self.store.mark(self.agent.name, a.task_id, "turn_work")
             after = end_digest if end_digest is not None else self._work_digest(a)
             if before and before[0] and after and before[0] != after:      # unknown is never free
@@ -1947,6 +1969,12 @@ class AgentRunner:
             wait["native_receiver"] = native_receiver
         if receipt_reg:
             wait["receipt_reg"] = receipt_reg["reg_id"]
+        if recovery_reg:
+            wait["recovery_reg"] = recovery_reg["reg_id"]
+        if lifecycle_reg:
+            wait["lifecycle_reg"] = lifecycle_reg["reg_id"]
+        if stall_reg:
+            wait["stall_reg"] = stall_reg["reg_id"]
         for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time"):
             if outcome.extra.get(key):
                 wait[key] = outcome.extra[key]
@@ -3917,6 +3945,9 @@ class AgentRunner:
             self._last_wake_check[a.id] = mono
             self._guard(a, "cap-event", self._check_cap_event)
         self._scan_receipts()
+        self._scan_lifecycle()
+        self._scan_recovery()
+        self._scan_stall()
         waiting = self.store.by_state(self.agent.name, ("waiting",))
         for key in [k for k, j in self._merge_jobs.items()
                     if j["result"] is not None and k not in {w.id for w in waiting}]:
@@ -4349,6 +4380,206 @@ class AgentRunner:
                                         state="ready", wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="receipt delivered")
 
+    def _recovery_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
+        """The live, undelivered registration this card's ``WAIT recovery:`` may bind to, else None."""
+        if not self.cfg.recovery_wait_v1 or a.mode != "work" or outcome.target != a.task8:
+            return None
+        try:
+            reg = recovery_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return None
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or recovery_wait.delivered(self.store, a.agent, a.task_id, reg["reg_id"])):
+            return None
+        return reg
+
+    def _scan_recovery(self) -> None:
+        """Reconcile every armed recovery registration of this agent with the actual Mesh cards,
+        waiting or not: a recovery card created before arming, or finished before the source
+        declares its wait, stays pending, never lost. Throttled to the wake poll interval."""
+        if not self.cfg.recovery_wait_v1:
+            return
+        mono = time.monotonic()
+        if mono - getattr(self, "_last_recovery_scan", -1e9) < self.cfg.wake_poll_seconds:
+            return
+        self._last_recovery_scan = mono
+        for task_id in self.store.marked(self.agent.name, recovery_wait.REG_KEY):
+            try:
+                recovery_wait.scan(self.store, self.agent.name, task_id, self.mesh, self.cats.category)
+            except Exception as e:             # noqa: BLE001 - an observer fault must not stop the lane
+                log.warning("%s: recovery scan failed: %s", self.agent.name, type(e).__name__)
+
+    def _wake_recovery(self, a: Attempt, task: dict) -> None:
+        """Wake on pending evidence of the exact registration this wait declared; ready + wake
+        text + one-shot delivered mark commit together (same outbox as the receipt wait)."""
+        if not self.cfg.recovery_wait_v1 or a.mode != "work":
+            return
+        try:
+            reg = recovery_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or reg["reg_id"] != a.wait.get("recovery_reg") or a.wait.get("target") != a.task8):
+            return                              # another generation or owner: never wakes this attempt
+        reg_id = reg["reg_id"]
+        try:
+            evidence = recovery_wait.scan(self.store, a.agent, a.task_id, self.mesh, self.cats.category)
+        except Exception as e:                  # noqa: BLE001 - retry next tick
+            log.warning("%s: recovery wake scan failed: %s", a.agent, type(e).__name__)
+            return
+        if (not evidence or evidence.get("reg_id") != reg_id
+                or recovery_wait.delivered(self.store, a.agent, a.task_id, reg_id)):
+            return
+        def still() -> bool:
+            try:
+                cur = recovery_wait.registration(self.store, a.agent, a.task_id)
+            except ValueError:
+                return False
+            return (cur is not None and cur["state"] == "armed" and cur["reg_id"] == reg_id
+                    and cur["owner_id"] == self.agent_id
+                    and recovery_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None)
+        event = recovery_wait.event_text(evidence)
+        if self.store.update_with_marks(a, {recovery_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                                        expect="waiting", expect_wait=a.wait, validate=still,
+                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+            self.emit("wake", a, event="recovery delivered")
+
+    def _stall_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
+        """The live, undelivered registration this card's ``WAIT stall:`` may bind to, else None."""
+        if not self.cfg.stall_wait_v1 or a.mode != "work" or outcome.target != a.task8:
+            return None
+        try:
+            reg = stall_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return None
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or stall_wait.delivered(self.store, a.agent, a.task_id, reg["reg_id"])):
+            return None
+        return reg
+
+    def _stall_consumed_by_next(self, a: Attempt) -> None:
+        """The notifier's own ``↻ NEXT`` comment can itself be the newest declaration of the turn
+        (``_read_outcome``): the session continues now and has the result in its comments. That
+        delivers the evidence, so the one-shot mark is written here and a later ``WAIT stall:`` of
+        the same registration cannot wake a second time on the same event."""
+        if not self.cfg.stall_wait_v1 or a.mode != "work":
+            return
+        try:
+            reg = stall_wait.registration(self.store, a.agent, a.task_id)
+            if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                    or stall_wait.delivered(self.store, a.agent, a.task_id, reg["reg_id"])):
+                return
+            if stall_wait.scan(self.store, a.agent, a.task_id, self.mesh):
+                self.store.mark(a.agent, a.task_id, stall_wait.DELIVERED_KEY, reg["reg_id"])
+        except Exception as e:                  # noqa: BLE001 - fail closed: the wait stays declarable
+            log.warning("%s: stall next-consume failed: %s", a.agent, type(e).__name__)
+
+    def _scan_stall(self) -> None:
+        """Read every armed stall registration of this agent, waiting or not: a result that lands
+        between arming and the source's declaration stays pending, never lost."""
+        if not self.cfg.stall_wait_v1:
+            return
+        mono = time.monotonic()
+        if mono - getattr(self, "_last_stall_scan", -1e9) < self.cfg.wake_poll_seconds:
+            return
+        self._last_stall_scan = mono
+        for task_id in self.store.marked(self.agent.name, stall_wait.REG_KEY):
+            try:
+                stall_wait.scan(self.store, self.agent.name, task_id, self.mesh)
+            except Exception as e:             # noqa: BLE001 - an observer fault must not stop the lane
+                log.warning("%s: stall scan failed: %s", self.agent.name, type(e).__name__)
+
+    def _wake_stall(self, a: Attempt, task: dict) -> None:
+        """Wake on pending evidence of the exact registration this wait declared; ready + wake
+        text + one-shot delivered mark commit together (same outbox as the other event waits)."""
+        if not self.cfg.stall_wait_v1 or a.mode != "work":
+            return
+        try:
+            reg = stall_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or reg["reg_id"] != a.wait.get("stall_reg") or a.wait.get("target") != a.task8):
+            return                              # another generation or owner: never wakes this attempt
+        reg_id = reg["reg_id"]
+        try:
+            evidence = stall_wait.scan(self.store, a.agent, a.task_id, self.mesh)
+        except Exception as e:                  # noqa: BLE001 - retry next tick, fail closed
+            log.warning("%s: stall wake scan failed: %s", a.agent, type(e).__name__)
+            return
+        if (not evidence or evidence.get("reg_id") != reg_id
+                or stall_wait.delivered(self.store, a.agent, a.task_id, reg_id)):
+            return
+        def still() -> bool:
+            try:
+                cur = stall_wait.registration(self.store, a.agent, a.task_id)
+            except ValueError:
+                return False
+            return (cur is not None and cur["state"] == "armed" and cur["reg_id"] == reg_id
+                    and cur["owner_id"] == self.agent_id
+                    and stall_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None)
+        event = stall_wait.event_text(evidence)
+        if self.store.update_with_marks(a, {stall_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                                        expect="waiting", expect_wait=a.wait, validate=still,
+                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+            self.emit("wake", a, event="stall delivered")
+
+    def _lifecycle_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
+        """The live, undelivered registration this card's ``WAIT lifecycle:`` may bind to, else None."""
+        if not self.cfg.lifecycle_wait_v1 or a.mode != "work" or outcome.target != a.task8:
+            return None
+        try:
+            reg = lifecycle_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return None
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or lifecycle_wait.delivered(self.store, a.agent, a.task_id, reg["reg_id"])):
+            return None
+        return reg
+
+    def _scan_lifecycle(self) -> None:
+        """Advance every armed lifecycle registration of this agent, waiting or not: an event
+        between arming and the declaration stays pending, never lost."""
+        if not self.cfg.lifecycle_wait_v1:
+            return
+        for task_id in self.store.marked(self.agent.name, lifecycle_wait.REG_KEY):
+            try:
+                lifecycle_wait.scan(self.store, self.agent.name, task_id)
+            except Exception as e:             # noqa: BLE001 - an observer fault must not stop the lane
+                log.warning("%s: lifecycle scan failed: %s", self.agent.name, type(e).__name__)
+
+    def _wake_lifecycle(self, a: Attempt, task: dict) -> None:
+        """Wake on pending evidence of the exact registration this wait declared; ready + wake
+        text + one-shot delivered mark commit together (same outbox as the receipt wait)."""
+        if not self.cfg.lifecycle_wait_v1 or a.mode != "work":
+            return
+        try:
+            reg = lifecycle_wait.registration(self.store, a.agent, a.task_id)
+        except ValueError:
+            return
+        if (reg is None or reg["state"] != "armed" or reg["owner_id"] != self.agent_id
+                or reg["reg_id"] != a.wait.get("lifecycle_reg") or a.wait.get("target") != a.task8):
+            return                              # another generation or owner: never wakes this attempt
+        reg_id = reg["reg_id"]
+        evidence = lifecycle_wait.scan(self.store, a.agent, a.task_id)
+        if (not evidence or evidence.get("reg_id") != reg_id
+                or lifecycle_wait.delivered(self.store, a.agent, a.task_id, reg_id)):
+            return
+        def still() -> bool:
+            # Same transaction as the wake: the registration must still be this generation and owner.
+            try:
+                cur = lifecycle_wait.registration(self.store, a.agent, a.task_id)
+            except ValueError:
+                return False
+            return (cur is not None and cur["state"] == "armed" and cur["reg_id"] == reg_id
+                    and cur["owner_id"] == self.agent_id
+                    and lifecycle_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None)
+        event = lifecycle_wait.event_text(evidence)
+        if self.store.update_with_marks(a, {lifecycle_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                                        expect="waiting", expect_wait=a.wait, validate=still,
+                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+            self.emit("wake", a, event="lifecycle delivered")
+
     def _wake_queue(self, a: Attempt, task: dict) -> None:
         # Queue demand never falls through to age/recheck/error-budget wakes.
         if not self.cfg.queue_wait_freshness_v1 or a.mode != "work":
@@ -4726,6 +4957,15 @@ class AgentRunner:
             return
         if a.wait.get("kind") == "receipt":
             self._wake_receipt(a, task)
+            return
+        if a.wait.get("kind") == "lifecycle":
+            self._wake_lifecycle(a, task)
+            return
+        if a.wait.get("kind") == "recovery":
+            self._wake_recovery(a, task)
+            return
+        if a.wait.get("kind") == "stall":
+            self._wake_stall(a, task)      # its own predicate only: never the generic NEXT/comment path
             return
         # Observers mutate nested seen state. Keep both the live attempt and
         # its CAS baseline isolated from the working observation/effects copy.

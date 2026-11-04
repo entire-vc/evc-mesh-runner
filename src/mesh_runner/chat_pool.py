@@ -39,6 +39,9 @@ class ChatPool:
         self.clock = clock
         self.slots: dict[tuple[str, str], Slot] = {}
         self.queue: list[tuple[str, str]] = []
+        # agent id -> Stop of the service that owns that agent's sessions (windows are known only to it):
+        # an eviction caused by another agent's host is stopped through the owner
+        self.owners: dict[str, object] = {}
         self.lock = threading.Lock()
 
     def _count(self, agent: str | None = None) -> int:
@@ -80,6 +83,11 @@ class ChatPool:
             s = self.slots.get((agent, thread))
             if s:
                 s.busy, s.last_end = False, self.clock()
+
+    def restore(self, slot: Slot) -> None:
+        """Put back an idle slot whose session could not be stopped, so it is stopped again later."""
+        with self.lock:
+            self.slots.setdefault((slot.agent, slot.thread), slot)
 
     def release(self, agent: str, thread: str) -> bool:
         with self.lock:

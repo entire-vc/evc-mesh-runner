@@ -196,6 +196,125 @@ def _receipt_wait(argv: list[str]) -> int:
     return 0
 
 
+def _stall_wait(argv: list[str]) -> int:
+    """`stall-wait`: the operator's arm / inspect / disarm of one card's mesh-stall-control
+    registration, written through Runner's own store API. Arm reads the card's current comments
+    through the owner lane's own Mesh key, so events already there become the baseline."""
+    import time
+    from . import stall_wait as sw
+    from .mesh import MeshClient
+    p = argparse.ArgumentParser(prog="mesh-runner stall-wait")
+    p.add_argument("action", choices=["arm", "inspect", "disarm"])
+    p.add_argument("--config", required=True)
+    p.add_argument("--agent", required=True, help="the lane that owns the source card")
+    p.add_argument("--task", required=True, help="full UUID of the source card (the card that will wait)")
+    p.add_argument("--owner-id", help="arm: Mesh agent id of that lane (the notifier's comment author)")
+    args = p.parse_args(argv)
+    cfg = config_mod.load(args.config)
+    if not cfg.stall_wait_v1:
+        print(json.dumps({"error": "stall_wait_v1 is off in this config"}))
+        return 2
+    lane = next((a for a in cfg.agents if a.name == args.agent), None)
+    if lane is None:
+        p.error("--agent must name an exact configured lane")
+    store = Store(cfg.state_dir / "runner.sqlite")
+    try:
+        if args.action == "arm":
+            if not args.owner_id:
+                p.error("arm needs --owner-id")
+            mesh = MeshClient(cfg.mesh_url, lane.key, basic_auth=cfg.mesh_basic_auth,
+                              bearer=cfg.extension_token)
+            sw.arm(store, args.agent, args.task, args.owner_id, mesh.comments_all(args.task), time.time())
+        elif args.action == "disarm":
+            sw.disarm(store, args.agent, args.task)
+        out = sw.inspect(store, args.agent, args.task)
+    except Exception as exc:    # noqa: BLE001 - a Mesh read failure refuses the arm (fail closed)
+        print(json.dumps({"error": str(exc)[:200]}))
+        return 1
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def _recovery_wait(argv: list[str]) -> int:
+    """`recovery-wait`: the operator's arm / inspect / disarm of one card's future shared recovery
+    card registration, written through Runner's own store API (never by hand into its database)."""
+    import time
+    from . import recovery_wait as rw
+    p = argparse.ArgumentParser(prog="mesh-runner recovery-wait")
+    p.add_argument("action", choices=["arm", "inspect", "disarm"])
+    p.add_argument("--config", required=True)
+    p.add_argument("--agent", required=True, help="the lane that owns the source card")
+    p.add_argument("--task", required=True, help="full UUID of the source card (the card that will wait)")
+    p.add_argument("--owner-id", help="arm: Mesh agent id of that lane; must match at declaration and wake")
+    p.add_argument("--project-id", help="arm: UUID of the project the recovery card is created in")
+    p.add_argument("--marker", help="arm: exact text the recovery card's title/description carries")
+    p.add_argument("--recovery-owner-id", help="arm: Mesh agent id the recovery card is assigned to")
+    p.add_argument("--receipt-author-id", help="arm: Mesh agent id whose `carrier-receipt: <ref>` comment completes it")
+    args = p.parse_args(argv)
+    cfg = config_mod.load(args.config)
+    if not cfg.recovery_wait_v1:
+        print(json.dumps({"error": "recovery_wait_v1 is off in this config"}))
+        return 2
+    if args.agent not in {a.name for a in cfg.agents}:
+        p.error("--agent must name an exact configured lane")
+    store = Store(cfg.state_dir / "runner.sqlite")
+    try:
+        if args.action == "arm":
+            need = (args.owner_id, args.project_id, args.marker, args.recovery_owner_id, args.receipt_author_id)
+            if not all(need):
+                p.error("arm needs --owner-id --project-id --marker --recovery-owner-id --receipt-author-id")
+            rw.arm(store, args.agent, args.task, *need, time.time())
+        elif args.action == "disarm":
+            rw.disarm(store, args.agent, args.task)
+        out = rw.inspect(store, args.agent, args.task)
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"error": str(exc)[:200]}))
+        return 1
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
+def _lifecycle_wait(argv: list[str]) -> int:
+    """`lifecycle-wait`: the operator's arm / inspect / disarm / rebaseline of one card's native
+    SessionStart registration, written through Runner's own store API."""
+    import time
+    from . import lifecycle_wait as lw
+    p = argparse.ArgumentParser(prog="mesh-runner lifecycle-wait")
+    p.add_argument("action", choices=["arm", "inspect", "disarm", "rebaseline"])
+    p.add_argument("--config", required=True)
+    p.add_argument("--agent", required=True, help="the lane that owns the source card")
+    p.add_argument("--task", required=True, help="full UUID of the source card (the card that will wait)")
+    p.add_argument("--owner-id", help="arm: Mesh agent id of that lane")
+    p.add_argument("--profile", help="arm: Codex profile of the observed lane, e.g. khan")
+    p.add_argument("--manifest", help="arm: absolute path of the lane's lifecycle manifest.json")
+    p.add_argument("--codex-home", help="arm: absolute CODEX_HOME holding sessions/")
+    p.add_argument("--journal", help="arm: absolute path of khan-lifecycle.jsonl (may not exist yet)")
+    args = p.parse_args(argv)
+    cfg = config_mod.load(args.config)
+    if not cfg.lifecycle_wait_v1:
+        print(json.dumps({"error": "lifecycle_wait_v1 is off in this config"}))
+        return 2
+    if args.agent not in {a.name for a in cfg.agents}:
+        p.error("--agent must name an exact configured lane")
+    store = Store(cfg.state_dir / "runner.sqlite")
+    try:
+        if args.action == "arm":
+            if not (args.owner_id and args.profile and args.manifest and args.codex_home and args.journal):
+                p.error("arm needs --owner-id --profile --manifest --codex-home --journal")
+            lw.arm(store, args.agent, args.task, args.owner_id, args.profile, args.manifest,
+                   args.codex_home, args.journal, time.time())
+        elif args.action == "disarm":
+            lw.disarm(store, args.agent, args.task)
+        elif args.action == "rebaseline":
+            lw.rebaseline(store, args.agent, args.task)
+        out = lw.inspect(store, args.agent, args.task)
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"error": str(exc)[:200]}))
+        return 1
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args_in = sys.argv[1:] if argv is None else argv
     if args_in and args_in[0] == "recheck-delivery":
@@ -225,6 +344,12 @@ def main(argv: list[str] | None = None) -> int:
         return command(args_in[1:])
     if args_in and args_in[0] == "receipt-wait":
         return _receipt_wait(args_in[1:])
+    if args_in and args_in[0] == "stall-wait":
+        return _stall_wait(args_in[1:])
+    if args_in and args_in[0] == "recovery-wait":
+        return _recovery_wait(args_in[1:])
+    if args_in and args_in[0] == "lifecycle-wait":
+        return _lifecycle_wait(args_in[1:])
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")

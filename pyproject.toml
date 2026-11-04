@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mesh-runner"
-version = "0.1.30"
+version = "0.1.34"
 description = "Run Claude Code and Codex agents on Mesh tasks: parallel sessions per agent, isolated worktrees, resumable waits."
 readme = "README.md"
 license = "Apache-2.0"
@@ -19,4 +19,4 @@ mesh-runner-guarded-launch = "mesh_runner.launch_guard:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-mesh_runner = ["editor_bundle/*.json"]
+mesh_runner = ["editor_bundle/*.json", "qa_assignment_v1/*"]

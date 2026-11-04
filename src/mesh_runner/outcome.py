@@ -56,13 +56,16 @@ _MERGE = re.compile(
     r"\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64})" + _EXPLANATION)
 _MERGE_HEAD = re.compile(_WAIT_HEAD + r"merge:")
 _RECEIPT = re.compile(_WAIT_HEAD + r"receipt:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
+_LIFECYCLE = re.compile(_WAIT_HEAD + r"lifecycle:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
+_STALL = re.compile(_WAIT_HEAD + r"stall:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
+_RECOVERY = re.compile(_WAIT_HEAD + r"recovery:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _NATIVE = re.compile(_WAIT_HEAD + r"native:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
 _CARD = re.compile(_WAIT_HEAD + r"card:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _QUEUE = re.compile(_WAIT_HEAD + r"queue:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _DECISION = re.compile(_WAIT_HEAD + r"decision:@(?P<handle>[\w.\-]+)" + _EXPLANATION)
 # Time is a structured assertion about a specific external schedule, not a retry interval.
 # Any other WAIT is a time wait: `2h`, `tomorrow`, `in 2 hours`, `poll:` all get the time guidance.
-_TIME_HEAD = re.compile(_WAIT_HEAD + r"(?!(?:pipeline|mr|merge|card|decision|receipt)\s*:)\S", re.IGNORECASE)
+_TIME_HEAD = re.compile(_WAIT_HEAD + r"(?!(?:pipeline|mr|merge|card|decision|receipt|lifecycle|recovery|stall)\s*:)\S", re.IGNORECASE)
 _EXTERNAL_TIME = re.compile(
     _WAIT_HEAD + r"(?P<when>\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d)):"
     r"\s+external=(?P<external>[A-Za-z0-9][A-Za-z0-9._:/@#%+!?=~-]{0,255})"
@@ -100,7 +103,7 @@ class Outcome:
 
     @property
     def is_wait(self) -> bool:
-        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "native"}
+        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native"}
 
 
 def _explicit_wait_problem(line: str) -> str:
@@ -205,6 +208,15 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
     if m := _RECEIPT.match(line):
         # Event wait on this card's own armed receipt registration; runner validates it.
         return Outcome("receipt", m["id"], note=note(m), line=line)
+    if m := _STALL.match(line):
+        # Event wait on this card's own armed stall registration; runner validates it.
+        return Outcome("stall", m["id"], note=note(m), line=line)
+    if m := _RECOVERY.match(line):
+        # Event wait on this card's own armed recovery registration; runner validates it.
+        return Outcome("recovery", m["id"], note=note(m), line=line)
+    if m := _LIFECYCLE.match(line):
+        # Event wait on this card's own armed lifecycle registration; runner validates it.
+        return Outcome("lifecycle", m["id"], note=note(m), line=line)
     if m := _QUEUE.match(line):
         # Event wait on this card's own machine queue request; runner validates the source.
         return Outcome("queue", m["id"], note=note(m), line=line)

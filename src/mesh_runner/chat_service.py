@@ -35,6 +35,8 @@ class ChatService:
         self.client, self.agents, self.pool = client, list(agents), pool
         self.delivery_for, self.stop_session, self.delete_transcript = delivery_for, stop_session, delete_transcript
         self.token_path = token_path
+        for a in self.agents:
+            self.pool.owners[a] = stop_session            # the pool is shared: other hosts stop our sessions through this
         self.spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True, name="chat-turn").start())
         self.cancel: set[str] = set()
         self.running: set[str] = set()
@@ -159,12 +161,29 @@ class ChatService:
                 pass
             return 0
         if adm.evict is not None:
-            self.stop_session(adm.evict.agent, adm.evict.thread)
+            try:
+                self._stop_owned(adm.evict.agent, adm.evict.thread)
+            except Exception as e:
+                # no worker will start: the reservation goes back and the claim is returned, or the
+                # slot stays busy with nothing running and the turn hangs
+                log.warning("chat turn %s: eviction stop failed: %s", turn["turn_id"][:8], type(e).__name__)
+                self.pool.release(agent, thread)
+                self.pool.restore(adm.evict)
+                self.hold_until = time.monotonic() + 5.0
+                try:
+                    self.client.release(turn["turn_id"], turn["claim_token"], "eviction_failed")
+                except ChatError:
+                    pass
+                return 0
         with self.lock:
             self.running.add(turn["turn_id"])
             self.running_on[turn["turn_id"]] = (agent, thread)
         self.spawn(lambda: self._run(turn))
         return 1
+
+    def _stop_owned(self, agent: str, thread: str) -> None:
+        """Stop a session through the service that owns its agent (the evicted slot may be another agent's)."""
+        self.pool.owners.get(agent, self.stop_session)(agent, thread)
 
     def _run(self, turn: dict) -> None:
         tid, agent, thread = turn["turn_id"], turn["agent_id"], turn["thread_id"]

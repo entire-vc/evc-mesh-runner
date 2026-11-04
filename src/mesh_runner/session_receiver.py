@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import meta_delivery as md
 from . import iterm_transport as it
+from . import qa_assignment as qa
 from .interactive import Tmux
 
 log = logging.getLogger("mesh_runner.session_receiver")
@@ -289,6 +290,7 @@ class ReceiverConfig:
     pin: "ProducerPin | it.ITermPin"
     enabled: bool
     transport: str = "tmux"
+    qa: "qa.QASettings | None" = None                      # [host_local_qa_assignment_v1]; None = OFF (default)
 
     @property
     def transport_sha(self) -> str | None:
@@ -312,7 +314,7 @@ def _secret(file, env, what):
     return read_secret(file, env, what)
 
 
-def load_config(path: str | Path, require_enabled: bool = True) -> ReceiverConfig:
+def load_config(path: str | Path, require_enabled: bool = True, allow_expired_qa: bool = False) -> ReceiverConfig:
     p = Path(path).expanduser()
     try:
         mode = p.stat().st_mode
@@ -324,8 +326,11 @@ def load_config(path: str | Path, require_enabled: bool = True) -> ReceiverConfi
         raw = tomllib.loads(p.read_text())
     except (OSError, ValueError):
         raise Refusal("config_unreadable") from None
-    if set(raw) - {"session_metadata", SECTION}:
+    if set(raw) - {"session_metadata", SECTION, qa.SECTION}:
         raise Refusal("config_unknown_section")
+    for name in ("session_metadata", SECTION, qa.SECTION):                  # an array of tables / scalar is malformed, never a traceback
+        if name in raw and not isinstance(raw[name], dict):
+            raise Refusal("config_invalid_section", name)
     sec = raw.get(SECTION) or {}
     unknown = set(sec) - set(KEYS)
     if unknown:
@@ -365,9 +370,14 @@ def load_config(path: str | Path, require_enabled: bool = True) -> ReceiverConfi
         if isinstance(e, Refusal):
             raise
         raise Refusal("config_invalid", type(e).__name__) from None
+    try:
+        qa_settings = qa.parse_section(raw.get(qa.SECTION), _secret, settings.identity, settings.credential, pin, transport,
+                                    allow_expired_qa)
+    except qa.QARefusal as e:
+        raise Refusal(e.code, e.detail) from None
     return ReceiverConfig(settings, str(sec["mesh_url"]), Path(str(sec["ledger_root"])).expanduser(), sec["harness"],
                           str(sec.get("claude_config_dir") or ""), Path(str(sec["runner_credential_file"])).expanduser(),
-                          str(sec.get("tmux_binary") or "tmux"), pin, enabled, transport)
+                          str(sec.get("tmux_binary") or "tmux"), pin, enabled, transport, qa_settings)
 
 
 def read_runner_token(path: Path, runner_id: str) -> str:
@@ -442,7 +452,7 @@ def preflight(cfg: ReceiverConfig, tmux: Tmux | None = None, known=None, started
 
 # ---------------------------------------------------------------------- run
 def run(cfg: ReceiverConfig, stop: threading.Event, tmux: Tmux | None = None, known=None, started=process_started,
-        opener=None, adopt_existing_ledger: bool = False, info=None, local_host: str | None = None) -> int:
+        opener=None, adopt_existing_ledger: bool = False, info=None, local_host: str | None = None, qa_opener=None, argv_of=None) -> int:
     """Gate, then serve. Every gate is checked BEFORE registration, so a refused start leaves no admission side effect."""
     ident = cfg.settings.identity
     tmux = tmux or (it.ITermAPI() if cfg.transport == "iterm" else Tmux(cfg.tmux_binary))
@@ -467,8 +477,22 @@ def run(cfg: ReceiverConfig, stop: threading.Event, tmux: Tmux | None = None, kn
         receiver = md.MetaReceiver(ident, build_session(cfg, tmux, known, started, info), md.Journal(cfg.ledger_root / "journal"),
                                    client, cfg.ledger_root / "acks")
         log.info("session receiver on for session %s", ident.fields["session_id"][:8])
-        md.receiver_loop(receiver, stop, cfg.settings.interval)
-        return EXIT_REFUSED if client.record_failed else 0
+        receivers, qa_client = [receiver], None
+        if cfg.qa is not None:                                    # opt-in, separate admission; same lock, journal and injector
+            try:
+                qa.pinned()
+                qa_client = qa.QAClient(cfg.mesh_url, cfg.qa.credential, token, cfg.qa.identity, cfg.ledger_root,
+                                        opener=qa_opener, stop=stop)
+                observe = qa.make_observer(cfg.qa.identity, cfg.pin, lambda: _credential_runner_id(cfg.runner_credential_file),
+                                           known or _known(cfg), tmux, info, argv_of, local_host)
+                receivers.append(qa.QAReceiver(cfg.qa.identity, receiver.session, receiver.journal, qa_client, cfg.ledger_root,
+                                               observe=observe))
+                log.info("host-local QA assignment receiver on (separate admission)")
+            except (qa.QARefusal, ValueError) as e:
+                log.error("host-local QA assignment off: %s", getattr(e, "code", type(e).__name__))
+        md.serve_loop(receivers, stop, cfg.settings.interval if qa_client is None else min(cfg.settings.interval,
+                                                                                         cfg.qa.interval))
+        return EXIT_REFUSED if client.record_failed or (qa_client is not None and qa_client.record_failed) else 0
     finally:
         lock.release()
 
@@ -522,6 +546,71 @@ def preflight_gates(cfg, tmux, known, started, info=None, local_host=None):
                                                          != "mismatch" else "ledger_mismatch")]
 
 
+# ---------------------------------------------------------------------- host-local QA assignment: guard and disable
+def qa_observer(cfg: ReceiverConfig, known=None, api=None, info=None, argv_of=None, local_host=None, clock=None):
+    """The supported read-only proof of the ACTUAL target + producer for this config (see ``qa.observe_local``)."""
+    if cfg.qa is None:
+        raise Refusal("qa_not_enabled")
+    runner_id = cfg.settings.identity.fields["runner_id"]
+    return qa.make_observer(cfg.qa.identity, cfg.pin,
+                            lambda: _credential_runner_id(cfg.runner_credential_file), known or _known(cfg), api, info,
+                            argv_of, local_host, clock or qa.now_epoch)
+
+
+def _credential_runner_id(path: Path) -> str:
+    """The runner id of the ALREADY registered runner credential (read only; the token is never returned)."""
+    try:
+        if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise Refusal("runner_credential_not_private")
+        return str(uuid.UUID(str(json.loads(path.read_text())["runner_id"])))
+    except Refusal:
+        raise
+    except (OSError, ValueError, KeyError, TypeError):
+        raise Refusal("runner_credential_missing") from None
+
+
+def _qa_client(cfg: ReceiverConfig, opener=None, clock=None):
+    if cfg.qa is None:
+        raise Refusal("qa_not_enabled")
+    token = read_runner_token(cfg.runner_credential_file, cfg.settings.identity.fields["runner_id"])
+    return qa.QAClient(cfg.mesh_url, cfg.qa.credential, token, cfg.qa.identity, cfg.ledger_root, opener=opener,
+                       clock=clock or qa.now_epoch)
+
+
+def qa_command(cfg: ReceiverConfig, action: str, delivery_id: str, boundary: str, opener=None, api=None, info=None,
+               local_host: str | None = None, out=None, clock=None, known=None, argv_of=None) -> int:
+    """``qa-check`` is the host-local guard the operation owner calls before EACH normal mutation: exit 0 and one JSON line
+    only when the live backend and the live local binding both say yes right now; every other outcome is exit 3 with a
+    typed reason and the mutation must not happen. It executes nothing. ``qa-revoke`` disables the QA scope only."""
+    out = out or sys.stdout
+    try:
+        if action == "qa-observe":
+            res = qa_observer(cfg, known, api, info, argv_of, local_host, clock)()
+            print(json.dumps(res, sort_keys=True), file=out)
+            return 0
+        client = _qa_client(cfg, opener, clock)
+        if action == "qa-revoke":
+            ids = qa.revoke(cfg.qa, cfg.ledger_root, client)
+            for rid in ids:
+                print(f"revoked: qa receiver {rid[:8]}", file=out)
+            return 0
+        if not delivery_id or not boundary:
+            raise Refusal("qa_check_needs_delivery_and_boundary")
+        res = qa.guard(cfg.qa, cfg.ledger_root, cfg.ledger_root / "journal", client, delivery_id, boundary,
+                       qa_observer(cfg, known, api, info, argv_of, local_host, clock), clock or qa.now_epoch)
+    except (Refusal, qa.QARefusal) as e:
+        print(f"refused: {e.code}", file=sys.stderr)
+        return EXIT_REFUSED
+    except (KeyError, TypeError, AttributeError) as e:          # untrusted state of an unexpected shape: typed refusal, no traceback
+        print(f"refused: malformed_state ({type(e).__name__})", file=sys.stderr)
+        return EXIT_REVOKE_FAILED if action == "qa-revoke" else EXIT_REFUSED
+    except (md.MeshError, OSError, ValueError) as e:
+        print(f"refused: {'revoke_failed' if action == 'qa-revoke' else 'check_unavailable'} ({type(e).__name__})", file=sys.stderr)
+        return EXIT_REVOKE_FAILED if action == "qa-revoke" else EXIT_REFUSED
+    print(json.dumps(res, sort_keys=True), file=out)
+    return 0
+
+
 # ---------------------------------------------------------------------- launchd job (the receiver only)
 def plist(config: str, python: str, pythonpath: str, log_dir: str) -> str:
     """The supervisor job: it starts and stops THIS process and nothing else. A refused start is retried at the throttle."""
@@ -551,26 +640,37 @@ def status(cfg: ReceiverConfig, tmux=None, known=None, started=process_started) 
     for p in journal.glob("*.json") if journal.is_dir() else []:
         rec = md.Journal(journal).get(p.stem) or {}
         states[str(rec.get("state"))] = states.get(str(rec.get("state")), 0) + 1
+    qa_states: dict[str, int] = {}
+    for p in journal.glob("*.json") if journal.is_dir() else []:
+        rec = md.Journal(journal).get(p.stem) or {}
+        if rec.get("capability") == qa.CAPABILITY:
+            qa_states[str(rec.get("state"))] = qa_states.get(str(rec.get("state")), 0) + 1
+            states[str(rec.get("state"))] -= 1                 # legacy counts stay legacy-only
+            if not states[str(rec.get("state"))]:
+                del states[str(rec.get("state"))]
     return {"session_id": ident.fields["session_id"], "enabled": cfg.enabled, "transport": cfg.transport,
             "checks": dict(preflight(cfg, tmux, known, started)),
-            "ledger": states}
+            "ledger": states, "host_local_qa_assignment_v1": {"enabled": cfg.qa is not None, "ledger": qa_states}}
 
 
 # ---------------------------------------------------------------------- CLI
 def command(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="mesh-runner session-receiver")
-    p.add_argument("action", choices=["preflight", "run", "status", "plist", "revoke"])
+    p.add_argument("action", choices=["preflight", "run", "status", "plist", "revoke", "qa-check", "qa-revoke", "qa-observe"])
     p.add_argument("--config", required=True)
     p.add_argument("--python", default=sys.executable)
     p.add_argument("--pythonpath", default="")
     p.add_argument("--log-dir", default="")
     p.add_argument("--bind-existing-ledger", action="store_true",
                    help="run: pin an existing unpinned ledger to this identity (explicit, once)")
+    p.add_argument("--delivery-id", default="", help="qa-check: the delivered assignment this mutation belongs to")
+    p.add_argument("--boundary", default="", choices=["", *qa.BOUNDARIES], help="qa-check: the mutation about to be made")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s")
     try:
-        cfg = load_config(args.config, require_enabled=args.action == "run")
+        cfg = load_config(args.config, require_enabled=args.action == "run",
+                          allow_expired_qa=args.action in ("qa-revoke", "revoke", "status"))   # disable paths never get stuck
     except Refusal as e:
         print(f"refused: {e.code}" + (f" ({e.detail})" if e.detail else ""), file=sys.stderr)
         return EXIT_REFUSED
@@ -581,6 +681,8 @@ def command(argv: list[str]) -> int:
         return 0
     if args.action == "revoke":
         return revoke(cfg)
+    if args.action in ("qa-check", "qa-revoke", "qa-observe"):
+        return qa_command(cfg, args.action, args.delivery_id, args.boundary)
     if args.action == "status":
         json.dump(status(cfg), sys.stdout, indent=2)
         print()

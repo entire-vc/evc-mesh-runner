@@ -1,4 +1,5 @@
 """End-to-end loop with an in-memory Mesh and real child processes."""
+import sqlite3
 import datetime as dt
 import json
 import os
@@ -14,6 +15,7 @@ from mesh_runner.outcome import Outcome
 from fakes import AGENT_ID, FAKE_AGENT, HarnessGate, FakeAdapter, FakeProfileAdapter, FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT
 from test_workspace import make_repo
 
+from mesh_runner.adapters.base import group_alive, proc_stamp
 from mesh_runner.config import AgentConfig, RunnerConfig
 from mesh_runner.runner import AgentRunner, AlreadyRunning, Runner, public_harness_error, startup_error_excerpt
 from mesh_runner.store import Store
@@ -42,11 +44,45 @@ class Bench(unittest.TestCase):
         self.adapter = FakeAdapter(script)
 
     def tearDown(self):
+        stuck = self.stop_live_groups()
+        if stuck:
+            # A writer is still alive: removing the tree now would race it. Leave the tree, fail loudly.
+            self.fail(f"teardown: process group(s) {stuck} survived _kill; temp tree {self.tmp.name} kept")
         self.tmp.cleanup()
 
+    def stop_live_groups(self, wait=5):
+        """Kill every live attempt group the runners own; return the pids that outlived `wait` seconds.
+
+        A turn the test left running (killed turns, SLEEP replies) still writes under state/
+        (journals, receipts, logs); the groups must be gone before the tree is removed, or rmtree
+        races a writer: "Directory not empty: .../state/interactive"."""
+        runners, self._runners = getattr(self, "_runners", []), []
+        stuck = []
+        for r in runners:
+            try:
+                live = r.store.by_state(self.agent.name, ("starting", "running", "unknown", "ready", "waiting"))
+            except sqlite3.ProgrammingError:
+                continue                    # the test closed this store itself: nothing of it can still write
+            for a in live:
+                if a.pid:
+                    try:
+                        r._kill(a)
+                    except Exception:
+                        pass
+                    if a.id not in r.procs:
+                        continue            # a pid the test planted (not our child): it never writes under state/
+                    deadline = time.monotonic() + wait
+                    while group_alive(a.pid, a.stamp) and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    if group_alive(a.pid, a.stamp):
+                        stuck.append(a.pid)
+        return stuck
+
     def runner(self, mesh, gitlab=None):
-        return AgentRunner(self.cfg, self.agent, Store(self.root / "state" / "r.sqlite"), mesh=mesh,
-                           adapter=self.adapter, gitlab=gitlab)
+        r = AgentRunner(self.cfg, self.agent, Store(self.root / "state" / "r.sqlite"), mesh=mesh,
+                        adapter=self.adapter, gitlab=gitlab)
+        self.__dict__.setdefault("_runners", []).append(r)
+        return r
 
     def settle_all(self, r, timeout=10, *, skip8=None, total_timeout=120):
         """Bound idle polling per turn, not synchronous tick/workspace work.
@@ -453,6 +489,31 @@ class Loop(Bench):
         self.assertEqual(self.states(r), {})
 
 
+class TeardownWaitsForKilledGroups(Bench):
+    def test_a_surviving_runner_owned_group_is_reported_and_a_planted_pid_is_not(self):
+        import subprocess, signal
+        t = task(950)
+        r = self.runner(FakeMesh([t]))
+        own = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        planted = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            a = r.store.create("builder", t["id"], "claude")
+            r.store.update(a, state="running", pid=own.pid, stamp=proc_stamp(own.pid))
+            r.procs[a.id] = own
+            t2 = task(951)
+            b = r.store.create("builder", t2["id"], "claude")
+            r.store.update(b, state="running", pid=planted.pid, stamp=proc_stamp(planted.pid))
+            with mock.patch.object(r, "_kill"):          # a kill that does nothing: the group survives
+                started = time.monotonic()
+                stuck = self.stop_live_groups(wait=0.3)
+            self.assertEqual(stuck, [own.pid])           # reported; the planted pid is skipped
+            self.assertGreaterEqual(time.monotonic() - started, 0.3)   # it waited out the budget
+        finally:
+            for p in (own, planted):
+                p.kill()
+                p.wait()
+
+
 class ReviewFindings(Bench):
     def test_one_broken_task_does_not_stop_the_others_or_heartbeats(self):
         t1, t2 = task(1, "high"), task(2)
@@ -856,7 +917,14 @@ class ReviewFindings(Bench):
         started = time.time()
         self.settle_all(r, timeout=20)
         self.assertLess(time.time() - started, 15)
-        self.assertNotEqual(self.states(r)[t["id"][:8]], "running")
+        # The limit is 0 min, so the kill can land before the fake harness has passed its
+        # UserPromptSubmit hook (a slow interpreter start): the runner then rightly holds the
+        # turn as `unknown` (delivery unproven, no replay) instead of `failed`. Both mean the
+        # session was killed; `running` is the only wrong state. The `unknown` rows are not in
+        # states(), so read them directly.
+        attempts = {a.task8: a.state for a in r.store.by_state(self.agent.name, (
+            "starting", "running", "waiting", "ready", "completed", "failed", "aborted", "unknown"))}
+        self.assertIn(attempts[t["id"][:8]], ("failed", "unknown"))
 
     def test_children_left_behind_are_killed_after_the_grace(self):
         t = task(1)

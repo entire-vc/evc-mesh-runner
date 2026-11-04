@@ -1,3 +1,4 @@
+
 # Authenticated capability recovery
 
 This source protocol is opt-in through the trusted `start_gate_command`. No
@@ -34,23 +35,19 @@ capacity, bypasses a fresh ledger or grants GitLab permissions. No timer invokes
 this command. There is no new event bus or cache. The existing extension must
 already be installed; this command cannot install or rekey it.
 
-The paired fleet hook implements this protocol only for explicitly configured
-v2 independent-account publication routes. Other provider-auth, quota and
-filesystem-permission holds keep their existing mechanisms. A changed review
-route/policy/context intentionally cannot release an older hold: the route owner
-must reconcile that provenance; this command does not rewrite it. Rolling back
-to the previous Runner leaves the new mark keys inert and preserves their data.
+A compatible external gate hook is required for explicitly configured
+v2 independent-account publication routes. It must implement the hold/recheck
+protocol described above; Runner installation does not supply this hook or enable
+an owner configuration. Other provider-auth, quota and filesystem-permission
+holds keep their existing mechanisms. A changed review route/policy/context
+intentionally cannot release an older hold: the route owner must reconcile that
+provenance; this command does not rewrite it. Rolling back to the previous Runner
+leaves the new mark keys inert and preserves their data.
 
-The separate matching bob source is pinned to commit
-`eebce3c55173f0ced3390efa0fc7aff53a45a731` (base
-`5e1465de190a898cc8aace65ecd147a9b05f5b82`). Its delivery patch SHA256 is
-`20a14664bedfd62a1929e149b667670f78fb005cfa324538730364a8abed331b`.
-The relevant production files are `scripts/mesh-runner-gate.py`,
-`scripts/fleet-tools/gl-admin`, and `scripts/fleet-tools/gl-admin-driver.rb`;
-`scripts/tests/test_runner_access_recovery_integration.py` exercises their
-cross-repository contract. Runner installation alone does not deliver this
-dependency or enable an owner configuration. Reviewers must inspect that exact
-source packet alongside this release; its hash is not proof of activation.
+Operators must separately pin and review the external hook and permission-grant
+integration source, including cross-component contract tests, and verify their
+activation alongside the accepted Runner release. A source hash alone does not
+prove activation. No specific external implementation is distributed here.
 
 The explicit producer authenticates its selected lane via the normal Mesh
 `GET /agents/me` before invoking its hook, and requires that identity to match
@@ -61,11 +58,20 @@ session to obtain identity.
 
 ## Native permission-grant notifier
 
-The fleet's existing `gl-admin grant-developer` and `grant-maintainer` driver
-now includes a post-success effective-role readback bound to the native user ID
-and canonical project path. The owner-host wrapper invokes
-`mesh-runner notify-access-change` automatically when its explicit local owner
-configuration exists at `~/.config/mesh-runner/access-recovery-owner.json`:
+Automatic permission-grant notification requires an external grant wrapper;
+Runner does not install one. Such an integration must perform a post-success
+effective-role readback bound to the native user ID and canonical project path,
+then invoke the real Runner command on the owner host:
+
+```sh
+mesh-runner notify-access-change --config /absolute/path/runner.toml --gitlab-actor 123 --project group/project
+```
+
+Here `123` and `group/project` are example values to replace with the authenticated
+native user ID and canonical project path. An external wrapper can use the
+following local configuration contract at
+`~/.config/mesh-runner/access-recovery-owner.json` (this is an integration
+example, not a configuration file read by Runner itself):
 
 ```json
 {"version":1,"runner_config":"/absolute/local/runner.toml","runner_command":["/absolute/python3.12","-m","mesh_runner.cli"],"runner_pythonpath":"/absolute/installed-release/src"}
@@ -73,8 +79,9 @@ configuration exists at `~/.config/mesh-runner/access-recovery-owner.json`:
 
 The config contains only local paths and the explicit module invocation. These
 must select the same accepted release and config as the local running Runner; no SSH hop or remote owner is inferred. A standalone installed executable can use a one-item `runner_command` and empty
-`runner_pythonpath`. Per-call `--runner-config` and `--runner-bin` may select
-that executable form. The only environment override is named `PYTHONPATH`; no
+`runner_pythonpath`. In a wrapper implementing this example, per-call `--runner-config` and
+`--runner-bin` may select that executable form; these are wrapper options, not
+Runner CLI options. The only environment override is named `PYTHONPATH`; no
 credential environment is configured or emitted. A malformed config
 refuses before the grant. Missing/unavailable owner or failed own probes is
 reported separately as `access_recovery.status=notification_pending`: the grant
@@ -85,8 +92,8 @@ The notifier enumerates configured lanes' existing durable holds only, selecting
 exact native actor/project and `independent-account-note-label/v1`. It does not
 create a hold or task, and refuses more than 16 matching holds. It calls the
 existing explicit producer for each selected hold and reports selected/released
-counts. A zero-match acknowledgement means no eligible hold, not a wake. The
-wrapper has a 300-second bounded delivery timeout; timeout is pending, not proof
+counts. A zero-match acknowledgement means no eligible hold, not a wake. An integration following this contract must impose a 300-second bounded
+delivery timeout; timeout is pending, not proof
 of rollback or release. No timer retries it. After delivery failure the owner can
 invoke the notifier directly for the exact actor/project, without reissuing a grant.
 

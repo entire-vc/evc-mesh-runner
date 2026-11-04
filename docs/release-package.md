@@ -14,10 +14,11 @@ A release archive must contain, besides the rest of the tree:
 |---|---|
 | `src/mesh_runner/reviewer_merge.py` | the `reviewer-merge` command and the merge-only gate |
 | `src/mesh_runner/{cli,config,runner,extension_service}.py` | wiring of that command |
-| `scripts/select-reviewer.py` | router adapter; needs an installed fleet router, see `docs/reviewer-merge.md` |
+| `scripts/select-reviewer.py` | router adapter; requires a separately installed compatible router, see `docs/reviewer-merge.md` |
 | `scripts/reviewer-canary.py` | read-only canary |
 | `docs/reviewer-merge.md` | operator contract and rollback |
 | `src/mesh_runner/session_receiver.py`, `docs/session-receiver.md` | the `session-receiver` command and its operator contract |
+| `src/mesh_runner/qa_assignment.py`, `src/mesh_runner/qa_assignment_v1/conformance.json`, `docs/host-local-qa-assignment.md` | the default-off `host_local_qa_assignment_v1` capability, its pins (the frozen bytes stay private, loaded from the operator's `bundle_dir`) and operator contract |
 
 `tests/test_release_package.py` checks the version sync and, against `git ls-files`, that every
 listed path is tracked (so `git archive` carries it), and that the reviewer files carry no card
