@@ -1,3 +1,13 @@
+---
+created: 2026-11-05T15:52:43+03:00
+updated: 2026-11-05T15:52:43+03:00
+author: Codex-Mesh
+status: review
+project: mesh
+type: guide
+tags: [mesh]
+---
+
 # WAIT workspace suspension
 
 `runner.workspace_wait_release_minutes` defaults to zero (disabled).
@@ -238,3 +248,32 @@ recurrence prevention requires owner-enabled observation of the ready backlog,
 pressure-release mode is added here. This command never enables that policy. Rollback is to stop issuing requests; pending requests expire.
 Code rollback/deployment remains owner-controlled, retaining checkpoints and
 receipts for existing restore obligations.
+
+### Bounded operator cleanup with manifest pins
+
+`pool --prune-checkpoints` and `pool --compact-checkpoints` accept repeatable
+`--checkpoint-pin ID:SHA256` arguments. SHA256 is the digest of the exact
+`manifest.json` bytes, obtained during the dry run/inventory. Pins restrict the
+existing candidate policy; they never override grace periods or safety checks.
+Use the same pins for dry run and `--apply` (with the Runner stopped and its lock
+available). A compacted checkpoint has a new manifest and needs a fresh inventory
+before another operation.
+
+IDs must be direct children of one configured owner's checkpoint directory.
+Missing/ambiguous IDs, symlink checkpoints/manifests, changed manifests, and live,
+unknown or transitional journal references are refused. Validation covers the
+whole request before mutation, then repeats under the repository lock; compaction
+also checks the manifest immediately before swapping the verified replacement.
+An error exits nonzero; a later failure can leave earlier selected checkpoints
+processed. Unselected checkpoints, abandoned pending captures, pre-existing trash
+and unrelated pin refs are excluded from a pinned prune operation. Cleanup keeps
+its existing deadline and can leave newly renamed trash for a later maintenance
+pass. Readonly directories are made removable through their already opened,
+no-follow directory descriptors.
+
+On macOS file copies call `clonefile` in-process, preserving APFS copy-on-write
+without a child process per file; unsupported filesystems use `copy2`. A slim
+capture that falls back to a full snapshot retains `slim_failed: true` and adds
+`slim_failure_reason`: `bundle-base-unavailable`, `replay-mismatch`, or
+`slim-verification-failed`. This finite classification never includes exception
+text, filesystem paths or captured command output.

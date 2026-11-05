@@ -9,6 +9,8 @@ from fakes import FakeMesh, task
 from test_runner import Bench
 
 TID = "00000000-0000-0000-0000-000000000001"
+CONDITIONAL = ("access_ready", "contract_ready", "artifact_published",
+               "shipped", "deployed", "accepted")
 
 def edge(n, tid=TID, satisfied=True):
     return {"id": f"edge-{n}", "task_id": tid,
@@ -61,6 +63,52 @@ class Predicate(unittest.TestCase):
 
     def test_single_satisfied_other_target_also_allows_observer(self):
         self.assertFalse(blocks_stale_observation({"outgoing": [edge(1)]}, TID, "deadbeef"))
+
+    def test_server_satisfied_conditional_edges_allow_observer_without_retargeting(self):
+        for condition in CONDITIONAL:
+            fulfilled = dict(edge(1), condition=condition)
+            with self.subTest(condition=condition):
+                self.assertFalse(blocks_stale_observation({"outgoing": [fulfilled]}, TID, "deadbeef"))
+                self.assertIsNone(sole_dependency({"outgoing": [fulfilled]}, TID,
+                                                  "00000001", allow_satisfied=True))
+        mixed = [dict(edge(n), condition=condition)
+                 for n, condition in enumerate(("task_done",) + CONDITIONAL, 1)]
+        self.assertFalse(blocks_stale_observation({"outgoing": mixed}, TID, "deadbeef"))
+
+    def test_conditional_edges_require_an_explicit_true_verdict(self):
+        for condition in CONDITIONAL:
+            for verdict in (False, None, 0, 1, "true"):
+                for target in ("deadbeef", "00000001"):
+                    e = dict(edge(1), condition=condition, condition_satisfied=verdict)
+                    with self.subTest(condition=condition, verdict=verdict, target=target):
+                        self.assertTrue(blocks_stale_observation({"outgoing": [e]}, TID, target))
+            missing = dict(edge(1), condition=condition)
+            del missing["condition_satisfied"]
+            self.assertTrue(blocks_stale_observation({"outgoing": [missing]}, TID, "00000001"))
+
+    def test_conditional_informational_links_are_invalid_even_when_satisfied(self):
+        # Mesh permits conditional gates only on blocks, never informational links.
+        for condition in CONDITIONAL:
+            malformed = dict(edge(1), dependency_type="relates_to", condition=condition)
+            with self.subTest(condition=condition):
+                self.assertTrue(blocks_stale_observation({"outgoing": [malformed]}, TID, "deadbeef"))
+
+    def test_satisfied_condition_cannot_hide_invalid_or_truncated_edges(self):
+        fulfilled = dict(edge(1), condition="deployed")
+        for key, value in (("id", ""), ("task_id", "foreign"),
+                           ("depends_on_task_id", "bad"), ("condition", []),
+                           ("condition", {}), ("condition", "future_condition")):
+            with self.subTest(key=key, value=value):
+                self.assertTrue(blocks_stale_observation(
+                    {"outgoing": [dict(fulfilled, **{key: value})]}, TID, "00000001"))
+        for rows in ({"outgoing": [fulfilled], "has_more": True},
+                     {"outgoing": [fulfilled], "next": "page2"},
+                     {"outgoing": [fulfilled, fulfilled]},
+                     {"outgoing": [fulfilled, dict(fulfilled, id="duplicate")]},
+                     {"outgoing": [fulfilled, dict(edge(2), condition="accepted",
+                                                   condition_satisfied=False)]}):
+            with self.subTest(rows=rows):
+                self.assertTrue(blocks_stale_observation(rows, TID, "00000001"))
 
     def test_semantic_duplicate_with_distinct_row_identity_still_holds(self):
         first = edge(1)
@@ -136,6 +184,47 @@ class SameAttemptWake(Bench):
     def test_informational_link_alone_is_not_a_wake_event(self):
         r, a = self.prepare(body="FYI progress only")
         r.mesh.deps[a.task_id] = [dict(edge(1, a.task_id), dependency_type="relates_to")]
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, "waiting")
+        self.assertFalse(r.procs)
+        self.assertFalse(self.calls.exists())
+
+    def test_done_card_with_fulfilled_deployed_edge_wakes_same_attempt_once(self):
+        r, a = self.prepare(body="FYI progress only")
+        awaited = r.mesh.tasks[task(2)["id"]]
+        awaited["status_id"] = "s-done"
+        r.mesh.deps[a.task_id] = [dict(edge(2, a.task_id), condition="deployed",
+            depends_on_task_id=awaited["id"],
+            evidence_url="https://git.example/jobs/566637")]
+        r.store.update(a, session_id="preserved-session")
+        a = r.store.get(a.id)
+        original_edges = copy.deepcopy(r.mesh.deps)
+        r._wake_one(a)
+        b = r.store.get(a.id)
+        self.assertEqual((b.id, b.task_id, b.session_id, b.turns, b.state),
+                         (a.id, a.task_id, a.session_id, a.turns, "ready"))
+        self.assertIn("done", b.wake_text)
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).wake_text, b.wake_text)
+        self.assertEqual(len(r.store.by_state(a.agent, ("ready", "waiting"))), 1)
+        self.assertEqual(r.mesh.deps, original_edges)
+        self.assertFalse(r.procs)
+        self.assertFalse(self.calls.exists())
+
+    def test_done_card_does_not_bypass_unfulfilled_deployment(self):
+        r, a = self.prepare(body="@builder continue the remaining delivery")
+        r.mesh.tasks[task(2)["id"]]["status_id"] = "s-done"
+        r.mesh.deps[a.task_id] = [dict(edge(2, a.task_id, satisfied=False),
+            condition="deployed", depends_on_task_id=task(2)["id"])]
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, "waiting")
+        self.assertFalse(r.procs)
+        self.assertFalse(self.calls.exists())
+
+    def test_fulfilled_deployment_alone_is_not_a_wake_event(self):
+        r, a = self.prepare(body="FYI progress only")
+        r.mesh.deps[a.task_id] = [dict(edge(2, a.task_id), condition="deployed",
+            depends_on_task_id=task(2)["id"])]
         r._wake_one(a)
         self.assertEqual(r.store.get(a.id).state, "waiting")
         self.assertFalse(r.procs)

@@ -3,6 +3,13 @@
 
 ## Unreleased
 
+## 0.1.40
+
+- Let the ordinary card observer proceed when Mesh explicitly satisfies every supported formal dependency condition; retain conservative handling of unknown or unsatisfied conditions.
+- Clone checkpoint files through the native APFS API without starting a process per file; retain a portable copy fallback.
+- Report bounded slim-checkpoint failure reasons and preserve bytes, modes, staged changes and symlinks on restore.
+- Restrict checkpoint prune and compaction to explicit manifest pins; reject changed, active, ambiguous and unsafe checkpoints.
+
 ## 0.1.39
 
 - Add the narrow, policy-pinned `admit-git-index` admission (one closed operation, scoped receipt, per-delivery re-proof); see docs/git-index-admission.md.

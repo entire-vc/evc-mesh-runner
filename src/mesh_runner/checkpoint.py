@@ -18,7 +18,9 @@ Checkpoints are retained after restore, including failures, for operator recover
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
+from functools import lru_cache
 import json
 import os
 import shutil
@@ -491,19 +493,59 @@ def find_excludes(source: Path, names: tuple) -> list:
     return found
 
 
+@lru_cache(maxsize=1)
+def _clonefile():
+    if sys.platform != 'darwin':
+        return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    clone = getattr(libc, 'clonefile', None)
+    if clone is not None:
+        clone.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int)
+        clone.restype = ctypes.c_int
+    return clone
+
+
+def _copy_file(src, dst):
+    """Clone on APFS in-process; portable copy when cloning is unavailable."""
+    clone = _clonefile()
+    if clone is not None and clone(os.fsencode(src), os.fsencode(dst), 0) == 0:
+        shutil.copystat(src, dst)
+        return dst
+    return shutil.copy2(src, dst)
+
+
+def manifest_digest(checkpoint: Path) -> str:
+    """Hash a regular manifest without following a checkpoint/manifest symlink."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root = os.open(checkpoint.parent, flags)
+    try:
+        directory = os.open(checkpoint.name, flags, dir_fd=root)
+        try:
+            fd = os.open('manifest.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            with os.fdopen(fd, 'rb') as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise WorkspaceError('checkpoint pin: manifest is not a regular file')
+                return hashlib.file_digest(stream, 'sha256').hexdigest()
+        finally:
+            os.close(directory)
+    finally:
+        os.close(root)
+
+
 def _copy(src: Path, dst: Path, excludes: frozenset = frozenset()) -> None:
-    # APFS clones use no second full allocation. Portable fallback is budgeted below.
-    if sys.platform == 'darwin':
-        def copyfile(a, b):
-            r = _run(['cp', '-cp', str(a), str(b)], capture_output=True)
-            if r.returncode:
-                shutil.copy2(a, b)
-            return b
-    else:
-        copyfile = shutil.copy2
-    shutil.copytree(src, dst, symlinks=True, copy_function=copyfile,
+    shutil.copytree(src, dst, symlinks=True, copy_function=_copy_file,
                     ignore=lambda p, names: [n for n in names if (Path(p) == src and n == '.git')
                                              or (Path(p) / n).relative_to(src).as_posix() in excludes])
+
+
+def _slim_failure_reason(error: WorkspaceError) -> str:
+    # Persist only a finite classification, never exception text, paths or command output.
+    message = str(error)
+    if 'bundle base' in message:
+        return 'bundle-base-unavailable'
+    if 'fingerprint' in message or 'differs' in message or 'replay' in message:
+        return 'replay-mismatch'
+    return 'slim-verification-failed'
 
 
 def _clear_tree(root: Path) -> None:
@@ -713,9 +755,11 @@ class Checkpoints:
                 raise
             # The compact form did not replay to the same state (filters, skip-worktree, a
             # missing base): keep the full form, which is always self-contained.
-            return self._create(key, source, metadata, slim=False, slim_failed=True)
+            return self._create(key, source, metadata, slim=False, slim_failed=True,
+                                slim_failure_reason=_slim_failure_reason(e))
 
-    def _create(self, key: str, source: Path, metadata: dict, slim: bool = False, slim_failed: bool = False) -> Path:
+    def _create(self, key: str, source: Path, metadata: dict, slim: bool = False, slim_failed: bool = False,
+                slim_failure_reason: str | None = None) -> Path:
         if not key or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in key):
             raise WorkspaceError('checkpoint: invalid key')
         final = self.root / key
@@ -788,6 +832,7 @@ class Checkpoints:
                 manifest['ignored'] = ignored
             if slim_failed:
                 manifest['slim_failed'] = True      # full form kept on purpose: not a migration candidate
+                manifest['slim_failure_reason'] = slim_failure_reason or 'slim-verification-failed'
             if delta is not None:
                 manifest['delta'] = delta
                 manifest['stored_bytes'] = stored
@@ -846,11 +891,8 @@ class Checkpoints:
             out.parent.mkdir(parents=True, exist_ok=True)
             if src.is_symlink():
                 os.symlink(os.readlink(src), out)
-            elif sys.platform == 'darwin' and _run(['cp', '-cp', str(src), str(out)],
-                                                             capture_output=True).returncode == 0:
-                continue
             else:
-                shutil.copy2(src, out)
+                _copy_file(src, out)
         for name in sorted(dirs, key=lambda n: -len(Path(n).parts)):
             (dst / name).mkdir(parents=True, exist_ok=True)
             if name in full:
@@ -1239,7 +1281,8 @@ class Checkpoints:
         return any(name in self.exclude_names for rel in data['fingerprint']['tree']
                    for name in Path(rel).parts)
 
-    def compact(self, checkpoint: Path, base_objects: Path | None = None) -> dict:
+    def compact(self, checkpoint: Path, base_objects: Path | None = None,
+                expected_manifest_sha: str | None = None) -> dict:
         """Rewrite an old-format snapshot in place as a new-format one (same directory name).
 
         The old snapshot is replayed into scratch (hash-verified against its own fingerprint), a new
@@ -1250,9 +1293,14 @@ class Checkpoints:
         manifest records, else from `base_objects` (the pool's base clone, for a manifest written
         before `objects` was recorded); `CheckpointBaseMissing` when that store lacks it."""
         with _IO_LOCK:
-            return self._compact(checkpoint, base_objects)
+            return self._compact(checkpoint, base_objects, expected_manifest_sha)
 
-    def _compact(self, checkpoint: Path, base_objects: Path | None = None) -> dict:
+    def _compact(self, checkpoint: Path, base_objects: Path | None = None,
+                 expected_manifest_sha: str | None = None) -> dict:
+        def check_pin():
+            if expected_manifest_sha is not None and manifest_digest(checkpoint) != expected_manifest_sha:
+                raise WorkspaceError('checkpoint pin: manifest drift')
+        check_pin()
         retired = self.root / f'.retired-{checkpoint.name}'
         if not self.is_old_format(checkpoint):
             return {'compacted': False}
@@ -1290,6 +1338,7 @@ class Checkpoints:
                 manifest.pop('objects', None)       # the scratch store is about to be deleted
             atomic_json(created / 'manifest.json', manifest)
             self._verify(created)
+            check_pin()
             os.rename(checkpoint, retired)
             try:
                 os.rename(created, checkpoint)
