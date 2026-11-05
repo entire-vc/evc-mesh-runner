@@ -70,9 +70,9 @@ def plan(ledger, request, attempt, task, owner, *, channels=None):
         if not registered["binding"]["test"]:
             raise Refused("production native rebind requires the enrolled channel")
     else:
-        from .native_result_channel import load
+        from .native_result_channel import contract, load
         desc, _ = load(channels / request["registration"])
-        if (desc["source"]["binding"] != registered["binding"]
+        if (contract(desc) != registered["binding"]
                 or desc["receiver"] != current or desc["owner"] != owner):
             raise Refused("native rebind channel scope changed")
     wait = {"kind": "native", "target": request["registration"], "native_receiver": current,

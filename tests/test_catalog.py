@@ -250,6 +250,15 @@ class PoolObserverTest(unittest.TestCase):
         self.assertEqual(rep, {"state": "threshold", "verified": True, "observed_at": iso(NOW - 60),
                                "threshold_ref": "thr-default-v1", "evidence_kind": "configured_threshold"})
 
+    def test_available_observation_with_future_reset_keeps_threshold_policy(self):
+        record = self.quota("p/5h", 0.92)
+        record["reset_at"] = iso(NOW + 4 * 86400)
+        q = self.write("q.json", "quota-observations/v1", [record])
+        local = PoolObserver(observations=q).observe({"p/5h"}, NOW)
+        # A reset is metadata, not exhaustion; the existing 90% policy still applies.
+        self.assertEqual(local["p/5h"]["state"], "threshold")
+        self.assertEqual(local["p/5h"]["reset_at"], record["reset_at"])
+
     def test_transfer_is_reported_as_threshold(self):
         q = self.write("q.json", "quota-observations/v1", [self.quota("p/5h", 0.97)])
         o = PoolObserver(observations=q)

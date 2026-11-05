@@ -27,6 +27,7 @@ from .native_result_ledger import (Ledger, Refused, binding, canonical, event,
                                   digest, fields, identity, receiver, uuid)
 from .native_result_source import enroll, scan
 from . import native_result_process as process_fence
+from . import native_result_receipt as receipts
 from .native_result_lineage import source_identity, validate as lineage_validate, verify_local
 
 MAX_MESSAGE = 2 * 1024 * 1024
@@ -94,9 +95,35 @@ def locked(root):
         os.close(fd)
 
 
+def contract(desc):
+    """Native ledger binding of a channel: rollout source (v1-3) or receipt enrollment (v4)."""
+    if desc["version"] == 4:
+        return desc["receipt"]["pin"]["native"]["binding"]
+    return desc["source"]["binding"]
+
+
+def _receipt_descriptor(value):
+    fields(value, ("version", "receipt", "receiver", "observer", "owner"))
+    receiver(value["receiver"])
+    uuid(value["observer"])
+    owner = uuid(value["owner"])
+    enrolled = receipts.enrollment(value["receipt"])
+    pin = enrolled["pin"]
+    if value["receiver"] != pin["receiver"]:
+        raise Refused("receipt enrollment receiver differs from channel receiver")
+    if enrolled["assignment"]["owner"] != owner:
+        raise Refused("receipt assignment owner differs from channel owner")
+    if value["observer"] in (pin["native"]["binding"]["producer"], pin["issuer_actor_id"],
+                             pin["publisher_actor_id"], pin["transport_source_id"]):
+        raise Refused("observer must be distinct from receipt source identities")
+    return value
+
+
 def descriptor(value):
     if not isinstance(value, dict) or type(value.get("version")) is not int:
         raise Refused("unsupported channel version")
+    if value["version"] == 4:
+        return _receipt_descriptor(value)
     names = ("version", "source", "receiver", "observer", "owner")
     wanted = (*names, "lineage", "process") if value["version"] == 3 else (
         (*names, "lineage") if value["version"] == 2 else names)
@@ -171,10 +198,26 @@ def bootstrap(directory, journal, target, observer, owner, *, process=None, auth
     return identity(desc)
 
 
+def bootstrap_receipt(directory, enrollment, observer, owner):
+    """Explicit operator enrollment of a reviewer-receipt source (descriptor v4).
+
+    The receiver comes from the pinned enrollment; there is no rollout journal,
+    so no Codex source/lineage/process pin is involved or weakened.
+    """
+    desc = descriptor({"version": 4, "receipt": enrollment,
+                       "receiver": enrollment["pin"]["receiver"],
+                       "observer": uuid(observer), "owner": uuid(owner)})
+    root = Path(directory)
+    root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    save_private(root / "channel.json", canonical(desc))
+    save_private(root / "key", secrets.token_bytes(32))
+    return identity(desc)
+
+
 def failure_binding(desc):
-    return binding({"producer": desc["observer"], "task": desc["source"]["binding"]["task"],
+    return binding({"producer": desc["observer"], "task": contract(desc)["task"],
                     "stage": "source-failure", "package_sha256": identity(desc),
-                    "test": desc["source"]["binding"]["test"]})
+                    "test": contract(desc)["test"]})
 
 
 def install(directory, ledger, bootstrap_directory):
@@ -184,12 +227,16 @@ def install(directory, ledger, bootstrap_directory):
     channel cannot be silently overwritten, rebound or repaired by this method.
     """
     desc, key = load(bootstrap_directory)
-    native = ledger.register(desc["source"]["binding"], desc["receiver"])["registration"]
+    native = ledger.register(contract(desc), desc["receiver"])["registration"]
+    if desc["version"] == 4 and native != desc["receipt"]["pin"]["native"]["registration"]:
+        raise Refused("receipt enrollment native registration differs from the ledger")
     failure = ledger.register(failure_binding(desc), desc["receiver"])["registration"]
     root = Path(directory)
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     save_private(root / "channel.json", canonical(desc))
     save_private(root / "key", key)
+    if desc["version"] == 4:
+        (root / "receipts").mkdir(mode=0o700)
     save_private(root / "endpoint.json", canonical({"ledger": str(ledger.root.resolve()),
                  "native": native, "failure": failure}))
     return {"channel": identity(desc), "native": native, "failure": failure}
@@ -239,7 +286,7 @@ def failure_delivery(channels, ledger, registration, current):
     primary = ledger.readback(registration)
     if (endpoint["native"] != registration or Path(endpoint["ledger"]) != ledger.root.resolve()
             or desc["receiver"] != receiver(current)
-            or primary["receiver"] != current or primary["binding"] != desc["source"]["binding"]):
+            or primary["receiver"] != current or primary["binding"] != contract(desc)):
         raise Refused("observer channel registration changed")
     failed = ledger.readback(endpoint["failure"])
     if failed["binding"] != failure_binding(desc) or failed["receiver"] != current:
@@ -269,7 +316,17 @@ def receive(root, envelope):
         endpoint = json.loads(read_private(root / "endpoint.json"))
         fields(endpoint, ("ledger", "native", "failure"))
         ledger = Ledger(endpoint["ledger"])
-        if body["kind"] == "native":
+        if body["kind"] == "receipt":
+            if desc["version"] != 4:
+                raise Refused("channel has no receipt enrollment")
+            if (root / "failure.json").exists():
+                raise Refused("source failure latched; explicit recovery required")
+            packet = receipts.admit_packet(body["value"], desc["receipt"])
+            value = receipts.native_event(packet, desc["receipt"])
+            rid = endpoint["native"]
+        elif body["kind"] == "native":
+            if desc["version"] == 4:
+                raise Refused("receipt channel accepts only enrolled receipts")
             if (root / "failure.json").exists():
                 raise Refused("source failure latched; explicit recovery required")
             value = event(body["value"])
@@ -290,7 +347,14 @@ def receive(root, envelope):
         row = ledger.readback(rid)
         if row["binding"] != value["binding"] or row["receiver"] != desc["receiver"]:
             raise Refused("receiver channel registration changed")
+        if body["kind"] == "receipt":
+            if rid != packet["native"]["registration"]:
+                raise Refused("receipt native registration differs from the endpoint")
+            # Full bytes are durable before the event; linkage follows the event.
+            receipts.store(root, packet)
         receipt = ledger.publish(value, value["binding"]["producer"], value["binding"]["task"])
+        if body["kind"] == "receipt":
+            receipts.link(root, rid, receipt["event"], packet)
         return signed({"version": 1, "channel": identity(desc), "request": identity(body),
                        "receipt": receipt}, key)
 
@@ -332,13 +396,23 @@ class RemoteSink:
 
     def publish(self, value, authenticated_producer, authenticated_task):
         value = event(value)
-        contract = self.desc["source"]["binding"]
-        if (value["binding"] != contract or authenticated_producer != contract["producer"]
-                or authenticated_task != contract["task"]):
+        pinned = contract(self.desc)
+        if (self.desc["version"] == 4 or value["binding"] != pinned
+                or authenticated_producer != pinned["producer"]
+                or authenticated_task != pinned["task"]):
             raise Refused("source channel producer/task mismatch")
         if (self.root / "failure.json").exists():
             raise Refused("source failure latched; explicit recovery required")
         return self._exchange("native", value, value)
+
+    def deliver_receipt(self, packet):
+        """Transport one already-issued receipt. The publisher is not the issuer."""
+        if self.desc["version"] != 4:
+            raise Refused("channel has no receipt enrollment")
+        if (self.root / "failure.json").exists():
+            raise Refused("source failure latched; explicit recovery required")
+        packet = receipts.admit_packet(packet, self.desc["receipt"])
+        return self._exchange("receipt", packet, receipts.native_event(packet, self.desc["receipt"]))
 
     def fail(self, operation, error, reason):
         # First failure is sticky, also across process death or lost replies.

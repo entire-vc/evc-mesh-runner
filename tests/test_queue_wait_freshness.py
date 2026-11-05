@@ -1114,3 +1114,115 @@ class ExplicitQueueWait(Bench):
         self.assertEqual(q.as_any(VALUE)['mode'], 'any')
         r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8], description=description(every))
         self.assertEqual(a.wait['queue_request']['contract']['mode'], 'any')
+
+
+A2 = str(UUID(int=23))
+P2 = str(UUID(int=24))
+TWO = dict(version=1, observed_at=NOW - 600,
+           targets=[dict(agent_id=A, project_id=P, lane='Bart'), dict(agent_id=A2, project_id=P2, lane='Luke')])
+
+
+class ResidualQueueWait(ExplicitQueueWait):
+    """ANY wake served for Bart must leave Luke observable: once, durable, fail closed."""
+
+    def setUp(self):
+        super().setUp()
+        self.line = '⏳ WAIT queue:#' + task(1)['id'][:8]
+
+    def with_recovered(self, a, recovered, r=None):
+        value = proof(a.wait['queue_request'])
+        if r is not None:  # bind to the manifest the runner actually published
+            m = q.published_manifest(r.store)
+            value.update(manifest_revision=m['revision'], manifest_digest=q.digest(m))
+        if recovered is not None:
+            value['requests'][a.wait['queue_request']['generation_id']]['proof']['recovered'] = recovered
+        self.receipt(a, value)
+
+    def receipt(self, a, value=None):
+        q.write_json(self.cfg.state_dir / 'queue-wait-receipts.json', value or proof(a.wait['queue_request']))
+
+    def armed(self, source=TWO):
+        r, a, t = self.settle_line(self.line, description=description(source))
+        self.mark_delivered(r, a)
+        q.publish(r.store, self.cfg.state_dir / 'queue-wait-requests.json',
+                  self.cfg.state_dir / 'queue-wait-receipts.json')
+        return r, a, t
+
+    def bart_served(self):
+        r, a, t = self.armed()
+        self.with_recovered(a, [dict(agent_id=A, project_id=P)])
+        r._wake_one(a)
+        self.assertEqual(a.state, 'ready')
+        return r, a, t
+
+    def rewait(self, r, a, t):
+        path = self.root / 'second-wait.jsonl'
+        path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
+                                        result=self.line, session_id='s2')) + '\n')
+        r.store.update(a, state='running', log_path=str(path), turns=2, wait={})
+        r.settle(a)
+        return r.store.get(a.id)
+
+    def test_bart_only_any_wake_leaves_luke_residual_and_rewait_is_accepted(self):
+        r, a, t = self.bart_served()
+        first = a.wait['queue_request']['contract']
+        self.assertTrue(q.served(r.store, a, r.agent_id, first))
+        res = q.residual(r.store, a, r.agent_id, first)
+        self.assertEqual([x['lane'] for x in res['targets']], ['Luke'])
+        self.assertEqual(res['observed_at'], TWO['observed_at'])
+        b = self.rewait(r, a, t)
+        self.assertEqual((b.state, b.wait['kind']), ('waiting', 'queue'))
+        self.assertEqual(b.wait['queue_request']['contract'], res)
+
+    def test_replay_and_restart_do_not_wake_residual_without_new_luke_proof(self):
+        r, a, t = self.bart_served()
+        b = self.rewait(r, a, t)
+        self.mark_delivered(r, b)  # no extra first-move turn is owed either way
+        q.publish(r.store, self.cfg.state_dir / 'queue-wait-requests.json', self.cfg.state_dir / 'queue-wait-receipts.json')
+        # the Bart proof (old generation) cannot wake the residual generation
+        r._wake_one(b)
+        self.assertEqual(r.store.get(b.id).state, 'waiting')
+        restarted = self.runner(r.mesh)
+        restarted.refresh_me()
+        restarted._wake_one(restarted.store.get(b.id))
+        self.assertEqual(restarted.store.get(b.id).state, 'waiting')
+
+    def test_residual_needs_no_second_first_move_turn(self):
+        r, a, t = self.bart_served()
+        b = self.rewait(r, a, t)
+        self.assertTrue(q.delivered(r.store, b, r.agent_id, b.wait['queue_request']['contract']))
+
+    def test_luke_start_wakes_once_and_then_nothing_remains(self):
+        r, a, t = self.bart_served()
+        b = self.rewait(r, a, t)
+        q.publish(r.store, self.cfg.state_dir / 'queue-wait-requests.json', self.cfg.state_dir / 'queue-wait-receipts.json')
+        self.with_recovered(b, [dict(agent_id=A2, project_id=P2)], r)
+        r._wake_one(b)
+        self.assertEqual(r.store.get(b.id).state, 'ready')
+        self.assertEqual(json.loads(r.store.mark(b.agent, b.task_id, q.key(b.wait['queue_request']))[0])['state'], 'complete')
+        self.assertIsNone(q.residual(r.store, b, r.agent_id, b.wait['queue_request']['contract']))
+        self.assertIsNone(q.effective(r.store, b, r.agent_id, TWO))
+        again = self.rewait(r, r.store.get(b.id), t)
+        self.assertNotEqual(again.wait.get('kind'), 'queue')
+
+    def test_unproven_served_set_creates_no_residual_old_observer_fails_closed(self):
+        r, a, t = self.armed()
+        req = a.wait['queue_request']
+        for recovered in (None, [], [dict(agent_id=A2, project_id=P)], 'x', [dict(agent_id=A, project_id=P)] * 2):
+            value = proof(req)
+            if recovered is not None:
+                value['requests'][req['generation_id']]['proof']['recovered'] = recovered
+            self.assertEqual(q.residual_mark(r.agent_id, req, value), {}, recovered)
+
+    def test_all_targets_recovered_leaves_no_residual(self):
+        r, a, t = self.armed()
+        self.with_recovered(a, [dict(agent_id=A, project_id=P), dict(agent_id=A2, project_id=P2)])
+        r._wake_one(a)
+        self.assertIsNone(q.residual(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
+
+    def test_newer_source_supersedes_residual_and_holds_fail_closed(self):
+        r, a, t = self.bart_served()
+        newer = dict(TWO, observed_at=TWO['observed_at'] + 1)
+        self.assertEqual(q.effective(r.store, a, r.agent_id, newer)['targets'], q.as_any(newer)['targets'])
+        r.mesh.tasks[t['id']]['human_gate'] = True
+        self.assertIsNone(r._queue_source(r.mesh.tasks[t['id']], NOW))

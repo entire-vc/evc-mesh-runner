@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Callable, Iterable, Protocol
 
+from . import chat_diag
 from .chat_protocol import ChatClient, ChatError
 
 log = logging.getLogger("mesh_runner")
@@ -118,6 +119,7 @@ class ChatTurnRunner:
             except Exception as e:                      # never leave a turn without a terminal event
                 # a refusal with a stable code (e.g. headless_forbidden) keeps it; messages stay user-safe
                 code = getattr(e, "code", "") or "delivery_failed"
+                chat_diag.record("produce", e, tid, getattr(self.delivery, "diag_dir", None))
                 note_first()
                 feed.put({"type": "error", "code": code, "retryable": False,
                           "message": (str(e) if hasattr(e, "code") else type(e).__name__)[:120]})

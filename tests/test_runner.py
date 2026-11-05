@@ -312,9 +312,10 @@ class Loop(Bench):
                 a = self.error_envelope(r, t, "Long harmless provider context. " * 20,
                                         errors=["Long harmless error context. " * 20, signal], turns=2)
                 if i == 1:
-                    self.assertEqual((a.state, a.no_outcome), ("ready", 1))
-                    self.assertGreater(r._starts_paused_until, time.monotonic())
-                    self.assertIn("provider limit or overload", a.wake_text)
+                    self.assertEqual((a.state, a.no_outcome), ("ready", 0))
+                    self.assertEqual(r._starts_paused_until, 0.0)
+                    self.assertTrue(r._quota_admission_required(a))
+                    self.assertIn("fresh account capacity", a.wake_text)
                 elif i == 2:
                     self.assertEqual(a.state, "failed")
                     self.assertIn("content policy refusal", a.note)
@@ -937,19 +938,92 @@ class ReviewFindings(Bench):
         self.assertEqual(self.states(r)[t["id"][:8]], "waiting")
 
     def test_error_with_text_is_retried_not_counted_as_no_outcome(self):
+        self._assert_outage_resumes_without_capacity_gate("API overloaded, try later")
+
+    def test_structured_server_overload_uses_outage_cadence(self):
+        self._assert_outage_resumes_without_capacity_gate("server_overloaded: at capacity")
+
+    def _assert_outage_resumes_without_capacity_gate(self, error):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "ERROR:API overloaded, try later",
+        # No capacity-capable gate: an outage recovers on the existing cadence.
+        write_replies(self.replies, {t["id"][:8]: "ERROR:" + error,
                                      t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
-        self.assertEqual(self.states(r)[t["id"][:8]], "ready")
-        self.assertGreater(r._starts_paused_until, 0)       # an overload pauses starts and resumes
-        r._starts_paused_until = 0                          # the pause is over
+        a = r.store.by_state(self.agent.name, ("ready",))[0]
+        self.assertEqual(a.no_outcome, 0)
+        self.assertFalse(r._quota_admission_required(a))
+        self.assertEqual(r._starts_paused_until, 0.0)
+        self.assertIsNone(r._agent_gate_hold)
+        self.assertGreater(r._resume_hold[a.id], time.monotonic())
+        for _ in range(3):
+            r.tick()
+        self.assertEqual(len(calls(self.calls)), 1)
+        r._resume_hold.clear()              # advance only the existing local outage cadence
+        r.tick()
+        self.settle_all(r)
+        resumed = r.store.get(a.id)
+        self.assertEqual(resumed.state, "waiting")
+        self.assertEqual(resumed.session_id, a.session_id)
+        self.assertFalse(r._quota_admission_required(resumed))
+        self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
+
+    def test_hash_containing_429_is_an_ordinary_harness_error(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: "ERROR:fatal: bad object 7e1a429bc0",
+                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        r = self.runner(mesh)
+        r.tick()
+        a = self.finish_turn(r)
+        self.assertEqual(a.state, "ready")
+        self.assertEqual(a.no_outcome, 1)
+        self.assertFalse(r._quota_admission_required(a))
+        self.assertEqual(r._starts_paused_until, 0.0)
+        self.assertIsNone(r._agent_gate_hold)
+        r.tick()
+        self.settle_all(r)
+        self.assertEqual(r.store.get(a.id).state, "waiting")
+        self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
+
+    def test_usage_limit_requires_fresh_account_capacity(self):
+        self._assert_terminal_quota_needs_capacity("usage limit reached")
+
+    def test_http_429_requires_fresh_account_capacity(self):
+        self._assert_terminal_quota_needs_capacity("HTTP Error: 429")
+
+    def _assert_terminal_quota_needs_capacity(self, error):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        capacity = self.root / "account-capacity-ready"
+        # External operator hook: actual subprocesses enforce both admission phases.
+        self.agent.start_gate_command = [sys.executable, "-c",
+            "import os, pathlib, sys; "
+            "required = os.environ.get('MESH_RUNNER_REQUIRE_ACCOUNT_CAPACITY') == '1'; "
+            f"ready = pathlib.Path({str(capacity)!r}).exists(); "
+            "print('ACCOUNT_CAPACITY_READY=1' if required and ready else 'account capacity unavailable'); "
+            "sys.exit(75 if required and not ready else 0)"]
+        write_replies(self.replies, {t["id"][:8]: "ERROR:" + error,
+                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        a = r.store.by_state(self.agent.name, ("ready",))[0]
+        self.assertEqual(a.no_outcome, 0)
+        self.assertEqual(r._starts_paused_until, 0.0)
+        self.assertIsNone(r._agent_gate_hold)
+        self.assertTrue(r._quota_admission_required(a))
+        for _ in range(3):
+            r.tick()
+        self.assertEqual(len(calls(self.calls)), 1)          # no provider retries without account capacity
+        capacity.touch()
+        r._resume_hold.clear()                             # advance the existing local gate recheck
         r.tick()
         self.settle_all(r)
         self.assertEqual(self.states(r)[t["id"][:8]], "waiting")
+        self.assertFalse(r._quota_admission_required(r.store.get(a.id)))
         self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
 
     def test_resume_of_a_session_the_harness_does_not_know_starts_over(self):
@@ -1005,7 +1079,7 @@ class ReviewFindings(Bench):
         self.assertEqual(len(calls(self.calls)), 1)
         self.assertNotEqual(self.states(r).get(t["id"][:8]), "ready")
 
-    def test_quota_pause_also_stops_resumes(self):
+    def test_quota_requires_account_admission_before_resuming(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         write_replies(self.replies, {t["id"][:8]: "ERROR:usage limit reached"})
@@ -2094,7 +2168,11 @@ class RuntimeStateUntil(unittest.TestCase):
 
     def test_an_expired_until_is_left_out(self):
         past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat(timespec="milliseconds")
-        self.assertEqual(self._state(past), {"kind": "waiting", "ref": "time"})
+        state = self._state(past)
+        cons = state.pop("constraints")
+        self.assertEqual(state, {"kind": "waiting", "ref": "time"})
+        self.assertEqual([c["class"] for c in cons], ["local_wait"])
+        self.assertNotIn("until_at", cons[0]["wake"])               # the expired until is still left out
 
     def test_an_until_about_to_pass_is_left_out(self):
         soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=5)).isoformat(timespec="milliseconds")
@@ -2911,6 +2989,27 @@ class OwnWorkInReview(Bench):
         self.assertEqual(self.review_hold(r, t), "")
         self.assertNotIn(t["id"], r._review_why)                     # a SHIP verdict since: may accept
 
+    def test_a_rejected_review_is_never_retried_after_the_window_or_a_restart(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        a = self.own_work(mesh, r, t)
+        ago = lambda h: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=h)).isoformat()  # noqa: E731
+        r.store.db.execute("UPDATE attempts SET created_at=?, updated_at=? WHERE id=?", (ago(30), ago(30), a.id))
+        for c in mesh.comment_log[t["id"]]:
+            c["created_at"] = ago(30)
+        r.store.mark("builder", t["id"], "review_fed", "earlier-feed")
+        r.store.db.execute("UPDATE marks SET at=? WHERE task_id=? AND key='review_fed'", (ago(26), t["id"]))
+        # control: no rejection recorded, the day-old feed is past the window and routes on
+        self.assertEqual(self.review_hold(r, t), "")
+        r.store.mark("builder", t["id"], "review_rejected", "1")
+        fresh = self.runner(mesh)                      # a restart: nothing in process memory
+        self.assertEqual(self.review_hold(fresh, t),
+                         "review: already reviewed (DO-NOT-SHIP); waits for a new comment")
+        mesh.add_comment(t["id"], "fixed it, look again", author="agent-reviewer",
+                         at=dt.datetime.now(dt.timezone.utc))
+        self.assertEqual(self.review_hold(fresh, t), "")          # only someone else's comment reopens it
+
     def test_one_merge_request_outside_the_token_does_not_switch_gitlab_off(self):
         import urllib.error
         t = task(1)
@@ -3298,8 +3397,11 @@ class Holds(Bench):
             r.refresh_me()
             self.assertEqual(r.hold_reason(dict(t, _mode="work"), "work"), "dependencies unreadable (403)")
             r.publish_skips()
-            self.assertEqual(mesh.runtime[t["id"]], {"kind": "waiting", "reason_code": "dependencies_unreadable",
-                                                     "reason": "blocker card is not readable by this agent"})
+            state = dict(mesh.runtime[t["id"]])
+            cons = state.pop("constraints")
+            self.assertEqual(state, {"kind": "waiting", "reason_code": "dependencies_unreadable",
+                                     "reason": "blocker card is not readable by this agent"})
+            self.assertEqual([c["class"] for c in cons], ["write_acl"])      # 403 stays explicit, no ref revealed
         finally:
             for x in others:
                 selection._READERS.add(x)
@@ -3379,6 +3481,8 @@ class Limits(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         flag = self.root / "switched"
         self.agent.on_limit_command = [sys.executable, "-c", f"open({str(flag)!r},'w').write('x'); print('to acct-2')"]
+        # External operator hook confirms fresh capacity in both admission phases.
+        self.agent.start_gate_command = [sys.executable, "-c", "print('ACCOUNT_CAPACITY_READY=1')"]
         write_replies(self.replies, {t["id"][:8]: "ERROR:usage limit reached", t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
         r = self.runner(mesh)
         r.tick()
@@ -3387,7 +3491,7 @@ class Limits(Bench):
         self.assertEqual(r._starts_paused_until, 0.0)
         self.assertEqual(self.states(r)[t["id"][:8]], "waiting")       # resumed on the new account
 
-    def test_failed_switch_pauses_starts(self):
+    def test_failed_switch_keeps_ready_without_pausing_lane(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.agent.on_limit_command = [sys.executable, "-c", "import sys; print('no capacity'); sys.exit(1)"]
@@ -3395,7 +3499,10 @@ class Limits(Bench):
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
-        self.assertGreater(r._starts_paused_until, 0)
+        self.assertEqual(r._starts_paused_until, 0.0)
+        a = r.store.by_state(self.agent.name, ("ready",))[0]
+        self.assertEqual(a.no_outcome, 0)
+        self.assertTrue(r._quota_admission_required(a))
 
 
 class Plan(Bench):
