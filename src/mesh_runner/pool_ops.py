@@ -13,11 +13,12 @@ import itertools
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
 
-from .checkpoint import CheckpointBaseMissing, base_objects_dir
+from .checkpoint import CheckpointBaseMissing, base_objects_dir, manifest_digest
 from .store import Store, iso
 from .workspace import (POOL_ADMIN_HOLD_NOTE, POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE,
                         WorkspacePool, WorkspaceError, _COMMON_DIRS, base_lock, git)
@@ -260,6 +261,11 @@ def _bounded_rmtree(target: Path, deadline: float, anchor: Path | None = None) -
         while stack:
             _budget(deadline, 1)
             name, fd = stack[-1]
+            # Captured directory modes may be readonly. Change only the opened,
+            # owned directory; never chmod through a path that could be a symlink.
+            mode = stat.S_IMODE(os.fstat(fd).st_mode)
+            if mode & 0o700 != 0o700:
+                os.fchmod(fd, mode | 0o700)
             with os.scandir(fd) as it:
                 batch = list(itertools.islice(it, 256))
             if not batch:
@@ -463,8 +469,37 @@ def _checkpoint_repo(path: Path) -> str | None:
         return None
 
 
+def _check_pin(pool: WorkspacePool, path: Path, expected: str) -> None:
+    root = pool.root.parent / 'checkpoints' / pool.owner
+    if path.parent != root or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', path.name):
+        raise WorkspaceError('checkpoint pin: unsafe ID or path')
+    if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected):
+        raise WorkspaceError('checkpoint pin: invalid manifest SHA256')
+    try:
+        if manifest_digest(path) != expected:
+            raise WorkspaceError('checkpoint pin: manifest drift')
+    except OSError:
+        raise WorkspaceError('checkpoint pin: missing or unsafe manifest') from None
+    db = pool.store.db
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='attempts'").fetchone():
+        raise WorkspaceError('checkpoint pin: attempt state unavailable')
+    for row in db.execute(
+            "SELECT w.phase, a.state FROM workspace_checkpoints w LEFT JOIN attempts a ON a.id=w.attempt "
+            "WHERE w.checkpoint=?", (str(path),)):
+        if row[1] is None or row[1] in _LIVE_ATTEMPT_STATES or row[0] not in ('verified', 'released', 'restored'):
+            raise WorkspaceError('checkpoint pin: active or unknown reference')
+
+
+def _check_pins(pool: WorkspacePool, pins: dict[str, str] | None) -> None:
+    if pins is not None:
+        root = pool.root.parent / 'checkpoints' / pool.owner
+        pool._checkpoints()
+        for key, expected in pins.items():
+            _check_pin(pool, root / key, expected)
+
+
 def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = False,
-                      deadline: float | None = None) -> dict:
+                      deadline: float | None = None, checkpoint_pins: dict[str, str] | None = None) -> dict:
     """Remove workspace checkpoints that nothing can restore any more, and the refs pinning them.
 
     Garbage is: the checkpoint of an attempt that ended (not starting/running/unknown/waiting/
@@ -484,18 +519,35 @@ def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = 
     all_roots = pool.root.parent / "checkpoints"
     root = all_roots / pool.owner
     db = pool.store.db
+    _check_pins(pool, checkpoint_pins)
     if not root.is_dir() or not db.execute("SELECT 1 FROM sqlite_master WHERE name='attempts'").fetchone():
         return result
     pool._checkpoints()
+    trashed = []
+    trashed_keys: set[tuple[str, str]] = set()
     cutoff = time.time() - grace_hours * 3600
 
-    def victim(path: Path, reason: str, row: dict | None) -> None:
+    def victim(path: Path, reason: str, row: dict | None, repo_name: str | None = None) -> None:
+        if checkpoint_pins is not None:
+            if path.name not in checkpoint_pins:
+                return
+            _check_pin(pool, path, checkpoint_pins[path.name])
+        if path.parent != root or path.is_symlink():
+            raise WorkspaceError('checkpoint cleanup: unsafe path')
         entry = {"checkpoint": str(path), "reason": reason, "bytes": 0}
+        if checkpoint_pins is not None:
+            entry['manifest_sha256'] = checkpoint_pins[path.name]
         if path.exists() and not apply:
             entry["bytes"] = _dir_bytes(path, deadline)
         if apply:
             if path.exists():
-                os.rename(path, root / f".trash-{path.name}")
+                trash = root / f".trash-{path.name}"
+                if trash.exists() or trash.is_symlink():
+                    raise WorkspaceError('checkpoint cleanup: trash already exists')
+                os.rename(path, trash)
+                trashed.append(trash)
+                if repo_name is not None:
+                    trashed_keys.add((repo_name, path.name))
             if row is not None:
                 db.execute("DELETE FROM workspace_checkpoints WHERE owner=? AND attempt=? AND repo=?",
                            (pool.owner, row["attempt"], row["repo"]))
@@ -519,35 +571,40 @@ def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = 
                     if (row["repo"] == repo_name and row["attempt_state"] is not None
                             and row["attempt_state"] not in _LIVE_ATTEMPT_STATES
                             and _ended_before(row["attempt_updated"], cutoff)):
-                        victim(Path(row["checkpoint"]), f"attempt {row['attempt_state']}", row)
+                        victim(Path(row["checkpoint"]), f"attempt {row['attempt_state']}", row, repo_name)
                 for path in sorted(root.iterdir()):
                     if (path.name.startswith(".") or str(path) in named or path.is_symlink()
                             or not path.is_dir() or path.stat().st_mtime >= cutoff
                             or _checkpoint_repo(path) != repo_name):
                         continue
-                    victim(path, "superseded", None)
+                    victim(path, "superseded", None, repo_name)
                 if apply:
                     refs = git(repo.base, "for-each-ref", "--format=%(refname)", *_CHECKPOINT_REF_PREFIXES,
                                check=False, env=pool.env).split()
                     for ref in refs:
                         key = ref.rsplit("/", 1)[-1]
+                        if checkpoint_pins is not None and (repo_name, key) not in trashed_keys:
+                            continue
                         if not any(all_roots.glob(f"*/{key}")):
                             git(repo.base, "update-ref", "-d", ref, check=False, env=pool.env)
                             result["refs"] += 1
         from .checkpoint import _IO_LOCK
-        if _IO_LOCK.acquire(blocking=False):            # no capture is running in this process
+        if checkpoint_pins is None and _IO_LOCK.acquire(blocking=False):            # no capture is running in this process
             try:
                 for path in sorted(root.glob(".pending-*")):
                     victim(path, "abandoned capture", None)
             finally:
                 _IO_LOCK.release()
-        for trash in sorted(root.glob(".trash-*")) if apply else ():
+        for trash in (trashed if checkpoint_pins is not None else sorted(root.glob(".trash-*"))) if apply else ():
             size = _dir_bytes(trash, deadline)
             _bounded_rmtree(trash, deadline, anchor=root)
             result["freed_bytes"] += size
             log.info("checkpoint gc: removed %s bytes=%d", trash.name, size)
-    except WorkspaceError:
-        pass                                            # budget spent: the next pass continues
+    except WorkspaceError as e:
+        if checkpoint_pins is not None:
+            result['errors'] += 1
+            result['error'] = str(e)
+        # Budget spent: the next automatic pass continues.
     except OSError as e:
         log.warning("checkpoint gc %s: %s", pool.owner, e)
         result["errors"] += 1
@@ -589,13 +646,15 @@ def _remember_compact(db, path: Path, reason: str, *, final: bool) -> None:
                (str(path), reason, time.time(), int(final)))
 
 
-def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: float | None = None) -> dict:
+def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: float | None = None,
+                        checkpoint_pins: dict[str, str] | None = None) -> dict:
     """One-shot migration: rewrite waiting old-format snapshots (still holding regenerable caches)
     as new-format ones, one at a time, each replay-verified before the swap. Rows being released or
     restored right now are skipped. Dry run lists the candidates and their current size."""
     deadline = deadline if deadline is not None else time.monotonic() + 3600
     result = {"owner": pool.owner, "candidates": [], "compacted": 0, "freed_bytes": 0, "errors": 0}
     db = pool.store.db
+    _check_pins(pool, checkpoint_pins)
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='workspace_checkpoints'").fetchone():
         return result
     checkpoints = pool._checkpoints()
@@ -609,6 +668,10 @@ def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: f
         if time.monotonic() >= deadline:
             break
         path = Path(row["checkpoint"])
+        if checkpoint_pins is not None:
+            if path.name not in checkpoint_pins:
+                continue
+            _check_pin(pool, path, checkpoint_pins[path.name])
         if row["phase"] not in _COMPACTABLE_PHASES or row["repo"] not in pool.repos or not path.is_dir():
             continue
         memo = db.execute("SELECT reason, failed_at, final FROM checkpoint_compact_failures WHERE checkpoint=?",
@@ -622,6 +685,8 @@ def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: f
             result["errors"] += 1
             continue
         entry = {"checkpoint": str(path), "attempt": row["attempt"], "bytes": _dir_bytes(path, deadline)}
+        if checkpoint_pins is not None:
+            entry['manifest_sha256'] = checkpoint_pins[path.name]
         result["candidates"].append(entry)
         if not apply:
             continue
@@ -631,12 +696,16 @@ def compact_checkpoints(pool: WorkspacePool, *, apply: bool = False, deadline: f
                 if not locked:
                     result["errors"] += 1
                     continue
-                now = db.execute("SELECT phase FROM workspace_checkpoints WHERE owner=? AND attempt=? AND repo=?",
+                now = db.execute("SELECT phase, checkpoint FROM workspace_checkpoints WHERE owner=? AND attempt=? AND repo=?",
                                  (pool.owner, row["attempt"], row["repo"])).fetchone()
-                if now is None or now["phase"] not in _COMPACTABLE_PHASES:
+                if now is None or now["phase"] not in _COMPACTABLE_PHASES or now["checkpoint"] != str(path):
                     continue                        # a restore moved the row while we waited for the lock
+                pin_args = {}
+                if checkpoint_pins is not None:
+                    _check_pin(pool, path, checkpoint_pins[path.name])
+                    pin_args['expected_manifest_sha'] = checkpoint_pins[path.name]
                 done = checkpoints.compact(path, base_objects=base_objects_dir(Path(repo.base),
-                                                                               getattr(pool, "env", None)))
+                                                                               getattr(pool, "env", None)), **pin_args)
         except (WorkspaceError, OSError) as e:
             reason = _compact_reason(e)
             final = isinstance(e, CheckpointBaseMissing)

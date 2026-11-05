@@ -9,6 +9,10 @@ from .outcome import declaration_lines, parse_line
 from .selection import parse_time
 
 
+_DEPENDENCY_CONDITIONS = ("task_done", "access_ready", "contract_ready",
+                          "artifact_published", "shipped", "deployed", "accepted")
+
+
 @dataclass(frozen=True)
 class Intent:
     target: str
@@ -105,7 +109,9 @@ def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
                 or destination == task_id or edge.get("task_id") != task_id
                 or not isinstance(edge.get("id"), str) or not edge["id"].strip()
                 or edge.get("dependency_type") not in ("blocks", "relates_to")
-                or edge.get("condition") != "task_done"
+                or edge.get("condition") not in _DEPENDENCY_CONDITIONS
+                or (edge.get("dependency_type") == "relates_to"
+                    and edge.get("condition") != "task_done")
                 or type(edge.get("condition_satisfied")) is not bool
                 or edge["id"] in seen):
             return True
@@ -116,7 +122,9 @@ def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
         seen_semantic.add(semantic)
         if edge["dependency_type"] == "blocks":
             edges.append(edge)
-    # Satisfied formal edges no longer constrain the awaited event.
+    # Mesh's explicit verdict releases known conditions, including deployment
+    # and acceptance. This only admits the ordinary observer, not a wake or
+    # retarget; unknown/false verdicts still require the task_done-only path.
     if all(edge["condition_satisfied"] for edge in edges):
         return False
     if len(edges) != 1:

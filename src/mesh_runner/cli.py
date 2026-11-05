@@ -37,6 +37,15 @@ from .store import OPEN, Store
 from .workspace import WorkspaceError
 
 
+def _checkpoint_pin_arg(text: str) -> tuple[str, str]:
+    key, separator, sha = text.partition(':')
+    import re
+    if (not separator or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', key)
+            or not re.fullmatch(r'[0-9a-f]{64}', sha)):
+        raise argparse.ArgumentTypeError('checkpoint pin must be ID:manifestSHA256 (safe ID, lowercase hex)')
+    return key, sha
+
+
 def _idle_hours_arg(text: str) -> float:
     try:
         hours = float(text)
@@ -386,6 +395,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="pool: preview (or with --apply, perform) rewriting waiting old-format checkpoints without regenerable caches")
     p.add_argument("--prune-checkpoints", action="store_true",
                    help="pool: preview (or with --apply, perform) removal of checkpoints of ended attempts and superseded generations")
+    p.add_argument("--checkpoint-pin", type=_checkpoint_pin_arg, action="append", default=None,
+                   help="pool checkpoint operations: restrict to repeatable ID:manifestSHA256 pins; refuse drift/active references")
     p.add_argument("--checkpoint-grace-hours", type=_idle_hours_arg, default=None,
                    help="pool --prune-checkpoints: override config grace period")
     p.add_argument("--idle-hours", type=float, default=6)
@@ -559,6 +570,11 @@ def main(argv: list[str] | None = None) -> int:
         print()
         return 0
 
+    if args.checkpoint_pin is not None:
+        if args.command != 'pool' or args.prune_checkpoints == args.compact_checkpoints or args.evict or args.prune_ignored:
+            p.error('--checkpoint-pin requires exactly one checkpoint operation and no other cleanup')
+        if len(dict(args.checkpoint_pin)) != len(args.checkpoint_pin):
+            p.error('duplicate checkpoint pin ID')
     cfg = config_mod.load(args.config)
     if args.command == "pool" and args.apply and not (args.evict or args.prune_ignored or args.prune_checkpoints or args.compact_checkpoints):
         p.error("--apply needs --evict, --prune-ignored, --prune-checkpoints or --compact-checkpoints")
@@ -641,6 +657,26 @@ def main(argv: list[str] | None = None) -> int:
 def _pool(runner, cfg, args) -> int:
     """Pool metrics; with --evict a bounded batch (dry run unless --apply, which holds the runner lock)."""
     from . import pool_ops
+    pins = getattr(args, 'checkpoint_pin', None)
+    selected = {}
+    if pins is not None:
+        # Validate the entire cross-agent request before the first mutation.
+        for key, sha in pins:
+            owners = [ar.pool for ar in runner.agents
+                      if (ar.pool.root.parent / 'checkpoints' / ar.pool.owner / key).exists()
+                      or (ar.pool.root.parent / 'checkpoints' / ar.pool.owner / key).is_symlink()]
+            if len(owners) != 1:
+                print('checkpoint pin: missing or ambiguous ID', file=sys.stderr)
+                return 1
+            selected.setdefault(owners[0].owner, {})[key] = sha
+        try:
+            for ar in runner.agents:
+                pool_ops._check_pins(ar.pool, selected.get(ar.pool.owner, {}))
+        except WorkspaceError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+    def pin_args(pool):
+        return {} if pins is None else {'checkpoint_pins': selected.get(pool.owner, {})}
     out = {"pool": pool_ops.summary(runner.store, cfg.pool_root)}
     if args.evict:
         removed = []
@@ -657,15 +693,22 @@ def _pool(runner, cfg, args) -> int:
                                                        if args.ignored_idle_hours is not None
                                                        else cfg.ignored_cleanup_idle_hours, apply=args.apply)
                                 for ar in runner.agents]
-    if args.prune_checkpoints:
-        grace = args.checkpoint_grace_hours if args.checkpoint_grace_hours is not None else cfg.checkpoint_gc_grace_hours
-        out["prune_checkpoints"] = [pool_ops.prune_checkpoints(ar.pool, grace_hours=grace, apply=args.apply)
-                                    for ar in runner.agents]
-    if args.compact_checkpoints:
-        out["compact_checkpoints"] = [pool_ops.compact_checkpoints(ar.pool, apply=args.apply)
-                                      for ar in runner.agents]
+    try:
+        if args.prune_checkpoints:
+            grace = args.checkpoint_grace_hours if args.checkpoint_grace_hours is not None else cfg.checkpoint_gc_grace_hours
+            out["prune_checkpoints"] = [pool_ops.prune_checkpoints(ar.pool, grace_hours=grace, apply=args.apply, **pin_args(ar.pool))
+                                        for ar in runner.agents]
+        if args.compact_checkpoints:
+            out["compact_checkpoints"] = [pool_ops.compact_checkpoints(ar.pool, apply=args.apply, **pin_args(ar.pool))
+                                          for ar in runner.agents]
+    except WorkspaceError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
     print()
+    if pins is not None:
+        key = 'prune_checkpoints' if args.prune_checkpoints else 'compact_checkpoints'
+        return int(any(item.get('errors') for item in out[key]))
     return 0
 
 
