@@ -70,6 +70,7 @@ SKIP_CLEARS_PER_TICK = 10               # clears take at most this share of a pa
 SKIP_CLEAR_TRIES = 3                    # a clear that fails this often is given up (logged)
 STATE_FIELDS = ("kind", "ref", "reason")
 BACKLOG_BLOCKER = "blocked by a card in backlog: "
+ACCESS_HELD = "capability held; waits for authenticated own-access recheck"   # access_recovery.REASON
 EDGE_DENIED_MARK = "edge_denied"        # store mark prefix: an edge this lane's key may not remove / add (HTTP 403)
 UNSCHEDULE_MARK = "unschedule"          # store mark: a start_after this lane set and could not clear yet
 UNSCHEDULE_TRIES = 2                    # clears per attempt when Mesh answers 409: one re-read, one retry
@@ -151,6 +152,90 @@ def _asked_at(posted, floor: str) -> str:
     return at if server and (local is None or server > local) else floor
 
 
+# ------------------------------------------------------- operational constraints
+# Additive contract v1: the producer names the
+# reason, who lifts it and the exact existing event, per observation. It adds no wait
+# mechanism: wake.predicate / ref / target copy what the wait record already holds.
+CONSTRAINT_ID_MAX = 128
+_CI_FROM_STATUS = {"manual": "manual_required", "waiting_for_resource": "capacity"}
+
+
+def _cid(*parts: str) -> str:
+    text = ":".join(p for p in parts if p)
+    return text if len(text) <= CONSTRAINT_ID_MAX else f"{parts[0]}:{hashlib.sha1(text.encode()).hexdigest()[:16]}"
+
+
+def _constraint(cls: str, code: str, cid: str, source: str, *, actor: dict | None = None,
+                predicate: str = "unknown", ref: str | None = None, target: dict | None = None,
+                observed_at: str | None = None, params: dict | None = None, reason: str | None = None,
+                ci: dict | None = None) -> dict:
+    """One constraint. ``observed_at`` left out is stamped by ``Effects._put`` at write time (a
+    state the runner re-observes every pass); a value given is the real observation moment and is
+    never refreshed by a heartbeat. ``next_actor`` is unknown unless the wait names who acts."""
+    out: dict = {"id": cid, "class": cls, "reason_code": code,
+                 "next_actor": actor or {"kind": "unknown"},
+                 "wake": {"predicate": predicate}, "source": {"kind": source}}
+    if ref:
+        out["wake"]["ref"] = ref[:300]
+    if target:
+        out["wake"]["target"] = target
+    if observed_at:
+        out["observed_at"] = observed_at
+    if params:
+        out["reason_params"] = params
+    if reason:
+        out["reason"] = reason[:500]
+    if ci:
+        out["ci"] = ci
+    return out
+
+
+def _wake_target(kind: str, target: str, w: dict, until: str | None) -> dict | None:
+    """The typed-wait fields of a pipeline / MR wait, copied from its record."""
+    out: dict = {}
+    if kind in ("pipeline", "mr", "merge"):
+        out["provider"] = "gitlab"
+        sep = "#" if kind == "pipeline" else "!"
+        project, _, number = str(target).rpartition(sep)
+        if project and number.isdigit():
+            out["project_path"] = project[:300]
+            out["pipeline_id" if kind == "pipeline" else "mr_iid"] = int(number)
+    contract = w.get("ci_change") if isinstance(w.get("ci_change"), dict) else {}
+    if contract.get("predicate"):
+        out["until"] = str(contract["predicate"])
+    if contract.get("jobs"):
+        out["required_jobs"] = [str(j)[:100] for j in contract["jobs"]][:16]
+    if until:
+        out["until_at"] = until
+    return out or None
+
+
+def wait_constraints(a: Attempt, until: str | None = None) -> list[dict]:
+    """Constraints of a waiting attempt: its own declared wait (local_wait, never folded into a
+    Mesh dependency) and, only when GitLab itself reported the awaited pipeline as manual or
+    waiting for a runner, a ci_capacity one. Scope and position are provider evidence this runner
+    does not hold, so they stay absent; a lane position is never a CI position."""
+    w = a.wait or {}
+    kind, target = w.get("kind"), str(w.get("target") or "")
+    if kind not in ("card", "pipeline", "mr", "merge", "decision", "time"):
+        return []
+    since = w.get("since") if parse_time(w.get("since")) else None
+    actor = {"kind": "agent", "name": str(w["handle"])[:100]} if kind == "decision" and w.get("handle") else None
+    ref = f"card:#{target}" if kind == "card" else (target or None)
+    out = [_constraint("local_wait", f"wait_{kind}", _cid("wait", kind, target or "-"), "runner_wait", actor=actor,
+                       predicate=kind, ref=ref, target=_wake_target(kind, target, w, until), observed_at=since,
+                       params={"target": target[:100]} if target else None)]
+    if kind in ("pipeline", "mr", "merge"):
+        seen = w.get("seen") if isinstance(w.get("seen"), dict) else {}
+        status = str(seen.get("pipeline") or str(seen.get("mr_pipeline") or "").rpartition(":")[2])
+        if status in _CI_FROM_STATUS:
+            out.append(_constraint(
+                "ci_capacity", "ci_" + _CI_FROM_STATUS[status], _cid("ci", kind, target), "gitlab",
+                predicate=kind, ref=target, target=_wake_target(kind, target, w, until), observed_at=since,
+                ci={"state": _CI_FROM_STATUS[status], "provider": "gitlab"}))
+    return out
+
+
 def runtime_state(a: Attempt, lane: str) -> dict | None:
     """The runtime_state a task shows for this attempt (Mesh's vocabulary)."""
     if a.state in ("starting", "running", "unknown"):
@@ -178,6 +263,8 @@ def runtime_state(a: Attempt, lane: str) -> dict | None:
     until = parse_time(w.get("until"))
     if until and until > now() + dt.timedelta(seconds=30):   # Mesh refuses until < since (= now): never in the past
         out["until"] = w["until"]
+    if constraints := wait_constraints(a, out.get("until")):
+        out["constraints"] = constraints
     return out
 
 
@@ -214,7 +301,19 @@ def skip_state(reason: str, lane: str) -> dict | None:
     if r.startswith("review: just sent"):
         return _stopped("review_cooldown", "just sent to review")
     if r.startswith("review: already reviewed"):
-        return _stopped("review_refeed_hold", "already reviewed; waits for a new comment")
+        out = _stopped("review_refeed_hold", "already reviewed; waits for a new comment")
+        if "(DO-NOT-SHIP)" in r:
+            # rejected on the verdict: only a new commit or comment moves it, never a retry
+            out["constraints"] = [_constraint(
+                "review_rejection", "review_do_not_ship", "review:verdict", "review_verdict",
+                actor={"kind": "agent", "name": "author"}, predicate="comment",
+                reason="review verdict DO-NOT-SHIP; waits for a fix or a new comment")]
+        return out
+    if r == ACCESS_HELD:
+        return {"kind": "stopped", "reason": "capability held; waits for authenticated own-access recheck",
+                "constraints": [_constraint(
+                    "expired_authority", "capability_held", "authority:capability", "access_recovery",
+                    reason="capability held; waits for an authenticated own-access recheck")]}
     if r.startswith("review: the agent's own work"):
         return {"kind": "stopped", "reason": "waits for someone else to review it"}
     if r.startswith("waiting for new input after "):
@@ -228,7 +327,9 @@ def skip_state(reason: str, lane: str) -> dict | None:
     if r == "dependencies unreadable (403)":
         # held until a blocker it cannot see closes: say so, or it waits without a word
         return {"kind": "waiting", "reason_code": "dependencies_unreadable",
-                "reason": "blocker card is not readable by this agent"}
+                "reason": "blocker card is not readable by this agent",
+                "constraints": [_constraint("write_acl", "dependencies_unreadable", "acl:dependencies", "mesh_acl",
+                                            reason="a blocker card is not readable by this agent")]}
     if r.startswith("project not served") or (r.startswith("label ") and r.endswith(" missing")):
         return _stopped("outside_lane_scope", "outside this agent's scope")
     return None                                # a transient read error etc.: say nothing
@@ -273,17 +374,32 @@ class Effects:
         self._orphan_checked: dict[str, dt.datetime] = {}
         self._edges_denied: set[tuple[str, str]] = set()     # memory of 403 edge operations when there is no store
 
+    def _stamp(self, state: dict) -> dict:
+        """A constraint with no observation time of its own is observed now (the runner
+        re-reads it every pass); one with a time keeps it, so a heartbeat never freshens it."""
+        cs = state.get("constraints")
+        if not cs:
+            return state
+        at = iso(now())
+        return {**state, "constraints": [c if c.get("observed_at") else {**c, "observed_at": at} for c in cs]}
+
     def _put(self, task_id: str, state: dict) -> None:
         """PUT a runtime state. A Mesh that does not know a reason code refuses the
         whole write (422 on ``reason_code``): the state goes out without the code,
-        its reason text says the same."""
+        its reason text says the same. A refused ``constraints`` list (422 naming a
+        ``constraints[...]`` field) is dropped the same way: the base state still goes out."""
+        state = self._stamp(state)
         code = state.get("reason_code")
         body = {k: v for k, v in state.items() if k != "reason_code"} if code in self._refused_codes else state
         try:
             self.mesh.put_runtime_state(task_id, body)
         except MeshError as e:
-            if not (code and body is state and e.status == 422
-                    and (not isinstance(e.body, dict) or e.body.get("field") in (None, "reason_code"))):
+            field = e.body.get("field") if isinstance(e.body, dict) else None
+            if e.status == 422 and str(field or "").startswith("constraints") and "constraints" in body:
+                log.warning("%s: Mesh refused constraints on #%s (%s); publishing without them", self.lane, task_id[:8], field)
+                self.mesh.put_runtime_state(task_id, {k: v for k, v in body.items() if k != "constraints"})
+                return
+            if not (code and body is state and e.status == 422 and field in (None, "reason_code")):
                 raise
             self._refused_codes.add(code)
             log.info("%s: Mesh does not know reason code %s; publishing without it", self.lane, code)

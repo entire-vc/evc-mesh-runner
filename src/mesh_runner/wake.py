@@ -44,6 +44,20 @@ RUN_CONCLUSIONS = {"success": "success", "neutral": "success", "failure": "faile
                    "skipped": "skipped", "action_required": "manual"}
 
 
+_PROVIDER = re.compile(r"^(github|gitlab):")
+
+
+def split_provider(target: str) -> tuple[str, str]:
+    """(provider, target without the selector): ``github:org/repo!N`` -> ("github", "org/repo!N");
+    a bare target -> ("", target) and keeps the configured-allowlist inference."""
+    m = _PROVIDER.match(target)
+    return (m[1], target[m.end():]) if m else ("", target)
+
+
+class ProviderUnavailable(ValueError):
+    """An explicit ``github:`` target while no GitHub is configured (never read from GitLab)."""
+
+
 @dataclass
 class GitHub:
     """Reads a GitHub pull request as the merge-request dict the wait evaluators already
@@ -62,6 +76,9 @@ class GitHub:
         """True for ``org/repo!N`` (pull request) and ``org/repo#N`` (Actions run) whose org (or
         full org/repo) is configured as GitHub-hosted. One repo can be listed alone, because the
         same org may also exist on GitLab."""
+        provider, target = split_provider(target)
+        if provider:
+            return provider == "github"
         project = re.split(r"[!#]", target, maxsplit=1)[0]
         return any(project == o or project.startswith(o.rstrip("/") + "/") for o in self.orgs)
 
@@ -74,7 +91,7 @@ class GitHub:
             return json.loads(budget.read(r))
 
     def get_mr(self, target: str) -> dict:
-        project, number = target.rsplit("!", 1)
+        project, number = split_provider(target)[1].rsplit("!", 1)
         pr = self.get(f"repos/{project}/pulls/{number}")
         state = "merged" if pr.get("merged") or pr.get("merged_at") else \
             ("closed" if pr.get("state") == "closed" else "opened")
@@ -89,7 +106,7 @@ class GitHub:
     def get_run(self, target: str) -> dict:
         """A GitHub Actions run as a GitLab pipeline row. ``finished_at`` is the run's last update
         once it is completed: a re-run moves it, as a retried GitLab pipeline moves its own."""
-        project, run_id = target.rsplit("#", 1)
+        project, run_id = split_provider(target)[1].rsplit("#", 1)
         run = self.get(f"repos/{project}/actions/runs/{run_id}")
         status, conclusion = run.get("status"), run.get("conclusion")
         if status == "completed":
@@ -128,11 +145,24 @@ class GitLab:
         return urllib.parse.quote(path, safe="")
 
     def github_owns(self, target: str) -> bool:
+        """Explicit ``github:`` always selects GitHub (and fails closed when none is configured);
+        explicit ``gitlab:`` never does; a bare target follows the configured allowlist."""
+        provider = split_provider(target)[0]
+        if provider == "github":
+            if self.github is None:
+                raise ProviderUnavailable("github: target but no [github] section is configured")
+            return True
+        if provider == "gitlab":
+            return False
         return self.github is not None and self.github.owns(target)
 
     def host(self, target: str) -> str:
         """The host a CI/MR target is read from: github.com for a GitHub-hosted repo, else GitLab's."""
-        if self.github_owns(target):
+        try:
+            owned = self.github_owns(target)
+        except ProviderUnavailable:
+            return "github.com (not configured)"
+        if owned:
             host = urllib.parse.urlsplit(self.github.api_url).hostname or "github.com"
             return "github.com" if host == "api.github.com" else host
         return urllib.parse.urlsplit(self.base_url).hostname or self.base_url or "GitLab"
@@ -140,7 +170,7 @@ class GitLab:
     def get_pipeline(self, target: str) -> dict:
         if self.github_owns(target):
             return self.github.get_run(target)
-        project, pid = target.rsplit("#", 1)
+        project, pid = split_provider(target)[1].rsplit("#", 1)
         return self.get(f"projects/{self.project(project)}/pipelines/{pid}")
 
     def pipeline_status(self, target: str) -> str:
@@ -151,7 +181,7 @@ class GitLab:
         ``canceled`` for a moment with jobs still winding down)."""
         if self.github_owns(target):
             return self.github.get_run(target)["status"] in PIPELINE_IN_PROGRESS
-        project, pid = target.rsplit("#", 1)
+        project, pid = split_provider(target)[1].rsplit("#", 1)
         scopes = "&".join(f"scope[]={s}" for s in sorted(PIPELINE_IN_PROGRESS))
         return bool(self.get(f"projects/{self.project(project)}/pipelines/{pid}/jobs?{scopes}&per_page=1"))
 
@@ -160,7 +190,7 @@ class GitLab:
         A GitHub run has no per-job reads here: a ``jobs=`` wait on one is refused."""
         if self.github_owns(target):
             raise ValueError("jobs= waits read GitLab pipeline jobs; a GitHub run has none")
-        project, pid = target.rsplit("#", 1)
+        project, pid = split_provider(target)[1].rsplit("#", 1)
         rows: list[dict] = []
         for page in range(1, JOB_PAGES + 1):
             batch = self.get(f"projects/{self.project(project)}/pipelines/{pid}/jobs?per_page=100&page={page}")
@@ -176,7 +206,7 @@ class GitLab:
         for a GitHub run: the runs of a branch are not listed)."""
         if self.github_owns(target):
             return None
-        project, pid = target.rsplit("#", 1)
+        project, pid = split_provider(target)[1].rsplit("#", 1)
         row = row if row is not None else self.get_pipeline(target)
         ref = row.get("ref")
         if not ref:
@@ -201,14 +231,14 @@ class GitLab:
         return ""
 
     def mr_head_key(self, target: str) -> str:
-        project, iid = target.rsplit("!", 1)
+        project, iid = split_provider(target)[1].rsplit("!", 1)
         head = self.get(f"projects/{self.project(project)}/merge_requests/{iid}").get("head_pipeline") or {}
         return f"{head.get('id')}:{head.get('status')}"
 
     def get_mr(self, target: str) -> dict:
-        if self.github is not None and self.github.owns(target):
+        if self.github_owns(target):
             return self.github.get_mr(target)
-        project, iid = target.rsplit("!", 1)
+        project, iid = split_provider(target)[1].rsplit("!", 1)
         return self.get(f"projects/{self.project(project)}/merge_requests/{iid}")
 
     def seed(self, kind: str, target: str, now: dt.datetime) -> dict:
@@ -710,6 +740,8 @@ def manual_next_step(kind: str, target: str, sha: str, row: dict | None, merge_g
     verdict exists and then merges, so the next wait is ``merge:``; without one, the owner arranges
     the review or the authorized manual action. Never suggests another wait on the blocked pipeline:
     measured, agents copied such a hint literally and re-armed the same dead wait."""
+    if split_provider(target)[0]:
+        merge_gate = False                       # `merge:` has no provider-qualified form
     if kind == "mr":
         project, _, iid = target.rpartition("!")
         head = sha
@@ -757,6 +789,8 @@ def blocked_mr_next_step(target: str, cause: str, merge_gate: bool) -> str:
     red (``cause`` ``red``), it conflicts with its target (``conflict``) or it must be rebased
     (``need_rebase``). The way out is a new head, so the text never suggests another wait for the
     merge of the current one: measured, agents re-armed that same wait and it parked for good."""
+    if split_provider(target)[0]:
+        merge_gate = False                       # `merge:` has no provider-qualified form
     project, _, iid = target.rpartition("!")
     if cause == "red":
         fix = ("open the failed job, fix the cause and push (or retry it once if it is a proven flake), "

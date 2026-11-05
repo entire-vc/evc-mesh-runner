@@ -3,6 +3,28 @@
 
 ## Unreleased
 
+## 0.1.37
+
+- Keep provider quota within account admission; reject quota-driven task schedules and preserve same-session recovery.
+- Require fresh capacity confirmation for reserve and admit, then launch with the selected account environment.
+
+## 0.1.36
+
+- Enrolled reviewer-receipt source for the native result channel (merged to main after 0.1.35 was published) is now
+  packaged; retained controls pin the exact A1-issued packet vector. Receipt delivery is data, never admission.
+
+## 0.1.35
+
+- A chat turn that fails before its native process starts now leaves a durable, secret-free diagnosis (runner log and
+  a separate durable diagnostics file): stage, exception class, an allowlisted reason (env command/file failure, barrier refusal,
+  workspace error, OS error) and the own-package file/function/line. No exception text, traceback, environment,
+  arguments, prompt or full paths. Terminal error codes, guards and retry are unchanged.
+- Provider-qualified `mr:` / `pipeline:` waits: `mr:github:org/repo!N`, `mr:gitlab:group/project!N`,
+  `pipeline:github:org/repo#N` (`mr:github:` supports plain and `until=merged`; its `until=change|success` is refused, use `pipeline:github:…#run`). An explicit
+  provider always wins over the `[github]` allowlist, so a GitHub repo no longer has to be listed (and thereby capture the
+  same-path GitLab project); it is never read from the other provider, and a provider that is not configured fails closed.
+  Observation/dedupe keys carry the provider. Bare targets keep the allowlist inference. `merge:` has no qualified form
+  and is rejected with the supported spelling. `[github]` with only a token now builds the GitHub reader.
 - `host_local_qa_assignment_v1`: the frozen brief/policy/schema bytes are no longer packaged. They stay private and are
   read only from the explicit local opt-in `bundle_dir`, verified against the unchanged sha256 pins before any registration,
   credential read or state change (fail closed); absent/empty/`enabled = false` still never reads them. The disable path

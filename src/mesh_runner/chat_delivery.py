@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
+from . import chat_diag
 from .interactive import CHAT_PREFIX
 
 log = logging.getLogger(__name__)
@@ -142,19 +143,27 @@ class DriverDelivery:
                  log_dir: Path, poll: float = 0.2, term_wait: float = 20.0):
         self.harness, self.plan, self.log_dir = harness, plan, Path(log_dir)
         self.poll, self.term_wait = poll, term_wait
+        self.diag_dir = self.log_dir.parent
 
     def run(self, turn: dict, cancelled: Callable[[], bool]) -> Iterator[dict]:
+        diag_dir, tid = self.log_dir.parent, str(turn.get("turn_id") or "")
         t_plan = time.monotonic()
         try:
             argv, cwd, env, prompt, *rest = self.plan(turn)
+        except Exception as e:                            # the cause must outlive the process and the logs
+            chat_diag.record("plan", e, tid, diag_dir)
+            raise
         finally:                                          # a slow or failing plan is the one worth seeing
-            logging.getLogger(__name__).info("chat turn %s plan=%.1f", str(turn.get("turn_id"))[:8],
-                                             time.monotonic() - t_plan)
+            logging.getLogger(__name__).info("chat turn %s plan=%.1f", tid[:8], time.monotonic() - t_plan)
         harness = rest[0] if rest else self.harness       # a plan may name the harness it routed to
         # one directory per chat: deleting the chat removes whatever a crash left in it
-        logs = self.log_dir / window_key(str(turn.get("thread_id") or "none"))
-        logs.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd, name = tempfile.mkstemp(dir=logs, prefix=turn["turn_id"][:8] + ".", suffix=".jsonl")
+        try:
+            logs = self.log_dir / window_key(str(turn.get("thread_id") or "none"))
+            logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, name = tempfile.mkstemp(dir=logs, prefix=turn["turn_id"][:8] + ".", suffix=".jsonl")
+        except Exception as e:
+            chat_diag.record("prepare", e, tid, diag_dir)
+            raise
         log = Path(name)
         errlog = log.with_suffix(".stderr")
         try:

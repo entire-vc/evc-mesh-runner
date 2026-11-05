@@ -19,7 +19,7 @@ class ExternalTimeGrammar(unittest.TestCase):
         self.assertEqual(o.kind, 'time')
         self.assertEqual(o.until, dt.datetime(2026, 10, 29, 9, 30, tzinfo=dt.timezone.utc))
         self.assertEqual(o.extra['external_time'], {'event':'backup-20261029', 'source':'https://provider.example/schedule', 'why':'published backup available', 'at':'2026-10-29T12:30:00+03:00'})
-        o = parse_outcome(external(at='2026-10-28T12:00:01Z', source='card:#abcdef12', event='quota-reset'), NOW)
+        o = parse_outcome(external(at='2026-10-28T12:00:01Z', source='card:#abcdef12', event='export-window'), NOW)
         self.assertEqual(o.until - NOW, dt.timedelta(seconds=1))
 
     def test_relative_bare_poll_and_missing_evidence_cannot_schedule(self):
@@ -42,7 +42,7 @@ class ExternalTimeGrammar(unittest.TestCase):
     def test_explicit_external_reference_does_not_depend_on_natural_language(self):
         # A cited source may mention a card or person; prose is never the validator.
         self.assertEqual(parse_outcome(external(why='approved by @Pavel on #abcdef12'), NOW).kind, 'time')
-        for kind in ('backup', 'export', 'scheduled-job', 'measurement', 'provider-retry', 'quota-reset'):
+        for kind in ('backup', 'export', 'scheduled-job', 'measurement'):
             self.assertEqual(parse_outcome(external(event=kind), NOW).kind, 'time')
 
     def test_contract_has_one_schema_and_no_poll_escape(self):
@@ -132,7 +132,7 @@ class TypedTimeSettlement(Bench):
     def test_valid_external_timer_retains_evidence_and_exact_mesh_schedule(self):
         t = task(1); mesh = FakeMesh([t], max_concurrent=1)
         at = (dt.datetime.now(dt.timezone.utc)+dt.timedelta(minutes=2)).replace(microsecond=0).isoformat()
-        write_replies(self.replies,{t['id'][:8]:external(at=at, event='provider-retry', why='provider Retry-After expires')})
+        write_replies(self.replies,{t['id'][:8]:external(at=at, event='backup-window', why='published backup becomes available')})
         self.cfg.mesh_effects=True
         r=self.runner(mesh);r.tick();self.settle_all(r)
         a=r.store.by_state(self.agent.name,('waiting',))[0]

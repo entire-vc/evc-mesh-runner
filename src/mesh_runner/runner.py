@@ -37,6 +37,7 @@ import urllib.error
 import uuid
 from pathlib import Path
 
+from . import chat_diag
 from . import asks
 from . import card_wait_reconcile
 from . import reviewer_merge
@@ -70,11 +71,11 @@ from .effects import (BACKLOG_BLOCKER, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SK
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
-from .outcome import QUEUE_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
+from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, QUEUE_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
 from .selection import CLOSED, StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from . import observation_budget
-from .wake import (GitHub, GitLab, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
+from .wake import (GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign, target_jobs_state, UnknownJobs)
@@ -128,12 +129,14 @@ GITLAB_DOWN_SECONDS = 120                 # after a failed GitLab read, review c
 ENUMERATED_VERDICTS = re.compile(r"\b(?:SHIP|DO-NOT-SHIP)\b\s*(?:/|\||,|\bor\b)\s*\b(?:SHIP|DO-NOT-SHIP)\b")
 OPEN_CHILD = {"todo", "in_progress", "review", "backlog"}
 ENV_PASSTHROUGH = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TERM", "TZ", "SSH_AUTH_SOCK")
-QUOTA_HINT = re.compile(r"rate.?limit|usage limit|quota|overloaded|429|too many requests", re.I)
+QUOTA_HINT = re.compile(
+    r"rate.?limit|usage limit|quota|too many requests"
+    r"|\b(?:HTTP(?:/\d(?:\.\d)?)?(?:\s+Error)?|API Error|status(?:\s+code)?)\s*[:=]?\s*429\b", re.I)
 # A provider-side outage, not a fault of the task: the CLI's typed auth failure, a 403 with no tokens,
 # codex failing to reach its account service at TUI bootstrap. It passes without anyone's action.
 PROVIDER_OUTAGE_HINT = re.compile(
     r"authentication_failed|API Error: 403|Request not allowed|workspace routing discovery failed"
-    r"|account/read failed during TUI bootstrap", re.I)
+    r"|account/read failed during TUI bootstrap|\b(?:server_)?overloaded\b", re.I)
 OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY = "_runtime", "_provider_outage", "pause_until"
 POLICY_REFUSAL_HINT = re.compile(r"flagged for possible cybersecurity risk", re.I)
 # Codex says "No saved session found with ID …" when it cannot resume a thread
@@ -307,6 +310,11 @@ class _GitLabReads:
             try:
                 self.memo[key] = (self.runner.gitlab.get_mr(target) if kind == "mr"
                                   else self.runner.gitlab.get_pipeline(target))
+            except ProviderUnavailable as e:  # an explicit provider that is not configured: this target only
+                self.runner._gitlab_unreadable[key] = mono + GITLAB_TARGET_UNREADABLE_SECONDS
+                log.info("%s: %s %s: %s; skipped for %ss", self.runner.agent.name, kind, target, e,
+                         GITLAB_TARGET_UNREADABLE_SECONDS)
+                raise _TargetUnreadable() from None
             except urllib.error.HTTPError as e:
                 if 400 <= e.code < 500:
                     self.runner._gitlab_unreadable[key] = mono + GITLAB_TARGET_UNREADABLE_SECONDS
@@ -548,11 +556,11 @@ class AgentRunner:
             try:
                 env.update(read_env_file(self.agent.env_file))
             except (OSError, ValueError) as e:
-                raise RuntimeError(f"env file unreadable: {type(e).__name__}") from None
+                raise chat_diag.EnvDenied(f"env file unreadable: {type(e).__name__}", "env_file_unreadable") from None
         if self.agent.env_command:
             res = subprocess.run(self.agent.env_command, capture_output=True, text=True, timeout=60)
             if res.returncode != 0:
-                raise RuntimeError(f"env command failed (rc {res.returncode}): {res.stderr.strip()[:200]}")
+                raise chat_diag.EnvDenied(f"env command failed (rc {res.returncode}): {res.stderr.strip()[:200]}", "env_command_failed")
             for line in res.stdout.splitlines():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -1329,6 +1337,8 @@ class AgentRunner:
         if previous and previous[0]:
             self.store.mark(self.agent.name, a.task_id, "launch_readiness_hold", "")
             self.store.event(a.id, "launch_readiness_restored", "intended-exec-succeeded")
+        if self._quota_admission_required(a):
+            self.store.mark(self.agent.name, a.task_id, "quota_admission_required", "")
         self._last_beat[a.id] = time.monotonic()
         self._record_launch(a, resume)
         self.emit("resume" if resume else "start", a, title=a.title[:120], session=sid)
@@ -1706,15 +1716,16 @@ class AgentRunner:
             if self.store.mark(self.agent.name, a.task_id, "outage_since"):
                 self.store.mark(self.agent.name, a.task_id, "outage_since", "")
             if QUOTA_HINT.search(text):
-                if self._switch_on_limit(a):
-                    # another account/profile is in place: retry this task on it at once
-                    self.store.update(a, state="ready",
-                                      wake_text=prompts.wake_prompt(task, "the provider limit was hit; "
-                                                                          "you now run on another account"))
-                    return
-                self._starts_paused_until = time.monotonic() + self.cfg.quota_pause_minutes * 60
-                log.warning("%s: harness reports a limit; new starts paused %s min", self.agent.name,
-                            self.cfg.quota_pause_minutes)
+                # The terminal error requires fresh account admission, not a card
+                # schedule or a pause of unrelated work on this lane. The gate
+                # checks the existing catalog policy, including allowed reserves.
+                self.store.mark(self.agent.name, a.task_id, "quota_admission_required", a.id)
+                switched = self._switch_on_limit(a)
+                self.store.update(a, state="ready", pid=0, stamp="",
+                    wake_text=prompts.wake_prompt(task,
+                        "the provider limit was hit; account routing selected another account"
+                        if switched else "the provider limit was hit; fresh account capacity admission is required"))
+                return
             failures = a.no_outcome + 1
             startup = not result.session_id        # the harness reported none (Claude's pre-assigned a.session_id does not count)
             if startup:
@@ -1738,9 +1749,15 @@ class AgentRunner:
         outcome, at = self._read_outcome(a, result, comments)
         if outcome is not None and outcome.kind == "time":
             # Settlement is the admission boundary, including programmatic outcomes.
-            outcome = self._parse(outcome.line, now(), a.task8)
-            if outcome.kind != "time":
+            if quota_time_wait({"kind": "time", "line": outcome.line, **outcome.extra}):
+                outcome = Outcome("unparsed", note=QUOTA_TIME_WAIT_GUIDANCE, line=outcome.line)
+            else:
+                outcome = self._parse(outcome.line, now(), a.task8)
+            if outcome.kind != "time" and outcome.note != QUOTA_TIME_WAIT_GUIDANCE:
                 outcome = Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=outcome.line)
+        if outcome is not None and outcome.note == QUOTA_TIME_WAIT_GUIDANCE:
+            self._reject_quota_time_wait(a, task)
+            return
         if outcome is None or outcome.kind == "unparsed":
             self._no_outcome(a, task, outcome)
             return
@@ -1752,8 +1769,9 @@ class AgentRunner:
             try:
                 queue_contract = self._queue_source(task, time.time())
                 if queue_contract and outcome.kind == "queue":
-                    queue_contract = queue_wait.as_any(queue_contract)
-                if queue_contract and queue_wait.served(self.store, a, self.agent_id, queue_contract):
+                    # After a served ANY wake only the targets it did not cover remain.
+                    queue_contract = queue_wait.effective(self.store, a, self.agent_id, queue_contract)
+                elif queue_contract and queue_wait.served(self.store, a, self.agent_id, queue_contract):
                     queue_contract = None
             except MeshError:
                 return  # retry settlement, without another turn or a stale source
@@ -4642,7 +4660,8 @@ class AgentRunner:
         except MeshError:
             return
         if source and req["contract"].get("mode") == "any":
-            source = queue_wait.as_any(source)  # an explicit `WAIT queue:` keeps its event meaning
+            # An explicit `WAIT queue:` keeps its event meaning; a served wake leaves its residual.
+            source = queue_wait.effective(self.store, a, self.agent_id, source)
         if source != req["contract"]:
             # A new machine demand supersedes this identity without waking an LLM.
             if source and source["observed_at"] > req["contract"]["observed_at"]:
@@ -4670,7 +4689,9 @@ class AgentRunner:
             checked = time.time()
             return checked >= finished and queue_wait.available(
                 receipt, req, checked, queue_wait.published_manifest(self.store))
+        residual = queue_wait.residual_mark(self.agent_id, req, receipt)
         if self.store.update_with_marks(a, {queue_wait.key(req): json.dumps(pending), "met_wake": a.id,
+                    **residual,
                     queue_wait.consumed_key(self.agent_id, req["contract"]): "fulfilled",
                 queue_wait.delivered_key(self.agent_id, req["contract"]): "fulfilled",
                 queue_wait.FLOOR_KEY: queue_wait.raised_floor(
@@ -4912,6 +4933,23 @@ class AgentRunner:
                   registration=request["registration"], old_registration=request["old_registration"])
         return "applied"
 
+    def _reject_quota_time_wait(self, a: Attempt, task: dict) -> None:
+        """Remove only this attempt's obsolete quota schedule; ordinary admission still applies."""
+        expected = copy.deepcopy(a.wait)
+        current = self.store.get(a.id)
+        if (not current or current.agent != self.agent.name or current.task_id != a.task_id
+                or current.state != a.state or current.wait != expected):
+            return
+        wait = copy.deepcopy(expected)
+        self.effects.on_end(a, wait, "quota time WAIT rejected", close_request=False)
+        for key in ("kind", "until", "external_time", "line", "note"):
+            wait.pop(key, None)
+        wait["quota_wait_rejected"] = True
+        if self.store.update_with_marks(a, {}, expect=a.state, expect_wait=expected,
+                state="ready", wait=wait,
+                wake_text=prompts.wake_prompt(task, QUOTA_TIME_WAIT_GUIDANCE)):
+            self.store.event(a.id, "quota_time_wait_rejected")
+
     def _wake_one(self, a: Attempt) -> None:
         if self._maintenance_held(a):
             return                           # WAIT stays exactly as declared until the owner finishes
@@ -4920,6 +4958,9 @@ class AgentRunner:
             queue_wait.cancel(self.store, a)
             self._note_ownership_loss(a, task)
             self._finish(a, "completed", "task left the agent while waiting")
+            return
+        if quota_time_wait(a.wait):
+            self._reject_quota_time_wait(a, task)
             return
         if a.wait.get("kind") == "native":
             self._wake_native(a, task)
@@ -5358,6 +5399,21 @@ class AgentRunner:
             self._note_ownership_loss(a, task)
             self._finish(a, "completed", "task left the agent before resuming")
             return
+        if a.wait.get("quota_wait_rejected"):
+            # Removing our obsolete quota date grants no exemption from a
+            # person's schedule, human gate, labels or other ordinary policy.
+            plain = dict(task)
+            if (task.get("checked_out_by") == self.agent_id
+                    and task.get("checkout_session_id") == a.id and a.checkout.get("token")):
+                plain["checked_out_by"] = None
+            reason = static_skip_reason(plain, self.agent.policy, now())
+            if reason:
+                self._release_gate(a, "quota-wait-policy-held")
+                self._release_checkout(a)
+                self._suspend_held_ready(a)
+                self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                self._log_hold("resume", a.task8, reason)
+                return
         scope = self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY)
         prior_scope = recorded_scope(scope[0] if scope else None, a.id)
         was_metadata = prior_scope == "metadata-only"
@@ -5418,6 +5474,16 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "review_gate_hold", "")
         self._clear_hold_log(a.task8, "resume")
         self._remember_gate(a, gate)
+        if self._quota_admission_required(a):
+            # Reserve may have selected an allowed account since the pre-gate
+            # environment read. Launch/auth checks must use that fresh route.
+            try:
+                env = self._fresh_env()
+            except (RuntimeError, OSError, subprocess.SubprocessError):
+                self._release_gate(a, "quota-route-environment-unavailable")
+                self._release_checkout(a)
+                self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                raise
         restored = []
         fresh_paths: list[str] = []
         prior_workspaces = list(a.workspaces)
@@ -6396,6 +6462,9 @@ class AgentRunner:
                 reviewed = (event.startswith("review verdict SHIP ")
                             or foreign_comment(comments, self.agent_id, own[1]) is not None)
                 self._review_why[task["id"]] = {"event": event, "since": iso(own[1])}
+                # durable (survives a restart): the hold below says so and never retries a rejection
+                self.store.mark(self.agent.name, task["id"], "review_rejected",
+                                "1" if event.startswith("review verdict DO-NOT-SHIP ") else "0")
                 if getattr(self, "_review_ci_delivery", {}).get(task["id"]):
                     self._review_why[task["id"]]["ci_delivery"] = self._review_ci_delivery[task["id"]]
                 if not reviewed:
@@ -6414,6 +6483,11 @@ class AgentRunner:
             # nobody looked at it for the whole window: the author routes it, not accepts it
             self._unreviewed(task, own[1])
             return ""
+        rejected = self.store.mark(self.agent.name, task["id"], "review_rejected")
+        if fed_at and rejected and rejected[0] == "1" and not foreign_comment(comments, self.agent_id, fed_at):
+            # a rejection is never retried: not after a restart, not after the refeed window;
+            # only a new comment from someone else reopens it
+            return "review: already reviewed (DO-NOT-SHIP); waits for a new comment"
         if fed_at and now() - fed_at < self._refeed_max() and not foreign_comment(comments, self.agent_id, fed_at):
             return "review: already reviewed; waits for a new comment"
         if (own and not foreign_comment(comments, self.agent_id, own[1])
@@ -6529,6 +6603,12 @@ class AgentRunner:
                 return f"parent waits on {len(kids)} open children; none changed since the last feed"
         return ""
 
+    def _quota_admission_required(self, a: Attempt | None) -> bool:
+        if a is None:
+            return False
+        mark = self.store.mark(self.agent.name, a.task_id, "quota_admission_required")
+        return bool(mark and mark[0] == a.id)
+
     def _hook_env(self, task_id: str, mode: str, phase: str, attempt: Attempt | None = None,
                   gate: dict | None = None) -> dict:
         """Hooks get the allowlisted environment (no runner or lane secrets), what the
@@ -6539,6 +6619,8 @@ class AgentRunner:
                    MESH_RUNNER_TASK=task_id, MESH_RUNNER_MODE=mode, MESH_RUNNER_PHASE=phase,
                    MESH_RUNNER_HARNESS=attempt.harness if attempt else self.agent.harness,
                    MESH_RUNNER_ATTEMPT=attempt.id if attempt else "")
+        if phase in ("reserve", "admit") and self._quota_admission_required(attempt):
+            env["MESH_RUNNER_REQUIRE_ACCOUNT_CAPACITY"] = "1"
         co = (attempt.checkout if attempt else None) or {}
         if co.get("request_id"):
             env.update(MESH_RUNNER_CHECKOUT_REQUEST=str(co["request_id"]),
@@ -6590,8 +6672,9 @@ class AgentRunner:
         if phase in ("reserve", "admit") and access_recovery.held(self.store, self.agent.name, task_id):
             self._gate_task_only = True
             return access_recovery.REASON, gate
+        quota_required = phase in ("reserve", "admit") and self._quota_admission_required(attempt)
         if not self.agent.start_gate_command:
-            return "", gate
+            return ("account capacity admission requires a capable start gate", gate) if quota_required else ("", gate)
         if phase == "reserve" and self._agent_gate_hold:
             reason, until, source = self._agent_gate_hold
             if source in self._gate_hold and time.monotonic() < until:
@@ -6599,7 +6682,10 @@ class AgentRunner:
         rc, out, err = self._run_hook(self.agent.start_gate_command,
                                       self._hook_env(task_id, mode, phase, attempt, gate), timeout=15 if phase == "transport" else 120)
         if rc == 0:
-            gate.update(self._kv(out))
+            fresh = self._kv(out)
+            gate.update(fresh)
+            if quota_required and fresh.get("ACCOUNT_CAPACITY_READY") != "1":
+                return "account capacity admission was not confirmed by the start gate", gate
             if phase == "admit":
                 self._clear_agent_gate_hold()
             return "", gate
@@ -6610,7 +6696,7 @@ class AgentRunner:
                 access_recovery.remember(self, task_id, mode, self._kv(out).get("ACCESS_HOLD", ""))
             reason = gate_hold_reason(out)
             gate.update(self._kv(out))
-            if rc == GATE_HOLD and phase in ("reserve", "admit"):
+            if rc == GATE_HOLD and phase in ("reserve", "admit") and not quota_required:
                 key = ("agent", reason)
                 failures = min(self._gate_failures.get(key, 0) + 1, 4)
                 self._gate_failures = {key: failures}
@@ -7534,7 +7620,7 @@ class Runner:
                 except BlockingIOError:
                     raise AlreadyRunning(f"another runner owns {cfg.state_dir}") from None
         self.store = Store(cfg.state_dir / "runner.sqlite")
-        github = GitHub(cfg.github_token, cfg.github_api_url, cfg.github_orgs) if cfg.github_orgs else None
+        github = GitHub(cfg.github_token, cfg.github_api_url, cfg.github_orgs) if (cfg.github_orgs or cfg.github_token) else None
         gitlab = GitLab(cfg.gitlab_url, cfg.gitlab_token, github) if (cfg.gitlab_url or github) else None
         # one sqlite connection per agent: each agent ticks in its own thread (run_forever)
         self.agents = [AgentRunner(cfg, a, Store(cfg.state_dir / "runner.sqlite"), gitlab=gitlab)

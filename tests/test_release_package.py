@@ -79,3 +79,32 @@ class SelectReviewerFailsClosed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReceiptDependencyContract(unittest.TestCase):
+    """cryptography is an explicit optional extra, documented with a preflight; absence stays fail-closed."""
+
+    def test_extra_declared_and_core_stays_stdlib(self):
+        text = (ROOT / "pyproject.toml").read_text()
+        self.assertIn("dependencies = []", text)
+        self.assertRegex(text, r'(?m)^receipt = \["cryptography[^"]*"\]')
+
+    def test_docs_carry_preflight(self):
+        doc = (ROOT / "docs" / "release-package.md").read_text()
+        self.assertIn("cryptography.hazmat.primitives.asymmetric.ed25519", doc)
+        self.assertIn("fail closed", doc)
+
+    def test_missing_dependency_refuses(self):                         # red control: import blocked -> Refused
+        import builtins
+        from unittest import mock
+        from mesh_runner.native_result_ledger import Refused
+        from mesh_runner import native_result_receipt as nrr
+        real = builtins.__import__
+
+        def blocked(name, *a, **k):
+            if name.startswith("cryptography"):
+                raise ImportError(name)
+            return real(name, *a, **k)
+        with mock.patch("builtins.__import__", blocked):
+            with self.assertRaisesRegex(Refused, "cryptography required"):
+                nrr.verify_issuer({"issuer_signature": "x", "receipt_sha256": "0" * 64}, {})

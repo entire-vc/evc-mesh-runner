@@ -30,3 +30,19 @@ Dry run (prints the file list and hashes of the required files):
 git archive --format=tar HEAD | tar -tf - | grep -E 'reviewer_merge|select-reviewer|reviewer-canary|reviewer-merge.md'
 git archive --format=tar HEAD | shasum -a 256
 ```
+
+## Optional receipt dependency (source install)
+
+The core stays stdlib-only (`dependencies = []`). The enrolled reviewer receipt source verifies the
+issuer's Ed25519 signature and therefore needs `cryptography` (declared as the `receipt` extra). Without it
+`verify_issuer` refuses (`issuer verification unavailable: cryptography required`): fail closed, never admitted.
+
+The release is installed from the unpacked archive with `PYTHONPATH`, so pip does not resolve extras for it.
+Before enabling the receipt source, run the preflight under the same interpreter that starts the runner:
+
+```
+<runner-python> -c "import cryptography.hazmat.primitives.asymmetric.ed25519"
+```
+
+A non-zero exit means the dependency is missing: install it for that interpreter (`<runner-python> -m pip install 'cryptography>=41'`)
+or leave the receipt source disabled. Do not install it ad hoc into a running runtime without a rollback anchor.

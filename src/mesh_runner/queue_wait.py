@@ -69,6 +69,79 @@ def served(store, a, owner, value):
     return consumed(store, a, owner, v1) or consumed(store, a, owner, as_any(v1))
 
 
+def residual_key(owner, value):
+    payload = json.dumps(dict(owner=owner, contract=contract(value)), sort_keys=True, separators=(',', ':'))
+    return 'queue_residual:' + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def recovered_targets(receipt, req):
+    """Targets the observer proved recovered for this exact generation, or None (unknown).
+
+    Older observers publish no list: nothing is inferred, so no residual is created."""
+    try:
+        proof = receipt['requests'][req['generation_id']]['proof']
+        listed = proof['recovered']
+        wanted = {(t['agent_id'], t['project_id']) for t in req['contract']['targets']}
+        got = set()
+        for item in listed:
+            if not isinstance(item, dict) or set(item) != {'agent_id', 'project_id'}:
+                return None
+            got.add((str(UUID(item['agent_id'])), str(UUID(item['project_id']))))
+        return got if got and got <= wanted and len(got) == len(listed) else None
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def residual_mark(owner, req, receipt):
+    """Marks recording which targets an ANY wake did not serve ({} when nothing remains or the served
+    set is unproven). Written in the same transaction as the fulfilment. The residual starts as
+    already delivered: the lead's first-move turn was spent on this source."""
+    wire = contract(req['contract'])
+    got = recovered_targets(receipt, req)
+    if wire['version'] != 2 or wire['mode'] != 'any' or not got:
+        return {}
+    rest = [t for t in wire['targets'] if (t['agent_id'], t['project_id']) not in got]
+    if not rest:
+        return {}
+    value = dict(version=1, source_observed_at=wire['observed_at'], generation_id=req['generation_id'],
+                 served=[dict(agent_id=a, project_id=p) for a, p in sorted(got)],
+                 remaining=rest)
+    left = contract(dict(version=2, mode='any', observed_at=wire['observed_at'], targets=rest))
+    return {residual_key(owner, wire): json.dumps(value, sort_keys=True),
+            delivered_key(owner, left): 'delivered'}
+
+
+def residual(store, a, owner, value):
+    """The unserved-target contract left by a served ANY wake on `value`: same source stamp,
+    only the targets no wake has covered. None when absent or malformed (fail closed)."""
+    wire = contract(value)
+    found = store.mark(a.agent, a.task_id, residual_key(owner, wire))
+    try:
+        saved = json.loads(found[0]) if found else None
+        if (not isinstance(saved, dict) or saved.get('version') != 1
+                or saved.get('source_observed_at') != wire['observed_at']):
+            return None
+        out = contract(dict(version=2, mode='any', observed_at=wire['observed_at'],
+                            targets=saved['remaining']))
+        have = {(t['agent_id'], t['project_id']) for t in wire['targets']}
+        return out if {(t['agent_id'], t['project_id']) for t in out['targets']} < have else None
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def effective(store, a, owner, source):
+    """What an explicit `WAIT queue:` observes for `source`: the ANY contract, or after each served
+    wake the residual of it. None = fully served (or unproven): nothing to observe."""
+    current = as_any(source)
+    for _ in range(17):
+        if not served(store, a, owner, current):
+            return current
+        current = residual(store, a, owner, current)
+        if current is None:
+            return None
+    return None
+
+
 def request(value):
     if (not isinstance(value, dict) or set(value) != {'version', 'generation_id', 'task_id', 'contract'}
             or type(value['version']) is not int or value['version'] != 1):

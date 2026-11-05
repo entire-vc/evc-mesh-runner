@@ -16,7 +16,10 @@ the attempt started and takes the last declaration line in it:
     ❓ Blocking @<person>: <question>                      a person must decide (Mesh raises the gate)
 
 Anything after the target (": why", " — why", " | why") is an explanation and is
-kept. ``pipeline:<project>!<iid>`` (a merge request number under the pipeline
+kept. ``mr:`` / ``pipeline:`` targets may carry an explicit provider, ``mr:github:org/repo!N``,
+``mr:gitlab:group/project!N``, ``pipeline:github:org/repo#N``; the explicit selector always wins over the
+configured GitHub allowlist and is never read from the other provider. A bare target keeps the allowlist
+inference. ``merge:`` has no qualified form. ``pipeline:<project>!<iid>`` (a merge request number under the pipeline
 kind) is read as the MR wait it names.
 """
 from __future__ import annotations
@@ -33,10 +36,10 @@ _JOBS = r"(?:\s+jobs=\[(?P<jobs>[^\]]*)\])?"
 # ``jobs=[...]`` written between the target and ``until=`` is moved behind the baseline.
 _JOBS_FIRST = re.compile(r"^(\s*⏳\s*WAIT\s+(?:mr|pipeline):\S+)(\s+jobs=\[[^\]]*\])(\s+until=\S+(?:\s+after=\S+)?)")
 _PIPELINE = re.compile(
-    _WAIT_HEAD + r"pipeline:(?P<project>[\w.\-/]+)#(?P<id>\d+)(?:\s+jobs=\[(?P<jobs>[^\]]*)\])?" + _EXPLANATION)
-_MR = re.compile(_WAIT_HEAD + r"(?:mr|pipeline):(?P<project>[\w.\-/]+)!(?P<id>\d+)" + _EXPLANATION)
+    _WAIT_HEAD + r"pipeline:(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)#(?P<id>\d+)(?:\s+jobs=\[(?P<jobs>[^\]]*)\])?" + _EXPLANATION)
+_MR = re.compile(_WAIT_HEAD + r"(?:mr|pipeline):(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)!(?P<id>\d+)" + _EXPLANATION)
 _CI_CHANGE = re.compile(
-    _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
+    _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
     r"\s+until=(?P<predicate>change|success)\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64}):"
     r"(?P<pipeline>[1-9]\d{0,11}):(?P<status>created|waiting_for_resource|preparing|pending|running|success|failed|canceled|cancelled|skipped|manual|scheduled)"
     + _JOBS + _EXPLANATION)
@@ -44,12 +47,12 @@ _CI_CHANGE = re.compile(
 # parser cannot read GitLab, so it only marks the wait (``extra["ci_default"]`` / ``["mr_default"]``)
 # and the runner fills the baseline in (or falls back to the plain wait when it cannot read it).
 _CI_DEFAULT = re.compile(
-    _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
+    _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
     r"\s+until=(?P<predicate>change|success)" + _JOBS + _EXPLANATION)
 _MR_MERGED_DEFAULT = re.compile(
-    _WAIT_HEAD + r"mr:(?P<project>[\w.\-/]+)!(?P<id>[1-9]\d{0,11})\s+until=merged" + _EXPLANATION)
+    _WAIT_HEAD + r"mr:(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)!(?P<id>[1-9]\d{0,11})\s+until=merged" + _EXPLANATION)
 _MR_STATE = re.compile(
-    _WAIT_HEAD + r"mr:(?P<project>[\w.\-/]+)!(?P<id>[1-9]\d{0,11})"
+    _WAIT_HEAD + r"mr:(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)!(?P<id>[1-9]\d{0,11})"
     r"\s+until=merged\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64}):opened" + _EXPLANATION)
 _MERGE = re.compile(
     _WAIT_HEAD + r"merge:(?P<project>\w[\w.\-]*(?:/[\w.\-]+)+)!(?P<id>[1-9]\d{0,11})"
@@ -79,13 +82,42 @@ TIME_WAIT_GUIDANCE = (
     "invalid external time wait: use `⏳ WAIT <absoluteISO-with-timezone>: "
     "external=<stable-reference> source=<https-url|card:#8hex> <why>`. "
     "The future timestamp must come from the cited external event/window, scheduled job, "
-    "measurement endpoint, or provider Retry-After/quota reset. Describe cancellation in the comment. "
+    "or measurement endpoint. Describe cancellation in the comment. "
+    "Provider quota, account resets and Retry-After belong to account routing, never a task WAIT. "
     "Relative intervals, bare dates, `poll:` and invented retries are not time events. "
     "MR/CI/card/answer dependencies use `⏳ WAIT mr:<group>/<project>!<iid>`, "
     "`⏳ WAIT pipeline:<group>/<project>#<id>`, `⏳ WAIT card:#<8hex>`, "
     "`⏳ WAIT decision:@<agent>` or `❓ Blocking @<person>: <question>`. "
     "If an observer is missing, report the integration blocker; do not replace the event with a timer."
 )
+
+
+QUOTA_TIME_WAIT_GUIDANCE = (
+    "Provider quota/reset/Retry-After is account availability, never a task time WAIT or start_after. "
+    "A future account reset alone does not mean exhaustion. Continue this task through the existing "
+    "account routing/admission policy; do not change its role, checkpoint, session or human gates. "
+    "Use a task WAIT only for its actual external resource/dependency."
+)
+_PROVIDER_CAPACITY = re.compile(
+    r"quota|квот|rate[ _-]?limit|usage[ _-]?limit|weekly[ _-]?limit|лимит.{0,30}аккаунт"
+    r"|retry[ _-]?after|provider[ _:/-]+retry"
+    r"|(?:codex|claude|provider|account|аккаунт).{0,80}(?:reset|сброс)"
+    r"|(?:reset|сброс).{0,80}(?:codex|claude|provider|account|аккаунт)", re.I)
+
+
+def quota_time_wait(wait: dict) -> bool:
+    """Recognize prohibited account-capacity predicates, including persisted old waits.
+
+    Resetting an unrelated resource remains a valid external event. The check
+    uses the declaration/evidence only, never an account's reset timestamp alone.
+    """
+    if wait.get("kind") != "time":
+        return False
+    external = wait.get("external_time") or {}
+    external = external if isinstance(external, dict) else {}
+    text = " ".join(str(v or "") for v in (wait.get("line"), wait.get("note"),
+        external.get("event"), external.get("why"), external.get("source")))
+    return bool(_PROVIDER_CAPACITY.search(text))
 
 
 @dataclass(frozen=True)
@@ -133,6 +165,13 @@ JOBS_EMPTY = ("invalid explicit VCS wait: `jobs=[]` names no job; list the job n
               "(`jobs=[browser-tests,lint]`) or drop the field to wait on the whole pipeline")
 
 
+GITHUB_MR_CI_UNSUPPORTED = (
+    "invalid explicit VCS wait: a GitHub pull request carries no head pipeline, so `mr:github:… until=change|success` "
+    "has nothing to observe; wait on the Actions run itself with `⏳ WAIT pipeline:github:<org>/<repo>#<run-id> "
+    "until=change|success after=<full-sha>:<run-id>:<status>`, or on the merge with "
+    "`⏳ WAIT mr:github:<org>/<repo>!<n> until=merged after=<full-head-sha>:opened`")
+
+
 def declaration_lines(text: str) -> list[str]:
     return [line for line in (text or "").splitlines() if DECLARATION.match(line)]
 
@@ -147,12 +186,20 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
                 "invalid explicit VCS wait: `merge:` waits are not enabled on this runner; run the merge "
                 "gate yourself and, to await the merge, use "
                 "`⏳ WAIT mr:<group>/<project>!<iid> until=merged after=<full-head-sha>:opened`"), line=line)
+        if re.match(_WAIT_HEAD + r"merge:(?:github|gitlab):", line):
+            return Outcome("unparsed", note=(
+                "invalid explicit VCS wait: `merge:` has no provider-qualified form; the merge gate reads the "
+                "configured GitLab only. Use `⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>` for "
+                "GitLab, or `⏳ WAIT mr:github:<org>/<repo>!<n> until=merged after=<full-head-sha>:opened` to "
+                "observe a GitHub pull request"), line=line)
         if m := _MERGE.match(line):
             return Outcome("merge", f"{m['project']}!{m['id']}", note=note(m), line=line,
                            extra={"merge": {"sha": m["sha"]}})
         return Outcome("unparsed", note=(
             "invalid explicit VCS wait: expected `⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>` "
             "(the full 40 or 64 hex-digit SHA of the reviewed head)"), line=line)
+    if m := re.match(_WAIT_HEAD + r"mr:github:\S+\s+until=(?:change|success)\b", line):
+        return Outcome("unparsed", note=GITHUB_MR_CI_UNSUPPORTED, line=line)
     if m := _MR_STATE.match(line):
         return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line,
                        extra={"mr_state": {"predicate": "merged", "sha": m["sha"], "state": "opened"}})
@@ -222,6 +269,8 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         return Outcome("queue", m["id"], note=note(m), line=line)
     if m := _DECISION.match(line):
         return Outcome("decision", handle=m["handle"], note=note(m), line=line)
+    if _TIME_HEAD.match(line) and quota_time_wait({"kind": "time", "line": line}):
+        return Outcome("unparsed", note=QUOTA_TIME_WAIT_GUIDANCE, line=line)
     if m := _EXTERNAL_TIME.match(line):
         until = _parse_when(m["when"])
         # Never move a past event to now+5m, clamp a deadline, or invent a timezone.
@@ -306,6 +355,9 @@ After observing a known CI result, wait for a NEW observation explicitly:
   ⏳ WAIT mr:<group>/<project>!<iid> until=change after=<full-head-sha>:<pipeline-id>:<status>
 Use until=success to require a changed successful head pipeline; pending does not satisfy it.
 Use pipeline:<group>/<project>#<id> with the same fields to observe retries of that exact pipeline.
+A target on GitHub or GitLab may name its provider: mr:github:<org>/<repo>!<n>, mr:gitlab:<group>/<project>!<iid>,
+pipeline:github:<org>/<repo>#<run-id>. An explicit provider is never read from the other one; bare targets keep
+their configured provider. `merge:` has no provider-qualified form.
 To wait for specific jobs only, append jobs=[<job>,<job>] (GitLab job names): the wait is read from those jobs
 and wakes once all are final, even while other jobs (manual siblings) leave the pipeline unfinished.
 After you yourself run an authorized manual job, wait for its RESULT: until=success on that pipeline.
@@ -323,6 +375,8 @@ Pipeline success/manual and head changes do not complete it. UNKNOWN retains the
 Describe why this time and when the wait is cancelled in the comment. No relative intervals, bare dates,
 poll bypasses, or invented 6h/24h retries for dependencies. A missing observer is an integration blocker,
 not permission to poll. Internal retry/backoff never writes a task's start_after.
+Provider quotas, account resets and Retry-After are account routing/admission, never task WAITs.
+A future reset timestamp alone is not evidence that an account is unavailable.
 Healthy observable targets stay asleep until an event; external time waits wake at their exact deadline.
   ↻ NEXT                                    — you did a piece of work (an edit, a commit, a check run, a result
                                               posted) and want to continue immediately. Reading the task and

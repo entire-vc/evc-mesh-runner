@@ -168,7 +168,10 @@ class Declaration(MergeBench):
         self.assertEqual((a.wait["kind"], a.wait["target"], a.wait["merge"]["sha"]), ("merge", TARGET, SHA))
         r._merge_jobs[a.id]["thread"].join(15)
         self.assertEqual(self.runs(), [f"56 {PROJECT} {SHA}"])    # the gate ran at once, no model turn
-        self.assertEqual(runtime_state(a, "builder"), {"kind": "waiting", "ref": f"mr:{TARGET}"})
+        shown = runtime_state(a, "builder")
+        constraints = shown.pop("constraints")           # additive: the declared merge wait as a local_wait
+        self.assertEqual(shown, {"kind": "waiting", "ref": f"mr:{TARGET}"})
+        self.assertEqual([(c["class"], c["wake"]["predicate"]) for c in constraints], [("local_wait", "merge")])
 
     def test_feature_off_never_parks_or_runs_anything(self):
         for command, gitlab in ((), FakeGitLab()), (self.cfg.merge_command, None):
