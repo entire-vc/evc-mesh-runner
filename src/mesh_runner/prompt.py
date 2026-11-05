@@ -2,18 +2,65 @@
 file (team rules, review gates); the runner itself stays policy-free."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .outcome import DECISION_WAIT_GUIDANCE, contract
 
 
-def _comments_block(comments: list[dict], limit: int = 6) -> str:
-    rows = []
-    for c in comments[-limit:]:
-        who = c.get("author_name") or (c.get("author") or {}).get("name") or "?"
-        body = " ".join((c.get("body") or "").split())
-        rows.append(f"- {c.get('created_at', '')[:16]} {who}: {body[:600]}")
+FETCH_HINT = ("full comment bodies: list_comments(task_id, full=true, limit=N, page=P); "
+              "list_comments(task_id, full=true, after=<cursor id>) returns only newer comments, "
+              "excluding the cursor comment; use a page to fetch its body")
+
+# Comments that carry a standing decision or a gate. When one sits outside the tail it is
+# pinned below it, so an old verdict or prohibition is not lost with the history.
+_DECISION = re.compile(r"❓\s*\**\s*Blocking|⏳\s*WAIT|↻\s*NEXT|\bROUTE\b|\b(?:DO-NOT-SHIP|SHIP|BLOCKED)\b"
+                       r"|\bVERDICT\b|\bdecision\b|запрет|не (?:делай|меняй|трогай)|\bdo not\b|\bnever\b", re.I)
+
+
+def _who(c: dict, default: str = "?") -> str:
+    return c.get("author_name") or (c.get("author") or {}).get("name") or default
+
+
+def render_comment(c: dict, size: int, default_who: str = "?") -> str:
+    """One comment: id, UTC time, author and body. A body over ``size`` keeps its head AND its
+    tail (a Blocking/verdict line sits at the end) with the cut named; it is never passed off
+    as complete."""
+    body = " ".join((c.get("body") or "").split()) if size <= 600 else (c.get("body") or "").strip()
+    head = f"{c.get('id', '?')} {c.get('created_at', '')} {_who(c, default_who)}"
+    if len(body) <= size:
+        return f"{head}: {body}"
+    tail = max(size // 3, 80)
+    first = size - tail
+    return (f"{head} [TRUNCATED {first + tail}/{len(body)} chars, middle omitted; not the full text, "
+            f"fetch it before relying on it]: {body[:first]} […] {body[-tail:]}")
+
+
+def _comments_block(comments: list[dict], limit: int = 6, size: int = 600, skip: frozenset = frozenset()) -> str:
+    """The delta the session starts from: the newest ``limit`` comments, and up to three older
+    ones that carry a decision or a gate. Not the full history; what is left out is counted and
+    the way to fetch it is named."""
+    pool = [c for c in comments if c.get("id") not in skip]
+    tail = pool[-limit:]
+    older = pool[:-limit] if len(pool) > limit else []
+    pinned = [c for c in older if _DECISION.search(c.get("body") or "")][-3:]
+    rows: list[str] = []
+    if pinned:
+        rows.append("Older decisions/gates outside the tail (oldest first):")
+        rows += [f"- {render_comment(c, size)}" for c in pinned]
+        rows.append("Latest comments:")
+    rows += [f"- {render_comment(c, size)}" for c in tail]
+    left = len(older) - len(pinned)
+    if left > 0:
+        rows.append(f"- (+{left} older comments not shown; {FETCH_HINT})")
+    elif not comments:
+        rows.append("- (none)")
     return "\n".join(rows) or "- (none)"
+
+
+def harness_note(agent_name: str, harness: str = "") -> str:
+    """Who the session is: the lane name plus the harness it was actually routed to."""
+    return f"{agent_name} (running on the {harness} harness)" if harness else agent_name
 
 
 # Work whose result is not a merge request: it is closed by its evidence. The label is
@@ -37,7 +84,7 @@ def delivery_note(task: dict) -> str:
 
 
 def start_prompt(task: dict, agent_name: str, workspaces: list[str], comments: list[dict],
-                 preamble: str = "", merge: bool = False) -> str:
+                 preamble: str = "", merge: bool = False, harness: str = "") -> str:
     short = task["id"][:8]
     where = "\n".join(f"  - {p}" for p in workspaces) or "  - (no repository configured)"
     return f"""{preamble.strip()}
@@ -45,12 +92,14 @@ def start_prompt(task: dict, agent_name: str, workspaces: list[str], comments: l
 [runner] Task #{short} — {task.get('title', '')}
 Mesh task id: {task['id']} · priority {task.get('priority', '')}
 
-You are {agent_name}. This session belongs to this one task. Your writable checkouts for it:
+You are {harness_note(agent_name, harness)}. This session belongs to this one task. Your writable checkouts for it:
 {where}
 Work only in these checkouts; other clones of the same repositories belong to other sessions.
 The task is already checked out for you — do not check it out or release it yourself.
 
-Read the full task (description, dependencies, all comments) with your Mesh tools before acting.
+Read the task description and dependencies with your Mesh tools before acting. The comments below are the
+delta, not the whole thread: older history is not required by default; read it only for a concrete gap
+({FETCH_HINT}).
 Latest comments:
 {_comments_block(comments)}
 
@@ -83,7 +132,8 @@ Do one of these in this turn:
 
 def review_prompt(task: dict, agent_name: str, workspaces: list[str], comments: list[dict],
                   preamble: str = "", protocol: str = "", changed: str = "", news: str = "",
-                  unreviewed_hours: float | None = None) -> str:
+                  news_comments: list[dict] | None = None,
+                  unreviewed_hours: float | None = None, harness: str = "") -> str:
     """``changed``: the task is the agent's own recent work, fed back because of this
     event; ``news``: others' comments since its last turn (new_comments_block);
     ``unreviewed_hours``: its own work nobody reviewed for that long: routed on, never
@@ -103,13 +153,14 @@ def review_prompt(task: dict, agent_name: str, workspaces: list[str], comments: 
 [runner] Review #{short} — {task.get('title', '')}
 Mesh task id: {task['id']}
 
-You are {agent_name}. Checkouts you may use to verify it (read or test, do not push to others' branches):
+You are {harness_note(agent_name, harness)}. Checkouts you may use to verify it (read or test, do not push to others' branches):
 {where}
 The task is already checked out for you — do not check it out or release it yourself.
 
-Read the full task and all its comments with your Mesh tools before deciding.
+Read the task description and dependencies with your Mesh tools before deciding. The comments below are the
+delta, not the whole thread; read older ones only for a concrete gap ({FETCH_HINT}).
 Latest comments:
-{_comments_block(comments)}
+{_comments_block(comments, skip=frozenset(c.get("id") for c in news_comments or [] if c.get("id")))}
 {since}
 {rules.strip()}
 """.strip() + "\n"
@@ -119,7 +170,8 @@ def wake_prompt(task: dict, event: str) -> str:
     return f"""[runner] Resumed on task #{task['id'][:8]} — {task.get('title', '')}
 What changed: {event}
 
-Re-read the task's new comments, continue from where you stopped, and end the turn with the same
+The new comments by others are listed below when there are any; read older ones only for a concrete gap
+({FETCH_HINT}). Continue from where you stopped, and end the turn with the same
 outcome contract (a closing comment with ⏳ WAIT / ↻ NEXT / ❓ Blocking, or move the task on).
 
 {DECISION_WAIT_GUIDANCE}{delivery_note(task)}"""
@@ -128,15 +180,16 @@ outcome contract (a closing comment with ⏳ WAIT / ↻ NEXT / ❓ Blocking, or 
 def new_comments_block(comments: list[dict], limit: int = 8, size: int = 1500) -> str:
     """Comments by others since the agent's previous turn, as of the moment the
     turn starts. A wake text is written when the wait ends; a resume held after
-    that (a gate, a full pool) must not hand the agent a stale picture."""
+    that (a gate, a full pool) must not hand the agent a stale picture. Every comment
+    carries its id and time; a cut one says so, and the older ones that did not fit are counted."""
     if not comments:
         return ""
     shown = comments[-limit:]
     lines = [f"\nComments by others since your previous turn ({len(comments)}"
-             + (f", last {len(shown)} shown" if len(shown) < len(comments) else "") + "), oldest first:"]
+             + (f", last {len(shown)} shown; {len(comments) - len(shown)} older omitted, {FETCH_HINT}"
+                if len(shown) < len(comments) else "") + "), oldest first:"]
     for c in shown:
-        who = c.get("author_name") or (c.get("author") or {}).get("name") or "someone"
-        lines.append(f"--- {who} at {c.get('created_at', '')}:\n{(c.get('body') or '')[:size]}")
+        lines.append("--- " + render_comment(c, size, "someone"))
     return "\n".join(lines) + "\n"
 
 

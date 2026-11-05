@@ -44,6 +44,7 @@ from . import reviewer_merge
 from . import inputs
 from . import prompt as prompts
 from . import repo_admission
+from . import git_index_admission
 from . import maintenance
 from . import delivery_requests
 from . import headless_acceptance
@@ -187,6 +188,7 @@ class AlreadyRunning(Exception):
 
 
 PROFILE_VAR = "MESH_RUNNER_PROFILE"
+TASK_ROUTE_PREFIX = "runner-harness:"       # card label selecting a permitted alt harness for that card only
 HARNESS_VAR = "MESH_RUNNER_HARNESS"         # env command: the harness this agent is routed to now
 CHAT_CHECK_SECONDS = 60
 GATE_HOLD = 75                      # start gate exit code: hold starts of this agent (EX_TEMPFAIL)
@@ -544,8 +546,31 @@ class AgentRunner:
             return self.adapter
         return got
 
-    def _fresh_env(self) -> dict[str, str]:
-        return self._apply_env(self._read_env())
+    def _fresh_env(self, task_id: str = "") -> dict[str, str]:
+        env = self._read_env()
+        route = self._task_route(task_id) if task_id else ""
+        return self._apply_env(env, route)
+
+    def _task_route(self, task_id: str) -> str:
+        """The alt harness one card selects with the label ``runner-harness:<h>``. Only a harness the
+        agent lists in ``task_route_harnesses`` AND configures under ``alt`` is honoured; the lane's
+        global route (env command, pins) is untouched for every other card. Unknown/unlisted -> ''."""
+        allowed = set(self.agent.task_route_harnesses) & set(self.alt_adapters)
+        if not allowed:
+            return ""
+        try:
+            task = self._task(task_id)
+        except MeshError:
+            return ""
+        for label in (task or {}).get("labels") or []:
+            name = str(label.get("name") if isinstance(label, dict) else label)
+            if name.startswith(TASK_ROUTE_PREFIX):
+                h = name[len(TASK_ROUTE_PREFIX):].strip()
+                if h in allowed:
+                    return h
+                log.warning("%s: #%s label %s ignored: harness not permitted for per-card routing",
+                            self.agent.name, task_id[:8], name[:40])
+        return ""
 
     def _read_env(self) -> dict[str, str]:
         """Read the session environment: env file, then the operator's env
@@ -583,10 +608,14 @@ class AgentRunner:
             return env, harness, None
         return env, harness, profile or getattr(target, "_base_profile", target.profile)   # not sticky
 
-    def _apply_env(self, env: dict[str, str]) -> dict[str, str]:
+    def _apply_env(self, env: dict[str, str], task_route: str = "") -> dict[str, str]:
         """Take a read env for the lane: the harness and profile it routes to are set on the shared adapter
         (quick; the slow part is ``_read_env``)."""
         env, harness, profile = self._route_env(env)
+        if task_route:
+            # per-card route: the permitted alt harness with its configured base profile, never the env's
+            harness = task_route
+            profile = getattr(self.adapter_for(harness), "_base_profile", self.adapter_for(harness).profile)
         self._routed_harness = harness
         target = self.adapter_for(harness)
         if hasattr(target, "profile"):
@@ -1129,7 +1158,7 @@ class AgentRunner:
 
     def _spawn(self, a: Attempt, prompt_text: str, resume: bool, expect: tuple[str, ...],
                first_prompt=None, before_spawn=None, env=None, prompt_is_complete=False) -> bool:
-        env = self._fresh_env() if env is None else env
+        env = self._fresh_env(a.task_id) if env is None else env
         if not self._launch_ready(a, env, expect):
             return False
         try:
@@ -1149,7 +1178,7 @@ class AgentRunner:
                             + " are aliases of them and are not available to you.\n")
         # ONE environment build per spawn: a resume prepares it before restoring
         # checkpoints, so a held profile never leases their worktrees prematurely.
-        env = self._fresh_env() if env is None else env
+        env = self._fresh_env(a.task_id) if env is None else env
         routed = self._routed_harness
         profile = auth.profile_id(env, self.agent.profile_dir) if routed == "claude" else ""
         blocked = self._auth_blocked(a, env)
@@ -1222,6 +1251,9 @@ class AgentRunner:
                 resume, prompt_text = False, first_prompt()
                 sid = str(uuid.uuid4()) if adapter.session_id_known_upfront else ""
                 argv = build_argv()
+        # Every launched prompt (first start, resume, no-session, retry) carries the freshly proven state of this
+        # attempt's scoped admission; a persisted retry prompt may hold a stale permissive copy, so drop it first.
+        prompt_text = git_index_admission.strip(prompt_text) + self._git_index_notice(a)
         scope = self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY)
         if (not workspaces and metadata_receipt(scope[0] if scope else None, a.id)
                 and not self.pool.leased_to(a.id)):
@@ -4224,6 +4256,126 @@ class AgentRunner:
         return ("\n[runner] Repository " + str(n.get('repo')) + " was added to this task; its leased workspace is "
                 + str(n.get('path')) + ". Existing workspaces are unchanged.")
 
+    def _git_index_request(self, request: dict) -> dict:
+        """Issue (or refuse) the one scoped Git-index receipt. The owning tick is the only issuer;
+        every refusal changes nothing, and nothing here touches a Git index."""
+        gi = git_index_admission
+
+        def no(status: str, reason: str = '') -> dict:
+            return gi.receipt(request, status, None, reason)
+
+        a = self.store.get(request['attempt'])
+        if (a is None or a.agent != self.agent.name or a.task_id != request['task']
+                or a.state not in OPEN):
+            return no('rejected_identity_or_state')
+        if request['actor'] != self.agent_id:
+            return no('rejected_actor')
+        if workspace_requests.generation(a) != request['generation']:
+            return no('rejected_wait_generation')
+        if self._maintenance_held(a):
+            return no('rejected_maintenance_hold')
+        cfg = self.cfg.git_index_admission
+        try:
+            policy = gi.load_policy(cfg)
+            revoked = gi.load_revocations(cfg)
+        except gi.Unverifiable as e:
+            # UNKNOWN ends a live grant of this attempt for good: a later readable file must not revive it.
+            held = gi.load_grant(self.store.mark(a.agent, a.task_id, gi.GRANT_KEY))
+            if held and held['attempt'] == a.id and held['state'] == 'granted':
+                held.update(state='ended', ended='unverifiable: ' + str(e)[:100])
+                self.store.mark(a.agent, a.task_id, gi.GRANT_KEY, json.dumps(held, sort_keys=True))
+            return no('rejected_unverifiable', str(e))
+        if request['policy'] != cfg.policy_sha256:
+            return no('rejected_policy_pin')
+        if bad := gi.mismatch(request, policy):
+            return no('rejected_' + bad)
+        if policy['revision'] in revoked or request['request_id'] in revoked:
+            return no('rejected_revoked')
+        now = int(time.time())
+        if bad := gi.window(policy, now):
+            return no('rejected_' + bad)
+        saved = gi.load_grant(self.store.mark(a.agent, a.task_id, gi.GRANT_KEY))
+        if request['expires'] <= now:
+            # An expired request is never answered with a scope, also on replay. If its own grant was written
+            # before the receipt (crash), that grant ends here: a new explicit request is required.
+            if saved and saved['request_id'] == request['request_id'] and saved['state'] == 'granted':
+                saved.update(state='ended', ended='request expired before its receipt')
+                self.store.mark(a.agent, a.task_id, gi.GRANT_KEY, json.dumps(saved, sort_keys=True))
+            return no('expired')
+        live = bool(saved and saved['attempt'] == a.id and saved['state'] == 'granted'
+                    and saved['policy'] == request['policy'])
+        if bad := self._git_index_state(a, policy['target_root']):
+            # Current state is proven for every answer, a replay included; a live grant that no longer
+            # holds ends here, so no receipt and no later prompt keeps reporting it.
+            if live:
+                saved.update(state='ended', ended=bad)
+                self.store.mark(a.agent, a.task_id, gi.GRANT_KEY, json.dumps(saved, sort_keys=True))
+            return no(bad)
+        if live:
+            # Replay after a crash, or a second request while this grant lives: same grant, same expiry.
+            same = saved['request_id'] == request['request_id']
+            if now < saved['expires']:
+                if not same:
+                    # An id answered with someone else's grant is used too: it can never issue its own later.
+                    gi.ensure(self.store)
+                    self.store.db.execute("INSERT OR IGNORE INTO git_index_requests(request_id, task, attempt, "
+                                          "issued) VALUES(?,?,?,?)", (request['request_id'], a.task_id, a.id, now))
+                return gi.receipt(request, 'granted' if same else 'already_granted', saved)
+            if same:
+                return no('expired')            # a replay never reports an already-expired scope as granted
+        gi.ensure(self.store)
+        if self.store.db.execute("SELECT 1 FROM git_index_requests WHERE request_id=?",
+                                 (request['request_id'],)).fetchone():
+            return no('expired')                # a request id issues at most once, forever: no replay renews it
+        grant = gi.new_grant(request, policy, now)
+        # Id first: a crash between the two writes leaves an id with no grant (refused on replay, fail
+        # closed), never a grant whose id is unrecorded and could be renewed after it expires.
+        self.store.db.execute("INSERT OR IGNORE INTO git_index_requests(request_id, task, attempt, issued) "
+                              "VALUES(?,?,?,?)", (request['request_id'], a.task_id, a.id, now))
+        self.store.mark(a.agent, a.task_id, gi.GRANT_KEY, json.dumps(grant, sort_keys=True))
+        self.store.event(a.id, 'git_index_admission_granted', request['request_id'])
+        return gi.receipt(request, 'granted', grant)
+
+    def _git_index_state(self, a: Attempt, target_root: str) -> str:
+        """'' only while ownership is fresh, no other attempt is open on the task and no lease overlaps the
+        target. One proof for issuing, replaying and delivering; Mesh errors are refusals (UNKNOWN)."""
+        try:
+            ours = self._still_ours(self._task(a.task_id), a.mode)
+        except MeshError:
+            return 'rejected_ownership_unknown'
+        if not ours:
+            return 'rejected_ownership'
+        if any(o.id != a.id for o in self.store.open_on_task(a.task_id)):
+            return 'rejected_conflicting_attempt'
+        def canon(path: str) -> str:
+            return os.path.realpath(str(path)).rstrip('/') + '/'      # `..` and symlink aliases resolve first
+        root = canon(target_root)
+        for r in self.pool.rows():
+            p = canon(r['path'])
+            if r['state'] == 'leased' and (p.startswith(root) or root.startswith(p)):
+                return 'rejected_foreign_lease'
+        return ''
+
+    def _git_index_notice(self, a: Attempt) -> str:
+        """Turn instructions for the grant of THIS attempt, re-proven on every delivery. After the
+        grant ends, every later delivery of the attempt says so; nothing permissive survives in the text."""
+        gi = git_index_admission
+        saved = self.store.mark(a.agent, a.task_id, gi.GRANT_KEY)
+        grant = gi.load_grant(saved)
+        if not grant or grant.get('attempt') != a.id:
+            return ''
+        if grant.get('state') == 'ended':
+            return gi.ended_instructions(grant, str(grant.get('ended') or 'ended'))
+        now = int(time.time())
+        why = gi.current_problem(grant, self.cfg.git_index_admission, a.id, now)
+        if not why:
+            why = self._git_index_state(a, grant['target_root']).replace('rejected_', '').replace('_', ' ')
+        if not why:
+            return gi.instructions(grant)
+        grant.update(state='ended', notified=True, ended=why)
+        self.store.mark(a.agent, a.task_id, gi.GRANT_KEY, json.dumps(grant, sort_keys=True))
+        return gi.ended_instructions(grant, why)
+
     def _maintenance_request(self, request: dict) -> dict:
         """Open or close the maintenance window of one exact waiting lease. Runs on the owning tick,
         the same serialization as admission, wake, suspend, capture, restore and free; the hold row is
@@ -5449,7 +5601,7 @@ class AgentRunner:
             self._suspend_held_ready(a)
             self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
             return                               # the gate keeps refusing this review: noticed, not retried
-        env = self._fresh_env()
+        env = self._fresh_env(a.task_id)
         if not self._launch_ready(a, env, ("ready",)):
             return
         reason, gate = self._gate("reserve", a.task_id, a.mode, a)
@@ -5478,7 +5630,7 @@ class AgentRunner:
             # Reserve may have selected an allowed account since the pre-gate
             # environment read. Launch/auth checks must use that fresh route.
             try:
-                env = self._fresh_env()
+                env = self._fresh_env(a.task_id)
             except (RuntimeError, OSError, subprocess.SubprocessError):
                 self._release_gate(a, "quota-route-environment-unavailable")
                 self._release_checkout(a)
@@ -5771,15 +5923,17 @@ class AgentRunner:
         if mode == "review":
             protocol = prompts.load_preamble(self.agent.review_prompt_file) if self.agent.review_prompt_file else ""
             changed = changed or {}
-            news = ""
+            news, fresh = "", []
             since = parse_time(changed.get("since"))
             if since:
-                news = prompts.new_comments_block(foreign_comments(comments, self.agent_id, since))
+                fresh = foreign_comments(comments, self.agent_id, since)
+                news = prompts.new_comments_block(fresh)
             return prompts.review_prompt(task, self.agent.name, paths, comments, self.preamble, protocol,
-                                         changed=changed.get("event", ""), news=news,
-                                         unreviewed_hours=changed.get("unreviewed_hours"))
+                                         changed=changed.get("event", ""), news=news, news_comments=fresh,
+                                         unreviewed_hours=changed.get("unreviewed_hours"),
+                                         harness=self._routed_harness)
         return prompts.start_prompt(task, self.agent.name, paths, comments, self.preamble,
-                                    merge=self.merge_enabled)
+                                    merge=self.merge_enabled, harness=self._routed_harness)
 
     def _own_hold_hours(self) -> float:
         own = self.agent.review_own_hold_hours
@@ -7133,7 +7287,7 @@ class AgentRunner:
                         json.dumps({"attempt": a.id, "scope":
                                     "metadata-only" if metadata_only(task, mode) else "workspace"}))
         try:
-            env = self._fresh_env()
+            env = self._fresh_env(a.task_id)
             if not self._launch_ready(a, env, ("starting",)):
                 return False
             if not self._acquire(a):
@@ -7468,6 +7622,7 @@ class AgentRunner:
             spool=native_result_rebind.SPOOL, check=native_result_rebind.validate)
         workspace_requests.consume(self.cfg.state_dir, self.agent.name, self._workspace_request)
         repo_admission.consume(self.cfg.state_dir, self.agent.name, self._repo_admission_request)
+        git_index_admission.consume(self.cfg.state_dir, self.agent.name, self._git_index_request)
         maintenance.consume(self.cfg.state_dir, self.agent.name, self._maintenance_request)
         self.deliver_mentions()
         room = self.cap() - self.store.active_count(self.agent.name)

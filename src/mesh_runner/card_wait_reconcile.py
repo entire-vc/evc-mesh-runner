@@ -85,46 +85,42 @@ def sole_dependency(rows: dict, task_id: str, target: str, *, allow_satisfied: b
 def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
     """An absent newer declaration grants no authority to ignore formal edges.
 
-    Do not pick an older marker. A known empty or fully satisfied dependency
-    set may use the ordinary observer, as may one fully known edge to the
-    current target. Unsupported or ambiguous unsatisfied edges preserve WAIT.
+    Do not pick an older marker. Valid informational links do not constrain
+    observation. A known empty or fully satisfied blocking set may use the
+    ordinary observer, as may one fully known block to the current target.
+    Unsupported or ambiguous edges preserve WAIT.
     """
     if (not isinstance(rows, dict) or not isinstance(rows.get('outgoing'), list)
             or rows.get('has_more') or rows.get('next')):
         return True
-    edges = rows['outgoing']
-    if not edges:
-        return False
-    # Satisfied formal edges no longer constrain the awaited event. Validate
-    # every edge before allowing the ordinary comment/card observer to decide.
+    # Validate even informational links before excluding them: malformed,
+    # foreign, unknown or duplicate rows must not weaken the guard.
+    edges = []
     seen = set()
     seen_semantic = set()
-    all_satisfied = True
-    for edge in edges:
+    for edge in rows['outgoing']:
         destination = edge.get("depends_on_task_id") if isinstance(edge, dict) else None
         if (not isinstance(destination, str)
+                or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', destination)
+                or destination == task_id or edge.get("task_id") != task_id
                 or not isinstance(edge.get("id"), str) or not edge["id"].strip()
-                or edge.get("condition_satisfied") is not True
-                or sole_dependency({"outgoing": [edge]}, task_id, destination[:8],
-                                   allow_satisfied=True) is None
+                or edge.get("dependency_type") not in ("blocks", "relates_to")
+                or edge.get("condition") != "task_done"
+                or type(edge.get("condition_satisfied")) is not bool
                 or edge["id"] in seen):
-            all_satisfied = False
-            break
+            return True
         semantic = (edge["task_id"], destination, edge["dependency_type"], edge["condition"])
         if semantic in seen_semantic:
-            all_satisfied = False
-            break
+            return True
         seen.add(edge["id"])
         seen_semantic.add(semantic)
-    if all_satisfied:
+        if edge["dependency_type"] == "blocks":
+            edges.append(edge)
+    # Satisfied formal edges no longer constrain the awaited event.
+    if all(edge["condition_satisfied"] for edge in edges):
         return False
-    if len(edges) != 1 or not isinstance(edges[0], dict):
-        return True
-    edge = edges[0]
-    if not isinstance(edge.get("id"), str) or not edge["id"].strip():
-        return True
-    if type(edge.get('condition_satisfied')) is not bool:
+    if len(edges) != 1:
         return True
     # The guard accepts a satisfied edge to the current target too; the normal
     # observer still decides whether that awaited event has actually occurred.
-    return sole_dependency(rows, task_id, target, allow_satisfied=True) is None
+    return sole_dependency({"outgoing": edges}, task_id, target, allow_satisfied=True) is None

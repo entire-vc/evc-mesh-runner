@@ -3,6 +3,18 @@
 
 ## Unreleased
 
+## 0.1.39
+
+- Add the narrow, policy-pinned `admit-git-index` admission (one closed operation, scoped receipt, per-delivery re-proof); see docs/git-index-admission.md.
+- Clarify implementation comments and docstrings without changing behavior or fixture bytes.
+- Add `requirements.lock` (hash-pinned, generated from the `receipt` extra) with a declaration/lock drift test and a CI scanner-coverage job.
+- Use synthetic identifiers in the admission test fixtures; binding and negative controls are kept.
+
+## 0.1.38
+
+- Package bounded initial, review and resume comment context for every routed provider, with comment IDs, truncation markers and authoritative fetch hints.
+- Preserve the 0.1.37 account-capacity admission and same-session quota recovery changes.
+
 ## 0.1.37
 
 - Keep provider quota within account admission; reject quota-driven task schedules and preserve same-session recovery.

@@ -29,6 +29,7 @@ from . import config as config_mod
 from . import maintenance
 from . import repo_admission
 from . import workspace_requests
+from . import git_index_admission
 from .native_result_ledger import identity as native_wait_identity
 from . import auth
 from .runner import AlreadyRunning, Runner
@@ -353,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
-    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "quarantine-list", "quarantine-restore", "pool", "suspend-wait-workspace", "admit-workspace-repo", "workspace-maintenance", "clear-auth-hold", "rearm-cap"])
+    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "quarantine-list", "quarantine-restore", "pool", "suspend-wait-workspace", "admit-workspace-repo", "admit-git-index", "workspace-maintenance", "clear-auth-hold", "rearm-cap"])
     p.add_argument("--config", required=True)
     p.add_argument("--path", help="slot path for free-slot / quarantine-list / quarantine-restore")
     p.add_argument("--run", help="quarantine-restore: quarantine run name (see quarantine-list)")
@@ -488,6 +489,25 @@ def main(argv: list[str] | None = None) -> int:
             result = maintenance.submit(cfg.state_dir, args.agent, args.action, args.task, args.attempt,
                 args.wait_generation, args.request_id, args.pool, args.slot, args.lease, args.ttl_seconds,
                 args.window or "")
+        except (ValueError, OSError):
+            print("request rejected (identity, deadline or private spool)", file=sys.stderr)
+            return 2
+        print(json.dumps(result, sort_keys=True))
+        return 0
+
+    if args.command == "admit-git-index":
+        # Request only: the owning Runner tick verifies the pinned policy and is the sole issuer.
+        cfg = config_mod.load(args.config)
+        if args.agent not in {a.name for a in cfg.agents}:
+            p.error("--agent must name a configured agent")
+        if not all((args.task, args.attempt, args.wait_generation, args.request_id)):
+            p.error("exact --task, --attempt, --wait-generation and --request-id required")
+        try:
+            result = git_index_admission.submit(cfg.state_dir, cfg.git_index_admission, args.agent, args.task,
+                                                args.attempt, args.wait_generation, args.request_id, args.ttl_seconds)
+        except git_index_admission.Unverifiable:
+            print("request rejected (reviewed policy is not verifiable)", file=sys.stderr)
+            return 2
         except (ValueError, OSError):
             print("request rejected (identity, deadline or private spool)", file=sys.stderr)
             return 2
