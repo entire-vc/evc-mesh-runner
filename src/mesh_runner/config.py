@@ -193,6 +193,7 @@ class AgentConfig:
     start_gate_command: list[str] = field(default_factory=list)  # before a start/resume: 0 go, 75 hold
     turn_end_command: list[str] = field(default_factory=list)    # after every turn, with the gate's output
     alt: dict = field(default_factory=dict)    # other harnesses the agent may be routed to: {"codex": {"profile", "args", "binary"}}
+    task_route_harnesses: list[str] = field(default_factory=list)  # alt harnesses a card may select by label runner-harness:<h>; empty = none
     chat: dict = field(default_factory=dict)   # standing interactive session: session, command, idle_command, max_age_hours
     launch_mode: str = ""              # "" inherits RunnerConfig.launch_mode; "interactive" or "headless"
     decision_wake: str = ""            # "" inherits RunnerConfig.decision_wake; "any" or "answer"
@@ -233,6 +234,27 @@ class CatalogWorkspace:
     home: Path = Path()
     catalog_dir: Path = Path()
     manifest: Path | None = None
+
+
+@dataclass
+class GitIndexAdmissionConfig:
+    """`[git_index_admission]`: reviewed pin of the one narrow Git-index admission policy
+    (git_index_admission.py). Absent = the operation is refused."""
+    policy: Path | None = None
+    policy_sha256: str = ""
+    revocations: Path | None = None
+
+
+def _git_index_admission(raw) -> "GitIndexAdmissionConfig | None":
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("[git_index_admission] must be a table")
+    pin = str(raw.get("policy_sha256", "")).lower()
+    policy, revocations = _path(raw.get("policy")), _path(raw.get("revocations"))
+    if not (policy and revocations and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)):
+        raise ConfigError("[git_index_admission] needs policy, a 64-hex policy_sha256 and revocations")
+    return GitIndexAdmissionConfig(policy=policy, policy_sha256=pin, revocations=revocations)
 
 
 @dataclass
@@ -487,6 +509,7 @@ class RunnerConfig:
     # (Claude Code resumes the main thread itself when one finishes); 0 = paste at once
     background_wait_minutes: float = 45.0
     catalog: CatalogConfig = field(default_factory=CatalogConfig)
+    git_index_admission: "GitIndexAdmissionConfig | None" = None
     mesh_basic_auth: str = field(default="", repr=False)   # "user:pass" for a Mesh behind HTTP basic auth
     # Mesh extension: the service endpoint (/healthz, /mesh/install, /mesh/events) and the extension
     # actor token that replaces basic auth + agent key. Off unless `[extension]` says so.
@@ -766,6 +789,7 @@ def load(path: str | Path) -> RunnerConfig:
             launch_mode=_launch_mode(a.get("launch_mode", ""), f"agent {a['name']}", allow_empty=True),
             decision_wake=_decision_wake(a.get("decision_wake", ""), f"agent {a['name']}", allow_empty=True),
             alt={str(k): dict(v) for k, v in (a.get("alt") or {}).items()},
+            task_route_harnesses=[str(h) for h in (a.get("task_route_harnesses") or [])],
             env_file=_path(a.get("env_file")),
             preamble_file=a.get("preamble_file", ""),
             paused=bool(a.get("paused", False)),
@@ -879,6 +903,7 @@ def load(path: str | Path) -> RunnerConfig:
         background_wait_minutes=_idle_hours(r.get("background_wait_minutes", 45.0), "background_wait_minutes"),
         mesh_basic_auth=_basic_auth(r),
         catalog=_catalog(raw.get("catalog"), _path(r.get("state_dir") or _default_state_dir())),
+        git_index_admission=_git_index_admission(raw.get("git_index_admission")),
         extension_enabled=ext.get("enabled", False) is True,
         extension_host=str(ext.get("host", "127.0.0.1")),
         extension_port=_positive(ext.get("port", 8787), "[extension] port", integer=True),
