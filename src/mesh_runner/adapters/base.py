@@ -55,6 +55,14 @@ _EXEC_ERRNOS = {getattr(errno, name) for name in (
     "EBADARCH", "EBADEXEC", "EBADMACHO", "ELIBBAD") if hasattr(errno, name)}
 
 
+class LaunchProbeDenied(Exception):
+    """The final launch observation refused native exec; no native child was started."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 class LaunchExecError(Exception):
     """The intended native exec failed before the program could accept input."""
 
@@ -187,6 +195,9 @@ class Adapter:
                     result = json.loads(result)
                 except ValueError:
                     raise RuntimeError('native-exec-handoff-unconfirmed') from None
+                if isinstance(result.get('launch_denied'), str):
+                    proc.wait(timeout=10)
+                    raise LaunchProbeDenied(result['launch_denied'][:48])
                 if result.get('errno') in _EXEC_ERRNOS:
                     proc.wait(timeout=10)
                     raise LaunchExecError(OSError(result['errno'], 'native-exec-denied'))

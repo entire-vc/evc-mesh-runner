@@ -18,6 +18,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mesh_runner.adapters.base import proc_stamp
+from mesh_runner import launch_probe
 from mesh_runner.interactive import read_delivery, write_delivery
 
 
@@ -44,6 +45,26 @@ def main(argv: list[str]) -> int:
     env = dict(os.environ)
     env.pop('_MESH_RUNNER_PROMPT_INTENT', None)
     env.pop('_MESH_RUNNER_PROMPT_SHA256', None)
+    helper = env.pop('_MESH_RUNNER_LAUNCH_PROBE', None)
+    expect = env.pop('_MESH_RUNNER_LAUNCH_EXPECT', '')
+    facts = {}
+    if helper:
+        # The exact native argv/env/cwd that the Popen below receives, after transport removal.
+        try:
+            spec = json.loads(helper)
+            obs = launch_probe.observe(spec['argv'], launch_probe.build_context(native, env, os.getcwd()),
+                                       version=spec['version'])
+        except (ValueError, TypeError, KeyError, OSError):
+            obs = launch_probe.unknown('invalid_request')
+        if not obs.available or (expect and obs.account_ref != expect):
+            reason = obs.reason if not obs.available else 'snapshot_identity_mismatch'
+            phase('launch-probe-denied', launch_status=obs.status, launch_reason=reason)
+            status(launch_denied=reason)
+            return 1               # no native child, no prompt consumed beyond the private pipe
+        facts = {'account_ref': obs.account_ref, 'quota_bucket': obs.quota_bucket,
+                 'launch_fingerprint': obs.fingerprint,
+                 'primary_used_percent': obs.primary_used_percent,
+                 'secondary_used_percent': obs.secondary_used_percent}
     with tempfile.TemporaryFile() as stdin:
         stdin.write(prompt)
         stdin.seek(0)
@@ -54,7 +75,7 @@ def main(argv: list[str]) -> int:
             phase('native-exec-error', errno=exc.errno)
             status(errno=exc.errno)
             return 1
-        phase('native-exec-confirmed', native_pid=proc.pid, native_stamp=proc_stamp(proc.pid))
+        phase('native-exec-confirmed', native_pid=proc.pid, native_stamp=proc_stamp(proc.pid), **facts)
         status(exec_confirmed=True)
         code = proc.wait()
     # Native stdout is inherited from the original Adapter log descriptor.

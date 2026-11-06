@@ -156,6 +156,12 @@ class Store:
             (agent, task_id, key, value, iso()))
         return cur.rowcount == 1
 
+    def add_mark(self, agent: str, task_id: str, key: str, value: str) -> bool:
+        """Create the mark only if it does not exist yet: True for the one caller that created it."""
+        return self.db.execute(
+            "INSERT INTO marks VALUES (?,?,?,?,?) ON CONFLICT(agent,task_id,key) DO NOTHING",
+            (agent, task_id, key, value, iso())).rowcount == 1
+
     def compare_mark(self, agent: str, task_id: str, key: str, expected: str, value: str) -> bool:
         """Fenced single-statement update; an old event cannot clear a newer hold."""
         return self.db.execute(

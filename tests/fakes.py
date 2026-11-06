@@ -84,7 +84,8 @@ class FakeMesh:
         self.runtime.pop(tid, None)
 
     def add_dependency(self, tid, dep):
-        e = {"id": f"edge-{len(self.edges) + 1}", "depends_on_task_id": dep, "dependency_type": "blocks"}
+        e = {"id": f"edge-{len(self.edges) + 1}", "task_id": tid, "depends_on_task_id": dep,
+             "dependency_type": "blocks", "condition": "task_done", "condition_satisfied": False}
         self.edges.setdefault(tid, []).append(e)
         return e
 
@@ -199,7 +200,10 @@ class FakeMesh:
         return [dict(link) for link in getattr(self, "links", {}).get(tid, [])]
 
     def dependencies(self, tid):
-        return {"outgoing": self.deps.get(tid, []), "incoming": []}
+        # edges the runner added through add_dependency are real rows in Mesh too
+        known = {e.get("id") for e in self.deps.get(tid, [])}
+        extra = [e for e in self.edges.get(tid, []) if e["id"] not in known]
+        return {"outgoing": list(self.deps.get(tid, [])) + extra, "incoming": []}
 
     def patch_task(self, tid, fields):
         if self.refuse_patch:

@@ -145,6 +145,7 @@ class ExtensionService:
         self.expected_secret, self.trust_first_install = expected_secret, trust_first_install
         self.server: ThreadingHTTPServer | None = None
         self.editor = None          # EditorBridge when [tgpeek_editor] is enabled; its routes are 404 otherwise
+        self.native_config = None   # separate native operator authority; default off
         self.controller = None      # EditorController when [tgpeek_editor_control] is configured: the only owner of ``editor``
 
     # ------------------------------------------------------------------ handlers; each returns (status, json)
@@ -263,9 +264,12 @@ class ExtensionService:
             def _operator(self, method: str) -> bool:
                 """``/operator/editor/*``: signed, loopback-only lifecycle of the editor bridge (see editor_control)."""
                 from .editor_control import PREFIX
-                if not self.path.startswith(PREFIX):
+                from .native_result_config import PREFIX as NATIVE_PREFIX, MAX_BODY as NATIVE_BODY
+                native = self.path.startswith(NATIVE_PREFIX)
+                if not native and not self.path.startswith(PREFIX):
                     return False
-                if svc.controller is None:
+                controller = svc.native_config if native else svc.controller
+                if controller is None:
                     self._send(403, {"error": "operator_control_disabled"})
                     return True
                 try:
@@ -273,12 +277,12 @@ class ExtensionService:
                 except ValueError:
                     self._send(400, {"error": "bad length"})
                     return True
-                if length < 0 or length > 4096:
+                if length < 0 or length > (NATIVE_BODY if native else 4096):
                     self._send(413, {"error": "body_too_large"})
                     return True
                 body = self.rfile.read(length) if method == "POST" else b""
                 try:
-                    res = svc.controller.handle(method, self.path, self.headers, body, self.client_address[0])
+                    res = controller.handle(method, self.path, self.headers, body, self.client_address[0])
                 except Exception as e:
                     log.warning("operator endpoint failed: %s", type(e).__name__)
                     res = (500, {"error": "internal"})

@@ -349,6 +349,9 @@ def main(argv: list[str] | None = None) -> int:
         return command(args_in[1:])
     if args_in and args_in[0] == "editor-control":
         return _editor_control(args_in[1:])
+    if args_in and args_in[0] == "native-result-config":
+        from .native_result_config import command
+        return command(args_in[1:])
     if args_in and args_in[0] == "native-rebind":
         from .native_result_rebind import command
         return command(args_in[1:])
