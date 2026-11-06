@@ -45,6 +45,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # observations = "~/runtime/quota-observations.json"    # quota-observations/v1; absent = pools unknown
     # harness_limits = "~/runtime/harness-limits.json"      # harness-limits/v1: usage limits lanes printed
     # thresholds = "~/runtime/thresholds.json"
+    # launch_bindings / launch_cache = actual-launch evidence files (built-in host defaults; one path for every workspace)
 
       [[catalog.workspace]]
       id = "<workspace uuid>"
@@ -80,7 +81,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import asks
+from . import asks, catalog_launch
 from .selection import Policy
 from .workspace import RepoSpec
 
@@ -192,6 +193,8 @@ class AgentConfig:
     on_auth_command: list[str] = field(default_factory=list)  # exact auth hold; exit 0 = routed, never clears hold
     start_gate_command: list[str] = field(default_factory=list)  # before a start/resume: 0 go, 75 hold
     turn_end_command: list[str] = field(default_factory=list)    # after every turn, with the gate's output
+    launch_probe_command: list[str] = field(default_factory=list)  # Codex launch-context probe helper (stdin protocol)
+    launch_probe_version: int = 1                                  # 2 = opt-in: reply also carries used percents
     alt: dict = field(default_factory=dict)    # other harnesses the agent may be routed to: {"codex": {"profile", "args", "binary"}}
     task_route_harnesses: list[str] = field(default_factory=list)  # alt harnesses a card may select by label runner-harness:<h>; empty = none
     chat: dict = field(default_factory=dict)   # standing interactive session: session, command, idle_command, max_age_hours
@@ -267,6 +270,8 @@ class CatalogConfig:
     observations: Path | None = None
     harness_limits: Path | None = None
     thresholds: Path | None = None
+    launch_bindings: Path | None = None
+    launch_cache: Path | None = None
     workspaces: tuple = ()
 
 
@@ -308,6 +313,8 @@ def _catalog(raw, state_dir: Path) -> CatalogConfig:
         interval_seconds=_positive(c.get("interval_seconds", 120), "[catalog] interval_seconds"),
         manifest=_path(c["manifest"]), observations=_path(c.get("observations")),
         harness_limits=_path(c.get("harness_limits")), thresholds=_path(c.get("thresholds")),
+        launch_bindings=_path(c.get("launch_bindings")) or _path(catalog_launch.DEFAULT_BINDINGS),
+        launch_cache=_path(c.get("launch_cache")) or _path(catalog_launch.DEFAULT_CACHE),
         workspaces=tuple(spaces))
 
 
@@ -555,6 +562,11 @@ class RunnerConfig:
     # Placeholders: {target} {project} {iid} {sha}. Empty = merge waits are rejected.
     merge_command: tuple = ()
     merge_command_cwd: Path | None = None
+    native_result_adoption: dict | None = field(default=None, repr=False)
+    # Receipt/CAS metadata, not semantic config: byte-only changes and the
+    # explicitly admitted repo delta must not become repo-admission drift.
+    native_config_preimage: str = field(default="", compare=False, repr=False)
+    native_config_unrelated: str = field(default="", compare=False, repr=False)
     native_result_dir: Path | None = None  # opt-in; private enrolled outbox
     native_result_channels_dir: Path | None = None  # authenticated observer channels
     reviewer_select_command: tuple = ()      # router adapter for `reviewer-merge`: JSON {lane, reason, username}
@@ -571,6 +583,12 @@ class RunnerConfig:
 
 
 LAUNCH_MODES = ("interactive", "headless")
+
+
+def _probe_version(value, name: str) -> int:
+    if type(value) is not int or value not in (1, 2):
+        raise ValueError(f"agent {name}: launch_probe_version must be 1 or 2")
+    return value
 
 
 def _launch_mode(value, where: str, allow_empty: bool = False) -> str:
@@ -696,7 +714,16 @@ def _gitlab_username(value, agent: str) -> str | None:
 
 
 def load(path: str | Path) -> RunnerConfig:
-    raw = tomllib.loads(Path(path).read_text())
+    from .native_result_config import sha, unrelated
+    source_raw = Path(path).read_bytes()
+    raw = tomllib.loads(source_raw.decode())
+    native_pin = raw.get("native_result_adoption")
+    if native_pin is not None:
+        if (not isinstance(native_pin, dict) or set(native_pin) != {"policy", "policy_sha256", "revocations"}
+                or any(not isinstance(native_pin[k], str) for k in native_pin)
+                or not re.fullmatch(r"[0-9a-f]{64}", native_pin["policy_sha256"])
+                or any(not Path(native_pin[k]).is_absolute() for k in ("policy", "revocations"))):
+            raise ConfigError("invalid [native_result_adoption] policy pin")
     r = raw.get("runner") or {}
     import math
     floor = float(r.get("min_free_gb", 0.0))
@@ -785,6 +812,8 @@ def load(path: str | Path) -> RunnerConfig:
             on_auth_command=list(a.get("on_auth_command") or []),
             start_gate_command=list(a.get("start_gate_command") or []),
             turn_end_command=list(a.get("turn_end_command") or []),
+            launch_probe_command=list(a.get("launch_probe_command") or []),
+            launch_probe_version=_probe_version(a.get("launch_probe_version", 1), a["name"]),
             chat=dict(a.get("chat") or {}),
             launch_mode=_launch_mode(a.get("launch_mode", ""), f"agent {a['name']}", allow_empty=True),
             decision_wake=_decision_wake(a.get("decision_wake", ""), f"agent {a['name']}", allow_empty=True),
@@ -928,6 +957,9 @@ def load(path: str | Path) -> RunnerConfig:
                                                                     "unanswerable_users", ())),
         merge_command=_merge_command(r.get("merge_command")),
         merge_command_cwd=_path(r.get("merge_command_cwd")),
+        native_result_adoption=native_pin,
+        native_config_preimage=sha(source_raw),
+        native_config_unrelated=unrelated(source_raw),
         native_result_dir=_path(r.get("native_result_dir")),
         native_result_channels_dir=_path(r.get("native_result_channels_dir")),
         reviewer_select_command=_reviewer_select_command(r.get("reviewer_select_command")),

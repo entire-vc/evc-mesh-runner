@@ -489,6 +489,23 @@ Optional hooks per agent:
   model/effort overrides are preserved for restoration and do not override the
   alternate harness profile.
 
+- `launch_probe_command = ["/abs/codex_launch_probe.py"]` (headless Codex only) connects account
+  capacity to the real launch. The runner sends ONE JSON (<= 131072 bytes, then EOF) through a private
+  anonymous pipe: `{version:1, nonce, context:{executable, argv, codex_home, cwd, profile, env}}`;
+  nothing goes through arguments, logs or the store. The helper answers one line
+  `{version, nonce, status, reason, account_ref, quota_bucket, observed_at, cleanup_ok}` with
+  `status` in `available|quota_blocked|account_unknown` (<= 8 s shared deadline, bounded group
+  cleanup). Early, once per candidate after the env command and route selection, the opaque result
+  reaches the start gate as `MESH_RUNNER_LAUNCH_*` in `reserve`/`admit`; it is evidence, never a grant.
+  The final observation runs inside the spawn supervisor on the exact argv/env/cwd handed to the native
+  `Popen` (transport variables removed) and refuses exec on any non-`available`, unclean or
+  identity-changed answer; the attempt stays `ready` with the same session and a local retry hold.
+
+- `launch_probe_version = 2` (opt-in; default 1) sends `version: 2` and requires the reply to also carry
+  `primary_used_percent` / `secondary_used_percent` (int 0..100 or null; unknown carries both null; never a
+  synthesized 0). Both reach the gate as `MESH_RUNNER_LAUNCH_{PRIMARY,SECONDARY}_USED_PERCENT` (empty = null).
+  Percents are evidence, not admission authority.
+
 - `start_gate_command = ["..."]` is the operator's admission control (routing,
   capacity reservations). It runs in phases, `MESH_RUNNER_PHASE` =
   `reserve` (before a session starts or resumes), `admit` (the Mesh checkout is

@@ -132,3 +132,40 @@ def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
     # The guard accepts a satisfied edge to the current target too; the normal
     # observer still decides whether that awaited event has actually occurred.
     return sole_dependency({"outgoing": edges}, task_id, target, allow_satisfied=True) is None
+
+
+def removed_wait_edge(rows: dict, wait: dict, task_id: str) -> str | None:
+    """The blocking edge this exact WAIT created, if Mesh now provably lacks it.
+
+    Fails closed (None) on an unreadable/paginated edge set, on any row that is
+    not fully well-formed for this task, and while any other blocking edge is
+    not known satisfied: a deleted link releases only its own wait, never a
+    real remaining blocker. Deletion is not approval and not completion of the
+    target; the owner re-decides the next step.
+    """
+    edge_id = wait.get("edge")
+    if not isinstance(edge_id, str) or not edge_id:
+        return None
+    if (not isinstance(rows, dict) or not isinstance(rows.get("outgoing"), list)
+            or rows.get("has_more") or rows.get("next")):
+        return None
+    seen = set()
+    for edge in rows["outgoing"]:
+        if not isinstance(edge, dict):
+            return None
+        destination = edge.get("depends_on_task_id")
+        if (not isinstance(edge.get("id"), str) or not edge["id"].strip() or edge["id"] in seen
+                or edge.get("task_id") != task_id
+                or not isinstance(destination, str)
+                or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', destination)
+                or destination == task_id
+                or edge.get("dependency_type") not in ("blocks", "relates_to")
+                or edge.get("condition") not in _DEPENDENCY_CONDITIONS
+                or type(edge.get("condition_satisfied")) is not bool):
+            return None
+        seen.add(edge["id"])
+        if edge["id"] == edge_id:
+            return None
+        if edge["dependency_type"] == "blocks" and not edge["condition_satisfied"]:
+            return None
+    return edge_id

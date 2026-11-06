@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-from . import RUNNER_NAME, __version__
+from . import RUNNER_NAME, __version__, catalog_launch
 
 log = logging.getLogger("mesh_runner")
 
@@ -448,16 +448,24 @@ class PoolObserver:
     """Pool observations from the host's quota and harness-limit files. Never raises: any failure of
     one pool makes that pool unknown. Without an observations file every pool is unknown."""
 
-    def __init__(self, observations=None, harness_limits=None, thresholds=None, max_age=EVIDENCE_MAX_AGE):
+    def __init__(self, observations=None, harness_limits=None, thresholds=None, max_age=EVIDENCE_MAX_AGE,
+                 launch_bindings=None, launch_cache=None):
         self.observations = observations
+        self.launch_bindings = launch_bindings      # None: actual-launch evidence is not consulted
+        self.launch_cache = launch_cache
         self.harness_limits = harness_limits
         self.cfg = thresholds if thresholds is not None else load_thresholds(None)
         self.max_age = max_age
 
-    def observe(self, pool_refs, now: float, prior: dict | None = None) -> dict:
+    def observe(self, pool_refs, now: float, prior: dict | None = None, catalog: dict | None = None) -> dict:
         prior = prior or {}
         floor = now - OBSERVATION_SKEW
         records = _schema_records(self.observations, QUOTA_SCHEMA)
+        if self.launch_bindings and self.launch_cache and catalog:
+            # enrolled accounts take ONLY actual-launch evidence (missing/stale/revoked = unknown)
+            launch, overridden = catalog_launch.launch_records(catalog, now, self.launch_bindings,
+                                                               self.launch_cache, self.max_age)
+            records = [r for r in records if r.get("account_ref") not in overridden] + launch
         limits = active_limits(self.harness_limits, now) if self.harness_limits else {}
         out = {}
         for ref in sorted(pool_refs):
@@ -720,7 +728,7 @@ class WorkspaceController:
                     profiles[profile_ref] = {"model": acct["model"], "model_developer": acct["model_developer"],
                                              "model_family": acct["model_family"], "observed_at": stamp}
             prior = (read_json(self.home / "pools.json") or {}).get("pools") or {}
-            local = self.observer.observe(wanted, now, prior)
+            local = self.observer.observe(wanted, now, prior, manifest)
         return capabilities, local, profiles
 
     def tick(self, now: float) -> dict:
@@ -788,7 +796,7 @@ def build_controllers(cfg) -> list[WorkspaceController]:
             workspace_id=ws.workspace_id,
             client=ControllerClient(cfg.mesh_url, ws.workspace_id, ws.reporter_key, basic_auth=cfg.mesh_basic_auth),
             manifest_path=manifest, home=ws.home, catalog_dir=ws.catalog_dir,
-            observer=PoolObserver(c.observations, c.harness_limits, thresholds, age),
+            observer=PoolObserver(c.observations, c.harness_limits, thresholds, age, c.launch_bindings, c.launch_cache),
             controller_ref=c.controller_ref))
     return out
 

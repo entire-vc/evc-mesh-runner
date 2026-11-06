@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from mesh_runner import config as config_mod
 from mesh_runner import repo_admission as admission
 from mesh_runner import workspace_requests as requests
 from mesh_runner.workspace import RepoSpec
@@ -14,7 +15,7 @@ from test_runner import Bench, make_repo
 from test_workspace_requests import WorkspaceRequests as _Fixture
 
 
-class RepoAdmission(Bench):
+class AdmissionFixture(Bench):
     parked = _Fixture.parked
 
     def setUp(self):
@@ -41,6 +42,8 @@ class RepoAdmission(Bench):
             sub['request']['request_id'] + '.receipt.json')
         return sub, json.loads(path.read_text())['status'] if path.exists() else None
 
+
+class RepoAdmission(AdmissionFixture):
     def test_new_repo_attached_existing_preserved(self):
         r, (a,) = self.parked()
         before = list(r.store.get(a.id).workspaces)
@@ -185,3 +188,173 @@ class RepoAdmission(Bench):
         _, status = self.ask(r, a)
         self.assertEqual(status, 'rejected_pool_full')
         self.assertNotIn('bob', r.pool.repos)
+
+
+class RealConfigFixture(AdmissionFixture):
+    """Runner config comes from a real TOML read by the shipped loader: the first runner, the
+    restarted runner and the admission's fresh read all use it. Nothing replaces the loader."""
+
+    def setUp(self):
+        super().setUp()
+        key = self.root / 'agent.key'
+        key.write_text('k')
+        key.chmod(0o600)
+        self.key = key
+        self.toml = self.root / 'runner.toml'
+        self.write_toml()
+        self.reload()
+
+    def write_toml(self, extra=False, profile_dir=None):
+        a = self.agent
+        repos = [(r.name, r.base, r.max_slots) for r in a.repos if r.name != self.extra.name]
+        if extra:
+            repos.append((self.extra.name, self.extra.base, self.extra.max_slots))
+        text = (f'[runner]\nmesh_url = "http://mesh"\nstate_dir = "{self.cfg.state_dir}"\n'
+                'wake_poll_seconds = 0\nheartbeat_seconds = 0\nload_hold_per_cpu = 0\n\n'
+                f'[[agents]]\nname = "{a.name}"\nkey_file = "{self.key}"\nharness = "claude"\n'
+                f'profile_dir = "{profile_dir or a.profile_dir}"\n'
+                f'\n[agents.env]\nFAKE_REPLIES = "{self.replies}"\nFAKE_CALLS = "{self.calls}"\n')
+        for name, base, slots in repos:
+            text += f'\n[[agents.repos]]\nname = "{name}"\nbase = "{base}"\nmax_slots = {slots}\n'
+        self.toml.write_text(text)
+
+    def reload(self):
+        """What a (re)started runner does: load the file with the shipped loader."""
+        self.cfg = config_mod.load(self.toml)
+        self.agent = self.cfg.agents[0]
+        self.assertEqual(self.cfg.source, self.toml)
+
+    def fresh(self, **agent_changes):
+        self.write_toml(extra=True, **agent_changes)
+
+    def ask(self, r, a, fresh=True, spec=None, **changes):
+        if fresh is True:
+            self.write_toml(extra=True)             # the additive repo, as an operator would add it
+        values = dict(state=self.cfg.state_dir, agent=a.agent, task=a.task_id, attempt=a.id,
+                      token=requests.generation(a), request_id=str(uuid.uuid4()),
+                      repo=spec or self.extra, ttl=300)
+        values.update(changes)
+        sub = admission.submit(**values)
+        r.tick()
+        path = requests.directory(self.cfg.state_dir, a.agent, admission.SPOOL) / (
+            sub['request']['request_id'] + '.receipt.json')
+        return sub, json.loads(path.read_text())['status'] if path.exists() else None
+
+
+class ActiveJournalAdmission(RealConfigFixture):
+    """Waiting attempt after a real suspend -> restore -> resume: the journal rows stay `active`."""
+
+    def restored(self):
+        r, (a,) = self.parked()
+        (Path(r.store.get(a.id).workspaces[0]) / 'README').write_text('edit')
+        meta = {'session_id': 's', 'harness': 'claude', 'cwd': '', 'workspaces': [], 'wait': {}}
+        r.pool.suspend(a.id, meta, writer_stopped=True)
+        paths, _ = r.pool.restore(a.id, expected_repos={'app'})
+        r.store.update(r.store.get(a.id), workspaces=paths)
+        r.store.db.execute("UPDATE workspace_checkpoints SET phase='active' WHERE owner=? AND attempt=?",
+                           (r.pool.owner, a.id))
+        return r, a, meta
+
+    def rows(self, r, a):
+        return {x['repo']: (x['phase'], x['target']) for x in r.pool._checkpoint_rows(a.id)}
+
+    def test_active_journal_admits_and_preserves_journal_edits_and_session(self):
+        r, a, meta = self.restored()
+        before = self.rows(r, a)
+        got = r.store.get(a.id)
+        sid, old = got.session_id, list(got.workspaces)
+        self.assertEqual(self.ask(r, a)[1], 'admitted')
+        got = r.store.get(a.id)
+        self.assertEqual((got.session_id, got.workspaces[:1], len(got.workspaces)), (sid, old, 2))
+        self.assertEqual(self.rows(r, a), before)                       # journal untouched
+        self.assertEqual((Path(old[0]) / 'README').read_text(), 'edit')
+        self.assertEqual(len(r.pool.leased_to(a.id)), 2)
+        # idempotent: a new request adds no lease and no row
+        self.assertEqual(self.ask(r, a)[1], 'admitted')
+        self.assertEqual((len(r.pool.leased_to(a.id)), self.rows(r, a)), (2, before))
+        # expanded inventory survives resuspend/restore
+        r.pool.suspend(a.id, meta, writer_stopped=True)
+        self.assertEqual(sorted(self.rows(r, a)), ['app', 'bob'])
+        self.assertEqual(r.pool.leased_to(a.id), [])
+        paths, _ = r.pool.restore(a.id, expected_repos={'app', 'bob'})
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(Path(paths[0] if 'bob' not in paths[0] else paths[1]).joinpath('README').read_text(), 'edit')
+
+    def test_crash_after_lease_is_adopted_with_active_journal(self):
+        r, a, _ = self.restored()
+        before = self.rows(r, a)
+        with patch.object(r.store, 'update_with_marks', side_effect=RuntimeError('crash')):
+            self.assertEqual(self.ask(r, a)[1], 'failed_preserved')
+        self.assertEqual(len(r.pool.leased_to(a.id)), 2)
+        self.assertEqual(self.ask(r, a)[1], 'admitted')
+        self.assertEqual((len(r.pool.leased_to(a.id)), self.rows(r, a)), (2, before))
+
+    def test_runner_restart_after_crash_adopts_lease_and_keeps_journal(self):
+        # The crash is injected at the commit point (the only seam between lease and inventory
+        # update); the recovery path is a real new runner over the same sqlite state.
+        r, a, meta = self.restored()
+        before = self.rows(r, a)
+        old = list(r.store.get(a.id).workspaces)
+        with patch.object(r.store, 'update_with_marks', side_effect=RuntimeError('crash')):
+            self.assertEqual(self.ask(r, a)[1], 'failed_preserved')
+        self.reload()                                   # process restart: the loader reads the file again
+        restarted = self.runner(r.mesh)
+        restarted.refresh_me()
+        self.assertEqual(self.ask(restarted, a)[1], 'admitted')
+        got = restarted.store.get(a.id)
+        self.assertEqual((got.workspaces[:1], len(got.workspaces)), (old, 2))
+        self.assertEqual((len(restarted.pool.leased_to(a.id)), self.rows(restarted, a)), (2, before))
+        self.assertEqual((Path(old[0]) / 'README').read_text(), 'edit')
+        # restart again, then resuspend/restore the expanded inventory
+        self.reload()                                   # now the expanded file is the boot config
+        again = self.runner(r.mesh)
+        again.refresh_me()
+        again.pool.suspend(a.id, meta, writer_stopped=True)
+        paths, _ = again.pool.restore(a.id, expected_repos={'app', 'bob'})
+        self.assertEqual(len(paths), 2)
+
+    def refused_with(self, sql, *args):
+        r, a, _ = self.restored()
+        r.store.db.execute(sql, (*args, r.pool.owner, a.id))
+        self.assertEqual(self.ask(r, a)[1], 'rejected_checkpointed')
+        self.assertEqual(len(r.pool.leased_to(a.id)), 1)
+        self.assertNotIn('bob', r.pool.repos)
+
+    def test_non_active_phases_refused(self):
+        self.refused_with("UPDATE workspace_checkpoints SET phase='released' WHERE owner=? AND attempt=?")
+
+    def test_restoring_phase_refused(self):
+        self.refused_with("UPDATE workspace_checkpoints SET phase='restoring' WHERE owner=? AND attempt=?")
+
+    def test_verified_phase_refused(self):
+        self.refused_with("UPDATE workspace_checkpoints SET phase='verified' WHERE owner=? AND attempt=?")
+
+    def test_restored_phase_refused(self):
+        self.refused_with("UPDATE workspace_checkpoints SET phase='restored' WHERE owner=? AND attempt=?")
+
+    def test_journal_target_not_live_lease_refused(self):
+        self.refused_with("UPDATE workspace_checkpoints SET target='/elsewhere' WHERE owner=? AND attempt=?")
+
+    def test_journal_naming_requested_repo_refused(self):
+        self.refused_with("UPDATE workspace_checkpoints SET repo='bob' WHERE owner=? AND attempt=?")
+
+    def test_foreign_lease_with_active_journal_refused(self):
+        r, a, _ = self.restored()
+        r.pool._set(Path(self.root / 'stray'), 'app', 'leased', a.id)
+        self.assertEqual(self.ask(r, a)[1], 'rejected_foreign_lease')    # fail closed by the lease check
+
+    def test_active_writer_with_active_journal_refused(self):
+        r, a, _ = self.restored()
+        r.store.update(r.store.get(a.id), pid=1)
+        try:
+            with patch('mesh_runner.runner.group_alive', return_value=True):
+                self.assertEqual(self.ask(r, a)[1], 'rejected_active_writer')
+        finally:
+            # The planted pid is fictitious: teardown's _kill would killpg(1) in CI.
+            r.store.update(r.store.get(a.id), pid=0)
+
+    def test_config_drift_and_stale_generation_with_active_journal_refused(self):
+        r, a, _ = self.restored()
+        self.fresh(profile_dir=Path('/elsewhere'))
+        self.assertEqual(self.ask(r, a, fresh=False)[1], 'rejected_config')
+        self.assertEqual(self.ask(r, a, token='0' * 64)[1], 'rejected_wait_generation')
