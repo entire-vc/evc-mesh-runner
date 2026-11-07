@@ -77,10 +77,12 @@ from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
 from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, QUEUE_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
-from .selection import CLOSED, StatusCategories, blocking_tasks, order, parse_time, static_skip_reason
+from . import gate_owner
+from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, blocking_tasks, order,
+                        parse_time, static_skip_reason)
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from . import observation_budget
-from .wake import (GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
+from .wake import (_read_pinned, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign, target_jobs_state, UnknownJobs)
@@ -774,6 +776,55 @@ class AgentRunner:
             return False
         assignee = task.get("assignee_id") or (task.get("assignee") or {}).get("id")
         return assignee == self.agent_id and self.cats.category(task) in (REVIEWING if mode == "review" else WORKING)
+
+    def _gate_decision_for(self, task: dict | None, consume: bool = False, attempt_id: str = "") -> str:
+        """Decision comment id that admits THIS agent to one bounded turn on a gated card
+        (see gate_owner.py), else "". Looked up on the full task (the feed carries no
+        human_gate_info) and cached briefly; ``consume`` re-reads and claims the id for
+        ``attempt_id``. A claim is SPENT only once that attempt really ran a turn: a start that
+        aborted before launch (workspace full, gate hold, crash) leaves the answer claimable,
+        so one decision admits exactly one real turn and is never lost to a failed start."""
+        if not task or not task.get("human_gate") or not self.agent.policy.human_gate:
+            return ""
+        tid = task.get("id") or ""
+        cache = self.__dict__.setdefault("_gate_decision_cache", {})
+        hit = cache.get(tid)
+        if not consume and hit and time.monotonic() - hit[0] < 60:
+            did = hit[1]
+        else:
+            try:
+                did = gate_owner.pending_decision(self._task(tid), self.agent_id)
+            except MeshError:
+                did = ""
+            cache[tid] = (time.monotonic(), did)
+        if not did:
+            return ""
+        done = self.store.mark(self.agent.name, tid, gate_owner.MARK)
+        if done:
+            claimed, _, rest = done[0].partition("|")
+            att, _, base = rest.partition("|")
+            if claimed == did and self._launched_since(att, base):
+                return ""                  # this decision already had its turn
+            if consume and claimed == did and att == attempt_id:
+                return did                 # our own earlier claim, deferred before launch: still ours
+        if consume and not self.store.claim(self.agent.name, tid, gate_owner.MARK,
+                                            f"{did}|{attempt_id}|{self._turns_of(attempt_id)}"):
+            return ""                      # lost the claim race
+        return did
+
+    def _turns_of(self, attempt_id: str) -> int:
+        try:
+            att = self.store.get(attempt_id) if attempt_id else None
+        except Exception:
+            return 0
+        return int(att.turns) if att else 0
+
+    def _launched_since(self, attempt_id: str, base: str) -> bool:
+        """The claiming attempt launched a turn AFTER it claimed (turns above the count at claim time)."""
+        try:
+            return bool(attempt_id) and self._turns_of(attempt_id) > int(base or 0)
+        except ValueError:
+            return False
 
     def _record_launch(self, a: Attempt, resume: bool) -> None:
         """Attribution event for every launched turn (``a`` already carries this turn's count): the actual intent, the restart reason (a
@@ -3437,12 +3488,39 @@ class AgentRunner:
         if event:
             return f"{event} since the last session"
         if parked and wait.get("kind") == "card" and wait.get("target") and not wait.get("settled"):
+            pin = str(wait.get("target_id") or "")
+            waited = None
             try:
-                waited = self.mesh.task_by_short(str(wait["target"]))
+                if pin:
+                    # the pin fixes identity: read that card by its full id (this grant, then the
+                    # other readers of this process); the short ref is never consulted again
+                    waited = _read_pinned(self.mesh, pin)
+                else:
+                    short = str(wait["target"])
+                    by_short = lambda r: r.mesh.task_by_short(short)       # noqa: E731
+                    try:
+                        waited = self.mesh.task_by_short(short)
+                    except MeshError as e:
+                        if e.status != 403:
+                            raise
+                        waited = None
+                        denied = True
+                    else:
+                        denied = False
+                    if denied:             # another workspace: a reader of this process with a grant
+                        waited = _read_unique_elsewhere(f"s:{short}", self.mesh, by_short)
+                    elif isinstance(waited, dict):
+                        own_id = str(waited.get("task", waited).get("id") or "")
+                        if own_id:             # the short ref must not collide across tenants
+                            waited = (None if _read_unique_elsewhere(f"s:{short}", self.mesh, by_short,
+                                                                     known_id=own_id) is AMBIGUOUS else waited)
+                    if waited is AMBIGUOUS:
+                        waited = None
             except MeshError:
                 waited = None
             if isinstance(waited, dict):
                 waited = waited.get("task", waited)
+            if isinstance(waited, dict) and waited:
                 cat = self.cats.category(waited)
                 closed = parse_time(waited.get("completed_at") or waited.get("updated_at"))
                 if cat in CLOSED and closed is not None and closed > since:
@@ -3796,7 +3874,8 @@ class AgentRunner:
                     resolution = self._recover_headless_prompt(a, intent)
                 else:
                     resolution = delivery_recovery.recover(
-                        interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent, self.agent.name, self._tmux)
+                        interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent, self.agent.name, self._tmux,
+                        self.store.other_sessions(a.id))
             except (OSError, ValueError, KeyError, TypeError):
                 resolution = "native-evidence-unreadable"
             if resolution == "unsent":
@@ -5870,6 +5949,16 @@ class AgentRunner:
     def _resume_one(self, a: Attempt) -> None:
         if self._maintenance_held(a):
             return
+        # One answer admits ONE resume: the decision id is claimed the first time a gate
+        # check of this resume needs it, and both checks below share that single answer.
+        gate_admitted: list[str] = []
+
+        def gate_held(t: dict | None) -> bool:
+            if not (self.agent.policy.human_gate and t and t.get("human_gate")):
+                return False
+            if not gate_admitted:
+                gate_admitted.append(self._gate_decision_for(t, consume=True, attempt_id=a.id))
+            return not gate_admitted[0]
         task = self._task(a.task_id)
         if not self._still_ours(task, a.mode):
             self._note_ownership_loss(a, task)
@@ -5882,6 +5971,8 @@ class AgentRunner:
             if (task.get("checked_out_by") == self.agent_id
                     and task.get("checkout_session_id") == a.id and a.checkout.get("token")):
                 plain["checked_out_by"] = None
+            if gate_held(plain) is False and plain.get("human_gate") and self.agent.policy.human_gate:
+                plain["_gate_decision"] = gate_admitted[0]   # the answer's one turn, shared below
             reason = static_skip_reason(plain, self.agent.policy, now())
             if reason:
                 self._release_gate(a, "quota-wait-policy-held")
@@ -5893,7 +5984,7 @@ class AgentRunner:
         scope = self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY)
         prior_scope = recorded_scope(scope[0] if scope else None, a.id)
         was_metadata = prior_scope == "metadata-only"
-        if prior_scope and self.agent.policy.human_gate and task.get("human_gate"):
+        if prior_scope and gate_held(task):
             self._release_gate(a, "human-held")
             self._release_checkout(a)
             self._suspend_held_ready(a)
@@ -5975,7 +6066,7 @@ class AgentRunner:
                     self._note_ownership_loss(a, task)
                     self._finish(a, "completed", "task left the agent before resuming")
                     return
-                if self.agent.policy.human_gate and task.get("human_gate"):
+                if gate_held(task):
                     self._release_gate(a, "human-held")
                     self._release_checkout(a)
                     self._suspend_held_ready(a)
@@ -7522,6 +7613,10 @@ class AgentRunner:
             work += [t for t in feed[cat] if t.get("id") not in held]
         out += [dict(t, _mode="work") for t in self._work_order(work)]
         for task in out:
+            if task.get("human_gate") and task.get("_mode") == "work":
+                did = self._gate_decision_for(task)
+                if did:
+                    task["_gate_decision"] = did
             self._gate_event(task)
         mine = {tid for tid in held | {t.get("id") for t in out} if tid}
         self.owners.replace_for(self.agent.name, mine)   # Mesh events name a task; this says whose it is
@@ -7724,7 +7819,8 @@ class AgentRunner:
             if not self._still_ours(task, mode):
                 self._finish(a, "completed", "task left the agent before starting")
                 return False
-            if self.agent.policy.human_gate and task.get("human_gate"):
+            if (self.agent.policy.human_gate and task.get("human_gate")
+                    and not self._gate_decision_for(task, consume=True, attempt_id=a.id)):
                 self._finish(a, "aborted", "waiting for a human decision")
                 return False
             no_workspace = metadata_only(task, mode)

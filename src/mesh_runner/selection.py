@@ -44,10 +44,18 @@ def static_skip_reason(task: dict, policy: Policy, now: dt.datetime) -> str:
     for label in labels:
         if label in policy.skip_labels or label.startswith(policy.skip_label_prefixes):
             return f"label {label}"
-    if policy.human_gate and task.get("human_gate"):
+    if policy.human_gate and task.get("human_gate") and not task.get("_gate_decision"):
+        # `_gate_decision` is set only by the runner after Mesh itself reported that the
+        # ask's addressee answered and THIS agent owns the live ask (gate_owner.py); it
+        # admits one bounded turn and never lifts the gate.
         return "waiting for a human decision"
     start_after = parse_time(task.get("start_after"))
-    if start_after and start_after > now:
+    # The same admitted gate-owner answer also passes a future start_after: Mesh reports
+    # that delivery for a scheduled card (comment_delivery_outcome), so the runner must not
+    # hold it by the schedule. The marker is only ever set together with human_gate, so
+    # ordinary work keeps both holds; the schedule itself is left untouched.
+    owner_turn = bool(task.get("human_gate") and task.get("_gate_decision"))
+    if start_after and start_after > now and not owner_turn:
         return f"start_after {start_after.isoformat(timespec='minutes')}"
     if (task.get("delegation_level") or "") == "supervised":
         return "supervised task"
@@ -97,6 +105,57 @@ def _read_elsewhere(key: str, me, read, strict: bool = False):
             _READ_BY[key] = reader
         return got
     if strict and fault is not None:
+        raise fault
+    with _SHARED_LOCK:
+        _NOBODY[key] = time.monotonic() + NOBODY_SECONDS
+    return None
+
+
+AMBIGUOUS = object()     # a short ref that more than one reader resolves to different cards
+
+
+def _read_unique_elsewhere(key: str, me, read, pinned: str = "", known_id: str = ""):
+    """Like ``_read_elsewhere`` for a short card ref, but never guesses across tenants.
+    With ``pinned`` (the full UUID resolved earlier) only a card of that id is accepted.
+    Unpinned, every other reader is asked once: two different full ids for the same short
+    ref return AMBIGUOUS (nothing is read as the target); one id is returned and the caller
+    pins it. None when nobody can read it (remembered like ``_read_elsewhere``); a fault of
+    a reader that nobody else answered is raised.
+    ``known_id``: the id this agent's own grant already read; other readers only look for a
+    DIFFERENT card under the same short ref (AMBIGUOUS) and the result is ``{"id": known_id}``."""
+    with _SHARED_LOCK:
+        if not known_id and time.monotonic() < _NOBODY.get(key, 0):
+            return None                    # (a known id still compares: access may have changed, and it pins once)
+        others = [r for r in _READERS if r.mesh is not me]
+    found: dict[str, tuple] = {known_id: (None, {"id": known_id})} if known_id else {}
+    fault = None
+    for reader in others:
+        try:
+            got = read(reader)
+        except MeshError as e:
+            if e.status not in (403, 404, 410):
+                fault = fault or e
+            continue
+        got = got.get("task", got) if isinstance(got, dict) else got
+        tid = str((got or {}).get("id") or "")
+        if pinned and tid != pinned:
+            continue                           # another tenant's card with the same short ref
+        found.setdefault(tid, (reader, got))
+        if pinned:
+            break
+    if len(found) > 1:
+        return AMBIGUOUS
+    if fault is not None and not pinned:
+        raise fault                        # a reader that failed could hold the colliding card: identity not established
+    if known_id:
+        return {"id": known_id}            # every other reader answered and none sees another card
+    if found:
+        reader, got = next(iter(found.values()))
+        if reader is not None:
+            with _SHARED_LOCK:
+                _READ_BY[key] = reader
+        return got
+    if fault is not None:
         raise fault
     with _SHARED_LOCK:
         _NOBODY[key] = time.monotonic() + NOBODY_SECONDS

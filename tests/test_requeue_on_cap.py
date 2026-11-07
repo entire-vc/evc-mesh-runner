@@ -1,5 +1,6 @@
 """A task that hit a cap goes back to the queue and restarts on new input, never on a clock."""
 import dataclasses
+import logging
 import datetime as dt
 import json
 import time
@@ -645,6 +646,38 @@ class EventWokenStarts(CapBench):
     def test_a_waited_card_done_since_the_last_session_is_not_capped(self):
         t, mesh, r = self.capped({"kind": "card", "target": "00000002"})
         other = task(2, cat="done", completed_at=_stamp(dt.timedelta(seconds=30)))
+        mesh.tasks[other["id"]] = other
+        self.assert_event_start(r, t, "task #00000002 is done since the last session")
+
+    def test_a_card_under_the_short_ref_that_is_not_the_pinned_one_is_not_news(self):
+        t, mesh, r = self.capped({"kind": "card", "target": "00000002", "target_id": "some-other-card-uuid"})
+        other = task(2, cat="done", completed_at=_stamp(dt.timedelta(seconds=30)))
+        mesh.tasks[other["id"]] = other
+        with self.assertLogs("mesh_runner", level="INFO") as logs:
+            logging.getLogger("mesh_runner").info("probe")
+            self.settle_all(r)
+        self.assertFalse(any("task #00000002 is done since the last session" in m for m in logs.output), logs.output)
+        self.assertEqual(len(calls(self.calls)), 0)
+
+    def test_an_unpinned_short_ref_that_collides_across_tenants_is_not_news(self):
+        from mesh_runner import selection
+
+        class OtherTenant:
+            def task_by_short(self, short):
+                return {"id": "other-tenant-card", "project_id": "p", "status_id": "s", "status_category": "done"}
+        reader = selection.StatusCategories(OtherTenant())
+        t, mesh, r = self.capped({"kind": "card", "target": "00000002"})
+        other = task(2, cat="done", completed_at=_stamp(dt.timedelta(seconds=30)))
+        mesh.tasks[other["id"]] = other
+        with self.assertLogs("mesh_runner", level="INFO") as logs:
+            logging.getLogger("mesh_runner").info("probe")
+            self.settle_all(r)
+        self.assertFalse(any("task #00000002 is done since the last session" in m for m in logs.output), logs.output)
+        del reader
+
+    def test_the_pinned_card_closing_is_news_even_when_read_by_its_full_id(self):
+        other = task(2, cat="done", completed_at=_stamp(dt.timedelta(seconds=30)))
+        t, mesh, r = self.capped({"kind": "card", "target": "00000002", "target_id": other["id"]})
         mesh.tasks[other["id"]] = other
         self.assert_event_start(r, t, "task #00000002 is done since the last session")
 

@@ -301,6 +301,14 @@ class Store:
         row = self.db.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         return self._row(row) if row else None
 
+    def other_sessions(self, attempt_id: str) -> frozenset:
+        """Bound session ids that belong to attempts other than `attempt_id`; an id this attempt also owns is
+        excluded. Same set `launch_guard.legacy_rows_covered` builds for the pre-activation screen."""
+        bound: dict[str, set] = {}
+        for key, sid in self.db.execute("SELECT id, session_id FROM attempts WHERE session_id != ''"):
+            bound.setdefault(sid, set()).add(key)
+        return frozenset(sid for sid, owners in bound.items() if attempt_id not in owners)
+
     def by_state(self, agent: str, states: tuple[str, ...]) -> list[Attempt]:
         q = f"SELECT * FROM attempts WHERE agent=? AND state IN ({','.join('?' * len(states))}) ORDER BY created_at"
         return [self._row(r) for r in self.db.execute(q, (agent, *states))]

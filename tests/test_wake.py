@@ -166,6 +166,9 @@ class Denied:
     def statuses(self, pid):
         raise MeshError(403, "agent is not a member of this project")
 
+    def task(self, tid):
+        raise MeshError(403, "workspace access denied")
+
 
 class Reader(Denied):
     """An agent of this process whose grant covers that workspace."""
@@ -174,6 +177,11 @@ class Reader(Denied):
 
     def task_by_short(self, short):
         return {"id": short + "-full", "project_id": "p-w1", "status_id": "st-w1", "status_category": self.status}
+
+    def task(self, tid):
+        if tid.startswith("other-"):
+            raise MeshError(404, "not found")
+        return {"id": tid, "project_id": "p-w1", "status_id": "st-w1", "status_category": self.status}
 
 
 class CrossWorkspaceCardWait(unittest.TestCase):
@@ -215,6 +223,9 @@ class CrossWorkspaceCardWait(unittest.TestCase):
         class NoCategory(Reader):
             def task_by_short(self, short):
                 return {"id": short + "-full", "project_id": "p-w2", "status_id": "st-w2"}
+
+            def task(self, tid):
+                return {"id": tid, "project_id": "p-w2", "status_id": "st-w2"}
         wait = self.wait(errors=4)
         mine = StatusCategories(Denied())
         reader = StatusCategories(NoCategory())
@@ -241,7 +252,241 @@ class CrossWorkspaceCardWait(unittest.TestCase):
         wait = self.wait()
         mine = StatusCategories(Denied())
         later = NOW + dt.timedelta(hours=7)
-        self.assertIn("still unreadable", check(mine.mesh, mine, None, {}, wait, "me", [], later))
+        self.assertIn("UNKNOWN", check(mine.mesh, mine, None, {}, wait, "me", [], later))
+
+    def test_unreadable_wake_names_the_access_action_and_no_target_content(self):
+        wait = self.wait()
+        mine = StatusCategories(Denied())
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertIn("ask the owner of that workspace for access", out)
+        self.assertNotIn("done", out.replace("UNKNOWN (unreadable, not done and not missing)", ""))
+        self.assertFalse(wait.get("met"))
+
+    def test_a_short_ref_two_workspaces_resolve_differently_is_ambiguous_not_guessed(self):
+        class Other(Reader):
+            def task_by_short(self, short):
+                return {"id": "other-" + short, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+
+            def task(self, tid):
+                if not tid.startswith("other-"):
+                    raise MeshError(404, "not found")
+                return {"id": tid, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+        wait = self.wait()
+        mine = StatusCategories(Denied())
+        a, b = StatusCategories(Reader("done")), StatusCategories(Other("done"))
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertFalse(wait.get("met"))
+        self.assertTrue(wait["ambiguous"])
+        self.assertIn("full task id", out)
+        del a, b
+
+    def test_a_direct_read_is_checked_against_other_tenants_once(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                return {"id": "22223333-full", "project_id": "p", "status_id": "s", "status_category": "done"}
+
+        class Other(Reader):
+            def task_by_short(self, short):
+                return {"id": "other-" + short, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+
+            def task(self, tid):
+                if not tid.startswith("other-"):
+                    raise MeshError(404, "not found")
+                return {"id": tid, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+        wait = self.wait()
+        mine = StatusCategories(Own())
+        b = StatusCategories(Other("done"))
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertFalse(wait.get("met"))
+        self.assertTrue(wait["ambiguous"])
+        self.assertIn("full task id", out)
+        del b
+
+    def test_a_stale_nobody_cache_does_not_skip_the_direct_read_collision_check(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                return {"id": "22223333-full", "project_id": "p", "status_id": "s", "status_category": "done"}
+
+        class Other(Reader):
+            def task_by_short(self, short):
+                return {"id": "other-" + short, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+
+            def task(self, tid):
+                if not tid.startswith("other-"):
+                    raise MeshError(404, "not found")
+                return {"id": tid, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+        wait = self.wait()
+        mine = StatusCategories(Own())
+        b = StatusCategories(Other("done"))
+        selection._NOBODY["s:22223333"] = 10 ** 12          # an earlier "nobody could read it"
+        check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertFalse(wait.get("met"))
+        self.assertTrue(wait["ambiguous"])
+        del b
+
+    def test_a_direct_read_of_another_card_never_replaces_the_pin(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                return {"id": "someone-else", "project_id": "p", "status_id": "s", "status_category": "done"}
+        wait = self.wait(target_id="22223333-full")
+        mine = StatusCategories(Own())
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertFalse(wait.get("met"))
+        self.assertEqual(wait["target_id"], "22223333-full")
+        self.assertIn("full task id", out)
+
+    def test_own_next_supersedes_a_wait_whose_target_cannot_be_read(self):
+        wait = self.wait(target_id="22223333-full")
+        mine = StatusCategories(Denied())
+        own = {"author_id": "me", "body": "go on\n\n↻ NEXT",
+               "created_at": (NOW + dt.timedelta(minutes=1)).isoformat()}
+        out = check(mine.mesh, mine, None, {}, wait, "me", [own], NOW + dt.timedelta(minutes=2))
+        self.assertIn("superseded", out)
+        self.assertTrue(wait["met"])
+        foreign = {"author_id": "other", "body": "hello", "author_name": "x",
+                   "created_at": (NOW + dt.timedelta(minutes=1)).isoformat()}
+        wait2 = self.wait(target_id="22223333-full")
+        out2 = check(mine.mesh, mine, None, {}, wait2, "me", [foreign], NOW + dt.timedelta(minutes=2))
+        self.assertNotIn("superseded", out2)                 # someone else's NEXT-less comment is no supersede
+        self.assertFalse(wait2.get("met"))
+
+    def test_a_pinned_card_is_read_by_its_id_when_the_short_ref_reads_as_another_card(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                if "by-short-id" in path:
+                    return {"id": "someone-else", "project_id": "p", "status_id": "s", "status_category": "review"}
+                raise MeshError(403, "workspace access denied")
+        wait = self.wait(target_id="22223333-full")
+        mine = StatusCategories(Own())
+        a = StatusCategories(Reader("done"))                 # A's workspace grant
+        self.assertIn("is done", check(mine.mesh, mine, None, {}, wait, "me", [], NOW))
+        self.assertEqual(wait["target_id"], "22223333-full")
+        del a
+
+    def test_a_masked_404_with_a_pin_is_not_gone_and_a_reader_of_the_pin_delivers(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                raise MeshError(404, "not found")
+        wait = self.wait(target_id="22223333-full")
+        mine = StatusCategories(Own())
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertNotIn("gone", out)
+        self.assertIn("UNKNOWN", out)
+        a = StatusCategories(Reader("done"))
+        self.assertIn("is done", check(mine.mesh, mine, None, {}, wait, "me", [], NOW))
+        del a
+
+    def test_a_reader_fault_means_identity_is_not_established_and_nothing_is_pinned(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                return {"id": "22223333-full", "project_id": "p", "status_id": "s", "status_category": "done"}
+
+        class Faulty(Reader):
+            def task_by_short(self, short):
+                raise MeshError(500, "boom")
+        wait = self.wait()
+        mine = StatusCategories(Own())
+        f = StatusCategories(Faulty())
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW)
+        self.assertEqual(out, "")
+        self.assertFalse(wait.get("met"))
+        self.assertNotIn("target_id", wait)
+        self.assertEqual(wait["errors"], 1)
+        del f
+
+    def test_an_unpinned_masked_404_is_resolved_by_a_granted_reader_before_it_is_gone(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                raise MeshError(404, "not found")
+        wait = self.wait()
+        mine = StatusCategories(Own())
+        a = StatusCategories(Reader("done"))
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW)
+        self.assertIn("is done", out)
+        self.assertNotIn("gone", out)
+        self.assertEqual(wait["target_id"], "22223333-full")
+        del a
+
+    def test_an_unpinned_404_nobody_can_read_is_unknown_not_gone(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                raise MeshError(404, "not found")
+        wait = self.wait()
+        mine = StatusCategories(Own())
+        self.assertEqual(check(mine.mesh, mine, None, {}, wait, "me", [], NOW), "")   # not gone, not met
+        self.assertFalse(wait.get("met"))
+        self.assertTrue(wait.get("unreadable"))
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertIn("UNKNOWN", out)
+        self.assertNotIn("is gone", out)
+        self.assertFalse(wait.get("met"))
+
+    def test_a_late_colliding_reader_does_not_unpin_a_delivered_card(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                return {"id": "22223333-full", "project_id": "p", "status_id": "s", "status_category": "done"}
+
+        class Other(Reader):
+            def task_by_short(self, short):
+                return {"id": "other-" + short, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+
+            def task(self, tid):
+                if not tid.startswith("other-"):
+                    raise MeshError(404, "not found")
+                return {"id": tid, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+        wait = self.wait()
+        mine = StatusCategories(Own())
+        self.assertIn("is done", check(mine.mesh, mine, None, {}, wait, "me", [], NOW))     # A resolved and pinned
+        self.assertEqual(wait["target_id"], "22223333-full")
+        b = StatusCategories(Other("done"))                                                 # B appears later
+        wait.pop("met", None)
+        self.assertIn("is done", check(mine.mesh, mine, None, {}, wait, "me", [], NOW))     # A still delivered
+        self.assertEqual(wait["target_id"], "22223333-full")
+        self.assertFalse(wait.get("ambiguous"))
+        del b
+
+    def test_a_pinned_card_that_is_no_longer_readable_stays_unknown_even_if_b_is(self):
+        class Other(Reader):
+            def task_by_short(self, short):
+                return {"id": "other-" + short, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+
+            def task(self, tid):
+                if not tid.startswith("other-"):
+                    raise MeshError(404, "not found")
+                return {"id": tid, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+        wait = self.wait(target_id="22223333-full")
+        mine = StatusCategories(Denied())                    # A's grant is gone
+        b = StatusCategories(Other("done"))
+        out = check(mine.mesh, mine, None, {}, wait, "me", [], NOW + dt.timedelta(hours=7))
+        self.assertFalse(wait.get("met"))
+        self.assertIn("UNKNOWN", out)
+        self.assertEqual(wait["target_id"], "22223333-full")
+        del b
+
+    def test_a_direct_read_with_no_colliding_card_is_pinned_and_delivers(self):
+        class Own(Denied):
+            def request(self, method, path, body=None, query=None):
+                return {"id": "22223333-full", "project_id": "p", "status_id": "s", "status_category": "done"}
+        wait = self.wait()
+        mine = StatusCategories(Own())
+        self.assertIn("is done", check(mine.mesh, mine, None, {}, wait, "me", [], NOW))
+        self.assertEqual(wait["target_id"], "22223333-full")
+
+    def test_a_resolved_target_is_pinned_to_its_full_id(self):
+        class Other(Reader):
+            def task_by_short(self, short):
+                return {"id": "other-" + short, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+
+            def task(self, tid):
+                if not tid.startswith("other-"):
+                    raise MeshError(404, "not found")
+                return {"id": tid, "project_id": "p-w3", "status_id": "s", "status_category": "done"}
+        wait = self.wait(target_id="22223333-full")
+        mine = StatusCategories(Denied())
+        a, b = StatusCategories(Reader("review")), StatusCategories(Other("done"))
+        self.assertEqual(check(mine.mesh, mine, None, {}, wait, "me", [], NOW), "")   # not the other tenant's done
+        self.assertFalse(wait.get("met"))
+        del a, b
 
     def test_a_non_denial_error_still_counts_toward_a_wake(self):
         class Broken(Denied):
