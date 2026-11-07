@@ -119,7 +119,12 @@ A snapshot stores only what the repository cannot give back:
   slot, so verification does not need the slot.
 - Capture replays the result into scratch before publishing. If the compact form does not reproduce
   the state (clean/smudge filters, `skip-worktree`, a missing base) the full form is kept and the
-  manifest says `slim_failed`. Submodule repositories always use the full form.
+  manifest says `slim_failed`. Submodule repositories always use the full form. The full form is
+  only taken where the worktree can be cloned into the checkpoint directory (same filesystem):
+  when the slot lives on another volume a full form would be a real copy of the whole worktree on
+  every failure, so the capture fails with `lease retained` instead and the next suspend pass
+  retries (the step's usual growing backoff). Each fallback logs one line
+  `checkpoint slim fallback: agent=… card=… attempt=… repo=… stage=… reason=… git=… outcome=full-form|lease-retained`.
 
 Measured on the reference workspace: 135 MB and 48 s before, 1 MB and 4 s after.
 
@@ -274,6 +279,14 @@ no-follow directory descriptors.
 On macOS file copies call `clonefile` in-process, preserving APFS copy-on-write
 without a child process per file; unsupported filesystems use `copy2`. A slim
 capture that falls back to a full snapshot retains `slim_failed: true` and adds
-`slim_failure_reason`: `bundle-base-unavailable`, `replay-mismatch`, or
-`slim-verification-failed`. This finite classification never includes exception
-text, filesystem paths or captured command output.
+`slim_failure_reason`, `slim_failure_stage` and, when a git command failed,
+`slim_failure_git`. The stage is where the slim attempt stopped (`capture-plan`,
+`capture-copy`, `capture-stash`, `capture-refs`, `capture-bundle`, `verify-setup`,
+`verify-snapshot`, `verify-base`, `verify-fetch`, `verify-checkout`, `verify-overlay`,
+`verify-index`, `verify-refresh`, `verify-fingerprint`, `source-recheck`, …); the reason
+is a fixed class (`replay-mismatch`, `snapshot-mismatch`, `base-commit-missing`,
+`bundle-base-unavailable`, `git-lock`, `git-object-unreadable`, `git-timeout`, `git-other`,
+`other`, …, see `SLIM_REASONS`); the git field is the failing subcommand from an allowlist.
+Values come from allowlists only and never include exception text, filesystem paths or
+captured command output. Manifests written before this keep their old reason
+(`slim-verification-failed` was the catch-all).

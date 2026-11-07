@@ -24,6 +24,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from . import coalesced_http
 from .interactive import Tmux
 from .mesh import MeshClient, MeshError
 
@@ -204,7 +205,7 @@ class MetaClient:
         self._credential, self._token = credential, runner_token
         self.admission_revision: int | None = None          # server-assigned, learned from registration
 
-        real = opener or urllib.request.urlopen
+        real = opener or coalesced_http.urlopen
 
         def open_with_headers(req, timeout=None):
             req.add_header("X-Agent-Key", self._credential)

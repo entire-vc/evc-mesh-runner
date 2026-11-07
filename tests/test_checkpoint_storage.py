@@ -8,8 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mesh_runner.checkpoint import (Checkpoints, _copy, _copy_file, _slim_failure_reason,
-                                    fingerprint, manifest_digest)
+from mesh_runner.checkpoint import (SLIM_GIT_COMMANDS, SLIM_REASONS, SLIM_STAGES, Checkpoints, _copy,
+                                    _copy_file, _slim_failure_reason, fingerprint, manifest_digest,
+                                    slim_failure_cause)
 from mesh_runner.cli import _checkpoint_pin_arg
 from mesh_runner.pool_ops import _bounded_rmtree
 from mesh_runner.workspace import WorkspaceError, git
@@ -75,9 +76,68 @@ class CheckpointStorage(unittest.TestCase):
         path = cp.create('fallback', source, {})
         data = cp.read(path)
         self.assertTrue(data['slim_failed'])
-        self.assertIn(data['slim_failure_reason'], ('replay-mismatch', 'slim-verification-failed'))
+        self.assertEqual(data['slim_failure_reason'], 'replay-mismatch')
+        self.assertEqual(data['slim_failure_stage'], 'verify-fingerprint')
+        self.assertNotIn('slim_failure_git', data)
         self.assertFalse(cp.is_old_format(path))
-        self.assertEqual(_slim_failure_reason(WorkspaceError('/private/token=secret\noutput')), 'slim-verification-failed')
+        self.assertEqual(_slim_failure_reason(WorkspaceError('/private/token=secret\noutput')), 'other')
+
+    def test_slim_failure_cause_is_finite_and_names_the_git_command(self):
+        cases = {
+            'git checkout --quiet --force in /private/secret/slot: error: unable to read sha1 file of a (b)':
+                {'reason': 'git-object-unreadable', 'git': 'checkout'},
+            "git update-ref refs/runner-checkpoints/k abc in /p: fatal: cannot lock ref 'refs/x': Unable to create '/p/x.lock'":
+                {'reason': 'git-lock', 'git': 'update-ref'},
+            'git fetch --quiet --no-recurse-submodules in /p: timed out': {'reason': 'git-timeout', 'git': 'fetch'},
+            'git init in /p: token=abc': {'reason': 'git-other', 'git': 'init'},
+            'git made-up --x in /p: whatever': {'reason': 'git-other', 'git': 'other'},
+            'git timed out after 600s': {'reason': 'timeout', 'git': None},
+            'checkpoint: snapshot hash mismatch': {'reason': 'snapshot-mismatch', 'git': None},
+            'checkpoint: base commit missing in target; target untouched': {'reason': 'base-commit-missing', 'git': None},
+            'checkpoint: a new message /private/token=secret': {'reason': 'other', 'git': None},
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                cause = slim_failure_cause(WorkspaceError(message), 'verify-checkout')
+                self.assertEqual({k: cause[k] for k in expected}, expected)
+                self.assertEqual(cause['stage'], 'verify-checkout')
+                self.assertIn(cause['reason'], SLIM_REASONS)
+                self.assertTrue(cause['git'] is None or cause['git'] in SLIM_GIT_COMMANDS or cause['git'] == 'other')
+        self.assertEqual(slim_failure_cause(WorkspaceError('x'), '/private/stage')['stage'], 'unknown')
+
+    def test_injected_git_failure_records_stage_and_command_and_logs_one_line(self):
+        source = make_repo(self.root)
+        (source / 'note.txt').write_text('untracked work')
+        cp = Checkpoints(self.root / 'cp')
+        secret = 'git checkout-index --all --force in /private/secret-path: fatal: unable to read 0123abcd'
+        with patch.object(Checkpoints, '_overlay_delta', side_effect=WorkspaceError(secret)), \
+                self.assertLogs('mesh_runner', 'WARNING') as logs:
+            path = cp.create('injected', source, {'task': '0f1e2d3c-4b5a-4697-8877-665544332211',
+                                                  'attempt': 'a1b2c3d4-0000', 'repo': 'example-repo'})
+        data = cp.read(path)
+        self.assertEqual((data['slim_failure_stage'], data['slim_failure_reason'], data['slim_failure_git']),
+                         ('verify-overlay', 'git-object-unreadable', 'checkout-index'))
+        self.assertIn(data['slim_failure_stage'], SLIM_STAGES)
+        lines = [l for l in logs.output if 'checkpoint slim fallback' in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn('agent=cp card=0f1e2d3c attempt=a1b2c3d4 repo=example-repo stage=verify-overlay '
+                      'reason=git-object-unreadable git=checkout-index outcome=full-form', lines[0])
+        for leak in ('/private', 'secret', '0123abcd'):
+            self.assertNotIn(leak, lines[0])
+            self.assertNotIn(leak, (path / 'manifest.json').read_text())
+
+    def test_cross_volume_slim_failure_keeps_the_lease_instead_of_a_full_copy(self):
+        source = make_repo(self.root)
+        git(source, 'update-index', '--skip-worktree', 'README')
+        (source / 'README').write_text('hidden change')
+        cp = Checkpoints(self.root / 'cp')
+        with patch('mesh_runner.checkpoint._same_volume', return_value=False), \
+                self.assertLogs('mesh_runner', 'WARNING') as logs, \
+                self.assertRaisesRegex(WorkspaceError, r'verify-fingerprint/replay-mismatch.*lease retained'):
+            cp.create('crossvol', source, {'repo': 'app'})
+        self.assertEqual([p.name for p in (self.root / 'cp').iterdir()], [])     # no full copy, no pending
+        self.assertTrue(any('outcome=lease-retained' in l for l in logs.output))
+        self.assertEqual((source / 'README').read_text(), 'hidden change')        # source untouched
 
     def test_manifest_rejects_symlink_and_pin_parser_rejects_paths(self):
         path = self.root / 'cp'; path.mkdir(); (path / 'manifest.json').write_text('{}')

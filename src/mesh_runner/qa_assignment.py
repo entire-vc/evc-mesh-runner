@@ -35,6 +35,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import coalesced_http
 from . import iterm_transport as it
 from . import meta_delivery as md
 
@@ -338,7 +339,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def default_open(req, timeout=TIMEOUT):
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)   # no environment proxy
+    opener = coalesced_http.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)   # no environment proxy
     return opener.open(req, timeout=timeout)
 
 

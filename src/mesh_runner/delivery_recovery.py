@@ -1,15 +1,75 @@
 """Recover an ended native turn without starting a driver or sending a prompt."""
 from __future__ import annotations
 
+import glob
 import hashlib
 import io
 import json
 import os
+import re
 import time
 from pathlib import Path
 
-from .interactive import Tmux, read_delivery
+from .interactive import Tmux, delivery_path, read_delivery
 from .tui_driver import Driver, DriverError, _exact
+
+
+START_LINE = re.compile(r"exited during start-up, starting again \(\d+/\d+\) in \d+s: Error: .*failed during TUI bootstrap")
+
+
+def legacy_bootstrap_unsent(journal: dict, intent: dict) -> bool:
+    """Journals written before the driver recorded `bootstrap-failed`: the codex window died while the
+    TUI was bootstrapping, so no input was ever possible. Proven only when ALL hold: no session and no
+    rollout bound, the driver's own stderr names typed bootstrap failures and never a finished turn, and no
+    codex rollout for this cwd appeared after the send-intent (any candidate leaves it pending)."""
+    if journal.get('harness') != 'codex' or journal.get('session_id') or journal.get('rollout'):
+        return False
+    try:
+        stderr = Path(intent['log_path']).with_suffix('.stderr').read_text(errors='replace')
+        started = delivery_path(Path(intent['directory']), intent['key']).stat().st_mtime \
+            if intent.get('directory') and intent.get('key') else None
+    except (OSError, KeyError):
+        return False
+    lines = [x for x in stderr.splitlines() if x.strip()]
+    if not any(START_LINE.search(x) for x in lines) or any(x.startswith('timing:') for x in lines):
+        return False
+    return started is not None and not fresh_rollouts(journal, started)
+
+
+def unbound_bootstrap_proof(directory: Path, key: str, intent: dict) -> bool:
+    """Pre-activation screen for a `session-unbound` row: true only when the journal and the driver's own
+    stderr prove the codex window died in TUI bootstrap before it could take input. Never starts a driver."""
+    try:
+        journal = read_delivery(directory, key)
+        if journal.get('token') != intent.get('token') or journal.get('sha256') != intent.get('sha256'):
+            return False
+        if journal.get('phase') == 'bootstrap-failed':
+            return bool(journal.get('bootstrap_error')) and journal.get('harness') == 'codex' \
+                and not journal.get('session_id') and not journal.get('rollout')
+        return journal.get('phase') not in ('reserved', 'received') and legacy_bootstrap_unsent(
+            journal, {**intent, 'directory': str(directory), 'key': key})
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def fresh_rollouts(journal: dict, since: float) -> list[str]:
+    homes = {os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')}
+    homes.add(str(journal.get('codex_home') or '')) if journal.get('codex_home') else None
+    cwd = os.path.realpath(str(journal.get('cwd') or ''))
+    found = []
+    for home in homes:
+        for path in glob.glob(os.path.join(home, 'sessions', '*', '*', '*', 'rollout-*.jsonl')):
+            try:
+                if os.path.getmtime(path) < since - 5:
+                    continue
+                with open(path, 'rb') as fh:
+                    meta = json.loads(fh.readline(1 << 20))
+            except (OSError, ValueError):
+                found.append(path)               # unreadable candidate: not proof of absence
+                continue
+            if os.path.realpath(str((meta.get('payload') or {}).get('cwd') or '')) == cwd:
+                found.append(path)
+    return found
 
 
 def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux) -> str:
@@ -18,6 +78,8 @@ def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux) -> 
         return 'identity-mismatch'
     if journal.get('phase') in ('reserved', 'received'):
         return 'unsent'                    # every paste is preceded by a durable send-intent
+    if journal.get('phase') == 'bootstrap-failed' and journal.get('bootstrap_error'):
+        return 'unsent'                    # the driver proved the window died before it could take input
     harness = journal.get('harness')
     if harness not in ('claude', 'codex'):
         return 'native-contract-unavailable'
@@ -34,6 +96,8 @@ def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux) -> 
         return 'cursor-mismatch'
     sid = journal.get('session_id')
     if not sid:
+        if len(native) == base and legacy_bootstrap_unsent(journal, {**intent, 'directory': str(directory), 'key': key}):
+            return 'unsent'
         return 'session-unbound'
     if harness == 'codex':
         return recover_codex(d, journal, native, base, sid, intent)

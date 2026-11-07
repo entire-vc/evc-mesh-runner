@@ -15,6 +15,7 @@ import os
 import re
 from pathlib import Path
 
+from ..auth import is_codex_auth_error
 from .base import Adapter, TurnResult, read_events
 
 ROLLOUT_SCAN = 1 << 20          # how much of the rollout's end is searched for the latest turn_context
@@ -171,6 +172,7 @@ class CodexAdapter(Adapter):
     def parse(self, log_path: Path) -> TurnResult:
         r = TurnResult()
         r.model = self.profile_model()
+        worked = False
         for ev in read_events(log_path):
             t = ev.get("type", "")
             if t == "thread.started" and ev.get("thread_id"):
@@ -179,13 +181,18 @@ class CodexAdapter(Adapter):
                 item = ev.get("item") or {}
                 if item.get("type") in ("agent_message", "assistant_message") and item.get("text"):
                     r.final_text = item["text"]
+                if item.get("type") != "error":
+                    worked = True
             elif t == "turn.completed":
                 r.finished = True
                 r.usage = ev.get("usage") or {}
-                r.is_error, r.error = False, ""     # a transient error earlier in the turn did not end it
+                r.is_error, r.error, r.auth_failed, r.auth_only = False, "", False, False   # a transient error earlier in the turn did not end it
             elif t in ("turn.failed", "error"):
                 r.finished = True
                 r.is_error = True
                 err = ev.get("error") or {}
                 r.error = (err.get("message") if isinstance(err, dict) else str(err)) or ev.get("message", "") or t
+                # typed provider refusal only; never assistant prose or a quoted report
+                r.auth_failed = is_codex_auth_error(str(r.error))
+                r.auth_only = r.auth_failed and not worked
         return r

@@ -9,6 +9,7 @@ the attempt started and takes the last declaration line in it:
     ⏳ WAIT merge:<group>/<project>!<iid> after=<sha>      the runner runs the merge gate (opt-in)
     ⏳ WAIT card:#<8hex>                                   another task closes
     ⏳ WAIT decision:@<agent>                              another agent answers
+    ⏳ WAIT gmail:gmr_<12hex>                              a registered Gmail observation fires (docs/gmail-watch.md)
     ⏳ WAIT <absoluteISO>: external=<reference> source=<https-url|card:#8hex> <why>
     ⏳ WAIT pipeline:<proj>#<id> until=success|change     a changed/successful pipeline (``after=`` optional)
     ⏳ WAIT pipeline:<proj>#<id> until=... jobs=[a,b]     the same, read from the named jobs only
@@ -62,13 +63,14 @@ _RECEIPT = re.compile(_WAIT_HEAD + r"receipt:#(?P<id>[0-9a-f]{8})\b" + _EXPLANAT
 _LIFECYCLE = re.compile(_WAIT_HEAD + r"lifecycle:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _STALL = re.compile(_WAIT_HEAD + r"stall:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _RECOVERY = re.compile(_WAIT_HEAD + r"recovery:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
+_GMAIL = re.compile(_WAIT_HEAD + r"gmail:(?P<id>gmr_[0-9a-f]{12})\b" + _EXPLANATION)
 _NATIVE = re.compile(_WAIT_HEAD + r"native:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
 _CARD = re.compile(_WAIT_HEAD + r"card:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _QUEUE = re.compile(_WAIT_HEAD + r"queue:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _DECISION = re.compile(_WAIT_HEAD + r"decision:@(?P<handle>[\w.\-]+)" + _EXPLANATION)
 # Time is a structured assertion about a specific external schedule, not a retry interval.
 # Any other WAIT is a time wait: `2h`, `tomorrow`, `in 2 hours`, `poll:` all get the time guidance.
-_TIME_HEAD = re.compile(_WAIT_HEAD + r"(?!(?:pipeline|mr|merge|card|decision|receipt|lifecycle|recovery|stall)\s*:)\S", re.IGNORECASE)
+_TIME_HEAD = re.compile(_WAIT_HEAD + r"(?!(?:pipeline|mr|merge|card|decision|receipt|lifecycle|recovery|stall|gmail)\s*:)\S", re.IGNORECASE)
 _EXTERNAL_TIME = re.compile(
     _WAIT_HEAD + r"(?P<when>\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d)):"
     r"\s+external=(?P<external>[A-Za-z0-9][A-Za-z0-9._:/@#%+!?=~-]{0,255})"
@@ -135,7 +137,7 @@ class Outcome:
 
     @property
     def is_wait(self) -> bool:
-        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native"}
+        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native", "gmail"}
 
 
 def _explicit_wait_problem(line: str) -> str:
@@ -255,6 +257,11 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
     if m := _RECEIPT.match(line):
         # Event wait on this card's own armed receipt registration; runner validates it.
         return Outcome("receipt", m["id"], note=note(m), line=line)
+    if m := _GMAIL.match(line):
+        # Event wait on an operator-registered Gmail observation; runner validates it.
+        return Outcome("gmail", m["id"], note=note(m), line=line)
+    if re.match(_WAIT_HEAD + r"gmail:", line):
+        return Outcome("unparsed", note="gmail WAIT requires an exact registration id gmr_<12 hex>", line=line)
     if m := _STALL.match(line):
         # Event wait on this card's own armed stall registration; runner validates it.
         return Outcome("stall", m["id"], note=note(m), line=line)

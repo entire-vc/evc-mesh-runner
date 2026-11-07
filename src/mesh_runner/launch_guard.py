@@ -3,6 +3,11 @@
 The guard owns the existing singleton through exec. Same exact activated target
 may restart to reconcile pending delivery; changing targets requires no pending
 intent or UNKNOWN rows. No registry/schema/lease mutation is performed here.
+
+One exception: legacy codex bootstrap rows (`unknown`, `session-unbound`). The target that carries the
+guard may be entered with them pending only when EVERY pending row is such a row and the target's own
+`delivery_recovery` proves it (typed bootstrap failure, no session, no rollout, no live process). The
+rows are then reconciled by the ordinary tick of that same target; any other pending row refuses.
 """
 from __future__ import annotations
 
@@ -92,6 +97,46 @@ def pending(state: Path) -> bool:
     return False
 
 
+def legacy_rows_covered(state: Path, release: Path) -> bool:
+    """True only if the guard IS the target (its own code proves the rows) and every pending row is proven."""
+    if Path(__file__).resolve().parents[2] != release.resolve():
+        return False
+    db = state / 'runner.sqlite'
+    try:
+        connection = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
+        try:
+            rows = connection.execute('SELECT id, agent, state, pid, wait FROM attempts').fetchall()
+        finally:
+            connection.close()
+        src = str(Path(__file__).resolve().parents[1])
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from mesh_runner import delivery_recovery, interactive
+        found = False
+        for key, agent, status, pid, raw in rows:
+            value = json.loads(raw)
+            intent = value.get('interactive_prompt_intent') if isinstance(value, dict) else None
+            if status != 'unknown' and not (isinstance(value, dict) and 'interactive_prompt_intent' in value):
+                continue                                   # not pending
+            if (status != 'unknown' or not isinstance(intent, dict) or intent.get('resolution') != 'session-unbound'
+                    or intent.get('retryable') or intent.get('kind') != 'interactive' or intent.get('harness') != 'codex'):
+                return False
+            if pid:
+                try:
+                    os.kill(pid, 0)
+                    return False                           # a live process owns the row
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    return False
+            if not delivery_recovery.unbound_bootstrap_proof(interactive.agent_dir(state, agent), key, intent):
+                return False
+            found = True
+        return found
+    except (sqlite3.Error, ValueError, TypeError, KeyError, ImportError, OSError):
+        return False
+
+
 def publish_marker(state: Path, value: dict) -> None:
     fd, name = tempfile.mkstemp(prefix='.activated-', dir=state)
     try:
@@ -110,7 +155,7 @@ def publish_marker(state: Path, value: dict) -> None:
             os.unlink(name)
 
 
-def validate_pending_binding(state: Path, binding: dict) -> None:
+def validate_pending_binding(state: Path, binding: dict, release: Path | None = None) -> None:
     marker = state / MARKER
     previous = None
     if marker.exists():
@@ -121,6 +166,8 @@ def validate_pending_binding(state: Path, binding: dict) -> None:
         except (OSError, ValueError):
             raise GuardRefused('activation-binding-unreadable') from None
     if pending(state) and previous != binding:
+        if release is not None and legacy_rows_covered(state, release):
+            return
         raise GuardRefused('pending-delivery-target-change')
 
 
@@ -152,7 +199,7 @@ def check_locked(release: Path, config: Path, fd: int) -> dict:
     identity = target_identity(release)
     binding = {'version': 1, 'release': str(release), 'tree': identity,
                'config': str(config), 'config_sha256': config_sha, 'state': str(state)}
-    validate_pending_binding(state, binding)
+    validate_pending_binding(state, binding, release)
     if configured_state(config) != (state, config_sha) or target_identity(release) != identity:
         raise GuardRefused('activation-input-changed')
     return binding
@@ -173,7 +220,7 @@ def prepare(release: Path, config: Path, *, bind: bool = True):
             raise GuardRefused('singleton-file-changed')
         binding = {'version': 1, 'release': str(release), 'tree': identity,
                    'config': str(config), 'config_sha256': config_sha, 'state': str(state)}
-        validate_pending_binding(state, binding)
+        validate_pending_binding(state, binding, release)
         # Both config and complete target tree are checked again under singleton.
         if configured_state(config) != (state, config_sha) or target_identity(release) != identity:
             raise GuardRefused('activation-input-changed')

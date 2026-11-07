@@ -38,6 +38,7 @@ class CardEdgeRemoved(Bench):
         self.assertEqual((s.state, s.id, s.session_id), ('ready', a.id, 'native-session'))
         self.assertNotIn('edge', s.wait)
         self.assertIn('removed', s.wake_text)
+        self.assertIn('re-read', s.wake_text)           # a link restored after the commit is re-checked by the owner
         text = s.wake_text
         r.store.update(s, state='waiting')            # a replayed tick on the same attempt
         r._wake_one(r.store.get(a.id))
@@ -84,3 +85,46 @@ class CardEdgeRemoved(Bench):
         r, a, t, g = self.flow(lambda t, g: [edge_row(t['id'], task(4)['id'], 'e2', True)])
         r._wake_one(a)
         self.assertEqual(r.store.get(a.id).state, 'ready')
+
+    def test_edge_restored_between_read_and_apply_holds(self):
+        from mesh_runner import card_wait_reconcile as c
+        r, a, t, g = self.flow(lambda t, g: [])
+        real_deps, real_fn, state = r.mesh.dependencies, c.removed_wait_edge, {'restored': False}
+
+        def deps(tid):
+            if state['restored']:
+                return {'outgoing': [edge_row(tid, g['id'])], 'incoming': []}
+            return real_deps(tid)
+
+        def removed(rows, wait, task_id):
+            out = real_fn(rows, wait, task_id)
+            if out and not state['restored']:
+                state['restored'] = True             # Mesh restores the link after this read
+            return out
+        r.mesh.dependencies = deps
+        c.removed_wait_edge = removed
+        self.addCleanup(setattr, c, 'removed_wait_edge', real_fn)
+        r._wake_one(a)
+        self.assertTrue(state['restored'])
+        s = r.store.get(a.id)
+        self.assertEqual((s.state, s.wait.get('edge')), ('waiting', 'e1'))
+        # no dedup mark left behind: a later real deletion still wakes exactly once
+        state['restored'] = False
+        c.removed_wait_edge = real_fn
+        r.mesh.dependencies = real_deps
+        r._wake_one(r.store.get(a.id))
+        self.assertEqual(r.store.get(a.id).state, 'ready')
+
+    def test_dependency_read_failure_at_apply_holds(self):
+        from mesh_runner.mesh import MeshError
+        r, a, t, g = self.flow(lambda t, g: [])
+        real, calls = r.mesh.dependencies, []
+
+        def flaky(tid):
+            calls.append(tid)
+            if len(calls) > 1:
+                raise MeshError(502, 'bad gateway')
+            return real(tid)
+        r.mesh.dependencies = flaky
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, 'waiting')
