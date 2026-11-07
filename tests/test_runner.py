@@ -25,6 +25,12 @@ from mesh_runner.workspace import RepoSpec
 class Bench(unittest.TestCase):
     """Shared fixture: temp repo, fake agent, in-memory Mesh. No tests here."""
     def setUp(self):
+        # the cross-workspace readers of this process are module state: clients of earlier tests
+        # must not answer (or fail) this test's short-ref lookups
+        from mesh_runner import selection
+        selection._READERS.clear()
+        selection._NOBODY.clear()
+        selection._READ_BY.clear()
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.root = root

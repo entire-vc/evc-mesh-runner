@@ -142,6 +142,63 @@ class LegacyRows(unittest.TestCase):
         store.db.close()
         self.refused()
 
+    # -- rollouts of the same cwd bound to OTHER attempts are not candidates for this send --
+    def rollout(self, ident, name=None, raw=None):
+        day = self.home / 'sessions' / '2026' / '11' / '07'
+        day.mkdir(parents=True, exist_ok=True)
+        path = day / f'rollout-{name or ident}.jsonl'
+        path.write_text(raw if raw is not None else json.dumps({'payload': {'id': ident, 'cwd': str(self.root / 'work')}}) + '\n')
+
+    def bind(self, agent, session_id):
+        """A later, ordinary attempt of the same lane, bound to `session_id`."""
+        store = Store(self.state / 'runner.sqlite')
+        a = store.create(agent, str(uuid.uuid4()), 'codex')
+        store.update(a, state='done', session_id=session_id)
+        store.db.close()
+        return a.id
+
+    def test_rollouts_bound_to_other_attempts_do_not_block(self):
+        self.row('howard')
+        for n in range(3):
+            self.bind('howard', f'sid-{n}')
+            self.rollout(f'sid-{n}')
+        self.assertEqual(self.run_guard(self.new, self.new, '--check').returncode, 0)
+
+    def test_unbound_rollout_of_the_cwd_still_blocks(self):
+        self.row('howard')
+        self.bind('howard', 'sid-0')
+        self.rollout('sid-0')
+        self.rollout('nobody-owns-this')
+        self.refused()
+
+    def test_unreadable_rollout_still_blocks(self):
+        self.row('howard')
+        self.bind('howard', 'sid-0')
+        self.rollout('sid-0')
+        self.rollout('x', name='garbled', raw='{not json\n')
+        self.refused()
+
+    def test_rollout_bound_to_the_same_key_still_blocks(self):
+        self.row('howard')
+        _, key, _ = self.rows[0]
+        store = Store(self.state / 'runner.sqlite')
+        store.db.execute('UPDATE attempts SET session_id=? WHERE id=?', ('sid-own', key))
+        store.db.commit()
+        store.db.close()
+        self.rollout('sid-own')
+        self.refused()                                                                   # bound session of the row itself
+
+    def test_rollout_bound_to_this_and_another_attempt_still_blocks(self):
+        self.row('howard')
+        _, key, _ = self.rows[0]
+        self.bind('howard', 'sid-shared')
+        store = Store(self.state / 'runner.sqlite')
+        store.db.execute('UPDATE attempts SET session_id=? WHERE id=?', ('sid-shared', key))
+        store.db.commit()
+        store.db.close()
+        self.rollout('sid-shared')
+        self.refused()                                                                   # id not unique: the row owns it too
+
 
 if __name__ == '__main__':
     unittest.main()

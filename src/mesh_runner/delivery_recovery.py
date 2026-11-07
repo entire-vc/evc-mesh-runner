@@ -17,11 +17,12 @@ from .tui_driver import Driver, DriverError, _exact
 START_LINE = re.compile(r"exited during start-up, starting again \(\d+/\d+\) in \d+s: Error: .*failed during TUI bootstrap")
 
 
-def legacy_bootstrap_unsent(journal: dict, intent: dict) -> bool:
+def legacy_bootstrap_unsent(journal: dict, intent: dict, other_sessions: frozenset = frozenset()) -> bool:
     """Journals written before the driver recorded `bootstrap-failed`: the codex window died while the
     TUI was bootstrapping, so no input was ever possible. Proven only when ALL hold: no session and no
     rollout bound, the driver's own stderr names typed bootstrap failures and never a finished turn, and no
-    codex rollout for this cwd appeared after the send-intent (any candidate leaves it pending)."""
+    codex rollout for this cwd appeared after the send-intent (any candidate leaves it pending). A rollout whose
+    id is the bound session of a DIFFERENT attempt (`other_sessions`) belongs to that attempt, not to this send."""
     if journal.get('harness') != 'codex' or journal.get('session_id') or journal.get('rollout'):
         return False
     try:
@@ -33,10 +34,10 @@ def legacy_bootstrap_unsent(journal: dict, intent: dict) -> bool:
     lines = [x for x in stderr.splitlines() if x.strip()]
     if not any(START_LINE.search(x) for x in lines) or any(x.startswith('timing:') for x in lines):
         return False
-    return started is not None and not fresh_rollouts(journal, started)
+    return started is not None and not fresh_rollouts(journal, started, other_sessions)
 
 
-def unbound_bootstrap_proof(directory: Path, key: str, intent: dict) -> bool:
+def unbound_bootstrap_proof(directory: Path, key: str, intent: dict, other_sessions: frozenset = frozenset()) -> bool:
     """Pre-activation screen for a `session-unbound` row: true only when the journal and the driver's own
     stderr prove the codex window died in TUI bootstrap before it could take input. Never starts a driver."""
     try:
@@ -47,12 +48,12 @@ def unbound_bootstrap_proof(directory: Path, key: str, intent: dict) -> bool:
             return bool(journal.get('bootstrap_error')) and journal.get('harness') == 'codex' \
                 and not journal.get('session_id') and not journal.get('rollout')
         return journal.get('phase') not in ('reserved', 'received') and legacy_bootstrap_unsent(
-            journal, {**intent, 'directory': str(directory), 'key': key})
+            journal, {**intent, 'directory': str(directory), 'key': key}, other_sessions)
     except (OSError, ValueError, KeyError, TypeError):
         return False
 
 
-def fresh_rollouts(journal: dict, since: float) -> list[str]:
+def fresh_rollouts(journal: dict, since: float, other_sessions: frozenset = frozenset()) -> list[str]:
     homes = {os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')}
     homes.add(str(journal.get('codex_home') or '')) if journal.get('codex_home') else None
     cwd = os.path.realpath(str(journal.get('cwd') or ''))
@@ -67,12 +68,14 @@ def fresh_rollouts(journal: dict, since: float) -> list[str]:
             except (OSError, ValueError):
                 found.append(path)               # unreadable candidate: not proof of absence
                 continue
-            if os.path.realpath(str((meta.get('payload') or {}).get('cwd') or '')) == cwd:
+            payload = meta.get('payload') or {}
+            if os.path.realpath(str(payload.get('cwd') or '')) == cwd and payload.get('id') not in other_sessions:
                 found.append(path)
     return found
 
 
-def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux) -> str:
+def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux,
+            other_sessions: frozenset = frozenset()) -> str:
     journal = read_delivery(directory, key)
     if journal.get('token') != intent.get('token') or journal.get('sha256') != intent.get('sha256'):
         return 'identity-mismatch'
@@ -96,7 +99,8 @@ def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux) -> 
         return 'cursor-mismatch'
     sid = journal.get('session_id')
     if not sid:
-        if len(native) == base and legacy_bootstrap_unsent(journal, {**intent, 'directory': str(directory), 'key': key}):
+        if len(native) == base and legacy_bootstrap_unsent(
+                journal, {**intent, 'directory': str(directory), 'key': key}, other_sessions):
             return 'unsent'
         return 'session-unbound'
     if harness == 'codex':

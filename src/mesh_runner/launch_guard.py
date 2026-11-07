@@ -105,15 +105,19 @@ def legacy_rows_covered(state: Path, release: Path) -> bool:
     try:
         connection = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
         try:
-            rows = connection.execute('SELECT id, agent, state, pid, wait FROM attempts').fetchall()
+            rows = connection.execute('SELECT id, agent, state, pid, wait, session_id FROM attempts').fetchall()
         finally:
             connection.close()
         src = str(Path(__file__).resolve().parents[1])
         if src not in sys.path:
             sys.path.insert(0, src)
         from mesh_runner import delivery_recovery, interactive
+        bound: dict[str, set] = {}
+        for key, *_, sid in rows:
+            if sid:
+                bound.setdefault(sid, set()).add(key)
         found = False
-        for key, agent, status, pid, raw in rows:
+        for key, agent, status, pid, raw, _sid in rows:
             value = json.loads(raw)
             intent = value.get('interactive_prompt_intent') if isinstance(value, dict) else None
             if status != 'unknown' and not (isinstance(value, dict) and 'interactive_prompt_intent' in value):
@@ -129,7 +133,9 @@ def legacy_rows_covered(state: Path, release: Path) -> bool:
                     pass
                 except OSError:
                     return False
-            if not delivery_recovery.unbound_bootstrap_proof(interactive.agent_dir(state, agent), key, intent):
+            if not delivery_recovery.unbound_bootstrap_proof(
+                    interactive.agent_dir(state, agent), key, intent,
+                    frozenset(sid for sid, owners in bound.items() if key not in owners)):
                 return False
             found = True
         return found

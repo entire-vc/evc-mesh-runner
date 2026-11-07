@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from .mesh import MeshClient, MeshError
 from . import observation_budget as budget
 from .outcome import declaration_lines
-from .selection import CLOSED, StatusCategories, _read_elsewhere, parse_time, satisfied
+from .selection import AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, parse_time, satisfied
 
 log = logging.getLogger("mesh_runner")
 
@@ -1090,6 +1090,37 @@ def _negative_observation(wait: dict, kind: str, comments: list[dict], since: dt
         "interval_s": int(interval.total_seconds())}
 
 
+def _read_pinned(mesh: MeshClient, pin: str):
+    """The pinned card read by its full id: this agent's grant first, then another reader of this
+    process; None when nobody can read exactly that card (an UNKNOWN, never a verdict)."""
+    try:
+        got = mesh.task(pin)
+        got = got.get("task", got) if isinstance(got, dict) else {}
+        if str(got.get("id") or "") == pin:
+            return got
+    except MeshError as e:
+        if e.status not in (403, 404, 410):
+            raise
+    got = _read_unique_elsewhere(f"t:{pin}", mesh, lambda r: r.mesh.task(pin), pinned=pin)
+    return got if isinstance(got, dict) and got is not AMBIGUOUS else None
+
+
+def _unreadable_event(wait: dict, kind: str, started: dt.datetime, interval: dt.timedelta,
+                      now: dt.datetime, ambiguous: bool = False) -> str:
+    """The bounded re-check text for a target this process cannot read. It names the concrete
+    action (access or owner), never a verdict on the target, and never its title or body."""
+    if now - started < interval:
+        return ""
+    wait["recheck_due"] = True
+    ref = wait.get("target") or ""
+    why = ("the short id resolves to different cards in different workspaces; re-declare the wait "
+           "with the full task id" if ambiguous else
+           "no agent of this runner has a grant for its workspace: ask the owner of that workspace "
+           "for access, or move the wait to a card you can read")
+    return (f"re-check: the wait ({kind} {ref}) has lasted {_hours(now - started)}; its target is "
+            f"UNKNOWN (unreadable, not done and not missing): {why}")
+
+
 def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task: dict,
           wait: dict, agent_id: str, comments: list[dict], now: dt.datetime,
           max_wait: dt.timedelta = dt.timedelta(hours=6), max_errors: int = 5,
@@ -1204,28 +1235,80 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
         return "the human gate was lifted"
     try:
         if kind == "card":
+            own_read = False
             try:
                 target = mesh.request("GET", f"/tasks/by-short-id/{wait['target']}")
+                own_read = True
             except MeshError as e:
                 if e.status in (404, 410):
-                    wait["met"] = True
-                    return f"task #{wait['target']} is gone"
-                if e.status != 403:
+                    if not wait.get("target_id"):
+                        # a 404 of this grant can be a masked foreign card: ask the other readers of
+                        # this process before concluding it is gone (all of them agreeing it is absent)
+                        other = _read_unique_elsewhere(f"s:{wait['target']}", mesh,
+                                                       lambda r: r.mesh.task_by_short(wait["target"]))
+                        if other is AMBIGUOUS:
+                            wait["unreadable"], wait["ambiguous"], wait["errors"] = True, True, 0
+                            return _unreadable_event(wait, kind, started, interval, now, ambiguous=True)
+                        if other is None:
+                            # no grant of this process sees the card: a masked foreign card and a
+                            # deleted one look the same, so this is UNKNOWN, never "gone"/satisfied
+                            wait["unreadable"], wait["errors"] = True, 0
+                            return _unreadable_event(wait, kind, started, interval, now)
+                        if other.get("id"):
+                            wait["target_id"] = other["id"]
+                        target = other
+                    else:
+                        # pinned: a masked 404 of this grant is not "gone"; read the pinned card itself
+                        target = _read_pinned(mesh, str(wait["target_id"]))
+                        if target is None:
+                            wait["unreadable"], wait["errors"] = True, 0
+                            return _unreadable_event(wait, kind, started, interval, now)
+                elif e.status != 403:
                     raise
+                else:
+                    target = None
+            if not own_read and target is None:
                 # a card of another workspace: this agent may not read it, another agent of
                 # this process (its own grant) may. Nobody can: a denial is not transient, so
                 # it is not counted toward a wake (the wake re-declared the same wait, a loop);
                 # the wait's own re-check still comes back to the agent.
-                target = _read_elsewhere(f"s:{wait['target']}", mesh,
-                                         lambda r: r.mesh.task_by_short(wait["target"]), strict=True)
+                if wait.get("target_id"):
+                    target = _read_pinned(mesh, str(wait["target_id"]))
+                else:
+                    target = _read_unique_elsewhere(f"s:{wait['target']}", mesh,
+                                                    lambda r: r.mesh.task_by_short(wait["target"]))
+                if target is AMBIGUOUS:
+                    wait["unreadable"], wait["ambiguous"], wait["errors"] = True, True, 0
+                    return _unreadable_event(wait, kind, started, interval, now, ambiguous=True)
                 if target is None:
                     wait["unreadable"], wait["errors"] = True, 0
-                    if now - started >= interval:
-                        wait["recheck_due"] = True
-                        return (f"re-check: the wait ({kind} {wait.get('target') or ''}) has lasted "
-                                f"{_hours(now - started)}; its target is still unreadable")
-                    return ""
+                    return _unreadable_event(wait, kind, started, interval, now)
+                if target.get("id"):
+                    wait["target_id"] = target["id"]     # provenance: later ticks read this card only
+                wait.pop("ambiguous", None)
             target = target.get("task", target)
+            if own_read:
+                own_id = str(target.get("id") or "")
+                pin = str(wait.get("target_id") or "")
+                if own_id and pin and own_id != pin:
+                    # the short ref now reads as another card than the pinned one: never switch;
+                    # the pinned card itself is read by its full id (this grant, then the others)
+                    target = _read_pinned(mesh, pin)
+                    if target is None:
+                        wait["unreadable"], wait["ambiguous"], wait["errors"] = True, True, 0
+                        return _unreadable_event(wait, kind, started, interval, now, ambiguous=True)
+                    own_id = pin
+                if own_id and not pin:
+                    # first sight of this card by its own grant: another tenant's reader must not
+                    # see a different card under the same short ref
+                    other = _read_unique_elsewhere(f"s:{wait['target']}", mesh,
+                                                   lambda r: r.mesh.task_by_short(wait["target"]),
+                                                   known_id=own_id)
+                    if other is AMBIGUOUS:
+                        wait["unreadable"], wait["ambiguous"], wait["errors"] = True, True, 0
+                        return _unreadable_event(wait, kind, started, interval, now, ambiguous=True)
+                    wait["target_id"] = own_id
+                    wait.pop("ambiguous", None)
             cat = cats.category(target)
             if cat in CLOSED:
                 event = f"task #{wait['target']} is {cat}"
@@ -1265,11 +1348,7 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
     except Exception as e:         # transient or misconfigured: count, then tell the agent
         if kind == "card" and isinstance(e, MeshError) and e.status == 403:
             wait["unreadable"], wait["errors"] = True, 0     # e.g. its project's statuses: a denial, not a fault
-            if now - started >= interval:
-                wait["recheck_due"] = True
-                return (f"re-check: the wait ({kind} {wait.get('target') or ''}) has lasted "
-                        f"{_hours(now - started)}; its target is still unreadable")
-            return ""
+            return _unreadable_event(wait, kind, started, interval, now)
         if budget.classify(e) in ("timeout", "transport"):
             # a slow or broken CHANNEL says nothing about the awaited thing: it neither wakes the agent
             # nor changes the wait; the caller records the safe cause and the next check reads again.
