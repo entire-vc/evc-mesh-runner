@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-from . import RUNNER_NAME, __version__, catalog_launch
+from . import RUNNER_NAME, __version__, catalog_launch, coalesced_http
 
 log = logging.getLogger("mesh_runner")
 
@@ -554,7 +554,7 @@ class ControllerClient:
         self._key = agent_key
         self._basic = basic_auth
         self.timeout = timeout
-        self._open = (opener or urllib.request.build_opener(_NoRedirect())).open
+        self._open = (opener or coalesced_http.build_opener(_NoRedirect())).open
         self._sleep = sleep or threading.Event().wait
 
     def __repr__(self) -> str:      # never show the key

@@ -1035,7 +1035,7 @@ class Driver:
                 rollout_prefix = hashlib.sha256(fh.read(cursor)).hexdigest()
         self.delivery_phase("send-intent", harness=self.harness,
                             session_id=self.meta.get("session_id") or self.sid or self.rollout_thread(),
-                            cwd=str(self.cwd), native_base=len(native),
+                            cwd=str(self.cwd), codex_home=str(self.env.get("CODEX_HOME") or ""), native_base=len(native),
                             native_prefix=hashlib.sha256(json.dumps(native, sort_keys=True).encode()).hexdigest(),
                             offset=offset, meta=dict(self.meta), rollout=self.rollout, rollout_cursor=cursor,
                             rollout_prefix=rollout_prefix, totals=totals)
@@ -1448,6 +1448,8 @@ class Driver:
                     line = self.died_in_bootstrap()
                     if not line:
                         raise
+                    # proven: the prompt was never taken and the process died while bootstrapping
+                    self.delivery_phase("bootstrap-failed", bootstrap_error=line[:300])
                     if start == BOOTSTRAP_RETRIES:
                         raise DriverError(f"{self.harness} exited during start-up {start + 1} times: {line[:300]}",
                                           close=True) from None

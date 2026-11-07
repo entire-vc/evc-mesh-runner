@@ -209,6 +209,14 @@ class Tmux:
         self.run("kill-window", "-t", f"={session}:={window}")
 
 
+def native_tail(argv: list[str]) -> list[str]:
+    """The native harness argv a driver command carries after its ``--`` (what runs in tmux)."""
+    try:
+        return argv[argv.index("--") + 1:]
+    except ValueError:
+        raise ValueError("driver argv has no native tail") from None
+
+
 # ---------------------------------------------------------------------- adapter
 class InteractiveAdapter(Adapter):
     """Wraps a headless adapter: same session ids and turn-log format, but the turn's

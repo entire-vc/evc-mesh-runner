@@ -22,7 +22,9 @@ import ctypes
 import hashlib
 from functools import lru_cache
 import json
+import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -34,6 +36,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .workspace import TimedLock, WorkspaceError, git
+
+log = logging.getLogger("mesh_runner")
 
 def _run(args, *, timeout=600, input=None, capture_output=False, check=False, **kwargs):
     """subprocess.run with a deadline that also holds when the child is stuck in uninterruptible IO.
@@ -538,14 +542,86 @@ def _copy(src: Path, dst: Path, excludes: frozenset = frozenset()) -> None:
                                              or (Path(p) / n).relative_to(src).as_posix() in excludes])
 
 
+# Where a slim capture stopped. `_mark` records the stage last entered on this thread; the slim
+# attempt reads it when it fails. Only these names are ever persisted or logged.
+_TRACE = threading.local()
+SLIM_STAGES = frozenset({
+    'capture-plan', 'capture-copy', 'capture-stash', 'capture-refs', 'capture-bundle', 'capture-submodule',
+    'verify-setup', 'verify-snapshot', 'verify-base', 'verify-fetch', 'verify-checkout', 'verify-overlay',
+    'verify-index', 'verify-refresh', 'verify-fingerprint', 'source-recheck', 'unknown'})
+SLIM_GIT_COMMANDS = frozenset({
+    'bundle', 'cat-file', 'checkout', 'checkout-index', 'config', 'diff', 'fetch', 'init', 'ls-files',
+    'rev-list', 'rev-parse', 'stash', 'status', 'symbolic-ref', 'update-index', 'update-ref'})
+# Fixed checkpoint messages, checked in order; the first fragment found names the class.
+_SLIM_FIXED = (
+    ('bundle base', 'bundle-base-unavailable'),
+    ('replay verification failed', 'replay-mismatch'),
+    ('snapshot hash mismatch', 'snapshot-mismatch'),
+    ('base commit missing', 'base-commit-missing'),
+    ('cannot fingerprint', 'fingerprint-git-failed'),
+    ('cannot list', 'list-git-failed'),
+    ('active git writer', 'git-writer-active'),
+    ('delta path outside', 'unsafe-delta-path'),
+    ('invalid manifest', 'invalid-manifest'),
+    ('special file unsupported', 'special-file'),
+    ('submodule', 'submodule'),
+    ('disk availability unknown', 'disk-unknown'),
+)
+# What a failed git command said, reduced to a class (stderr itself is never kept).
+_SLIM_GIT_ERRORS = (
+    (('timed out',), 'timeout'),
+    (('.lock', 'unable to create', 'cannot lock', 'file exists'), 'lock'),
+    (('no space left',), 'no-space'),
+    (('permission denied', 'operation not permitted'), 'permission'),
+    (('bad object', 'unable to read', 'missing', 'not a valid', 'could not read', 'did not receive',
+      'packfile', 'pack file', 'loose object', 'corrupt', 'invalid object', 'unable to parse'), 'object-unreadable'),
+    (('not a git repository',), 'not-a-repository'),
+    (('unknown revision', 'ambiguous argument', 'bad revision', 'invalid reference'), 'revision-unknown'),
+)
+SLIM_REASONS = frozenset({kind for _, kind in _SLIM_FIXED} | {'git-' + kind for _, kind in _SLIM_GIT_ERRORS}
+                         | {'git-other', 'timeout', 'other'})
+_GIT_MESSAGE = re.compile(r'git (\S+)(?: .*?)? in .*?: (.*)\Z', re.S)
+
+
+def _mark(stage: str) -> None:
+    _TRACE.stage = stage
+
+
+def slim_failure_cause(error: Exception, stage: str | None = None) -> dict:
+    """{'reason', 'stage', 'git'} of a failed slim capture: finite allowlisted values only, never
+    exception text, paths or command output. `git` is the failing git subcommand, or None."""
+    message = str(error)
+    reason, command = 'other', None
+    lowered = message.lower()
+    # Fixed texts only in this module's own messages: a git message carries arguments and paths.
+    own = message.startswith('checkpoint:')
+    fixed = next((kind for fragment, kind in _SLIM_FIXED if fragment in message), 'other') if own else None
+    found = _GIT_MESSAGE.match(message) if not own else None
+    if fixed is not None:
+        reason = fixed
+    elif found is not None:
+        command = found.group(1) if found.group(1) in SLIM_GIT_COMMANDS else 'other'
+        said = found.group(2).lower()
+        reason = 'git-' + next((kind for fragments, kind in _SLIM_GIT_ERRORS
+                                if any(f in said for f in fragments)), 'other')
+    elif 'timed out' in lowered:
+        reason = 'timeout'
+    stage = stage if stage in SLIM_STAGES else 'unknown'
+    reason = reason if reason in SLIM_REASONS else 'other'
+    return {'reason': reason, 'stage': stage, 'git': command}
+
+
 def _slim_failure_reason(error: WorkspaceError) -> str:
     # Persist only a finite classification, never exception text, paths or command output.
-    message = str(error)
-    if 'bundle base' in message:
-        return 'bundle-base-unavailable'
-    if 'fingerprint' in message or 'differs' in message or 'replay' in message:
-        return 'replay-mismatch'
-    return 'slim-verification-failed'
+    return slim_failure_cause(error)['reason']
+
+
+def _same_volume(a: Path, b: Path) -> bool:
+    """True when a file clone from `a` into `b` is possible (same filesystem); unknown counts as not."""
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
 
 
 def _clear_tree(root: Path) -> None:
@@ -747,19 +823,39 @@ class Checkpoints:
     def _create_best(self, key: str, source: Path, metadata: dict) -> Path:
         if not self.slim:
             return self._create(key, source, metadata, slim=False)
+        _mark('capture-plan')
         try:
             return self._create(key, source, metadata, slim=True)
         except WorkspaceError as e:
             if (isinstance(e, CheckpointNestedTooLarge) or 'insufficient disk' in str(e)
                     or 'source changed' in str(e) or 'unsupported' in str(e)):
                 raise
-            # The compact form did not replay to the same state (filters, skip-worktree, a
-            # missing base): keep the full form, which is always self-contained.
-            return self._create(key, source, metadata, slim=False, slim_failed=True,
-                                slim_failure_reason=_slim_failure_reason(e))
+            cause = slim_failure_cause(e, getattr(_TRACE, 'stage', None))
+        # The compact form did not replay to the same state (filters, skip-worktree, a missing base).
+        # The full form is always self-contained, but it is only cheap where the tree can be cloned:
+        # across volumes it is a real copy of the whole worktree on the checkpoint volume, every time.
+        # There the lease is kept instead (the slot stays where it is, the next suspend pass retries).
+        if not _same_volume(source, self.root):
+            self._log_slim_fallback(metadata, cause, 'lease-retained')
+            raise WorkspaceError(f"checkpoint: slim capture failed ({cause['stage']}/{cause['reason']}); "
+                                 "a full copy would cross volumes; lease retained")
+        path = self._create(key, source, metadata, slim=False, slim_failed=True, slim_failure=cause)
+        self._log_slim_fallback(metadata, cause, 'full-form')
+        return path
+
+    def _log_slim_fallback(self, metadata: dict, cause: dict, outcome: str) -> None:
+        # One line per fallback, from allowlisted values and ids only.
+        def ident(value) -> str:
+            text = str(value or '')[:8]
+            return text if re.fullmatch(r'[0-9a-f]{1,8}', text) else '-'
+        repo = str(metadata.get('repo') or '')
+        repo = repo if re.fullmatch(r'[A-Za-z0-9._-]{1,64}', repo) else '-'
+        log.warning("checkpoint slim fallback: agent=%s card=%s attempt=%s repo=%s stage=%s reason=%s git=%s outcome=%s",
+                    self.root.name, ident(metadata.get('task')), ident(metadata.get('attempt')), repo,
+                    cause['stage'], cause['reason'], cause['git'] or '-', outcome)
 
     def _create(self, key: str, source: Path, metadata: dict, slim: bool = False, slim_failed: bool = False,
-                slim_failure_reason: str | None = None) -> Path:
+                slim_failure: dict | None = None) -> Path:
         if not key or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for c in key):
             raise WorkspaceError('checkpoint: invalid key')
         final = self.root / key
@@ -794,6 +890,7 @@ class Checkpoints:
         pending = Path(tempfile.mkdtemp(prefix='.pending-', dir=self.root))
         pending.chmod(0o700)
         try:
+            _mark('capture-copy')
             if delta is not None:
                 self._copy_delta(source, pending / 'tree', before['tree'], delta)
             else:
@@ -804,7 +901,9 @@ class Checkpoints:
             shutil.copy2(index, pending / 'index')
             # HEAD alone omits blobs referenced only by the staged index. A stash
             # commit records them without changing HEAD/index/worktree; keep its ref.
+            _mark('capture-stash')
             stash = _stash_create(source)
+            _mark('capture-refs')
             refs = ['HEAD']
             base_sha = metadata.get('base_sha')
             ref = None
@@ -816,8 +915,10 @@ class Checkpoints:
                 ref = f'refs/runner-checkpoints/{key}'
                 git(source, 'update-ref', ref, stash)
                 refs.append(ref)
+            _mark('capture-bundle')
             bundle = self._bundle(source, pending, refs, base_sha if slim else None, stash and ref)
             (pending / 'index').chmod(0o600)
+            _mark('capture-submodule')
             for i, entry in enumerate(plan):
                 if entry['gitdir']:
                     self._capture_submodule(key, source, modules, entry, pending / 'submodules' / str(i))
@@ -832,7 +933,11 @@ class Checkpoints:
                 manifest['ignored'] = ignored
             if slim_failed:
                 manifest['slim_failed'] = True      # full form kept on purpose: not a migration candidate
-                manifest['slim_failure_reason'] = slim_failure_reason or 'slim-verification-failed'
+                cause = slim_failure or {'reason': 'other', 'stage': 'unknown', 'git': None}
+                manifest['slim_failure_reason'] = cause['reason']
+                manifest['slim_failure_stage'] = cause['stage']
+                if cause.get('git'):
+                    manifest['slim_failure_git'] = cause['git']
             if delta is not None:
                 manifest['delta'] = delta
                 manifest['stored_bytes'] = stored
@@ -845,6 +950,7 @@ class Checkpoints:
             # scratch allocation; failure removes only this pending copy.
             self._budget(self.root, size + 2 * object_size, self.capture_min_free_bytes)
             self.verify(pending)
+            _mark('source-recheck')
             if submodule_plan(source) != plan or fingerprint(source, plan, tuple(excludes), tuple(ignored), self.max_nested_bytes) != before:
                 raise WorkspaceError('checkpoint: source changed during capture; lease retained')
             # fsync all regular files before publishing the checkpoint directory.
@@ -970,6 +1076,7 @@ class Checkpoints:
         ignored = tuple(data.get('ignored', []))
         delta = data.get('delta')
         expected = _delta_keep(data['fingerprint']['tree'], delta) if delta else data['fingerprint']['tree']
+        _mark('verify-snapshot')
         if inventory(checkpoint / 'tree', tuple(e['path'] for e in subs if e['populated'])) != expected:
             raise WorkspaceError('checkpoint: snapshot hash mismatch')
         modules = _modules_dir(target)
@@ -989,6 +1096,7 @@ class Checkpoints:
                                                          '+refs/remotes/*:refs/remotes/*', '+HEAD:refs/runner-replay/HEAD'],
                                'submodule bundle invalid; target untouched')
         bundle = data.get('bundle')
+        _mark('verify-base')
         if bundle:
             self._ensure_base(checkpoint, target, bundle['base'], data['source'])
         refspecs = ['+refs/*:refs/runner-replay/*', *(['HEAD'] if not bundle or bundle['has_head'] else [])]
@@ -1000,14 +1108,17 @@ class Checkpoints:
             self._prove_bundle(checkpoint / 'commits.bundle', refspecs, 'bundle invalid; target untouched',
                                reference=_objects_dir(target) if bundle else None)
         self._set_aside_stale_submodules(target, stale)
+        _mark('verify-fetch')
         # Replay never needs the target's own submodules; a set-aside gitdir would break the recursion.
         if not (bundle and bundle['mode'] == 'none'):
             git(target, 'fetch', '--quiet', '--no-recurse-submodules', str(checkpoint / 'commits.bundle'), *refspecs)
         branch = data.get('branch')
+        _mark('verify-checkout')
         if isinstance(branch, str) and branch.startswith('refs/heads/'):
             git(target, 'checkout', '--quiet', '--force', '-B', branch[len('refs/heads/'):], data['fingerprint']['head'])
         else:
             git(target, 'checkout', '--quiet', '--force', '--detach', data['fingerprint']['head'])
+        _mark('verify-overlay')
         _clear_tree(target)
         if delta:
             self._overlay_delta(checkpoint / 'tree', target, data['fingerprint']['tree'], delta)
@@ -1020,6 +1131,7 @@ class Checkpoints:
                     _copy(child, dest)
                 else:
                     shutil.copy2(child, dest)
+        _mark('verify-index')
         index = Path(git(target, 'rev-parse', '--git-path', 'index'))
         if not index.is_absolute():
             index = target / index
@@ -1033,10 +1145,12 @@ class Checkpoints:
         for i, entry in enumerate(subs):
             if entry['gitdir']:
                 self._replay_submodule(checkpoint / 'submodules' / str(i), target, modules, entry, data)
+        _mark('verify-refresh')
         git(target, 'update-index', '--really-refresh', check=False)
         for entry in subs:
             if entry['populated']:
                 git(target / entry['path'], 'update-index', '--really-refresh', check=False)
+        _mark('verify-fingerprint')
         if fingerprint(target, subs, excludes, ignored) != data['fingerprint']:
             raise WorkspaceError('checkpoint: replay verification failed; lease retained')
 
@@ -1256,6 +1370,7 @@ class Checkpoints:
             self._verify(checkpoint)
 
     def _verify(self, checkpoint: Path) -> None:
+        _mark('verify-setup')
         data = self.read(checkpoint)
         self._budget(self.root, data['bytes'] + 2 * data['object_bytes'])
         with tempfile.TemporaryDirectory(prefix='.verify-', dir=self.root) as name:

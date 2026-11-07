@@ -37,6 +37,8 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # lifecycle_wait_v1 = false        # enables `WAIT lifecycle:#<card8>` (docs/lifecycle-wait.md)
     # stall_wait_v1 = false            # enables `WAIT stall:#<card8>` on an operator-armed mesh-stall-control registration (docs/stall-wait.md)
     # receipt_wait_v1 = false          # enables `WAIT receipt:#<card8>` on an operator-armed receipt registration (docs/receipt-wait.md)
+    # gmail_watch_v1 = false           # enables `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
+    # gmail_watch_reader = ["ssh", "-o", "BatchMode=yes", "<host>", "<readonly-wrapper>"]   # fixed argv; JSON request on stdin
 
     [catalog]                     # optional: apply the runtime catalog and report on it (off by default)
     enabled = false
@@ -389,6 +391,10 @@ class RunnerConfig:
     lifecycle_wait_v1: bool = False    # `WAIT lifecycle:#<card8>` on an operator-armed native SessionStart registration (docs/lifecycle-wait.md)
     stall_wait_v1: bool = False        # `WAIT stall:#<card8>` on an operator-armed mesh-stall-control result registration
     receipt_wait_v1: bool = False      # `WAIT receipt:#<card8>` on an operator-armed Telegram receipt registration
+    gmail_watch_v1: bool = False       # `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
+    gmail_watch_reader: tuple = ()     # fixed argv of the read-only wrapper (JSON on stdin/stdout); never a shell string
+    gmail_watch_interval_seconds: float = 120.0
+    gmail_watch_timeout_seconds: float = 60.0
     max_wait_hours: float = 6.0
     # Which comments by other agents end a pipeline/MR/time/decision/card/merge wait early. "all":
     # every foreign comment. "addressed": only an @-mention of the waiting agent, a person's comment,
@@ -681,6 +687,15 @@ def _positive(value, name: str, integer: bool = False):
     return int(value) if integer else float(value)
 
 
+def _argv(value, name: str) -> tuple:
+    """A fixed argv list (never a shell string); absent means not configured."""
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) and v for v in value):
+        raise ConfigError(f"{name} must be a non-empty list of strings (an argv, not a shell string)")
+    return tuple(value)
+
+
 def _exclude_names(value) -> tuple:
     if value is None:
         return (".gocache", "node_modules", "target", ".venv", "__pycache__", "var")
@@ -895,6 +910,10 @@ def load(path: str | Path) -> RunnerConfig:
         checkpoint_exclude_names=_exclude_names(r.get("checkpoint_exclude_names")),
         queue_wait_freshness_v1=r.get("queue_wait_freshness_v1") is True,
         receipt_wait_v1=r.get("receipt_wait_v1") is True,
+        gmail_watch_v1=r.get("gmail_watch_v1") is True,
+        gmail_watch_reader=_argv(r.get("gmail_watch_reader"), "gmail_watch_reader"),
+        gmail_watch_interval_seconds=max(30.0, _idle_hours(r.get("gmail_watch_interval_seconds", 120.0), "gmail_watch_interval_seconds")),
+        gmail_watch_timeout_seconds=_idle_hours(r.get("gmail_watch_timeout_seconds", 60.0), "gmail_watch_timeout_seconds"),
         stall_wait_v1=r.get("stall_wait_v1") is True,
         lifecycle_wait_v1=r.get("lifecycle_wait_v1") is True,
         recovery_wait_v1=r.get("recovery_wait_v1") is True,

@@ -16,6 +16,7 @@ import uuid
 import urllib.request
 from typing import Any
 
+from . import coalesced_http
 from .mesh import MeshClient, MeshError
 
 PROTOCOL = 1
@@ -30,7 +31,7 @@ DROP_CODES = frozenset({"chat_stale_claim", "chat_lease_expired", "chat_turn_ter
 _PHASES = threading.local()      # per thread: when each stage of the current request finished
 
 
-class _TimedHTTPS(http.client.HTTPSConnection):
+class _TimedHTTPS(coalesced_http.CoalesceSendMixin, http.client.HTTPSConnection):
     """Marks connect (TCP+TLS), send and first byte, so a silent read timeout says which stage stalled."""
 
     def _mark(self, stage: str) -> None:

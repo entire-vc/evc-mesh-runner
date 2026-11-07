@@ -42,6 +42,11 @@ class Bench(unittest.TestCase):
                                 wake_poll_seconds=0, heartbeat_seconds=0,
                                 load_hold_per_cpu=0)       # the host's real load must not hold a test's starts
         self.adapter = FakeAdapter(script)
+        # The fixture's operator clone stands for the canonical project the fixture MR links name;
+        # tests of the repository preflight override this explicitly.
+        patcher = mock.patch("mesh_runner.repo_requirements.clone_project", lambda base, remote: "g/app")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         stuck = self.stop_live_groups()
@@ -4271,6 +4276,16 @@ class ResumeInventoryFixedAtAdmission(Bench):
         root = self.root / f'{name}-repo'
         root.mkdir()
         self.agent.repos.append(RepoSpec(name, make_repo(root), max_slots=1))
+
+    def test_suspend_manifest_names_the_task(self):
+        mesh, t, a = self.suspended_one_repo_attempt(83)
+        r = self.runner(mesh)
+        rows = r.pool._checkpoint_rows(a.id)
+        self.assertTrue(rows)
+        for row in rows:
+            manifest = r.pool._checkpoints().read(Path(row['checkpoint']))
+            self.assertEqual(manifest['metadata']['task'], t['id'])
+        self.assertEqual(r._suspend_metadata(r.store.get(a.id))['task'], t['id'])
 
     def test_old_one_repo_attempt_resumes_after_config_grew(self):
         mesh, t, a = self.suspended_one_repo_attempt(81)

@@ -45,6 +45,7 @@ from . import reviewer_merge
 from . import inputs
 from . import prompt as prompts
 from . import repo_admission
+from . import repo_requirements
 from . import git_index_admission
 from . import maintenance
 from . import delivery_requests
@@ -63,6 +64,7 @@ from .adapters.codex import CodexAdapter
 from . import queue_wait
 from . import native_result_wait, native_result_resume, native_result_rebind, native_result_config
 from . import receipt_wait
+from . import gmail_watch
 from . import lifecycle_wait
 from . import recovery_wait
 from . import stall_wait
@@ -1078,16 +1080,25 @@ class AgentRunner:
         return head + f"~${cost:.2f} notional (out {out_tok / 1000:.1f}k tok, cache_rd {cache_rd / 1e6:.1f}M)"
 
     # ------------------------------------------------------------------ turns
+    def _auth_profile_id(self, harness: str, env: dict[str, str]) -> str:
+        if harness == "claude":
+            return auth.profile_id(env, self.agent.profile_dir)
+        if harness == "codex":
+            adapter = self.adapter_for("codex")
+            adapter = getattr(adapter, "base", adapter)     # the interactive wrapper keeps the real adapter here
+            return auth.codex_profile_id(env, str(getattr(adapter, "profile", "") or ""))
+        return ""
+
     def _auth_blocked(self, a: Attempt, env: dict[str, str]) -> str:
         routed = self._routed_harness
-        profile = auth.profile_id(env, self.agent.profile_dir) if routed == "claude" else ""
+        profile = self._auth_profile_id(routed, env)
         unknown = self.store.mark(self.agent.name, a.task_id, "auth_unknown")
         try:
             unknown = json.loads(unknown[0]) if unknown and unknown[0] else {}
         except ValueError:
             unknown = {}
         unrecorded = unknown.get("profile", "") if isinstance(unknown, dict) and unknown.get("attempt") == a.id else ""
-        return (unrecorded if routed == "claude" and unrecorded and auth.held(self.store, unrecorded) else
+        return (unrecorded if routed in ("claude", "codex") and unrecorded and auth.held(self.store, unrecorded) else
                 profile if profile and auth.held(self.store, profile) else "")
 
     def _writer_launch_env(self, a: Attempt, env: dict[str, str],
@@ -1197,7 +1208,7 @@ class AgentRunner:
         # checkpoints, so a held profile never leases their worktrees prematurely.
         env = self._fresh_env(a.task_id) if env is None else env
         routed = self._routed_harness
-        profile = auth.profile_id(env, self.agent.profile_dir) if routed == "claude" else ""
+        profile = self._auth_profile_id(routed, env)
         blocked = self._auth_blocked(a, env)
         if blocked:
             self._authentication_failed(a, blocked)
@@ -1226,18 +1237,7 @@ class AgentRunner:
         def build_argv() -> list[str]:
             argv = (adapter.resume_argv if resume else adapter.start_argv)(
                 sid, self.agent.profile_dir, workspaces)
-            model = self.store.mark(self.agent.name, a.task_id, "model")
-            scope = self.store.mark(self.agent.name, a.task_id, "override_harness")
-            # Pre-upgrade Claude overrides can exist on a native Codex lane routed to Claude.
-            legacy_claude = bool(model and (model[0] in ("opus", "sonnet", "haiku")
-                                           or model[0].startswith("claude-")))
-            override_harness = scope[0] if scope and scope[0] else ("claude" if legacy_claude else self.agent.harness)
-            if model and model[0] and a.harness == override_harness:
-                argv = adapter.with_model(argv, model[0])
-            effort = self.store.mark(self.agent.name, a.task_id, "effort")
-            if effort and effort[0] and a.harness == override_harness:
-                argv = adapter.with_effort(argv, effort[0])
-            return argv
+            return self._with_override_marks(adapter, argv, a.task_id, a.harness)
 
         argv = build_argv()
         if self.pool.disk_hold():
@@ -1359,16 +1359,21 @@ class AgentRunner:
         if intent:
             launch_env["_MESH_RUNNER_PROMPT_INTENT"] = intent["token"]
             launch_env["_MESH_RUNNER_PROMPT_SHA256"] = intent["sha256"]
-        if not interactive_driver and self._probe_adapter(a.harness) is not None:
-            # The supervisor observes the exact native argv/env/cwd it is about to Popen (transport
-            # variables already removed) and refuses exec on anything but a matching available answer.
-            launch_env["_MESH_RUNNER_LAUNCH_PROBE"] = json.dumps(
-                {"argv": launch_probe.helper_command(self.agent.launch_probe_command,
-                                                        self.agent.launch_probe_version),
-                 "version": self.agent.launch_probe_version})
+        probed = self._probe_adapter(a.harness) is not None
+        expected = ""
+        if probed:
             early = self._launch_obs.get(a.task_id)
             if early and early[2].available:
-                launch_env["_MESH_RUNNER_LAUNCH_EXPECT"] = early[2].account_ref
+                expected = early[2].account_ref
+            if not interactive_driver:
+                # The supervisor observes the exact native argv/env/cwd it is about to Popen (transport
+                # variables already removed) and refuses exec on anything but a matching available answer.
+                launch_env["_MESH_RUNNER_LAUNCH_PROBE"] = json.dumps(
+                    {"argv": launch_probe.helper_command(self.agent.launch_probe_command,
+                                                            self.agent.launch_probe_version),
+                     "version": self.agent.launch_probe_version})
+                if expected:
+                    launch_env["_MESH_RUNNER_LAUNCH_EXPECT"] = expected
         if not interactive_driver and a.harness == "claude":
             argv = headless_acceptance.claude_argv(argv,
                 interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent)
@@ -1376,21 +1381,29 @@ class AgentRunner:
         from . import access_recovery
         if access_recovery.held(self.store, self.agent.name, a.task_id):
             return self._deny_launch(a, intent, pending_wait, "access_hold")
-        if not interactive_driver and self._probe_adapter(a.harness) is not None:
+        if probed:
             # Observe the exact snapshot BEFORE any one-time reservation (before_spawn) is consumed; the
             # supervisor repeats it on the real Popen arguments (a late change still cannot start native).
             transport = ("_MESH_RUNNER_PROMPT_INTENT", "_MESH_RUNNER_PROMPT_SHA256",
                          "_MESH_RUNNER_LAUNCH_PROBE", "_MESH_RUNNER_LAUNCH_EXPECT")
             try:
+                # Interactive Codex: the driver execs the tail after "--" in tmux, so that tail is the
+                # native argv; the env is exactly what the driver receives.
                 context = launch_probe.build_context(
-                    argv, {k: v for k, v in launch_env.items() if k not in transport}, self.agent.profile_dir)
+                    interactive.native_tail(argv) if interactive_driver else argv,
+                    {k: v for k, v in launch_env.items() if k not in transport}, self.agent.profile_dir)
                 obs = launch_probe.observe(launch_probe.helper_command(
                     self.agent.launch_probe_command, self.agent.launch_probe_version), context,
                     version=self.agent.launch_probe_version)
             except (ValueError, OSError):
                 obs = launch_probe.unknown(launch_probe.LOCAL["invalid"])
-            expected = launch_env.get("_MESH_RUNNER_LAUNCH_EXPECT", "")
-            if not obs.available or (expected and obs.account_ref != expected):
+            if (interactive_driver and not obs.available and obs.status != "quota_blocked"
+                    and not self._quota_admission_required(a)):
+                # Evidence the helper cannot prove (e.g. an argv form it does not know yet) must not
+                # pause an ordinary interactive start forever; without a capacity proof to feed it is
+                # simply not carried and the launch proceeds as before. A blocked quota still denies.
+                obs = None
+            if obs is not None and (not obs.available or (expected and obs.account_ref != expected)):
                 return self._deny_launch(a, intent, pending_wait,
                                          obs.reason if not obs.available else "snapshot_identity_mismatch")
         reserved = False
@@ -1756,7 +1769,7 @@ class AgentRunner:
         if self._still_ours(task, a.mode) and not self._settle_native(a, task):
             return
         auth_profile = None
-        if a.harness == "claude" and (result.auth_failed or result.verification_required):
+        if a.harness in ("claude", "codex") and (result.auth_failed or result.verification_required):
             # The process's exact profile is evidence even if ownership/status
             # changed before settle. Record it before releasing this attempt.
             auth_profile = self._record_authentication_failure(a, result.auth_only, result.verification_required)
@@ -1911,6 +1924,12 @@ class AgentRunner:
             receipt_reg = self._receipt_registration(a, outcome)
             if receipt_reg is None:
                 self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=receipt_wait.WAIT_GUIDANCE))
+                return
+        gmail_reg = None
+        if outcome.kind == "gmail":
+            gmail_reg = self._gmail_registration(a, outcome)
+            if gmail_reg is None:
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=gmail_watch.WAIT_GUIDANCE))
                 return
         recovery_reg = None
         if outcome.kind == "recovery":
@@ -2090,6 +2109,8 @@ class AgentRunner:
             wait["native_receiver"] = native_receiver
         if receipt_reg:
             wait["receipt_reg"] = receipt_reg["reg_id"]
+        if gmail_reg:
+            wait["gmail_reg"] = gmail_reg["id"]
         if recovery_reg:
             wait["recovery_reg"] = recovery_reg["reg_id"]
         if lifecycle_reg:
@@ -2620,6 +2641,8 @@ class AgentRunner:
         """
         if not self.agent.on_auth_command or not auth.held(self.store, profile):
             return False
+        if a.harness == "codex":
+            return False                       # the fallback IS codex: repair the login, then clear-auth-hold
         if self.agent.harness != "codex" and "codex" not in self.alt_adapters:
             return False                       # no runnable fallback adapter
         unknown = self.store.mark(self.agent.name, a.task_id, "auth_unknown")
@@ -4076,6 +4099,7 @@ class AgentRunner:
             self._last_wake_check[a.id] = mono
             self._guard(a, "cap-event", self._check_cap_event)
         self._scan_receipts()
+        self._scan_gmail()
         self._scan_lifecycle()
         self._scan_recovery()
         self._scan_stall()
@@ -4123,11 +4147,15 @@ class AgentRunner:
         rows = self.pool._checkpoint_rows(a.id)
         if rows and all(r["phase"] == "released" for r in rows) and not self.pool.leased_to(a.id):
             return
-        self.pool.suspend(a.id, {"session_id": a.session_id, "harness": a.harness,
-                               "cwd": str(self.agent.profile_dir), "workspaces": a.workspaces,
-                               "wait": a.wait}, writer_stopped=True)
+        self.pool.suspend(a.id, self._suspend_metadata(a), writer_stopped=True)
         if self.pool._checkpoint_rows(a.id):
             self.store.event(a.id, "workspace_suspended", "verified durable snapshot; leases returned")
+
+    def _suspend_metadata(self, a: Attempt) -> dict:
+        """What a checkpoint manifest records about the attempt it suspends. ``task`` names
+        the card in the slim fallback log line."""
+        return {"session_id": a.session_id, "harness": a.harness, "task": a.task_id,
+                "cwd": str(self.agent.profile_dir), "workspaces": a.workspaces, "wait": a.wait}
 
     def _umbrella_waits(self, a: Attempt) -> bool:
         """A parent task with open children waiting on something other than CI: it only resumes
@@ -4653,6 +4681,88 @@ class AgentRunner:
                                         state="ready", wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="receipt delivered")
 
+    def _gmail_reader(self):
+        reader = getattr(self, "_gmail_reader_obj", None)
+        if reader is None and self.cfg.gmail_watch_reader:
+            reader = self._gmail_reader_obj = gmail_watch.SubprocessReader(
+                list(self.cfg.gmail_watch_reader), self.cfg.gmail_watch_timeout_seconds)
+        return reader
+
+    def _gmail_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
+        """The registration this card's ``WAIT gmail:`` may bind to: this lane resumes it, this card
+        observes it, and it is still active (or fired with its wake not yet delivered, so a message
+        that lands between registration and the declaration is kept, not lost). Else None."""
+        if not self.cfg.gmail_watch_v1 or a.mode != "work":
+            return None
+        rows = [r for r in gmail_watch.registrations_of(self.store, self.agent_id, ("active", "fired"))
+                if r["id"] == outcome.target]
+        if not rows or rows[0]["observer_task"] != a.task_id:
+            return None
+        if rows[0]["state"] == "fired" and not gmail_watch.pending(self.store.db, rows[0]["id"], "wake"):
+            return None
+        return rows[0]
+
+    def _scan_gmail(self) -> None:
+        """Advance this lane's active registrations on their own schedule (never an agent turn) and
+        deliver pending comments. An observer fault must not stop the lane."""
+        if not self.cfg.gmail_watch_v1:
+            return
+        reader = self._gmail_reader()
+        if reader is None:
+            return
+        now_ms = int(time.time() * 1000)
+        try:
+            regs = gmail_watch.registrations_of(self.store, self.agent_id)
+        except Exception as e:                  # noqa: BLE001
+            log.warning("%s: gmail scan failed: %s", self.agent.name, type(e).__name__)
+            return
+        busy = getattr(self, "_gmail_inflight", None)
+        if busy is None:
+            busy = self._gmail_inflight = set()   # one read per registration at a time; empty after a restart
+        for r in regs:
+            if r["state"] != "active" or r["next_check_at"] > now_ms or r["id"] in busy:
+                continue
+            busy.add(r["id"])
+            try:
+                t = gmail_watch.tick(self.store, reader, r["id"], now_ms, self.cfg.gmail_watch_interval_seconds)
+                if t.alert:
+                    log.error("%s: gmail observation %s unavailable (%s) after %d consecutive failures; baseline kept, "
+                              "no wake, no turn", self.agent.name, r["id"], t.alert, gmail_watch.ALERT_AFTER)
+                    self.emit("gmail_alert", None, registration=r["id"], error_class=t.alert)
+            except Exception as e:             # noqa: BLE001
+                log.warning("%s: gmail tick failed: %s", self.agent.name, type(e).__name__)
+            finally:
+                busy.discard(r["id"])
+        try:
+            gmail_watch.deliver_comments(self.store, self.mesh, self.agent_id)
+        except Exception as e:                  # noqa: BLE001
+            log.warning("%s: gmail comment delivery failed: %s", self.agent.name, type(e).__name__)
+
+    def _wake_gmail(self, a: Attempt, task: dict) -> None:
+        """Wake on the pending wake row of the exact registration this wait declared. The ready
+        transition and the outbox ack commit together: an admission refusal or a crash keeps the
+        row pending, and a repeat cannot add a second wake."""
+        if not self.cfg.gmail_watch_v1 or a.mode != "work":
+            return
+        reg_id = a.wait.get("gmail_reg")
+        rows = [r for r in gmail_watch.registrations_of(self.store, self.agent_id) if r["id"] == reg_id]
+        if not rows or rows[0]["observer_task"] != a.task_id:
+            return
+        found = gmail_watch.wake_text(self.store, reg_id)
+        if found is None:
+            return
+        key, event = found
+
+        def ack_if_pending() -> bool:           # runs inside the delivery transaction
+            if not any(w["idempotency_key"] == key for w in gmail_watch.pending(self.store.db, reg_id, "wake")):
+                return False
+            gmail_watch.ack(self.store.db, key)
+            return True
+        if self.store.update_with_marks(a, {"gmail_delivered": key, "met_wake": a.id}, expect="waiting",
+                                        expect_wait=a.wait, validate=ack_if_pending, state="ready",
+                                        wake_text=prompts.wake_prompt(task, event)):
+            self.emit("wake", a, event="gmail delivered")
+
     def _recovery_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
         """The live, undelivered registration this card's ``WAIT recovery:`` may bind to, else None."""
         if not self.cfg.recovery_wait_v1 or a.mode != "work" or outcome.target != a.task8:
@@ -5056,8 +5166,20 @@ class AgentRunner:
         wait.pop("edge", None)
         event = (f"the blocking link to #{wait.get('target')} was removed by a user while that card is "
                  "still open: re-decide the next step of this work from the changed input "
-                 "(the removal is neither approval nor completion of the target)")
+                 "(the removal is neither approval nor completion of the target). First re-read the "
+                 "card's current dependencies: if a blocking link to it exists again, wait on it again "
+                 "instead of continuing")
+        def still_removed():
+            # Mesh may restore the link between the read above and this commit; the
+            # read is stale then. Re-read inside the CAS transaction and fail closed
+            # (WAIT, edge and dedup mark untouched) unless the edge is still provably gone.
+            try:
+                return card_wait_reconcile.removed_wait_edge(
+                    self.mesh.dependencies(a.task_id), expected, a.task_id) == edge_id
+            except MeshError:
+                return False
         if self.store.update_with_marks(a, {key: edge_id}, expect="waiting", expect_wait=expected,
+                validate=still_removed,
                 state="ready", wait=wait, wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="card edge removed")
         return True
@@ -5287,6 +5409,9 @@ class AgentRunner:
             return
         if a.wait.get("kind") == "receipt":
             self._wake_receipt(a, task)
+            return
+        if a.wait.get("kind") == "gmail":
+            self._wake_gmail(a, task)
             return
         if a.wait.get("kind") == "lifecycle":
             self._wake_lifecycle(a, task)
@@ -5786,9 +5911,7 @@ class AgentRunner:
                 if verified and leased <= verified:
                     if group_alive(a.pid, a.stamp):
                         raise WorkspaceError("checkpoint: writer group still alive")
-                    self.pool.suspend(a.id, {"session_id": a.session_id, "harness": a.harness,
-                        "cwd": str(self.agent.profile_dir), "workspaces": a.workspaces,
-                        "wait": a.wait}, writer_stopped=True)
+                    self.pool.suspend(a.id, self._suspend_metadata(a), writer_stopped=True)
             finally:
                 self._disk_hold_attempt(a)
             return
@@ -5800,6 +5923,9 @@ class AgentRunner:
             self._suspend_held_ready(a)
             self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
             return                               # the gate keeps refusing this review: noticed, not retried
+        if not metadata_only(task, a.mode) and self._repo_preflight_refused(
+                a, task, time.monotonic() + GATE_HOLD_SECONDS, resume=True):
+            return                               # before any Mesh checkout or model turn
         env = self._fresh_env(a.task_id)
         if not self._launch_ready(a, env, ("ready",)):
             return
@@ -5892,9 +6018,7 @@ class AgentRunner:
                         or leased_repos - journal_repos):
                     if group_alive(a.pid, a.stamp):
                         raise WorkspaceError("checkpoint: writer group still alive")
-                    self.pool.suspend(a.id, {"session_id": a.session_id, "harness": a.harness,
-                        "cwd": str(self.agent.profile_dir), "workspaces": a.workspaces,
-                        "wait": a.wait}, writer_stopped=True)
+                    self.pool.suspend(a.id, self._suspend_metadata(a), writer_stopped=True)
                 journal = self.pool._checkpoint_rows(a.id)
                 # The attempt's inventory was fixed when it was admitted and journaled; a
                 # config that grew repos since then applies to new attempts only. Anything
@@ -6956,6 +7080,35 @@ class AgentRunner:
                 return f"parent waits on {len(kids)} open children; none changed since the last feed"
         return ""
 
+    def _with_override_marks(self, adapter, argv: list[str], task_id: str, harness: str) -> list[str]:
+        """The task's model/effort override marks applied to ``argv`` exactly as a launch applies them
+        (shared by the launch builder and the early launch capture, so both describe one native argv)."""
+        model = self.store.mark(self.agent.name, task_id, "model")
+        scope = self.store.mark(self.agent.name, task_id, "override_harness")
+        # Pre-upgrade Claude overrides can exist on a native Codex lane routed to Claude.
+        legacy_claude = bool(model and (model[0] in ("opus", "sonnet", "haiku")
+                                       or model[0].startswith("claude-")))
+        override_harness = scope[0] if scope and scope[0] else ("claude" if legacy_claude else self.agent.harness)
+        if model and model[0] and harness == override_harness:
+            argv = adapter.with_model(argv, model[0])
+        effort = self.store.mark(self.agent.name, task_id, "effort")
+        if effort and effort[0] and harness == override_harness:
+            argv = adapter.with_effort(argv, effort[0])
+        return argv
+
+    def _launch_read_only(self, a: Attempt | None) -> bool:
+        """True when the launch of ``a`` is a sandboxed metadata-receipt turn (same rule as _spawn)."""
+        if a is None:
+            return False
+        scope = self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY)
+        if (a.workspaces or not metadata_receipt(scope[0] if scope else None, a.id)
+                or self.pool.leased_to(a.id)):
+            return False
+        try:
+            return bool(read_only(self._task(a.task_id)))
+        except MeshError:
+            return True
+
     def _quota_admission_required(self, a: Attempt | None) -> bool:
         if a is None:
             return False
@@ -6988,12 +7141,13 @@ class AgentRunner:
     LAUNCH_OBS_TTL = 60.0
 
     def _probe_adapter(self, harness: str):
-        """The native headless Codex adapter a probe applies to (None: TUI/other harness)."""
+        """The Codex adapter a probe applies to: headless, or interactive wrapping Codex (None: other harness)."""
         adapter = self.adapter_for(harness)
-        if (self.agent.launch_probe_command and isinstance(adapter, CodexAdapter)
-                and not isinstance(adapter, interactive.InteractiveAdapter)):
-            return adapter
-        return None
+        if not self.agent.launch_probe_command:
+            return None
+        if isinstance(adapter, interactive.InteractiveAdapter):
+            return adapter if isinstance(adapter.base, CodexAdapter) else None
+        return adapter if isinstance(adapter, CodexAdapter) else None
 
     def _capture_launch(self, task_id: str, attempt: Attempt | None) -> launch_probe.Observation | None:
         """Early read-only observation of the real candidate launch, after env_command and route
@@ -7008,7 +7162,13 @@ class AgentRunner:
                 return None
             sid = attempt.session_id if attempt else ""
             use_resume = bool(attempt and sid and attempt.harness == harness)
-            argv = (adapter.resume_argv if use_resume else adapter.start_argv)(sid, self.agent.profile_dir, [])
+            argv = (adapter.resume_argv if use_resume else adapter.start_argv)(
+                sid, self.agent.profile_dir, [Path(p) for p in (attempt.workspaces if attempt else [])])
+            if isinstance(adapter, interactive.InteractiveAdapter):
+                argv = self._with_override_marks(adapter, argv, task_id, harness)
+                if self._launch_read_only(attempt):
+                    argv = adapter.with_read_only(argv)     # the launch sandboxes it the same way
+                argv = interactive.native_tail(argv)
             context = launch_probe.build_context(argv, env, self.agent.profile_dir)
             key = launch_probe.fingerprint(context)
         except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, chat_diag.EnvDenied) as exc:
@@ -7541,6 +7701,8 @@ class AgentRunner:
             env = self._fresh_env(a.task_id)
             if not self._launch_ready(a, env, ("starting",)):
                 return False
+            if not metadata_only(task, mode) and self._repo_preflight_refused(a, task, backoff):
+                return False                   # before any Mesh checkout, lease or model turn
             if not self._acquire(a):
                 self.store.update(a, state="aborted", note="checkout refused")
                 self._task_backoff[task["id"]] = backoff
@@ -7656,6 +7818,41 @@ class AgentRunner:
         if why:
             self.store.mark(self.agent.name, a.task_id, self.OWNERSHIP_LOSS, "")   # the verdict is spent by a real launch
         self._first_start_succeeded(a, task, observed)
+        return True
+
+    REPO_PREFLIGHT = "repo_preflight"
+
+    def _repo_preflight_refused(self, a: Attempt, task: dict, backoff: float, resume: bool = False) -> bool:
+        """Refuse a code/review start whose required repository this lane cannot reach, before any
+        lease or model turn. One durable handoff comment per distinct fact set; transient slot
+        waits are left to the existing pool hold. Never changes config, clones or other leases."""
+        if not self.gitlab:
+            return False
+        try:
+            links = self.mesh.vcs_links(a.task_id)
+        except (MeshError, OSError) as e:
+            log.warning("%s: repository preflight skipped for #%s, VCS links unreadable: %s",
+                        self.agent.name, a.task_id[:8], e)
+            return False                       # unreadable is not a refusal: the normal path decides
+        approved = [s for ag in self.cfg.agents for s in ag.repos]
+        leased = {r["pool"].split("/", 1)[1] for r in self.pool.rows()
+                  if r["attempt"] == a.id and r["state"] == "leased"}
+        verdict = repo_requirements.check(
+            links, self.gitlab.base_url, agent_repos=list(self.agent.repos), approved_repos=approved,
+            leased_repos=leased, checkpoint_open=bool(self.pool._checkpoint_rows(a.id)),
+            resuming=bool(a.workspaces), pool_full=self.pool.full, config_only=resume)
+        if not verdict.durable:
+            return False
+        seen = self.store.mark(self.agent.name, a.task_id, self.REPO_PREFLIGHT)
+        if not (seen and seen[0] == verdict.fingerprint):
+            self.store.mark(self.agent.name, a.task_id, self.REPO_PREFLIGHT, verdict.fingerprint)
+            self._comment(a.task_id, verdict.text() + "\n\nrepo_preflight=" + json.dumps(verdict.as_dict()))
+            self.store.event(a.id, "repo_preflight_refused", json.dumps(verdict.as_dict()))
+        if resume:
+            self._resume_hold[a.id] = backoff     # the attempt stays ready; no checkout, no model turn
+            return True
+        self.store.update(a, state="aborted", note=f"repository preflight: {verdict.reason}")
+        self._task_backoff[a.task_id] = backoff
         return True
 
     def _prepare_first_start(self, a: Attempt, task: dict) -> tuple:

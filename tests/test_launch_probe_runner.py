@@ -6,6 +6,8 @@ import sys
 import uuid
 
 from fakes import FakeMesh, task
+from mesh_runner import interactive
+from mesh_runner.adapters.codex import CodexAdapter
 from test_headless_spawn_gate import HeadlessFixture
 from test_launch_probe import HELPER
 
@@ -194,6 +196,184 @@ class ProbeWiring(HeadlessFixture):
         self.assertEqual(self.records('starts'), [])
         self.assertEqual(self.runs(), 2)
         self.assertEqual(r.store.get(a.id).state, 'ready')
+
+
+class RecordingInteractive(interactive.InteractiveAdapter):
+    """Interactive Codex whose driver launch is recorded instead of started (no tmux)."""
+    launches: list
+
+    def spawn(self, launch, log_path):
+        self.launches.append(launch)
+        raise RuntimeError("recorded: driver not started")
+
+
+class InteractiveProbe(HeadlessFixture):
+    """Interactive Codex: the probe sees the native tail and env the driver gets."""
+
+    probe, runs = ProbeWiring.probe, ProbeWiring.runs
+
+    def setUp(self):
+        super().setUp()
+        self.helper_py = self.root / 'helper.py'
+        self.helper_py.write_text(HELPER)
+        self.configure('codex')
+        self.hook = self.root / 'hook.py'
+        self.hook.write_text(HOOK % str(self.root / 'hook.jsonl'))
+        self.adapter = RecordingInteractive(CodexAdapter(str(self.native)), self.agent.name, self.root / 'state',
+                                            tmux='/usr/bin/true', python=sys.executable)
+        self.adapter.launches = []
+
+    def context(self):
+        return json.loads((self.root / 'request.json').read_text())['context']
+
+    def start(self, n, mode, resume=False):
+        self.probe(mode)
+        self.agent.start_gate_command = []
+        t = task(n, cat='in_progress')
+        r = self.runner(FakeMesh([t]))
+        a = self.prepare(r, t)
+        if not resume:
+            r.store.update(a, wait={}, wake_text='', turns=0, session_id='')
+            a = r.store.get(a.id)
+        return r, a, t
+
+    def test_probe_adapter_applies_to_interactive_codex_only(self):
+        self.probe('ok')
+        r = self.runner(FakeMesh([]))
+        self.assertIs(r._probe_adapter('codex'), self.adapter)
+        self.agent.launch_probe_command = []
+        self.assertIsNone(r._probe_adapter('codex'))
+
+    def test_early_capture_uses_native_tail_and_env_for_start_and_resume(self):
+        self.probe('ok')
+        t = task(1001, cat='in_progress')
+        r = self.runner(FakeMesh([t]))
+        a = self.prepare(r, t)
+        r.store.mark('builder', t['id'], 'effort', 'high')
+        obs = r._capture_launch(t['id'], None)             # no attempt: a fresh start
+        self.assertTrue(obs.available)
+        start = self.context()
+        self.assertEqual(start['argv'][0], str(self.native))
+        self.assertNotIn('--', start['argv'])
+        self.assertNotIn('--harness', start['argv'])       # the driver's own flags are not native
+        self.assertNotIn('resume', start['argv'])
+        self.assertIn('model_reasoning_effort="high"', start['argv'])   # same with_effort as the launch
+        sid = str(uuid.uuid4())
+        r.store.update(a, session_id=sid)
+        r._launch_obs.clear()
+        r._capture_launch(t['id'], r.store.get(a.id))
+        resume = self.context()
+        self.assertEqual(resume['argv'][resume['argv'].index('resume') + 1], sid)
+        self.assertEqual(resume['env'].get('HEADLESS_ROOT'), str(self.root))   # env after env_command
+
+    def test_early_capture_follows_the_launch_override_rules_and_recaptures_on_change(self):
+        self.probe('ok')
+        t = task(1002, cat='in_progress')
+        r = self.runner(FakeMesh([t]))
+        self.prepare(r, t)
+        r._capture_launch(t['id'], None)
+        plain = self.context()['argv']
+        self.assertEqual(self.runs(), 1)
+        r.store.mark('builder', t['id'], 'effort', 'high')          # changed argv: a new candidate
+        r._capture_launch(t['id'], None)
+        self.assertEqual(self.runs(), 2)
+        self.assertNotEqual(self.context()['argv'], plain)
+        r._capture_launch(t['id'], None)
+        self.assertEqual(self.runs(), 2)                            # same candidate: cached
+        # a mark scoped to another harness is not part of this lane's native argv (as at launch)
+        r.store.mark('builder', t['id'], 'override_harness', 'claude')
+        r._capture_launch(t['id'], None)
+        self.assertEqual(self.context()['argv'], plain)
+
+    def test_early_capture_includes_the_read_only_sandbox_a_metadata_receipt_launch_gets(self):
+        from mesh_runner.workspace_scope import RECEIPT_KEY
+        self.probe('ok')
+        t = task(1003, cat='in_progress')
+        r = self.runner(FakeMesh([t]))
+        a = self.prepare(r, t)
+        r.store.update(a, workspaces=[])
+        r._capture_launch(t['id'], r.store.get(a.id))
+        plain = self.context()['argv']
+        self.assertNotIn('read-only', plain)
+        r.store.mark('builder', t['id'], RECEIPT_KEY, json.dumps({'attempt': a.id, 'scope': 'metadata-only'}))
+        r._capture_launch(t['id'], r.store.get(a.id))
+        sandboxed = self.context()['argv']
+        self.assertIn('read-only', sandboxed)
+        self.assertEqual(sandboxed, interactive.native_tail(self.adapter.with_read_only(self.adapter.resume_argv(
+            r.store.get(a.id).session_id, self.agent.profile_dir, []))))
+
+    def test_final_context_equals_what_the_driver_receives(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                self.adapter.launches.clear()
+                r, a, t = self.start(1010 + resume, 'ok', resume)
+                with self.assertRaises(RuntimeError):
+                    r._spawn(a, 'prompt', resume=resume, expect=('ready',))
+                self.assertEqual(len(self.adapter.launches), 1)
+                launch = self.adapter.launches[0]
+                ctx = self.context()
+                self.assertEqual(ctx['argv'], interactive.native_tail(launch.argv))
+                self.assertEqual(('resume' in ctx['argv']), resume)
+                self.assertEqual(ctx['env'], {k: v for k, v in launch.env.items() if not k.startswith('_MESH_RUNNER_')})
+                self.assertNotIn('_MESH_RUNNER_LAUNCH_PROBE', launch.env)   # only a headless supervisor reads it
+
+    def test_unproven_context_launches_unless_capacity_proof_is_required(self):
+        for n, mode in enumerate(('unknown', 'dirty', 'exit1', 'garbage')):
+            with self.subTest(mode=mode):
+                self.adapter.launches.clear()
+                r, a, t = self.start(1040 + n, mode, resume=True)
+                with self.assertRaises(RuntimeError):          # reached the (recording) driver launch
+                    r._spawn(a, 'prompt', resume=True, expect=('ready',))
+                self.assertEqual(len(self.adapter.launches), 1)
+
+    def test_blocked_quota_denies_even_without_capacity_requirement(self):
+        r, a, t = self.start(1050, 'blocked', resume=True)
+        self.assertFalse(r._spawn(a, 'prompt', resume=True, expect=('ready',)))
+        self.assertEqual(self.adapter.launches, [])
+
+    def test_denials_open_no_driver_and_keep_the_session(self):
+        for n, mode in enumerate(('blocked', 'unknown', 'dirty', 'nonce', 'exit1', 'garbage')):
+            with self.subTest(mode=mode):
+                self.adapter.launches.clear()
+                r, a, t = self.start(1020 + n, mode, resume=True)
+                r.store.mark('builder', t['id'], 'quota_admission_required', a.id)
+                session = r.store.get(a.id).session_id
+                before = r.store.get(a.id).turns
+                self.assertFalse(r._spawn(a, 'prompt', resume=True, expect=('ready',)))
+                held = r.store.get(a.id)
+                self.assertEqual((held.state, held.pid, held.session_id, held.turns), ('ready', 0, session, before))
+                self.assertEqual(self.adapter.launches, [])
+                self.assertEqual(r.procs, {})
+                self.assertTrue([e for e in r.store.events(a.id) if e[1] == 'launch_probe_denied'])
+                self.assertIn(a.id, r._resume_hold)         # bounded local pause, no WAIT/park
+
+    def test_identity_change_between_early_and_final_denies(self):
+        self.probe('ok')
+        t = task(1030, cat='in_progress')
+        r = self.runner(FakeMesh([t]))
+        a = self.prepare(r, t)
+        r._capture_launch(t['id'], r.store.get(a.id))
+        key, ts, obs = r._launch_obs[t['id']]
+        import dataclasses
+        r._launch_obs[t['id']] = (key, ts, dataclasses.replace(obs, account_ref='cd' * 32))
+        self.assertFalse(r._spawn(r.store.get(a.id), 'prompt', resume=True, expect=('ready',)))
+        self.assertEqual(self.adapter.launches, [])
+
+    def test_access_hold_before_driver_denies(self):
+        from mesh_runner import access_recovery
+        r, a, t = self.start(1031, 'ok', resume=True)
+        r._launch_ready = lambda *args, **kwargs: (r.store.mark('builder', t['id'], access_recovery.KEY, '{"hold":1}'), True)[1]
+        self.assertFalse(r._resume_one(a))
+        self.assertEqual(self.adapter.launches, [])
+
+    def test_reservation_is_returned_on_denial_and_untouched_before_it(self):
+        r, a, t = self.start(1032, 'blocked')
+        calls = []
+        def before_spawn():
+            calls.append('reserved')
+        before_spawn.undo = lambda: calls.append('returned')
+        self.assertFalse(r._spawn(a, 'prompt', resume=False, expect=('ready',), before_spawn=before_spawn))
+        self.assertEqual(calls, [])
 
 
 POOL_HOOK = """import os, json

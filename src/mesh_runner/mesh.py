@@ -20,6 +20,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from . import coalesced_http
 from . import observation_budget as budget
 
 DEFAULT_TIMEOUT = 30
@@ -85,7 +86,7 @@ class MeshClient:
         # an extension actor token (``ext_...``): a callable, so a rotated token is read at once
         self._bearer = bearer
         self.timeout = timeout
-        self._open = opener or urllib.request.urlopen
+        self._open = opener or coalesced_http.urlopen
 
     def __repr__(self) -> str:  # never show the key
         return f"MeshClient({self.base!r})"

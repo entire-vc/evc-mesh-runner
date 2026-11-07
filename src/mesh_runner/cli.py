@@ -206,6 +206,64 @@ def _receipt_wait(argv: list[str]) -> int:
     return 0
 
 
+def _watch(argv: list[str]) -> int:
+    """`watch gmail register|status|cancel`: the operator's registration of one read-only Gmail
+    observation, written through Runner's own store API (never by hand into its database)."""
+    from . import gmail_watch as gw
+    if not argv or argv[0] != "gmail":
+        print(json.dumps({"error": "usage: mesh-runner watch gmail register|status|cancel"}))
+        return 2
+    p = argparse.ArgumentParser(prog="mesh-runner watch gmail")
+    p.add_argument("action", choices=["register", "status", "cancel"])
+    p.add_argument("registration", nargs="?", help="status/cancel: registration id gmr_<12hex>")
+    p.add_argument("--config", required=True)
+    p.add_argument("--mailbox")
+    p.add_argument("--observer-task", help="full UUID of the card that will `WAIT gmail:<id>`")
+    p.add_argument("--resume-agent", help="Mesh agent id of the lane that resumes it (its Runner scans it)")
+    p.add_argument("--source-task", default="", help="full UUID of the card that receives the receipt comment")
+    p.add_argument("--from", dest="from_addr")
+    p.add_argument("--thread")
+    p.add_argument("--sender-domain", action="append", default=[])
+    p.add_argument("--marker", action="append", default=[])
+    p.add_argument("--since", type=int, help="epoch milliseconds: catch-up, matches after it fire on the first tick")
+    p.add_argument("--baseline-from-now", action="store_true", help="the default: seed with the current snapshot")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--reason", default="")
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args(argv[1:])
+    cfg = config_mod.load(args.config)
+    if not cfg.gmail_watch_v1:
+        print(json.dumps({"error": "gmail_watch_v1 is off in this config"}))
+        return 2
+    if args.since is not None and args.baseline_from_now:
+        p.error("--since and --baseline-from-now are exclusive")
+    store = Store(cfg.state_dir / "runner.sqlite")
+    try:
+        if args.action == "register":
+            if not cfg.gmail_watch_reader:
+                print(json.dumps({"error": "gmail_watch_reader is not configured"}))
+                return 2
+            if not (args.mailbox and args.observer_task and args.resume_agent):
+                p.error("register needs --mailbox, --observer-task and --resume-agent")
+            predicate = gw.build_predicate(from_addr=args.from_addr, thread=args.thread,
+                                           domains=args.sender_domain, markers=args.marker)
+            out = gw.register(store, gw.SubprocessReader(list(cfg.gmail_watch_reader), cfg.gmail_watch_timeout_seconds),
+                              mailbox=args.mailbox, observer_task=args.observer_task, resume_agent=args.resume_agent,
+                              predicate=predicate, source_task=args.source_task, since_ms=args.since,
+                              dry_run=args.dry_run, interval_s=cfg.gmail_watch_interval_seconds)
+        elif args.action == "status":
+            out = gw.status(store, args.registration)
+        else:
+            if not args.registration or not gw.ID_RE.fullmatch(args.registration):
+                p.error("cancel needs a registration id gmr_<12hex>")
+            out = gw.cancel(store, args.registration, args.reason)
+    except (ValueError, OSError, gw.GmailError) as exc:
+        print(json.dumps({"error": str(exc)[:200]}))
+        return 1
+    print(json.dumps(out, sort_keys=True, indent=None if args.json else 2))
+    return 0
+
+
 def _stall_wait(argv: list[str]) -> int:
     """`stall-wait`: the operator's arm / inspect / disarm of one card's mesh-stall-control
     registration, written through Runner's own store API. Arm reads the card's current comments
@@ -357,6 +415,8 @@ def main(argv: list[str] | None = None) -> int:
         return command(args_in[1:])
     if args_in and args_in[0] == "receipt-wait":
         return _receipt_wait(args_in[1:])
+    if args_in and args_in[0] == "watch":
+        return _watch(args_in[1:])
     if args_in and args_in[0] == "stall-wait":
         return _stall_wait(args_in[1:])
     if args_in and args_in[0] == "recovery-wait":
