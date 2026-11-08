@@ -318,6 +318,82 @@ class ArchiveRoot(unittest.TestCase):
         self.assertEqual((a / "only.txt").read_text(), "single")                # still in the slot
         self.assertEqual(self._quarantined(a, "only.txt"), [])
 
+    def test_unrenamable_entry_retried_by_every_sweep_leaves_no_archive_copies(self):
+        arch = self.root / "arch"
+        arch.mkdir()
+        pool = self.pool(archive_root=arch)
+        a = pool.lease("a1", "app")
+        (a / "proof").mkdir()
+        (a / "proof" / "f.txt").write_text("root-owned in real life")
+        real_rename = os.rename
+
+        def denied(src, dst, *args, **kw):              # root-safe stand-in for an entry that cannot be moved
+            if src == "proof":
+                raise PermissionError(errno.EACCES, "Permission denied", src)
+            return real_rename(src, dst, *args, **kw)
+
+        with mock.patch("mesh_runner.workspace.os.rename", denied):
+            for _ in range(4):                          # four sweeps over the same held slot
+                with self.assertRaises(WorkspaceError):
+                    pool._archive_untracked(a)
+        self.assertLessEqual(len(list((arch / "agent").glob("*"))), 1)
+        self.assertEqual((a / "proof" / "f.txt").read_text(), "root-owned in real life")   # source intact
+        with mock.patch("mesh_runner.workspace.os.rename", denied):
+            self.assertEqual(len(pool.release("a1")), 1)                                   # slot held
+        self.assertLessEqual(len(list((arch / "agent").glob("*"))), 1)
+        real = Path(os.path.realpath(a))
+        self.assertEqual(list(real.parent.glob(f".quarantine-{real.name}/*")), [])      # no empty quarantine runs
+
+    def test_failed_archive_with_read_only_nested_dir_leaves_no_copy(self):
+        arch = self.root / "arch"
+        arch.mkdir()
+        pool = self.pool(archive_root=arch)
+        a = pool.lease("a1", "app")
+        (a / "ro" / "sub").mkdir(parents=True)
+        (a / "ro" / "sub" / "f.txt").write_text("x")
+        (a / "ro" / "g.txt").write_text("y")
+        (a / "proof").mkdir()
+        (a / "proof" / "f.txt").write_text("unmovable")
+        os.chmod(a / "ro" / "sub", 0o555)
+        os.chmod(a / "ro", 0o555)
+        real_rename = os.rename
+
+        def denied(src, dst, *args, **kw):
+            if src == "proof":
+                raise PermissionError(errno.EACCES, "Permission denied", src)
+            return real_rename(src, dst, *args, **kw)
+
+        try:
+            with mock.patch("mesh_runner.workspace.os.rename", denied):
+                with self.assertRaises(WorkspaceError):
+                    pool._archive_untracked(a)
+            self.assertEqual(list((arch / "agent").glob("*")) if (arch / "agent").exists() else [], [])
+        finally:
+            os.chmod(a / "ro", 0o755)
+            os.chmod(a / "ro" / "sub", 0o755)
+
+    def test_failed_run_dir_fsync_leaves_no_empty_quarantine_run(self):
+        arch = self.root / "arch"
+        arch.mkdir()
+        pool = self.pool(archive_root=arch)
+        a = pool.lease("a1", "app")
+        (a / "only.txt").write_text("single")
+        real_fsync = os.fsync
+        calls = {"n": 0}
+
+        def flaky(fd):                                  # first fsync = the run directory entry sync
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(errno.EIO, "I/O error")
+            return real_fsync(fd)
+
+        with mock.patch("mesh_runner.workspace.os.fsync", flaky):
+            with self.assertRaises(Exception):
+                pool._archive_untracked(a)
+        real = Path(os.path.realpath(a))
+        self.assertEqual((a / "only.txt").read_text(), "single")
+        self.assertEqual(list(real.parent.glob(f".quarantine-{real.name}/*")), [])
+
     def test_partial_rename_then_restart_and_slot_reuse_keep_the_quarantine(self):
         arch = self.root / "arch"
         arch.mkdir()

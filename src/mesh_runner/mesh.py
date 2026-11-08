@@ -287,6 +287,9 @@ class MeshClient:
     def dependencies(self, task_id: str) -> dict:
         return self.request("GET", f"/tasks/{task_id}/dependencies") or {}
 
+    def next_action(self, task_id: str) -> dict:
+        return self.request("GET", f"/tasks/{task_id}/next-action") or {}
+
     def patch_task(self, task_id: str, fields: dict) -> dict:
         return self.request("PATCH", f"/tasks/{task_id}", fields)
 

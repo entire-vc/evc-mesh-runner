@@ -169,3 +169,70 @@ def removed_wait_edge(rows: dict, wait: dict, task_id: str) -> str | None:
         if edge["dependency_type"] == "blocks" and not edge["condition_satisfied"]:
             return None
     return edge_id
+
+
+_TYPED_CONDITIONS = tuple(c for c in _DEPENDENCY_CONDITIONS if c != "task_done")
+
+
+def satisfied_wait_edge(rows: dict, wait: dict, task_id: str) -> dict | None:
+    """The edge this exact WAIT created, if its owner narrowed it to a typed condition and
+    Mesh itself reports exactly that condition satisfied.
+
+    Fails closed (None) on an unreadable/paginated/malformed edge set, on an edge that is not
+    ours (id, task, blocks, target prefix), on a non-boolean verdict and on an unsatisfied
+    one. The target's own state is not consulted: the typed condition, not task_done,
+    is what was asked for."""
+    # ``edge``: created by this WAIT; ``observe_edge``: an existing operator-shaped edge it only watches.
+    edge_id, target = wait.get("edge") or wait.get("observe_edge"), wait.get("target")
+    if not isinstance(edge_id, str) or not edge_id or not isinstance(target, str):
+        return None
+    if (not isinstance(rows, dict) or not isinstance(rows.get("outgoing"), list)
+            or rows.get("has_more") or rows.get("next")):
+        return None
+    found, seen = None, set()
+    for edge in rows["outgoing"]:
+        if not isinstance(edge, dict) or not isinstance(edge.get("id"), str) or edge["id"] in seen:
+            return None
+        seen.add(edge["id"])
+        if edge["id"] == edge_id:
+            found = edge
+    if found is None:
+        return None
+    destination = found.get("depends_on_task_id")
+    if (found.get("task_id") != task_id or found.get("dependency_type") != "blocks"
+            or found.get("condition") not in _TYPED_CONDITIONS
+            or found.get("condition_satisfied") is not True
+            or not isinstance(destination, str)
+            or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', destination)
+            or destination == task_id or destination[:8] != target
+            or (wait.get("target_id") and wait["target_id"] != destination)):
+        return None
+    return found
+
+
+_UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+
+def readable_outgoing(rows: dict, task_id: str) -> list[dict] | None:
+    """The complete, fully well-formed outgoing edge set of ``task_id``, else None.
+
+    Used before an edge is created or its record dropped: any unreadable container, pagination,
+    malformed/foreign/duplicate row or unknown type/condition means "cannot tell", never "absent"."""
+    if (not isinstance(rows, dict) or not isinstance(rows.get("outgoing"), list)
+            or rows.get("has_more") or rows.get("next")):
+        return None
+    seen = set()
+    for edge in rows["outgoing"]:
+        if not isinstance(edge, dict):
+            return None
+        destination = edge.get("depends_on_task_id")
+        if (not isinstance(edge.get("id"), str) or not edge["id"].strip() or edge["id"] in seen
+                or edge.get("task_id") != task_id
+                or not isinstance(destination, str) or not _UUID.fullmatch(destination)
+                or destination == task_id
+                or edge.get("dependency_type") not in ("blocks", "relates_to")
+                or edge.get("condition") not in _DEPENDENCY_CONDITIONS
+                or type(edge.get("condition_satisfied")) is not bool):
+            return None
+        seen.add(edge["id"])
+    return rows["outgoing"]

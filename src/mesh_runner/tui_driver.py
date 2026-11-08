@@ -167,9 +167,36 @@ def load_average() -> str:
         return "?"
 
 
+def _quota_menu_footer(text: str) -> int | None:
+    """The cancel hint belongs to this terminal quota menu, not a running turn.
+
+    Match the native notice and complete trailing menu together. A quoted limit,
+    permission dialog, old menu above newer work, or another busy marker must
+    retain its normal meaning; only this menu's footer can be ignored.
+    """
+    tail = [(i, line.strip()) for i, line in enumerate(text.splitlines()) if line.strip()][-LIMIT_NOTICE_LINES:]
+    if len(tail) < 6 or background_agents(text):
+        return None
+    question, first, second, third, footer = tail[-5:]
+    if question[1] != "What do you want to do?" or not re.fullmatch(r"Enter to confirm\s*·\s*Esc to cancel", footer[1], re.I):
+        return None
+    choices = ((first[1], r"(?:❯\s*)?1\.\s+Stop and wait for limit to reset"),
+               (second[1], r"(?:❯\s*)?2\.\s+Wait here, then continue automatically at .+"),
+               (third[1], r"(?:❯\s*)?3\.\s+Ask your admin for more usage"))
+    if not all(re.fullmatch(pattern, line) for line, pattern in choices):
+        return None
+    if sum(line.startswith("❯") for line, _ in choices) != 1:
+        return None
+    if not any(line.startswith("⎿") and LIMIT_NOTICE_RE.search(line) for _, line in tail[:-5]):
+        return None
+    return footer[0]
+
+
 def is_busy(text: str) -> bool:
     """A running turn on the screen. A usage-limit notice is not one, whatever hint it carries."""
-    return bool(BUSY_RE.search("\n".join(x for x in text.splitlines() if not LIMIT_NOTICE_RE.search(x))))
+    quota_footer = _quota_menu_footer(text)
+    return bool(BUSY_RE.search("\n".join(x for i, x in enumerate(text.splitlines())
+                                       if i != quota_footer and not LIMIT_NOTICE_RE.search(x))))
 
 
 def limit_notice(text: str) -> str:
@@ -1012,6 +1039,13 @@ class Driver:
         # (its screen keeps the notice after the stated time, so every later turn would meet it again)
         notice = limit_notice(self.screen())
         if notice:
+            if self.prompt_intent and self.harness == "claude":
+                # Quota is an operational failure, not proof the prompt was taken.
+                # Preserve the outbox and give recovery a typed pre-paste result.
+                journal = read_delivery(self.dir, self.key)
+                if journal.get("phase") not in ("reserved", "received"):
+                    raise DriverError("quota notice cannot prove this prompt was unsent")
+                self.delivery_phase("pre-send-failed", harness="claude", failure_kind="quota")
             raise DriverError("usage limit reached: " + notice, close=True)
         base = len(self.read_events())
         offset = self.turn_offset = self.transcript_size()

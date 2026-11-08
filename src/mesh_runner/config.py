@@ -197,6 +197,10 @@ class AgentConfig:
     turn_end_command: list[str] = field(default_factory=list)    # after every turn, with the gate's output
     launch_probe_command: list[str] = field(default_factory=list)  # Codex launch-context probe helper (stdin protocol)
     launch_probe_version: int = 1                                  # 2 = opt-in: reply also carries used percents
+    queue_order_command: list[str] = field(default_factory=list)   # ordinary-work start order helper; empty = off
+    next_action_prep: bool = False             # opt-in: start the prep stage past typed blockers (next_action.py)
+    queue_order_timeout_seconds: float = 3.0
+    queue_order_cache_seconds: float = 60.0
     alt: dict = field(default_factory=dict)    # other harnesses the agent may be routed to: {"codex": {"profile", "args", "binary"}}
     task_route_harnesses: list[str] = field(default_factory=list)  # alt harnesses a card may select by label runner-harness:<h>; empty = none
     chat: dict = field(default_factory=dict)   # standing interactive session: session, command, idle_command, max_age_hours
@@ -597,6 +601,26 @@ def _probe_version(value, name: str) -> int:
     return value
 
 
+def _flag(value, key: str, name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"agent {name}: {key} must be true or false")
+    return value
+
+
+def _qo_argv(value, name: str) -> list[str]:
+    if value in (None, []):
+        return []
+    if not isinstance(value, list) or not all(isinstance(x, str) and x for x in value):
+        raise ValueError(f"agent {name}: queue_order_command must be a list of non-empty strings")
+    return list(value)
+
+
+def _qo_seconds(value, key: str, name: str, zero: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or (value == 0 and not zero):
+        raise ValueError(f"agent {name}: {key} must be a positive number")
+    return float(value)
+
+
 def _launch_mode(value, where: str, allow_empty: bool = False) -> str:
     v = str(value or "").strip()
     if (allow_empty and not v) or v in LAUNCH_MODES:
@@ -829,6 +853,10 @@ def load(path: str | Path) -> RunnerConfig:
             turn_end_command=list(a.get("turn_end_command") or []),
             launch_probe_command=list(a.get("launch_probe_command") or []),
             launch_probe_version=_probe_version(a.get("launch_probe_version", 1), a["name"]),
+            queue_order_command=_qo_argv(a.get("queue_order_command"), a["name"]),
+            next_action_prep=_flag(a.get("next_action_prep", False), "next_action_prep", a["name"]),
+            queue_order_timeout_seconds=_qo_seconds(a.get("queue_order_timeout_seconds", 3), "queue_order_timeout_seconds", a["name"]),
+            queue_order_cache_seconds=_qo_seconds(a.get("queue_order_cache_seconds", 60), "queue_order_cache_seconds", a["name"], zero=True),
             chat=dict(a.get("chat") or {}),
             launch_mode=_launch_mode(a.get("launch_mode", ""), f"agent {a['name']}", allow_empty=True),
             decision_wake=_decision_wake(a.get("decision_wake", ""), f"agent {a['name']}", allow_empty=True),

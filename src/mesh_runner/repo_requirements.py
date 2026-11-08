@@ -53,6 +53,7 @@ class Verdict:
     next_actor: str = ""
     action: str = ""
     fingerprint: str = ""
+    also: tuple = ()          # further blocking (reason, project) pairs found in the same pass
 
     @property
     def blocking(self) -> bool:
@@ -64,11 +65,15 @@ class Verdict:
         return self.blocking and self.reason not in TRANSIENT
 
     def as_dict(self) -> dict:
-        return {"reason": self.reason, "project": self.project, "repo": self.repo,
-                "next_actor": self.next_actor, "action": self.action}
+        out = {"reason": self.reason, "project": self.project, "repo": self.repo,
+               "next_actor": self.next_actor, "action": self.action}
+        if self.also:
+            out["also"] = [{"reason": r, "project": p} for r, p in self.also]
+        return out
 
     def text(self) -> str:
-        return (f"[runner] repository preflight: {self.reason}; required={self.project or '-'}; "
+        more = "".join(f"; also {r}={p}" for r, p in self.also)
+        return (f"[runner] repository preflight: {self.reason}; required={self.project or '-'}{more}; "
                 f"next_actor={self.next_actor}; action: {self.action}")
 
 
@@ -127,23 +132,30 @@ def check(links: list[dict], base_url: str, *, agent_repos: list, approved_repos
         return Verdict(NO_REPO, fingerprint=_digest(["none"]))
     mine = {project_of(s): s for s in agent_repos}
     theirs = {project_of(s): s for s in (approved_repos or [])}
+    found: list[tuple[str, str, object]] = []        # every blocking fact, so one handoff names them all
     for project in wanted:
-        def no(reason, spec=None):
-            actor, action = ACTIONS[reason]
-            repo = getattr(spec, "name", "")
-            return Verdict(reason, project, repo, actor, action, _digest([reason, project, repo]))
-
         spec = mine.get(project)
         if spec is None:
-            return no(NO_MEMBERSHIP if project in theirs else UNDECLARED, theirs.get(project))
+            found.append((NO_MEMBERSHIP if project in theirs else UNDECLARED, project, theirs.get(project)))
+            continue
         if not (Path(spec.base) / ".git").exists() and not Path(spec.base).joinpath("HEAD").exists():
-            return no(MISSING_CLONE, spec)
+            found.append((MISSING_CLONE, project, spec))
+            continue
         if config_only:
             continue                      # a resume restores its own leases; only the config must cover the repo
         if checkpoint_open and spec.name not in (leased_repos or set()):
-            return no(CHECKPOINT, spec)
-        if resuming and spec.name not in (leased_repos or set()):
-            return no(NO_CHECKOUT, spec)
-        if spec.name not in (leased_repos or set()) and pool_full(spec.name):
-            return no(NO_SLOT, spec)
-    return Verdict(OK, ",".join(wanted), fingerprint=_digest([OK, wanted]))
+            found.append((CHECKPOINT, project, spec))
+        elif resuming and spec.name not in (leased_repos or set()):
+            found.append((NO_CHECKOUT, project, spec))
+        elif spec.name not in (leased_repos or set()) and pool_full(spec.name):
+            found.append((NO_SLOT, project, spec))
+    if not found:
+        return Verdict(OK, ",".join(wanted), fingerprint=_digest([OK, wanted]))
+    # canonical order (durable before slot wait, then reason/project): link order never changes the handoff
+    found.sort(key=lambda f: (f[0] in TRANSIENT, f[0], f[1]))
+    reason, project, spec = found[0]
+    actor, action = ACTIONS[reason]
+    repo = getattr(spec, "name", "")
+    also = tuple((r, p) for r, p, _ in found[1:])
+    fp = _digest([reason, project, repo] + ([sorted(also)] if also else []))
+    return Verdict(reason, project, repo, actor, action, fp, also)

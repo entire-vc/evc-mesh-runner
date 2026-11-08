@@ -17,6 +17,12 @@ class EdgeDenied(Bench):
         self.r.refresh_me()
         self.a = self.r.store.create(self.agent.name, self.t["id"], "claude")
         self.deletes = []
+        # the edges these waits created still exist in Mesh with the shape they were created with
+        for owner, dest in ((self.t, self.other), (self.other, self.t)):
+            self.mesh.deps[owner["id"]] = [
+                {"id": eid, "task_id": owner["id"], "depends_on_task_id": dest["id"],
+                 "dependency_type": "blocks", "condition": "task_done", "condition_satisfied": False}
+                for eid in ("e1", "e2")]
 
     def deny_delete(self, status=403):
         def delete(tid, edge_id):

@@ -7,10 +7,18 @@ import io
 import json
 import os
 import re
+import subprocess
+import stat
+import sqlite3
+import sys
 import time
 from pathlib import Path
 
-from .interactive import Tmux, delivery_path, read_delivery
+from .interactive import (Tmux, delivery_path, read_delivery, read_meta, read_progress,
+                          pid_alive, session_name, meta_path, progress_path)
+from .adapters.base import group_alive, precise_stamp
+from .iterm_transport import process_argv
+from .qa_assignment import native_session_in_argv
 from .tui_driver import Driver, DriverError, _exact
 
 
@@ -53,6 +61,239 @@ def unbound_bootstrap_proof(directory: Path, key: str, intent: dict, other_sessi
         return False
 
 
+def _quota_unsent(journal: dict, intent: dict) -> bool:
+    prompt = intent.get('prompt')
+    if not isinstance(prompt, str):
+        return False
+    try:
+        digest = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+    except UnicodeError:
+        return False
+    return (journal.get('phase') == 'pre-send-failed' and journal.get('failure_kind') == 'quota'
+            and journal.get('harness') == 'claude' and intent.get('harness') == 'claude'
+            and digest == intent.get('sha256'))
+
+
+def proven_quota_unsent(directory: Path, key: str, intent: dict) -> bool:
+    """Exact typed pre-send quota proof, without reading or driving a native session."""
+    try:
+        journal = read_delivery(directory, key)
+        return (journal.get('token') == intent.get('token') and journal.get('sha256') == intent.get('sha256')
+                and _quota_unsent(journal, intent))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def legacy_journal_unsent(journal: dict, intent: dict) -> bool:
+    """Exact legacy non-delivery proof, including the pending UTF-8 bytes."""
+    try:
+        prompt, token, digest = intent.get('prompt'), intent.get('token'), intent.get('sha256')
+        return (set(journal) == {'version', 'token', 'sha256', 'phase'}
+                and type(journal['version']) is int and journal['version'] == 1
+                and journal['phase'] in ('reserved', 'received')
+                and type(intent.get('version')) is int and intent['version'] == 1
+                and intent.get('kind') == 'interactive' and intent.get('harness') == 'claude'
+                and intent.get('retryable') is True and intent.get('resume') is True
+                and isinstance(intent.get('session_id'), str) and bool(intent['session_id'])
+                and isinstance(token, str) and bool(token) and journal['token'] == token
+                and isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest) is not None
+                and journal['sha256'] == digest and isinstance(prompt, str)
+                and hashlib.sha256(prompt.encode('utf-8')).hexdigest() == digest)
+    except (ValueError, KeyError, TypeError, UnicodeError):
+        return False
+
+
+def proven_legacy_unsent(directory: Path, key: str, intent: dict) -> bool:
+    """Non-delivery only; callers must separately prove writer absence and fresh admission."""
+    try:
+        return legacy_journal_unsent(read_delivery(directory, key), intent)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _process_argv(pid: int) -> list[str]:
+    """Structured OS argv boundary on the supported local platforms; no environment."""
+    if sys.platform == 'darwin':
+        return process_argv(pid)
+    if sys.platform.startswith('linux'):
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as stream:
+                raw = stream.read((1 << 22) + 1)
+            return [x.decode('utf-8', 'replace') for x in raw.rstrip(b'\0').split(b'\0')] \
+                if raw.endswith(b'\0') and len(raw) <= 1 << 22 else []
+        except OSError:
+            pass
+    return []
+
+
+def _zombie_now(pid: int) -> bool:
+    """Only two fresh kernel zombie observations of the same own process prove no writer."""
+    def state():
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "pid=,uid=,ppid=,stat="],
+                                capture_output=True, text=True, timeout=10)
+        rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+        if (result.returncode or len(rows) != 1 or len(rows[0]) != 4
+                or rows[0][0] != str(pid) or rows[0][1] != str(os.geteuid())
+                or not rows[0][2].isdecimal() or int(rows[0][2]) <= 0
+                or re.fullmatch(r'Z[<NLsl+]*', rows[0][3]) is None):
+            return None
+        return rows[0]
+    try:
+        birth = precise_stamp(pid)
+        first = state()
+        return bool(birth and first and state() == first and precise_stamp(pid) == birth)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _session_process_absent(session_id: str, key: str) -> bool:
+    """Inspect only local process identity/argv, never environment or transcript.
+
+    Old journals did not persist a native PID. Enumerating our UID and checking
+    the structured session flag also catches a native child detached from tmux.
+    An unreadable live process is unknown, never evidence of absence.
+    """
+    try:
+        result = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,uid="],
+                                capture_output=True, text=True, timeout=10)
+        rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+        if (result.returncode or not rows or len(rows) > 65536
+                or any(len(row) != 2 or not row[0].isdecimal()
+                       or re.fullmatch(r'-?[0-9]+', row[1]) is None
+                       or int(row[0]) <= 0 for row in rows)):
+            return False
+        # Darwin selectors also include a login process by its real UID. The
+        # uid column is the effective owner; never read another user's argv.
+        pids = [int(pid) for pid, uid in rows if int(uid) == os.geteuid()]
+        if not pids:
+            return False
+        for pid in pids:
+            argv = _process_argv(pid)
+            if not argv:
+                if pid_alive(pid) and not _zombie_now(pid):
+                    return False
+            elif (native_session_in_argv(argv, session_id)
+                  or any(value == key and i > 0 and argv[i - 1] == '--key'
+                         or value == '--key=' + key for i, value in enumerate(argv))):
+                return False
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def legacy_writer_stopped(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux) -> bool:
+    """Positive stopped-writer check for the old exact unsent journal. No signals."""
+    return (proven_legacy_unsent(directory, key, intent)
+            and legacy_processes_stopped(directory, key, intent, agent, tmux))
+
+
+def legacy_processes_stopped(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux) -> bool:
+    """Process proof only; caller must also bind an exact non-delivery journal."""
+    present = []
+    for path in (progress_path(directory, key), meta_path(directory, key)):
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                return False
+            present.append(True)
+        except FileNotFoundError:
+            present.append(False)
+        except OSError:
+            return False
+    progress, meta = read_progress(directory, key), read_meta(directory, key)
+    driver = progress.get('pid')
+    if present == [False, True]:
+        # Ordinary cleanup removes DONE progress before retiring the idle
+        # session metadata. Extra matching idle metadata is not a live writer;
+        # window and complete session/attempt process absence remain mandatory.
+        if (meta.get('session_id') != intent['session_id'] or meta.get('harness') != 'claude'
+                or type(meta.get('busy_pid')) is not int or meta['busy_pid'] != 0):
+            return False
+    elif any(present):
+        if (type(driver) is not int or driver <= 0 or progress.get('phase') != 'done'
+                or meta.get('session_id') != intent['session_id'] or meta.get('harness') != 'claude'
+                or type(meta.get('busy_pid')) is not int or meta['busy_pid'] not in (0, driver)
+                or pid_alive(driver) or group_alive(driver)):
+            return False
+    # Normal cleanup may have removed both legacy metadata files. Their absence
+    # alone grants nothing: the current process scan covers the exact native
+    # session AND attempt driver, including children detached from tmux.
+    windows = tmux.windows_strict()
+    return (windows is not None and (session_name(agent), key) not in windows
+            and _session_process_absent(intent['session_id'], key))
+
+
+def recovery_journal_safe(directory: Path, key: str, archived: dict) -> bool:
+    """The original journal or a reserved orphan before the next SQLite outbox write.
+
+    An orphan supplies no writer-absence proof; the caller still scans processes
+    and windows. Any later native phase or malformed record remains held.
+    """
+    try:
+        current = read_delivery(directory, key)
+        return (current == archived or (
+            set(current) == {'version', 'token', 'sha256', 'phase'}
+            and type(current['version']) is int and current['version'] == 1
+            and current['phase'] == 'reserved'
+            and isinstance(current['token'], str) and bool(current['token'])
+            and current['token'] != archived['token']
+            and isinstance(current['sha256'], str)
+            and re.fullmatch(r'[0-9a-f]{64}', current['sha256']) is not None))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def restored_scope_inventory(db, key: str, agent: str, intent: dict, paths: list) -> bool:
+    """The existing completed checkpoint journal binds old paths to this attempt's leases."""
+    try:
+        old = intent.get('workspaces')
+        if (not isinstance(old, list) or not old or not isinstance(paths, list) or not paths
+                or old == paths or any(not isinstance(x, str) or not x for x in old + paths)
+                or len(set(old)) != len(old) or len(set(paths)) != len(paths)):
+            return False
+        rows = db.execute('SELECT repo, source, target, phase FROM workspace_checkpoints '
+                          'WHERE owner=? AND attempt=? ORDER BY repo', (agent, key)).fetchall()
+        if (len(rows) != len(old) or len(rows) != len(paths)
+                or {r[1] for r in rows} != set(old) or [r[2] for r in rows] != paths
+                or any(r[3] != 'active' for r in rows)):
+            return False
+        leases = db.execute("SELECT pool, path FROM slots WHERE attempt=? AND state='leased'", (key,)).fetchall()
+        return {(r[0], r[1]) for r in leases} == {(agent + '/' + r[0], r[2]) for r in rows}
+    except (sqlite3.Error, ValueError, TypeError, KeyError):
+        return False
+
+
+def unknown_restored_unsent(db, directory: Path, key: str, agent: str, tmux: Tmux) -> bool:
+    """Carry, never settle, a legacy unsent request fenced after a completed path restore."""
+    try:
+        row = db.execute('SELECT state,pid,harness,session_id,workspaces,wait FROM attempts '
+                         'WHERE id=? AND agent=?', (key, agent)).fetchone()
+        if not row or tuple(row[:4]) != ('unknown', 0, 'claude', ''):
+            return False
+        paths, wait = json.loads(row[4]), json.loads(row[5])
+        intent = wait.get('interactive_prompt_intent')
+        return (isinstance(intent, dict) and not intent.get('resolution')
+                and 'unsent_scope_recovery' not in wait
+                and restored_scope_inventory(db, key, agent, intent, paths)
+                and legacy_writer_stopped(directory, key, intent, agent, tmux))
+    except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def proven_unsent(directory: Path, key: str, intent: dict, other_sessions: frozenset = frozenset()) -> bool:
+    """True only when the durable journal itself proves the native send never began for THIS intent: the
+    token/sha match and the phase precedes every paste (`reserved`/`received` or the typed pre-send quota failure), or the typed bootstrap proofs
+    of `unbound_bootstrap_proof` hold. A terminal row alone, an unreadable journal or a mismatch is not proof."""
+    try:
+        journal = read_delivery(directory, key)
+        if journal.get('token') != intent.get('token') or journal.get('sha256') != intent.get('sha256'):
+            return False
+        if journal.get('phase') in ('reserved', 'received') or _quota_unsent(journal, intent):
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return unbound_bootstrap_proof(directory, key, intent, other_sessions)
+
+
 def fresh_rollouts(journal: dict, since: float, other_sessions: frozenset = frozenset()) -> list[str]:
     homes = {os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')}
     homes.add(str(journal.get('codex_home') or '')) if journal.get('codex_home') else None
@@ -79,6 +320,10 @@ def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux,
     journal = read_delivery(directory, key)
     if journal.get('token') != intent.get('token') or journal.get('sha256') != intent.get('sha256'):
         return 'identity-mismatch'
+    if journal.get('phase') == 'pre-send-failed':
+        if _quota_unsent(journal, intent):
+            return 'quota-unsent'         # typed driver failure before any native paste; never an ACK
+        return 'pre-send-failure-unrecognized'
     if journal.get('phase') in ('reserved', 'received'):
         return 'unsent'                    # every paste is preceded by a durable send-intent
     if journal.get('phase') == 'bootstrap-failed' and journal.get('bootstrap_error'):

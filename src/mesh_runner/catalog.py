@@ -661,6 +661,8 @@ class WorkspaceController:
     observer: PoolObserver
     controller_ref: str = RUNNER_NAME
     version: str = __version__
+    on_change: object = None         # callable(workspace_id), called once per accepted semantic change
+    _last_sig: object = None
 
     def _sync_desired(self, manifest: dict, now: float):
         """(info for state.json, reject) where reject is {'revision','digest'} of a slice that failed
@@ -731,6 +733,17 @@ class WorkspaceController:
             local = self.observer.observe(wanted, now, prior, manifest)
         return capabilities, local, profiles
 
+    def _notify_change(self, local: dict) -> None:
+        """Compare the meaning of an accepted publication (pool, state, verified), never its
+        timestamps; the first one only sets the baseline."""
+        sig = tuple(sorted((ref, o.get("state"), bool(o.get("verified"))) for ref, o in local.items()))
+        prior, self._last_sig = self._last_sig, sig
+        if prior is not None and prior != sig and callable(self.on_change):
+            try:
+                self.on_change(self.workspace_id)
+            except Exception as e:           # a consumer bug never stops the controller
+                log.warning("catalog %s: change notice failed: %s", self.workspace_id[:8], type(e).__name__)
+
     def tick(self, now: float) -> dict:
         """One pass. Returns the state written to ``home/state.json``; ``status`` is ok or error."""
         state = {"controller_ref": self.controller_ref, "version": self.version, "workspace_id": self.workspace_id,
@@ -775,6 +788,7 @@ class WorkspaceController:
                                               "pools": local})
         if result.recorded:
             state["last_report_at"] = iso(now)
+            self._notify_change(local)
         bad = result.recorded is False or info.get("desired_outcome") == "invalid"
         return done("error" if bad else "ok", outcome=result.outcome, http_status=result.http_status,
                     recorded=result.recorded, attempts=result.attempts, revision=applied["revision"],

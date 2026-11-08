@@ -3,6 +3,21 @@
 
 ## Unreleased
 
+## 0.1.44
+
+- Recover proven unsent requests after verified workspace migration while preserving pending delivery and fresh admission.
+- Recover wrapped native Claude quota menus before paste and preserve unsent requests through fresh capacity admission.
+- Carry exact typed quota and legacy unsent requests into a fresh admitted harness without losing pending delivery or workspace context.
+- Invalidate stale local capacity holds after observed route or pool changes.
+- Retire only proven-unsent terminal intents during drain and expose exact target coverage to older guards; preserve ambiguous and active delivery fences.
+- Preserve owner-edited typed WAIT edges, prepare explicitly allowed next actions, and retain routed ownership-return sessions.
+- Apply required repository admission, configured queue ordering, and clean failed archive destinations.
+- Optional external start order for a lane's ordinary work (default off). Per agent:
+  `queue_order_command` (argv), `queue_order_timeout_seconds` (3), `queue_order_cache_seconds` (60).
+  Applied in `_work_order` to the ordinary class only, with 2+ cards; any failure keeps the runner's own order.
+- A card that returns to a lane routed to its alternate harness after a status-only roundtrip now resumes that lane's own session, as it already did for lanes on their
+  native harness. Before, every such return started a new session.
+
 ## 0.1.43
 
 - Admit a human-gated card to the owner of its live ask for one bounded turn per answer: when Mesh reports `human_gate_info.decision_pending` with this agent as `owner_agent_id` and assignee, the runner claims exactly one start per `decision_comment_id` (also past a future `start_after`); the gate itself is never lifted by the runner, and missing info or a foreign owner keeps the ordinary hold.

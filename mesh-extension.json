@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "agent-runner",
   "name": "Agent Runner",
-  "version": "0.1.43",
+  "version": "0.1.44",
   "kind": "plugin",
   "runtime": "external",
   "mesh_api": ">=1 <2",

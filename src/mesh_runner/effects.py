@@ -42,6 +42,7 @@ import re
 import time
 import uuid
 
+from . import card_wait_reconcile
 from .mesh import MeshClient, MeshError
 from .blocking_path import BlockingPath, Budget
 
@@ -71,6 +72,7 @@ SKIP_CLEAR_TRIES = 3                    # a clear that fails this often is given
 STATE_FIELDS = ("kind", "ref", "reason")
 BACKLOG_BLOCKER = "blocked by a card in backlog: "
 ACCESS_HELD = "capability held; waits for authenticated own-access recheck"   # access_recovery.REASON
+EDGE_REMOVED_MARK = "card_edge_user_removed"   # store mark: a user deleted this lane's WAIT edge to <short target ref>
 EDGE_DENIED_MARK = "edge_denied"        # store mark prefix: an edge this lane's key may not remove / add (HTTP 403)
 UNSCHEDULE_MARK = "unschedule"          # store mark: a start_after this lane set and could not clear yet
 UNSCHEDULE_TRIES = 2                    # clears per attempt when Mesh answers 409: one re-read, one retry
@@ -634,7 +636,8 @@ class Effects:
                 wait.pop("edge", None)         # a denial is permanent for this key: not asked again
             else:
                 try:
-                    self.mesh.delete_dependency(a.task_id, wait["edge"])
+                    if self._edge_still_ours(a, wait):
+                        self.mesh.delete_dependency(a.task_id, wait["edge"])
                     wait.pop("edge", None)
                 except MeshError as e:
                     if e.status == 403:
@@ -642,6 +645,7 @@ class Effects:
                         wait.pop("edge", None)
                     log.warning("%s: edge #%s: %s%s", self.lane, a.task8, e,
                                 "; not removable by this lane, not retried" if e.status == 403 else "")
+        wait.pop("observe_edge", None)          # a read-only watch ends with the wait; the edge is untouched
         if close_request and wait.get("kind") in ("decision", "blocking"):
             active = self._decision(a.task_id)
             if active:
@@ -883,6 +887,23 @@ class Effects:
         if self.store is not None:
             self.store.mark(self.lane, task_id, key, "403")
 
+    def _edge_still_ours(self, a: Attempt, wait: dict) -> bool:
+        """True while the edge this WAIT created still has the shape it was created with
+        (blocks / task_done). A gone edge needs no delete; one an operator narrowed
+        (task_done -> deployed...) or retyped is theirs now: cleanup neither deletes nor downgrades it.
+        An unreadable edge set raises MeshError: the edge stays recorded and cleanup is retried."""
+        outgoing = card_wait_reconcile.readable_outgoing(self.mesh.dependencies(a.task_id), a.task_id)
+        if outgoing is None:
+            raise MeshError(502, "edge set unreadable")
+        for e in outgoing:
+            if e.get("id") == wait["edge"]:
+                if e.get("dependency_type") == "blocks" and e.get("condition") == "task_done":
+                    return True
+                log.info("%s: edge #%s %s is %s/%s now (changed by its owner); left in place",
+                         self.lane, a.task8, wait["edge"], e.get("dependency_type"), e.get("condition"))
+                return False
+        return False
+
     def _add_edge(self, a: Attempt, wait: dict) -> None:
         if self._edge_denied(a.task_id, "add:" + str(wait.get("target"))):
             return
@@ -890,6 +911,24 @@ class Effects:
             target = self.mesh.task_by_short(wait["target"])
             target_id = target.get("id")
             if not target_id or target_id == a.task_id:
+                return
+            # Never recreate or take over what an operator shaped: an existing edge to this
+            # target (any type/condition, e.g. narrowed task_done -> deployed) stays as it is and
+            # is not ours to clean up; a link a user deleted for this target is not restored by
+            # a re-declared WAIT. An unreadable edge set creates nothing (fail closed).
+            outgoing = card_wait_reconcile.readable_outgoing(self.mesh.dependencies(a.task_id), a.task_id)
+            if outgoing is None:
+                return
+            existing = [e for e in outgoing if e["depends_on_task_id"] == target_id]
+            if existing:
+                # Read-only binding: the wait may watch that one blocking edge's typed verdict
+                # (observe_edge) but it owns nothing, so cleanup never deletes or downgrades it.
+                blocking = [e for e in existing if e["dependency_type"] == "blocks"]
+                if len(blocking) == 1 and len(existing) == 1:
+                    wait["observe_edge"] = blocking[0]["id"]
+                return
+            if self.store is not None and self.store.mark(self.lane, a.task_id, f"{EDGE_REMOVED_MARK}:{wait.get('target')}"):
+                log.info("%s: edge #%s → #%s was removed by a user; not restored", self.lane, a.task8, wait.get("target"))
                 return
             edge = self.mesh.add_dependency(a.task_id, target_id)
             edge_id = edge.get("id") or (edge.get("dependency") or {}).get("id")

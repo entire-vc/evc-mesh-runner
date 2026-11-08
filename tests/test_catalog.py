@@ -413,5 +413,26 @@ class DigestCheckRedRunTest(unittest.TestCase):
                          [str(t) for t, _ in result.failures + result.errors])
 
 
+class ChangeNotice(unittest.TestCase):
+    def ctl(self,calls):
+        c=WorkspaceController(WS,None,Path('m'),Path('h'),Path('c'),PoolObserver())
+        c.on_change=calls.append;return c
+
+    def test_only_semantic_change_notifies_once(self):
+        calls=[];c=self.ctl(calls)
+        a={'p':{'state':'exhausted','verified':True,'observed_at':'t1'}}
+        c._notify_change(a);self.assertEqual(calls,[])                    # baseline
+        c._notify_change({'p':{'state':'exhausted','verified':True,'observed_at':'t2'}})
+        self.assertEqual(calls,[])                                       # new timestamp, same meaning
+        b={'p':{'state':'available','verified':True,'observed_at':'t3'}}
+        c._notify_change(b);self.assertEqual(calls,[WS])
+        c._notify_change(dict(b));self.assertEqual(calls,[WS])           # not again
+        c._notify_change({'p':{'state':'available','verified':False,'observed_at':'t4'}})
+        self.assertEqual(calls,[WS,WS])
+
+    def test_consumer_failure_does_not_break_controller(self):
+        c=self.ctl([]);c.on_change=lambda w:1/0
+        c._notify_change({'p':{'state':'a','verified':True}});c._notify_change({'p':{'state':'b','verified':True}})
+
 if __name__ == "__main__":
     unittest.main()

@@ -128,3 +128,137 @@ class CardEdgeRemoved(Bench):
         r.mesh.dependencies = flaky
         r._wake_one(a)
         self.assertEqual(r.store.get(a.id).state, 'waiting')
+
+
+def typed_row(task_id, target_id, condition, satisfied, edge_id='e1'):
+    row = edge_row(task_id, target_id, edge_id, satisfied)
+    row['condition'] = condition
+    return row
+
+
+class CardEdgeNarrowed(Bench):
+    flow = CardEdgeRemoved.flow
+    """An owner narrowed the WAIT edge task_done -> deployed (AC2/AC5 audit 07.11)."""
+
+    def test_satisfied_typed_condition_wakes_same_attempt_once_target_open(self):
+        r, a, t, g = self.flow(lambda t, g: [typed_row(t['id'], g['id'], 'deployed', True)])
+        r._wake_one(a)
+        s = r.store.get(a.id)
+        self.assertEqual((s.state, s.id, s.session_id), ('ready', a.id, 'native-session'))
+        self.assertIn('deployed', s.wake_text)
+        self.assertIn('not released', s.wake_text)
+        r.store.update(s, state='waiting')            # replay of the same verdict
+        r._wake_one(r.store.get(a.id))
+        self.assertEqual(r.store.get(a.id).state, 'waiting')
+
+    def test_satisfied_condition_on_a_closed_target_is_still_one_wake(self):
+        r, a, t, g = self.flow(lambda t, g: [typed_row(t['id'], g['id'], 'deployed', True)])
+        g['status'] = {'slug': 'done'}
+        g['status_category'] = 'done'
+        r._wake_one(a)
+        s = r.store.get(a.id)
+        self.assertEqual((s.state, s.id), ('ready', a.id))
+        self.assertIn('typed condition deployed', s.wake_text)   # the typed verdict wins; one wake, one attempt
+
+    def test_malformed_rows_create_nothing_and_keep_the_record(self):
+        for bad in ({'x': 1}, {'id': 'e9'}, 'junk',
+                    typed_row('other', 'y', 'deployed', True)):
+            with self.subTest(bad=bad):
+                r, a, t, g = self.flow(lambda t, g: [])
+                real = r.mesh.dependencies
+                r.mesh.dependencies = lambda tid, real=real, bad=bad: dict(real(tid), outgoing=[bad])
+                wait2 = {'kind': 'card', 'target': g['id'][:8]}
+                r.effects._add_edge(a, wait2)              # unreadable set is not "no edge"
+                self.assertNotIn('edge', wait2)
+                self.assertEqual(r.mesh.deps.get(t['id'], []), [])
+                wait = {'kind': 'card', 'target': g['id'][:8], 'edge': 'e1', 'fx': True}
+                r.effects.on_end(a, wait, 'woken')         # cleanup cannot tell: record kept for retry
+                self.assertEqual(wait.get('edge'), 'e1')
+                r.store.db.execute('DELETE FROM attempts WHERE id=?', (a.id,))
+
+    def test_redeclared_wait_keeps_observing_the_narrowed_edge(self):
+        # own e1 narrowed to deployed/false -> cleanup keeps it -> same target re-declared
+        r, a, t, g = self.flow(lambda t, g: [typed_row(t['id'], g['id'], 'deployed', False)])
+        old = dict(r.store.get(a.id).wait)
+        r.effects.on_end(a, old, 'woken')
+        self.assertNotIn('edge', old)
+        wait = {'kind': 'card', 'target': g['id'][:8], 'since': '2026-10-01T00:00:00Z',
+                'started': '2026-10-01T00:00:00Z', 'fx': True}
+        r.effects._add_edge(a, wait)
+        self.assertNotIn('edge', wait)                 # owns nothing
+        self.assertEqual(wait.get('observe_edge'), 'e1')
+        r.store.update(r.store.get(a.id), state='waiting', wait=wait)
+        r._wake_one(r.store.get(a.id))
+        self.assertEqual(r.store.get(a.id).state, 'waiting')       # unsatisfied: holds
+        r.mesh.deps[t['id']][0]['condition_satisfied'] = True      # server verdict, target still open
+        r._wake_one(r.store.get(a.id))
+        s = r.store.get(a.id)
+        self.assertEqual((s.state, s.id), ('ready', a.id))
+        self.assertEqual([e['condition'] for e in r.mesh.deps[t['id']]], ['deployed'])   # never touched
+        end = dict(s.wait)
+        r.effects.on_end(s, end, 'woken')
+        self.assertNotIn('observe_edge', end)
+        self.assertEqual(len(r.mesh.deps[t['id']]), 1)             # observed edge is not deleted
+
+    def test_ambiguous_existing_edges_are_not_observed(self):
+        r, a, t, g = self.flow(lambda t, g: [typed_row(t['id'], g['id'], 'deployed', True, 'e1'),
+                                             typed_row(t['id'], g['id'], 'accepted', True, 'e2')])
+        wait = {'kind': 'card', 'target': g['id'][:8]}
+        r.effects._add_edge(a, wait)
+        self.assertNotIn('observe_edge', wait)
+
+    def _held(self, row):
+        r, a, t, g = self.flow(lambda t, g: [row(t, g)])
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, 'waiting')
+
+    def test_unsatisfied_does_not_wake(self):
+        self._held(lambda t, g: typed_row(t['id'], g['id'], 'deployed', False))
+
+    def test_non_boolean_verdict_does_not_wake(self):
+        self._held(lambda t, g: typed_row(t['id'], g['id'], 'deployed', 'true'))
+       
+    def test_unknown_verdict_does_not_wake(self):
+        self._held(lambda t, g: typed_row(t['id'], g['id'], 'deployed', None))
+
+    def test_edge_to_other_target_does_not_wake(self):
+        self._held(lambda t, g: typed_row(t['id'], task(4)['id'], 'deployed', True))
+
+    def test_foreign_task_edge_does_not_wake(self):
+        self._held(lambda t, g: typed_row(task(5)['id'], g['id'], 'deployed', True))
+
+    def test_revoked_generation_does_not_wake(self):
+        r, a, t, g = self.flow(lambda t, g: [typed_row(t['id'], g['id'], 'accepted', True)])
+        real, calls = r.mesh.dependencies, []
+
+        def revoked(tid):
+            calls.append(tid)
+            rows = real(tid)
+            if len(calls) > 2:                       # verdict withdrawn before the commit
+                for e in rows['outgoing']:
+                    e['condition_satisfied'] = False
+            return rows
+        r.mesh.dependencies = revoked
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, 'waiting')
+
+    def test_cleanup_leaves_narrowed_edge_and_redeclare_does_not_recreate(self):
+        r, a, t, g = self.flow(lambda t, g: [typed_row(t['id'], g['id'], 'deployed', False)])
+        wait = dict(r.store.get(a.id).wait)
+        r.effects.on_end(a, wait, 'done')
+        self.assertNotIn('edge', wait)
+        self.assertEqual([e['condition'] for e in r.mesh.deps[t['id']]], ['deployed'])
+        wait2 = {'kind': 'card', 'target': g['id'][:8]}
+        before = list(r.mesh.deps[t['id']])
+        r.effects._add_edge(a, wait2)                 # re-declared WAIT: no second broad edge
+        self.assertNotIn('edge', wait2)
+        self.assertEqual(r.mesh.deps[t['id']], before)
+
+    def test_user_removed_edge_is_not_restored_by_redeclared_wait(self):
+        r, a, t, g = self.flow(lambda t, g: [])
+        r._wake_one(a)                                # removal observed, mark written
+        self.assertEqual(r.store.get(a.id).state, 'ready')
+        wait2 = {'kind': 'card', 'target': g['id'][:8]}
+        r.effects._add_edge(a, wait2)
+        self.assertNotIn('edge', wait2)
+        self.assertEqual(r.mesh.deps.get(t['id'], []), [])

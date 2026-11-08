@@ -1189,6 +1189,7 @@ class WorkspacePool:
     _pre_rename_hook = None         # test seam: called after the last read-back, before each rename
     _dest_name = ""
     _dest_parent = -1
+    _moved_any = False              # a source entry has been renamed into the quarantine: the archive is now the only copy
     _mount_ident = None             # (mount path, its (dev, ino), archive root path, its (dev, ino)) of the open dest
 
     def _open_archive_dest(self, slot_name: str) -> tuple[int, int | None]:
@@ -1360,9 +1361,10 @@ class WorkspacePool:
                     except FileExistsError:
                         n += 1
                 run = self._open_child(qfd, name, slot_dev)
-                os.fsync(qfd)                       # the run directory entry (and the quarantine dir) must outlive a crash
-                os.fsync(pfd)
+                moved = []
                 try:
+                    os.fsync(qfd)                   # the run directory entry (and the quarantine dir) must outlive a crash
+                    os.fsync(pfd)
                     row = self.store.db.execute("SELECT attempt FROM slots WHERE path=?", (str(path),)).fetchone()
                     doc = {"state": "renaming", "slot": real.name, "owner": self.owner,
                            "attempt": (row["attempt"] if row else "") or "",
@@ -1383,7 +1385,6 @@ class WorkspacePool:
                         except OSError:
                             return False
                         return stat.S_ISDIR(now.st_mode) and (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino)
-                    moved = []
                     for src, rel in srcs:
                         parent = self._ensure_dirs(dest, rel[:-1], want)
                         try:
@@ -1400,6 +1401,7 @@ class WorkspacePool:
                         try:
                             os.rename(rel[-1], rel[-1], src_dir_fd=sparent, dst_dir_fd=qparent)
                             moved.append(rel)
+                            self._moved_any = True
                             os.fsync(sparent)       # both directory entries of the rename are durable
                             os.fsync(qparent)       # before the next entry and before 'complete'
                         finally:
@@ -1421,6 +1423,10 @@ class WorkspacePool:
                         self._write_manifest(run, {**doc, "state": "restored"})
                         raise WorkspaceError("archive destination was removed; sources returned to the slot")
                     self._write_manifest(run, {**doc, "state": "complete"})
+                except BaseException:
+                    if not moved:                   # nothing left the slot: the run is an empty shell with a manifest
+                        self._discard_dir(qfd, name, run)
+                    raise
                 finally:
                     os.close(run)
             finally:
@@ -1592,6 +1598,8 @@ class WorkspacePool:
         caller holds the slot instead of crashing."""
         env = {**(self.env if self.env is not None else os.environ), "GIT_TERMINAL_PROMPT": "0"}
         dest = -1
+        done = False
+        self._moved_any = False
         try:
             res = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--exclude-standard",
                                   "-z", "--directory"], capture_output=True, timeout=600, env=env)
@@ -1622,14 +1630,73 @@ class WorkspacePool:
             if self._verified_hook:
                 self._verified_hook()
             self._quarantine(path, srcs, dest, want)
+            done = True
         except (OSError, subprocess.SubprocessError) as e:
             raise WorkspaceError(f"archive untracked in {path}: {e}") from None
         finally:
+            if not done and dest >= 0 and not self._moved_any:
+                self._discard_archive_dest(dest)
             if dest >= 0:
                 os.close(dest)
             if self._dest_parent >= 0:
                 os.close(self._dest_parent)
                 self._dest_parent = -1
+
+    def _discard_archive_dest(self, dest: int) -> None:
+        """A failed run removes the archive directory it created itself, so a held slot retried by every
+        sweep does not leave one full copy per retry. Only called while no source entry has left the slot
+        (the sources are intact, the copy is redundant). Everything is relative to the held fds; the entry
+        is removed only if its parent still names the directory we created. Best effort: an error leaves
+        the directory in place (a duplicate, never a loss)."""
+        try:
+            st = os.fstat(dest)
+            now = os.stat(self._dest_name, dir_fd=self._dest_parent, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISDIR(now.st_mode):
+                return
+            os.fchmod(dest, 0o700)
+            for _r, dirs, files, dfd in os.fwalk(".", dir_fd=dest, topdown=False):
+                os.fchmod(dfd, 0o700)                # copied directories keep the source mode (e.g. 0555)
+                for f in files:
+                    os.unlink(f, dir_fd=dfd)
+                for d in dirs:
+                    try:
+                        os.rmdir(d, dir_fd=dfd)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:                  # a symlink to a directory is listed in dirs by fwalk
+                        os.unlink(d, dir_fd=dfd)
+            if self._same_entry(self._dest_parent, self._dest_name, dest):   # recheck after the walk
+                os.rmdir(self._dest_name, dir_fd=self._dest_parent)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _discard_dir(parent: int, name: str, fd: int) -> None:
+        """Remove directory `name` of `parent` (open as `fd`) with its contents, fd-relative, only if the
+        entry still is that directory. Best effort: an error leaves it in place."""
+        try:
+            st = os.fstat(fd)
+            now = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISDIR(now.st_mode):
+                return
+            for _r, dirs, files, dfd in os.fwalk(".", dir_fd=fd, topdown=False):
+                for f in files:
+                    os.unlink(f, dir_fd=dfd)
+                for d in dirs:
+                    try:
+                        os.rmdir(d, dir_fd=dfd)
+                    except OSError:
+                        os.unlink(d, dir_fd=dfd)
+            if WorkspacePool._same_entry(parent, name, fd):          # recheck after the walk
+                os.rmdir(name, dir_fd=parent)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _same_entry(parent: int, name: str, fd: int) -> bool:
+        """`name` in `parent` still is the directory open as `fd` (rmdir only ever removes an empty one)."""
+        st, now = os.fstat(fd), os.stat(name, dir_fd=parent, follow_symlinks=False)
+        return stat.S_ISDIR(now.st_mode) and (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino)
 
     def _free(self, path: Path, repo: RepoSpec) -> None:
         self._archive_untracked(path)

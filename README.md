@@ -1054,3 +1054,12 @@ authentication, human, dependency, WAIT and turn-budget admission checks still
 run. Holds before attempt reservation leave it pending; later refusal, including
 authentication at launch, spends it without bypassing the hold. A changed cap invalidates
 it. This command never edits Mesh or clears other holds.
+
+## Optional start order (`queue_order_command`)
+
+Per agent, absent = off (no subprocess). The command gets `{"version":1,"agent","candidates":[{id,priority,created_at,version,workspace_id,project_id}]}`
+on stdin (runner order; never title, body or labels) and prints `{"version":1,"order":[ids]}`. Only `order` is used, and only as an
+exact permutation of the input; exit != 0, timeout (`queue_order_timeout_seconds`, default 3, process group killed), non-JSON,
+another version or a bad permutation fall back to the runner's order (logged on the edge). Results are cached for
+`queue_order_cache_seconds` (default 60) per agent + ids + priority/version. It reorders the ordinary class only: decision
+requests stay first, cap-waiting cards last, reviews untouched; every admission rule still runs per card before its start.

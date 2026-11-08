@@ -41,6 +41,7 @@ from . import chat_diag
 from . import op_pause
 from . import asks
 from . import card_wait_reconcile
+from . import next_action
 from . import reviewer_merge
 from . import inputs
 from . import prompt as prompts
@@ -62,6 +63,7 @@ from .adapters.base import Adapter, Launch, LaunchExecError, LaunchProbeDenied, 
 from .adapters.claude import ClaudeAdapter
 from .adapters.codex import CodexAdapter
 from . import queue_wait
+from . import queue_order
 from . import native_result_wait, native_result_resume, native_result_rebind, native_result_config
 from . import receipt_wait
 from . import gmail_watch
@@ -71,14 +73,14 @@ from . import stall_wait
 from . import config_receipt
 from . import config as config_mod
 from .config import AgentConfig, RunnerConfig, read_env_file
-from .effects import (BACKLOG_BLOCKER, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SKIP_EVERY, Effects, own_schedule,
+from .effects import (BACKLOG_BLOCKER, EDGE_REMOVED_MARK, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SKIP_EVERY, Effects, own_schedule,
                       skip_state)
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
 from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, QUEUE_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, parse_line
 from . import gate_owner
-from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, blocking_tasks, order,
+from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, blocking_edges, blocking_tasks, order,
                         parse_time, static_skip_reason)
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from . import observation_budget
@@ -368,6 +370,16 @@ GATE_PUBLIC_REASONS = {
 }
 
 
+# Older operators print the server's admit refusal as plain text without a typed code:
+# "runtime.capacity: server admit hold acquire_refused:pool_exhausted". Only these exact
+# capacity refusals are normalised; every other free-text reason keeps its own class.
+LEGACY_CAPACITY_REFUSAL = re.compile(
+    r"(?:capacity: )?(?:runtime\.capacity: )?server admit hold acquire_refused:pool_(?:exhausted|full)\b")
+# Holds that a changed pool state or runtime route can make stale. Human, auth and
+# ownership holds are never in this set.
+CAPACITY_CLASS_REASONS = frozenset({GATE_PUBLIC_REASONS["capacity"], GATE_PUBLIC_REASONS["profile"]})
+
+
 def gate_hold_reason(text: str) -> str:
     """Public diagnostic only: never copy values from hook KEY=VALUE output.
 
@@ -384,6 +396,8 @@ def gate_hold_reason(text: str) -> str:
         if re.match(r"[A-Z][A-Z0-9_]{0,40}=", line):
             continue
         if "=" not in line:
+            if LEGACY_CAPACITY_REFUSAL.match(line):
+                return GATE_PUBLIC_REASONS["capacity"]     # same class as the typed refusal
             return line[:200]  # existing operator text contract
         if line.startswith("waits for a human"):
             return GATE_PUBLIC_REASONS["human"]
@@ -433,6 +447,8 @@ class AgentRunner:
         self._gate_failures: dict[tuple[str, str], int] = {}
         self._launch_obs: dict[str, tuple[str, float, launch_probe.Observation]] = {}   # task -> early candidate observation
         self._resume_hold: dict[str, float] = {}              # attempt -> until
+        self._capacity_resume: set[str] = set()               # attempts whose resume hold came from a capacity/profile refusal
+        self._hold_route: str | None = None                   # routed harness when the lane hold was taken
         # attempt -> (holder attempt, holder slot path, recheck at): resume held because its branch is
         # checked out in a slot of a live attempt; eligible again when that attempt ends or frees the slot
         self._branch_wait: dict[str, tuple[str, str, float]] = {}
@@ -505,6 +521,7 @@ class AgentRunner:
         self._starts_paused_until = 0.0
         self._last_recheck = 0.0
         self._hold_cache: dict[str, tuple[str, float, str]] = {}   # task -> (updated_at, mono, verdict)
+        self._prep_pending: dict[str, str] = {}   # task -> next-action generation cleared for one prep start
         self._hold_deadline: dict[str, float] = {}   # task -> monotonic time a cached hold must be re-read
         self._review_why: dict[str, dict] = {}   # task -> why its own work is fed back (event/since/unreviewed_hours)
         self._merge_jobs: dict[str, dict] = {}      # attempt id -> a merge gate run (thread, result)
@@ -892,7 +909,9 @@ class AgentRunner:
         sid = note.get("session_id") or ""
         if not sid:
             return "", "session_missing", note
-        if note.get("harness") != a.harness or note.get("cwd") != str(self.agent.profile_dir):
+        # the harness this turn runs on is the routed one (set by the start's env build); a new
+        # attempt still carries the lane's native harness until the spawn applies the route
+        if note.get("harness") != self._routed_harness or note.get("cwd") != str(self.agent.profile_dir):
             return "", "cwd_or_harness_changed", note
         if note.get("observed_assignee") not in ("", self.agent_id) or note.get("observed_status") in (
                 "done", "cancelled"):
@@ -1236,7 +1255,8 @@ class AgentRunner:
         return False
 
     def _spawn(self, a: Attempt, prompt_text: str, resume: bool, expect: tuple[str, ...],
-               first_prompt=None, before_spawn=None, env=None, prompt_is_complete=False) -> bool:
+               first_prompt=None, before_spawn=None, env=None, prompt_is_complete=False,
+               handoff_guard=None) -> bool:
         env = self._fresh_env(a.task_id) if env is None else env
         if not self._launch_ready(a, env, expect):
             return False
@@ -1264,6 +1284,10 @@ class AgentRunner:
         if blocked:
             self._authentication_failed(a, blocked)
             return False
+        # Recheck under the Runner's existing single state-directory owner, after
+        # workspace/auth checks and before changing session or durable outbox.
+        if handoff_guard is not None and not handoff_guard():
+            raise RuntimeError("legacy unsent handoff evidence changed before spawn")
         if routed != a.harness and (routed == self.agent.harness or routed in self.alt_adapters):
             if resume and a.session_id:
                 if first_prompt is None:
@@ -3856,7 +3880,8 @@ class AgentRunner:
         if not isinstance(intent, dict):
             return True                     # attempts predating this protocol are unchanged
         if intent.get("retryable") and a.state == "unknown":
-            return False                    # normal admission fenced a changed retry scope
+            self._recover_restored_unsent_scope(a)
+            return False                    # all other changed scopes retain the ordinary fence
         # A live turn still uses the existing timeout/progress watchdog; its
         # outbox stays pending until the driver's durable end-of-turn ack.
         if a.pid and not self._turn_over(a):
@@ -3878,7 +3903,14 @@ class AgentRunner:
                         self.store.other_sessions(a.id))
             except (OSError, ValueError, KeyError, TypeError):
                 resolution = "native-evidence-unreadable"
-            if resolution == "unsent":
+            if resolution in ("unsent", "quota-unsent"):
+                if resolution == "quota-unsent":
+                    # Use the same quota policy as a failed accepted turn, but do
+                    # not consume this undelivered prompt or its pending marks.
+                    # The operator reads the failed log before prior is restored.
+                    self.store.mark(self.agent.name, a.task_id, "quota_admission_required", a.id)
+                    self._release_gate(a, "pre-send-quota")
+                    self._switch_on_limit(a)
                 # The durable phase precedes every native paste, not an inference
                 # from an empty log. The former driver is gone (or never registered).
                 prior = intent["prior"]
@@ -3907,6 +3939,7 @@ class AgentRunner:
                     if key == "queue_delivery":
                         marks[queue_wait.FLOOR_KEY] = delivery["floor"]
             wait.pop("interactive_prompt_intent")
+            wait.pop("unsent_scope_recovery", None)
             return self.store.update_with_marks(a, marks, expect=a.state, expect_wait=a.wait,
                        state="running", wait=wait, wake_text="", note="",
                        source_read_at=intent["source_read_at"])
@@ -3931,6 +3964,60 @@ class AgentRunner:
                             self.agent.name, a.task8, intent.get("turn"), resolution)
         return False
 
+    def _recover_restored_unsent_scope(self, a: Attempt) -> bool:
+        directory = interactive.agent_dir(self.cfg.state_dir, self.agent.name)
+        if (a.agent != self.agent.name or not delivery_recovery.unknown_restored_unsent(
+                self.store.db, directory, a.id, self.agent.name, self._tmux)):
+            return False
+        task = self._task(a.task_id)
+        if not self._still_ours(task, a.mode) or not self._release_legacy_gate(a):
+            return False
+        intent = a.wait["interactive_prompt_intent"]
+        wait = dict(a.wait)
+        wait.pop("interactive_prompt_intent")
+        journal = interactive.read_delivery(directory, a.id)
+        if not delivery_recovery.legacy_journal_unsent(journal, intent):
+            return False
+        wait["unsent_scope_recovery"] = {"intent": intent, "journal": journal,
+                                        "workspaces": list(a.workspaces)}
+        # Archive and retire atomically. Neither the old journal nor any delivery
+        # receipt is changed; only the new real native ACK may consume the wake.
+        archive = "unsent_scope_archive:" + a.id + ":" + intent["token"]
+        def still_owned():
+            current = self.store.get(a.id)
+            return (current is not None and current.workspaces == a.workspaces
+                    and delivery_recovery.legacy_writer_stopped(
+                        directory, a.id, intent, self.agent.name, self._tmux))
+        return self.store.update_with_marks(a, {archive: json.dumps(intent),
+            archive + ":journal": json.dumps(journal)}, expect="unknown",
+            expect_wait=a.wait, validate=still_owned, state="ready", wait=wait,
+            note="unsent request retained after verified checkpoint path restore; fresh admission required")
+
+    def _restored_unsent_ready(self, a: Attempt) -> bool:
+        saved = a.wait.get("unsent_scope_recovery") if a else None
+        if (not isinstance(saved, dict) or a.pid or a.state != "ready" or a.session_id
+                or "interactive_prompt_intent" in a.wait):
+            return False
+        intent = saved.get("intent")
+        if not isinstance(intent, dict) or saved.get("workspaces") != list(a.workspaces):
+            return False
+        archive = self.store.mark(self.agent.name, a.task_id,
+                                 "unsent_scope_archive:" + a.id + ":" + str(intent.get("token")))
+        journal_mark = self.store.mark(self.agent.name, a.task_id,
+            "unsent_scope_archive:" + a.id + ":" + str(intent.get("token")) + ":journal")
+        directory = interactive.agent_dir(self.cfg.state_dir, self.agent.name)
+        try:
+            return (archive is not None and json.loads(archive[0]) == intent
+                    and journal_mark is not None and json.loads(journal_mark[0]) == saved.get("journal")
+                    and delivery_recovery.legacy_journal_unsent(saved.get("journal"), intent)
+                    and delivery_recovery.recovery_journal_safe(directory, a.id, saved["journal"])
+                    and delivery_recovery.restored_scope_inventory(
+                        self.store.db, a.id, self.agent.name, intent, list(a.workspaces))
+                    and delivery_recovery.legacy_processes_stopped(
+                        directory, a.id, intent, self.agent.name, self._tmux))
+        except (ValueError, TypeError, KeyError):
+            return False
+
     def _delivery_recheck_request(self, request: dict) -> str:
         if request['expires'] <= int(time.time()):
             return "rejected_expired"
@@ -3953,14 +4040,49 @@ class AgentRunner:
         current = self.store.get(a.id)
         intent = current.wait.get("interactive_prompt_intent")
         if not intent:
-            return "resolved:exact-native-terminal-ack"
+            return ("resolved:durable-unsent-normal-admission" if current.wait.get("unsent_scope_recovery")
+                    else "resolved:exact-native-terminal-ack")
         if intent.get("token") != request["token"]:
             return "unresolved:owner-state-changed"
         if intent.get("retryable") and current.state == "ready":
             return "resolved:durable-unsent-normal-admission"
         return "unresolved:" + intent.get("resolution", "native-proof-incomplete")
 
+    def _retire_proven_unsent_intent(self, a: Attempt) -> bool:
+        """Drop the delivery intent of an attempt that can no longer deliver it, but only on proof: no live
+        process group, and the durable journal proves the native send never began for this exact token
+        (`delivery_recovery.proven_unsent`). A terminal state alone is not proof; anything unproven keeps the
+        intent and with it the drain guard. Compare-and-set on the row, so a concurrent change wins."""
+        intent = (a.wait or {}).get("interactive_prompt_intent")
+        if not isinstance(intent, dict) or intent.get("kind") != "interactive":
+            return False
+        if a.pid and group_alive(a.pid, a.stamp):
+            return False
+        try:
+            proven = delivery_recovery.proven_unsent(
+                interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent,
+                self.store.other_sessions(a.id))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        if not proven:
+            return False
+        wait = {k: v for k, v in a.wait.items() if k != "interactive_prompt_intent"}
+        if self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait, wait=wait):
+            self.store.event(a.id, "prompt_intent_retired", intent.get("token", ""))
+            self.emit("prompt_intent_retired", a, reason="proven-unsent")
+            return True
+        return False
+
+    def settle_terminal_intents(self) -> None:
+        """Retire proven-unsent intents left on ended attempts (e.g. ownership loss), at most once a minute."""
+        if time.monotonic() < getattr(self, "_terminal_intent_next", 0):
+            return
+        self._terminal_intent_next = time.monotonic() + 60
+        for a in self.store.terminal_with_intent(self.agent.name):
+            self._guard(a, "retire-intent", self._retire_proven_unsent_intent)
+
     def settle_finished(self) -> None:
+        self.settle_terminal_intents()
         for a in self.store.by_state(self.agent.name, ACTIVE):
             if (a.wait or {}).get("interactive_prompt_intent"):
                 self._guard(a, "prompt-delivery", lambda x:
@@ -4204,6 +4326,10 @@ class AgentRunner:
             self._guard(a, "ready-workspace-suspend", self._suspend_held_ready)
 
     def _suspend_waiting(self, a: Attempt, *, requested: bool = False) -> None:
+        # This pending delivery is bound to the verified restored paths. A
+        # second checkpoint generation before its ACK would erase that binding.
+        if "unsent_scope_recovery" in (a.wait or {}):
+            return
         if self._maintenance_held(a):
             return
         own = self.agent.workspace_wait_release_minutes
@@ -5257,10 +5383,51 @@ class AgentRunner:
                     self.mesh.dependencies(a.task_id), expected, a.task_id) == edge_id
             except MeshError:
                 return False
-        if self.store.update_with_marks(a, {key: edge_id}, expect="waiting", expect_wait=expected,
+        removed_mark = {}
+        if wait.get("target"):
+            removed_mark[f"{EDGE_REMOVED_MARK}:{wait['target']}"] = edge_id
+        if self.store.update_with_marks(a, {key: edge_id, **removed_mark}, expect="waiting", expect_wait=expected,
                 validate=still_removed,
                 state="ready", wait=wait, wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="card edge removed")
+        return True
+
+    def _wake_satisfied_card_edge(self, a: Attempt, task: dict) -> bool:
+        """The edge this card WAIT created was narrowed by its owner to a typed condition
+        (access_ready/contract_ready/artifact_published/shipped/deployed/accepted) and Mesh
+        reports that exact condition satisfied: wake the same attempt once. The target's own
+        state is deliberately not read: a typed condition is satisfied before the card closes, and a
+        closed target is the ordinary observer's wake; both end in the one waiting->ready CAS, so
+        whichever comes first is the single wake. Only Mesh's own boolean counts (never prose, an LLM or another edge);
+        an unsatisfied, unknown, foreign or revoked verdict wakes nothing."""
+        if a.state != "waiting" or not (a.wait.get("edge") or a.wait.get("observe_edge")):
+            return False
+        try:
+            rows = self.mesh.dependencies(a.task_id)
+        except MeshError:
+            return False
+        edge = card_wait_reconcile.satisfied_wait_edge(rows, a.wait, a.task_id)
+        if not edge:
+            return False
+        key = f"card_edge_satisfied:{a.id}:{edge['id']}:{edge['condition']}"
+        if self.store.mark(self.agent.name, a.task_id, key):
+            return False
+        expected = copy.deepcopy(a.wait)
+        wait = copy.deepcopy(expected)
+        event = (f"the typed condition {edge['condition']} of your WAIT on #{wait.get('target')} is satisfied "
+                 "(Mesh's own verdict on the edge); the card itself may still be open: continue the work this "
+                 "condition releases; final acceptance gates that the card still holds are not released")
+
+        def still_satisfied():
+            try:
+                again = card_wait_reconcile.satisfied_wait_edge(
+                    self.mesh.dependencies(a.task_id), expected, a.task_id)
+                return bool(again) and again["id"] == edge["id"] and again["condition"] == edge["condition"]
+            except MeshError:
+                return False
+        if self.store.update_with_marks(a, {key: edge["id"]}, expect="waiting", expect_wait=expected,
+                validate=still_satisfied, state="ready", wait=wait, wake_text=prompts.wake_prompt(task, event)):
+            self.emit("wake", a, event="card edge condition satisfied", condition=edge["condition"])
         return True
 
     def _maintenance_held(self, a: Attempt) -> bool:
@@ -5459,6 +5626,8 @@ class AgentRunner:
             if self._reconcile_card_wait(a, task, comments):
                 return
             if self._wake_removed_card_edge(a, task):
+                return
+            if self._wake_satisfied_card_edge(a, task):
                 return
         if (self.cfg.queue_wait_freshness_v1 and a.mode == "work" and a.wait.get("kind") == "time"):
             try:
@@ -5946,6 +6115,35 @@ class AgentRunner:
             self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
         self._log_hold("resume", a.task8, str(exc), episode="resume branch")
 
+    def _legacy_handoff_ready(self, a: Attempt, route: str) -> bool:
+        intent = ((a.wait or {}).get("interactive_prompt_intent") or {}) if a else {}
+        return (a is not None and not a.pid and a.state == "ready" and route == "codex"
+                and (route == self.agent.harness or route in self.alt_adapters)
+                and intent.get("workspaces") == list(a.workspaces)
+                and (a.harness == "claude" and a.session_id == intent.get("session_id")
+                     or a.harness == route and not a.session_id)
+                and delivery_recovery.proven_legacy_unsent(
+                    interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent)
+                and delivery_recovery.legacy_writer_stopped(
+                    interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, intent,
+                    self.agent.name, self._tmux))
+
+    def _release_legacy_gate(self, a: Attempt) -> bool:
+        # The old native writer is proven absent first. Keep an uncertain release
+        # durable: a timeout must not erase the only pointer to its reservation.
+        before = self.store.mark(self.agent.name, a.task_id, "gate")
+        if not before or not before[0]:
+            return True
+        gate = self._gate_of(a)
+        if not isinstance(gate, dict) or not gate:
+            return False
+        if not self._turn_end(a.task_id, a.mode, a, gate, "legacy-unsent-handoff", require_confirmation=True):
+            return False
+        if self.store.mark(self.agent.name, a.task_id, "gate") != before:
+            return False
+        self.store.mark(self.agent.name, a.task_id, "gate", "")
+        return True
+
     def _resume_one(self, a: Attempt) -> None:
         if self._maintenance_held(a):
             return
@@ -5962,7 +6160,8 @@ class AgentRunner:
         task = self._task(a.task_id)
         if not self._still_ours(task, a.mode):
             self._note_ownership_loss(a, task)
-            self._finish(a, "completed", "task left the agent before resuming")
+            self._retire_proven_unsent_intent(a)
+            self._finish(self.store.get(a.id) or a, "completed", "task left the agent before resuming")
             return
         if a.wait.get("quota_wait_rejected"):
             # Removing our obsolete quota date grants no exemption from a
@@ -6020,19 +6219,35 @@ class AgentRunner:
         env = self._fresh_env(a.task_id)
         if not self._launch_ready(a, env, ("ready",)):
             return
-        reason, gate = self._gate("reserve", a.task_id, a.mode, a)
+        retry = (a.wait or {}).get("interactive_prompt_intent") or {}
+        scope_recovery = (a.wait or {}).get("unsent_scope_recovery") if not retry else None
+        if scope_recovery and not self._restored_unsent_ready(a):
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            return
+        legacy_candidate = (retry.get("harness") == "claude" and self._routed_harness == "codex"
+                            and retry.get("retryable") and not self._quota_admission_required(a))
+        if legacy_candidate and (not self._legacy_handoff_ready(a, self._routed_harness)
+                                 or not self._release_legacy_gate(a)):
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._log_hold("resume", a.task8, "legacy unsent writer or reservation is not proven stopped")
+            return
+        reason, gate = self._gate("reserve", a.task_id, a.mode, a, require_capacity=bool(legacy_candidate or scope_recovery))
         if not reason:
             if not a.checkout.get("token") and not self._acquire(a):
                 self._turn_end(a.task_id, a.mode, a, gate, "not-started")
                 self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
                 return
             a = self.store.get(a.id) or a
-            reason, gate = self._gate("admit", a.task_id, a.mode, a, gate)
+            reason, gate = self._gate("admit", a.task_id, a.mode, a, gate, require_capacity=bool(legacy_candidate or scope_recovery))
         if reason:
             self._turn_end(a.task_id, a.mode, a, gate, "held")
             if a.checkout.get("token"):            # nobody heartbeats a held checkout
                 self._release_checkout(a)
             self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            if reason in CAPACITY_CLASS_REASONS:
+                self._capacity_resume.add(a.id)
+            else:
+                self._capacity_resume.discard(a.id)
             self._suspend_held_ready(a)
             self._log_hold("resume", a.task8, reason)
             if a.mode == "review":
@@ -6042,7 +6257,7 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "review_gate_hold", "")
         self._clear_hold_log(a.task8, "resume")
         self._remember_gate(a, gate)
-        if self._quota_admission_required(a):
+        if legacy_candidate or scope_recovery or self._quota_admission_required(a):
             # Reserve may have selected an allowed account since the pre-gate
             # environment read. Launch/auth checks must use that fresh route.
             try:
@@ -6222,14 +6437,78 @@ class AgentRunner:
         try:
             retry = (a.wait or {}).get("interactive_prompt_intent") or {}
             if retry.get("retryable"):
-                if retry.get("workspaces") != list(a.workspaces) or retry.get("harness") != a.harness:
+                routed = self._routed_harness
+                quota_handoff = (retry.get("kind") == "interactive" and retry.get("harness") != routed
+                    and not a.pid and self._quota_admission_required(a)
+                    and (routed == self.agent.harness or routed in self.alt_adapters)
+                    and (a.harness == retry.get("harness") or (a.harness == routed and not a.session_id))
+                    and delivery_recovery.proven_quota_unsent(
+                        interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, retry))
+                legacy_handoff = legacy_candidate and self._legacy_handoff_ready(a, routed)
+                handoff = quota_handoff or legacy_handoff
+                if (retry.get("workspaces") != list(a.workspaces)
+                        or (retry.get("harness") != a.harness and not handoff)
+                        or (retry.get("harness") != routed and not handoff)):
                     self.store.update(a, expect="ready", state="unknown",
                                       note="unsent prompt scope changed; owner resolution required")
                     self.store.event(a.id, "prompt_retry_scope_changed", "workspaces-or-harness")
                     self.emit("prompt_retry_scope_changed", a, action="owner-resolution")
                     return
-                started = self._spawn(a, retry["prompt"], resume=bool(retry.get("resume")),
-                                      expect=("ready",), env=env, prompt_is_complete=True)
+                if handoff:
+                    # Admission above selected this route. Only exact non-delivery
+                    # proof may carry the pending command into a fresh native context.
+                    # Reuse _spawn's session reset; its pre-outbox crash state (routed
+                    # harness, empty session, old journal) is safe to retry here too.
+                    pending_wake = a.wake_text if not a.session_id and not restored else ""
+                    def handoff_first():
+                        context = first()
+                        # A pre-outbox crash already cleared the source session, so
+                        # _spawn will not append the pending wake as a new switch.
+                        if pending_wake:
+                            context += "\n\n" + pending_wake
+                        reason = ("because the previous harness reported a quota limit" if quota_handoff
+                                  else "and its previous native writer has stopped")
+                        return context + "\n\n[runner] This exact pending request was never sent " + reason + ":\n" + retry["prompt"]
+                    def legacy_guard():
+                        current = self.store.get(a.id)
+                        return (current is not None and self._routed_harness == routed
+                                and current.wait.get("interactive_prompt_intent") == retry
+                                and self._legacy_handoff_ready(current, routed))
+                    started = self._spawn(a, retry["prompt"] if a.session_id else handoff_first(),
+                        resume=bool(a.session_id), first_prompt=handoff_first,
+                        expect=("ready",), env=env, prompt_is_complete=True,
+                        handoff_guard=legacy_guard if legacy_handoff else None)
+                else:
+                    started = self._spawn(a, retry["prompt"], resume=bool(retry.get("resume")),
+                                          expect=("ready",), env=env, prompt_is_complete=True)
+            elif scope_recovery:
+                previous = scope_recovery["intent"]
+                routed = self._routed_harness
+                context = first()
+                if not restored:
+                    manifests = [self.pool._checkpoints().read(Path(row["checkpoint"]))
+                                 for row in self.pool._checkpoint_rows(a.id)]
+                    history = [{"previous_session": m["metadata"].get("session_id", ""),
+                                "previous_workspaces": m["metadata"].get("workspaces", []),
+                                "head": m["fingerprint"]["head"],
+                                "wait": {k: v for k, v in m["metadata"].get("wait", {}).items()
+                                         if k not in ("interactive_prompt_intent", "unsent_scope_recovery")}}
+                               for m in manifests]
+                    context += "\n\n[runner] Existing verified checkpoint context: " + json.dumps(history)
+                if not restored and a.wake_text:
+                    context += "\n\n" + a.wake_text
+                context += ("\n\n[runner] The following request was never sent. Its original session and "
+                            "workspace paths are historical context only. Use only the current leased workspaces "
+                            "listed above; preserve the restored work and continue this pending request:\n"
+                            + previous["prompt"])
+                context += "\nPrevious native session: " + previous["session_id"]
+                def scope_guard():
+                    current = self.store.get(a.id)
+                    return (current is not None and self._routed_harness == routed
+                            and current.wait.get("unsent_scope_recovery") == scope_recovery
+                            and self._restored_unsent_ready(current))
+                started = self._spawn(a, context, resume=False, expect=("ready",), env=env,
+                                      prompt_is_complete=True, handoff_guard=scope_guard)
             elif first_start:
                 first_text, before_spawn, observed = self._prepare_first_start(a, task)
                 started = self._spawn(a, first(), resume=False, expect=("ready",), env=env,
@@ -7312,7 +7591,7 @@ class AgentRunner:
         return out
 
     def _gate(self, phase: str, task_id: str, mode: str, attempt: Attempt | None = None,
-              gate: dict | None = None) -> tuple[str, dict]:
+              gate: dict | None = None, *, require_capacity: bool = False) -> tuple[str, dict]:
         """One phase of the operator's start gate: `reserve` (before a session starts or
         resumes), `admit` (the Mesh checkout is held: the writer is known), `renew`
         (heartbeat of a running turn), `transport` (chat-only, no reservation). ('', merged outputs) = go; (reason, gate) = hold."""
@@ -7323,7 +7602,7 @@ class AgentRunner:
         if phase in ("reserve", "admit") and access_recovery.held(self.store, self.agent.name, task_id):
             self._gate_task_only = True
             return access_recovery.REASON, gate
-        quota_required = phase in ("reserve", "admit") and self._quota_admission_required(attempt)
+        quota_required = phase in ("reserve", "admit") and (require_capacity or self._quota_admission_required(attempt))
         if not self.agent.start_gate_command:
             return ("account capacity admission requires a capable start gate", gate) if quota_required else ("", gate)
         if phase in ("reserve", "admit") and self.agent.launch_probe_command:
@@ -7331,12 +7610,17 @@ class AgentRunner:
             if quota_required and obs is not None and not obs.available:
                 # bounded local cadence (the caller's resume/start hold); never a task WAIT or lane park
                 return self._launch_hold_reason(obs), gate
+        if phase == "reserve":
+            self._route_event()
         if phase == "reserve" and self._agent_gate_hold:
             reason, until, source = self._agent_gate_hold
             if source in self._gate_hold and time.monotonic() < until:
                 return reason, gate
+        hook_env = self._hook_env(task_id, mode, phase, attempt, gate)
+        if quota_required:
+            hook_env["MESH_RUNNER_REQUIRE_ACCOUNT_CAPACITY"] = "1"
         rc, out, err = self._run_hook(self.agent.start_gate_command,
-                                      self._hook_env(task_id, mode, phase, attempt, gate), timeout=15 if phase == "transport" else 120)
+                                      hook_env, timeout=15 if phase == "transport" else 120)
         if rc == 0:
             fresh = self._kv(out)
             gate.update(fresh)
@@ -7359,15 +7643,18 @@ class AgentRunner:
                 until = time.monotonic() + min(GATE_HOLD_SECONDS * 2 ** (failures - 1), TASK_HOLD_SECONDS)
                 self._agent_gate_hold = (reason, until, task_id)
                 self._gate_hold[task_id] = (reason, until)
+                self._hold_route = self._routed_harness
             return reason, gate
         log.warning("%s: start gate %s #%s rc=%s: %s", self.agent.name, phase, task_id[:8], rc,
                     (err or out).strip()[:200])
         return f"start gate failed ({phase}, rc {rc})", gate
 
-    def _turn_end(self, task_id: str, mode: str, attempt: Attempt | None, gate: dict, outcome: str) -> None:
+    def _turn_end(self, task_id: str, mode: str, attempt: Attempt | None, gate: dict, outcome: str, *, require_confirmation: bool = False) -> bool:
         """Tell the operator's hook a turn is over (release what the gate reserved)."""
-        if not self.agent.turn_end_command or not gate:
-            return
+        if not gate:
+            return True
+        if not self.agent.turn_end_command:
+            return False
         env = self._hook_env(task_id, mode, "end", attempt, gate)
         env["MESH_RUNNER_OUTCOME"] = outcome
         rc, out, err = self._run_hook(self.agent.turn_end_command, env, timeout=60)
@@ -7379,6 +7666,7 @@ class AgentRunner:
         if rc != 0:
             log.warning("%s: turn-end hook #%s rc=%s: %s", self.agent.name, task_id[:8], rc,
                         (err or out).strip()[:200])
+        return rc == 0 and (not require_confirmation or self._kv(out).get("RELEASE_CONFIRMED") == "1")
 
     def _remember_gate(self, a: Attempt, gate: dict) -> None:
         stale = self.store.mark(self.agent.name, a.task_id, "gate")
@@ -7437,6 +7725,33 @@ class AgentRunner:
         self._agent_gate_hold = None
         self._gate_failures.clear()
 
+    def invalidate_capacity_holds(self, why: str) -> bool:
+        """A confirmed change of pool state or runtime route makes a cached capacity/profile
+        refusal stale. Lift only those holds (lane hold, per-task cached refusals and the READY
+        delay that came from them) so the next ordinary cycle asks the full gate once more.
+        Human, auth, ownership and task-only holds stay; a new refusal starts a fresh backoff."""
+        lifted = False
+        held = self._agent_gate_hold
+        if held and held[0] in CAPACITY_CLASS_REASONS:
+            self._clear_agent_gate_hold()
+            lifted = True
+        for tid in [t for t, h in self._gate_hold.items() if h and h[0] in CAPACITY_CLASS_REASONS]:
+            self._gate_hold.pop(tid, None)
+            lifted = True
+        for aid in list(self._capacity_resume):
+            self._capacity_resume.discard(aid)
+            if self._resume_hold.pop(aid, None) is not None:
+                lifted = True
+        self._hold_route = None
+        if lifted:
+            log.info("%s: capacity hold lifted (%s); the next cycle re-checks the gate", self.agent.name, why)
+        return lifted
+
+    def _route_event(self) -> None:
+        """The runtime route changed since the lane hold was taken (provider fallback)."""
+        if self._agent_gate_hold and self._hold_route is not None and self._hold_route != self._routed_harness:
+            self.invalidate_capacity_holds("route changed")
+
     def _gate_event(self, task: dict) -> None:
         """An update of the refused task lifts its cached gate for a fresh decision."""
         held = self._gate_hold.get(task["id"])
@@ -7482,6 +7797,7 @@ class AgentRunner:
         if access_recovery.held(self.store, self.agent.name, task["id"]):
             return access_recovery.REASON
         self._gate_event(task)
+        self._route_event()
         if self._agent_gate_hold:
             reason, until, source = self._agent_gate_hold
             if source in self._gate_hold and time.monotonic() < until:
@@ -7555,7 +7871,10 @@ class AgentRunner:
             verdict = self._review_hold(task)
         else:
             try:
-                blockers = blocking_tasks(self.mesh, self.cats, task["id"])
+                pairs = blocking_edges(self.mesh, self.cats, task["id"])
+                blockers = [b for b, _edge in pairs]
+                if blockers and self._prep_cleared(task, [e for _b, e in pairs]):
+                    blockers = []                # prep may start; the edges stay open for Mesh
             except MeshError as e:
                 verdict = f"dependencies unreadable ({e.status})"   # cached below: do not ask each pass
                 self._hold_cache[task["id"]] = (task.get("updated_at") or "", time.monotonic(), verdict)
@@ -7564,6 +7883,26 @@ class AgentRunner:
         if verdict:
             self._hold_cache[task["id"]] = (task.get("updated_at") or "", time.monotonic(), verdict)
         return verdict
+
+    def _prep_cleared(self, task: dict, edges: list[dict]) -> bool:
+        """next-action v1 (opt-in): the prep stage may start past typed blockers, once per
+        projection generation. Any doubt (read error, other version, gate on prep) keeps the hold."""
+        self._prep_pending.pop(task["id"], None)
+        if not getattr(self.agent, "next_action_prep", False):
+            return False
+        try:
+            projection = self.mesh.next_action(task["id"])
+        except MeshError as e:
+            log.info("%s: #%s next-action unreadable (%s); held", self.agent.name, task["id"][:8], e.status)
+            return False
+        generation, why = next_action.clearance(task["id"], edges, projection)
+        if not generation:
+            log.debug("%s: #%s next-action: %s", self.agent.name, task["id"][:8], why)
+            return False
+        if next_action.dispatched(self.store, self.agent.name, task["id"], generation):
+            return False
+        self._prep_pending[task["id"]] = generation
+        return True
 
     def _blocked_verdict(self, blockers: list[dict]) -> str:
         """``blocked by …``; a blocker in backlog comes first and is named as such:
@@ -7633,7 +7972,20 @@ class AgentRunner:
             if t.get("id") in waiting:
                 return 2
             return 0 if DECISION_REQUEST_LABEL in (t.get("labels") or []) else 1
-        return sorted(ordered, key=rank)             # stable: priority order kept within a rank
+        ranked = sorted(ordered, key=rank)           # stable: priority order kept within a rank
+        argv = getattr(self.agent, "queue_order_command", None)
+        if not argv:
+            return ranked                            # off: no subprocess, the order above byte for byte
+        ordinary = [t for t in ranked if rank(t) == 1]
+        if len(ordinary) < 2:
+            return ranked
+        if getattr(self, "_queue_order", None) is None:
+            self._queue_order = queue_order.QueueOrder(
+                self.agent.name, argv, self.agent.queue_order_timeout_seconds,
+                self.agent.queue_order_cache_seconds)
+        chosen = iter(self._queue_order.apply(ordinary))
+        # decision requests stay first, CAP_WAIT last: only the ordinary slots are refilled
+        return [next(chosen) if rank(t) == 1 else t for t in ranked]
 
     def host_hold(self) -> bool:
         """The host is short of memory or overloaded. Both gates are asked, so each logs its own edge."""
@@ -7781,6 +8133,12 @@ class AgentRunner:
             if not (cur and cur.pid):
                 self._release_gate(a, "not-started")
             raise
+        generation = self._prep_pending.pop(task["id"], None)
+        if started and generation:
+            # recorded only now that the attempt really started: a refused start is retried
+            next_action.record(self.store, self.agent.name, task["id"], generation, a.id)
+            self.store.event(a.id, "next_action_prep", generation)
+            log.info("%s: #%s prep started on next-action generation %s", self.agent.name, task["id"][:8], generation)
         if not started:
             self._release_gate(a, "not-started")
         return started
@@ -7886,7 +8244,9 @@ class AgentRunner:
                 "source": "runner_admission"}))
         if keep:
             # spawn keeps the fallback: a harness that does not know the session starts fresh in this turn
-            self.store.update(a, session_id=keep)
+            # the kept session belongs to the routed harness (checked by the verdict): carry it on the
+            # attempt, else the spawn reads native -> routed as a harness switch and drops the session
+            self.store.update(a, session_id=keep, harness=self._routed_harness)
             a = self.store.get(a.id) or a
             first = prompt
             prompt += ("\n\n[runner] The card returned to this lane after a status roundtrip; this is your "
@@ -8610,12 +8970,22 @@ class Runner:
         threading.Thread(target=announce_loop, name="controller-announce", daemon=True, args=(
             {ar.agent.name: ar.mesh for ar in self.agents}, load_runner_id(self.cfg.state_dir), stop)).start()
 
+    def _pools_changed(self, workspace_id: str) -> None:
+        """One accepted publication changed the pool state: tell the owner threads once."""
+        for ar in self.agents:
+            ws = (ar.me or {}).get("workspace_id") or ""
+            if ws and workspace_id and ws != workspace_id:
+                continue                               # another workspace's change never wakes this lane
+            ar.invalidate_capacity_holds("pool state changed")
+
     def _start_catalog(self, stop: threading.Event) -> None:
         """Apply the runtime catalog of each `[[catalog.workspace]]` and report on it (`[catalog] enabled`)."""
         if not self.cfg.catalog.enabled:
             return
         from .catalog import build_controllers, catalog_loop
         controllers = build_controllers(self.cfg)
+        for ctl in controllers:
+            ctl.on_change = self._pools_changed
         threading.Thread(target=catalog_loop, name="catalog", daemon=True,
                          args=(controllers, stop, self.cfg.catalog.interval_seconds)).start()
         log.info("catalog controller %s for %d workspace(s)", self.cfg.catalog.controller_ref, len(controllers))
