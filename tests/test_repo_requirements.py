@@ -62,6 +62,29 @@ class Classify(Bench):
         v = self.run_check([link("g/app")], [app], ident=ident)
         self.assertEqual(v.reason, rr.OK)
 
+    def test_all_missing_repos_named_in_one_verdict(self):
+        app = self.spec()
+        v = self.run_check([link("g/deploy"), link("g/pipe"), link("g/app")], [app], ident={"app": "g/app"})
+        self.assertEqual((v.reason, v.project), (rr.UNDECLARED, "g/deploy"))
+        self.assertEqual([p for _, p in v.also], ["g/pipe"])
+        self.assertIn("g/pipe", v.text())
+        self.assertEqual(v.as_dict()["also"], [{"reason": rr.UNDECLARED, "project": "g/pipe"}])
+        single = self.run_check([link("g/deploy"), link("g/app")], [app], ident={"app": "g/app"})
+        self.assertNotEqual(v.fingerprint, single.fingerprint)
+
+    def test_link_order_does_not_change_the_handoff(self):
+        app = self.spec()
+        a = self.run_check([link("g/deploy"), link("g/pipe")], [app], ident={"app": "g/app"})
+        b = self.run_check([link("g/pipe"), link("g/deploy")], [app], ident={"app": "g/app"})
+        self.assertEqual((a.project, a.also, a.fingerprint), (b.project, b.also, b.fingerprint))
+
+    def test_durable_blocker_leads_over_slot_wait(self):
+        app = self.spec()
+        v = self.run_check([link("g/app"), link("g/deploy")], [app], ident={"app": "g/app"},
+                           pool_full=lambda n: True)
+        self.assertEqual((v.reason, v.project), (rr.UNDECLARED, "g/deploy"))
+        self.assertEqual(v.also, ((rr.NO_SLOT, "g/app"),))
+
     def test_own_lease_is_not_a_slot_wait_or_missing_checkout(self):
         app = self.spec()
         v = self.run_check([link("g/app")], [app], ident={"app": "g/app"}, resuming=True,

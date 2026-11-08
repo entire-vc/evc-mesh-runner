@@ -4110,6 +4110,60 @@ class WaitWorkspaceCheckpoint(Bench):
         r, first, later, ret, launches = self._return_roundtrip(78, holder='', mutate=other_paths)
         self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'path_changed'))
 
+    def _routed_roundtrip(self, n, back_to):
+        """A lane native on claude and routed to codex: status-only roundtrip, then the return
+        is admitted while the route says ``back_to``."""
+        t = task(n)
+        route = self.root / f"route-{n}"
+        route.write_text("codex")
+        self.agent.env_command = [sys.executable, "-c",
+                                  f"import pathlib;print('MESH_RUNNER_HARNESS='+pathlib.Path({str(route)!r}).read_text())"]
+        self.agent.alt = {"codex": {"profile": "base"}}
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work',
+                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r = self.runner(FakeMesh([t]))
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base", native="codex")}
+        # the harness's own session store is the boundary: the fixture codex keeps its session
+        r.alt_adapters["codex"].session_known = lambda sid, cwd, env: True
+        r.tick()
+        self.settle_all(r)
+        first = r.store.by_state('builder', ('waiting',))[0]
+        self.assertEqual(first.harness, 'codex')
+        r.mesh.tasks[t['id']]['assignee_id'] = ''
+        r.tick()
+        self.assertEqual(r.store.get(first.id).state, 'completed')
+        route.write_text(back_to)
+        r.mesh.tasks[t['id']]['assignee_id'] = AGENT_ID
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        r.tick()
+        self.settle_all(r)
+        later = [x for x in r.store.by_state('builder', ('waiting', 'running', 'starting', 'ready', 'completed'))
+                 if x.task_id == t['id'] and x.id != first.id]
+        self.assertTrue(later, 'ownership return admitted no new attempt')
+        ret = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'ownership_return']
+        launches = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'launch']
+        return r, first, r.store.get(later[0].id), ret, launches
+
+    def test_routed_lane_status_roundtrip_keeps_its_routed_session(self):
+        # A new attempt carries the native harness until the spawn applies the route: comparing the
+        # loss note with it read every return of an alt-routed lane as a harness change (live 0.1.43:
+        # 270 of 1347 surplus fresh starts, 02-07.11, Garfield/Riker/Calvin/Howard/Bill/Daedalus).
+        r, first, later, ret, launches = self._routed_roundtrip(84, back_to='codex')
+        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason']),
+                         ('resume', 'ownership_return_same_lane', ''))
+        self.assertEqual((launches[0]['intent'], launches[0]['restart_reason']), ('resume', ''))
+        self.assertEqual((later.harness, later.session_id), ('codex', first.session_id))
+        self.assertFalse([d for _, k, d in r.store.events(later.id) if k == 'harness_switch'])
+        self.assertTrue(calls(self.calls)[-1]['resume'])
+
+    def test_routed_lane_return_on_another_harness_starts_fresh(self):
+        r, first, later, ret, launches = self._routed_roundtrip(85, back_to='claude')
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'cwd_or_harness_changed'))
+        self.assertEqual((launches[0]['intent'], launches[0]['restart_reason']), ('start', 'cwd_or_harness_changed'))
+        self.assertEqual(later.harness, 'claude')
+        self.assertNotEqual(later.session_id, first.session_id)
+        self.assertFalse(calls(self.calls)[-1]['resume'])
+
     def test_ownership_return_after_review_roundtrip_keeps_own_session(self):
         def reviewed(r):
             note = json.loads(r.store.mark('builder', task(80)['id'], 'ownership_loss')[0])

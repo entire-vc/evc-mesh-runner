@@ -106,4 +106,77 @@ class SharedGateBackoff(Bench):
         self.assertTrue(r._gate_task_only)
         self.assertIsNone(r._agent_gate_hold)
 
+class StaleCapacityBackoff(Bench):
+    def _held(self,code='capacity'):
+        r=self.runner(FakeMesh([]));self.agent.start_gate_command=['operator-gate']
+        with patch.object(r,'_run_hook',return_value=(75,'HOLD_REASON_CODE='+code,'')):
+            r._gate('reserve','one','work')
+        return r
+
+    def test_legacy_pool_exhausted_is_normalised_to_capacity_only(self):
+        for line in ('runtime.capacity: server admit hold acquire_refused:pool_exhausted',
+                     'capacity: runtime.capacity: server admit hold acquire_refused:pool_exhausted'):
+            self.assertEqual(gate_hold_reason(line),'runtime capacity unavailable')
+        for line in ('runtime.capacity: server admit hold acquire_refused:auth_revoked','some other refusal'):
+            self.assertNotEqual(gate_hold_reason(line),'runtime capacity unavailable')
+
+    def test_legacy_text_refusal_is_lifted_by_local_turn_end(self):
+        r=self.runner(FakeMesh([]));self.agent.start_gate_command=['operator-gate']
+        self.agent.turn_end_command=['operator-end']
+        with patch.object(r,'_run_hook',return_value=(75,'runtime.capacity: server admit hold acquire_refused:pool_exhausted','')):
+            r._gate('reserve','one','work')
+        with patch.object(r,'_run_hook',return_value=(0,'','')):
+            r._turn_end('other','work',None,{'RES_ID':'x'},'turn-end')
+        self.assertIsNone(r._agent_gate_hold)
+
+    def test_semantic_change_lifts_capacity_hold_and_asks_gate_exactly_once(self):
+        r=self._held()
+        self.assertIsNotNone(r._agent_gate_hold)
+        self.assertTrue(r.invalidate_capacity_holds('pool state changed'))
+        self.assertIsNone(r._agent_gate_hold);self.assertNotIn('one',r._gate_hold)
+        with patch.object(r,'_run_hook',return_value=(0,'','')) as hook:
+            self.assertEqual(r._gate('reserve','one','work')[0],'')
+            self.assertEqual(hook.call_count,1)
+        self.assertFalse(r.invalidate_capacity_holds('again'))     # nothing left to lift
+
+    def test_repeated_pool_full_restarts_backoff_from_base(self):
+        r=self._held();r.invalidate_capacity_holds('x')
+        with patch.object(r,'_run_hook',return_value=(75,'HOLD_REASON_CODE=capacity','')),patch('mesh_runner.runner.time.monotonic',return_value=1000):
+            r._gate('reserve','one','work')
+        self.assertEqual(r._gate_hold['one'][1]-1000,GATE_HOLD_SECONDS)
+        self.assertIsNotNone(r._agent_gate_hold)
+
+    def test_human_and_task_only_holds_are_not_cleared(self):
+        r=self._held('human')
+        self.assertFalse(r.invalidate_capacity_holds('x'));self.assertIsNotNone(r._agent_gate_hold)
+        r=self.runner(FakeMesh([]));self.agent.start_gate_command=['operator-gate']
+        r._gate_hold['t']=('waits for a human decision',10**9)
+        with patch.object(r,'_run_hook',return_value=(76,'HOLD_REASON_CODE=human','')):
+            r._gate('reserve','two','work')
+        self.assertFalse(r.invalidate_capacity_holds('x'));self.assertIn('t',r._gate_hold);self.assertIsNone(r._agent_gate_hold)
+
+    def test_route_change_lifts_hold_but_same_route_does_not(self):
+        r=self._held('profile')
+        r._route_event();self.assertIsNotNone(r._agent_gate_hold)
+        r._routed_harness='codex'
+        with patch.object(r,'_run_hook',return_value=(0,'','')) as hook:
+            self.assertEqual(r._gate('reserve','one','work')[0],'')
+            self.assertEqual(hook.call_count,1)
+        self.assertIsNone(r._agent_gate_hold)
+
+    def test_capacity_ready_delay_is_lifted_only_for_capacity_origin(self):
+        r=self.runner(FakeMesh([]));import time
+        r._resume_hold['cap']=time.monotonic()+120;r._capacity_resume.add('cap')
+        r._resume_hold['other']=time.monotonic()+120
+        self.assertTrue(r.invalidate_capacity_holds('x'))
+        self.assertNotIn('cap',r._resume_hold);self.assertIn('other',r._resume_hold)
+
+    def test_pools_changed_skips_other_workspace(self):
+        r=self._held();r.me={'workspace_id':'ws-a'}
+        self.runner_group=type('G',(),{})()
+        from mesh_runner.runner import Runner
+        g=Runner.__new__(Runner);g.agents=[r]
+        g._pools_changed('ws-b');self.assertIsNotNone(r._agent_gate_hold)
+        g._pools_changed('ws-a');self.assertIsNone(r._agent_gate_hold)
+
 if __name__=='__main__':unittest.main()

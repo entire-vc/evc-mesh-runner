@@ -1,0 +1,11 @@
+  ⎿  You've hit your weekly limit · resets <reset-time>
+
+<unclassified native UI line>
+<unclassified native UI line>
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Nov 10 at 2pm
+     3. Ask your admin for more usage
+
+   Enter to confirm · Esc to cancel

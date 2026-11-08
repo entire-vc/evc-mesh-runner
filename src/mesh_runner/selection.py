@@ -239,6 +239,11 @@ def open_blockers(mesh: MeshClient, cats: StatusCategories, task_id: str) -> lis
 
 def blocking_tasks(mesh: MeshClient, cats: StatusCategories, task_id: str) -> list[dict]:
     """The open tasks themselves (each with ``id``), as open_blockers reads them."""
+    return [blocker for blocker, _edge in blocking_edges(mesh, cats, task_id)]
+
+
+def blocking_edges(mesh: MeshClient, cats: StatusCategories, task_id: str) -> list[tuple[dict, dict]]:
+    """(open blocker with ``id``, its dependency edge row) for every blocking edge."""
     rows = mesh.dependencies(task_id)
     if isinstance(rows, dict):
         rows = rows["outgoing"] if "outgoing" in rows else rows.get("dependencies") or rows.get("items") or []
@@ -257,7 +262,7 @@ def blocking_tasks(mesh: MeshClient, cats: StatusCategories, task_id: str) -> li
                 raise
         blocker = blocker.get("task", blocker) if isinstance(blocker, dict) else {}
         if not satisfied(cats, blocker, dep):
-            blockers.append(dict(blocker, id=bid))
+            blockers.append((dict(blocker, id=bid), dep))
     return blockers
 
 

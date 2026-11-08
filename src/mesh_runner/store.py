@@ -313,6 +313,12 @@ class Store:
         q = f"SELECT * FROM attempts WHERE agent=? AND state IN ({','.join('?' * len(states))}) ORDER BY created_at"
         return [self._row(r) for r in self.db.execute(q, (agent, *states))]
 
+    def terminal_with_intent(self, agent: str) -> list[Attempt]:
+        """Ended attempts that still carry a prompt-delivery intent (candidates for proven retirement)."""
+        q = (f"SELECT * FROM attempts WHERE agent=? AND state NOT IN ({','.join('?' * len(OPEN))}) "
+             "AND wait LIKE '%interactive_prompt_intent%'")
+        return [self._row(r) for r in self.db.execute(q, (agent, *OPEN))]
+
     def waiting_on_task(self, task8: str) -> list[Attempt]:
         """Waiting attempts of any agent on the task whose id starts with ``task8``."""
         q = "SELECT * FROM attempts WHERE state='waiting' AND task_id LIKE ?"

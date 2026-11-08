@@ -75,6 +75,27 @@ def configured_state(config: Path) -> tuple[Path, str]:
     return state.resolve(), digest(raw)
 
 
+TERMINAL_STATES = ('completed', 'aborted', 'failed', 'cancelled')
+
+
+def _settled(state: Path, key: str, agent: str, status: str, pid: int, intent, others: frozenset) -> bool:
+    """An intent that can no longer block a drain, proven by the target's own journal reader: the row is
+    (READY and runner-marked retryable) or terminal, has no process, and the journal proves the native send
+    never began. A live, ambiguous or unproven intent is never settled; a terminal state alone proves nothing."""
+    if not isinstance(intent, dict) or intent.get('kind') != 'interactive' or pid:
+        return False
+    if not (status == 'ready' and intent.get('retryable') is True) and status not in TERMINAL_STATES:
+        return False
+    try:
+        src = str(Path(__file__).resolve().parents[1])
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from mesh_runner import delivery_recovery, interactive
+        return delivery_recovery.proven_unsent(interactive.agent_dir(state, agent), key, intent, others)
+    except (ImportError, OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 def pending(state: Path) -> bool:
     db = state / 'runner.sqlite'
     if not db.exists():
@@ -84,14 +105,22 @@ def pending(state: Path) -> bool:
     try:
         connection = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
         try:
-            for status, raw in connection.execute('SELECT state, wait FROM attempts'):
-                value = json.loads(raw)
-                if not isinstance(value, dict):
-                    raise ValueError()
-                if status == 'unknown' or 'interactive_prompt_intent' in value:
-                    return True
+            rows = connection.execute('SELECT id, agent, state, pid, wait, session_id FROM attempts').fetchall()
         finally:
             connection.close()
+        bound: dict[str, set] = {}
+        for key, *_, sid in rows:
+            if sid:
+                bound.setdefault(sid, set()).add(key)
+        for key, agent, status, pid, raw, _sid in rows:
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError()
+            if status == 'unknown' or 'interactive_prompt_intent' in value:
+                if _settled(state, key, agent, status, pid, value.get('interactive_prompt_intent'),
+                            frozenset(s for s, owners in bound.items() if key not in owners)):
+                    continue
+                return True
     except (sqlite3.Error, ValueError, TypeError):
         raise GuardRefused('registry-unreadable') from None
     return False
@@ -122,6 +151,16 @@ def legacy_rows_covered(state: Path, release: Path) -> bool:
             intent = value.get('interactive_prompt_intent') if isinstance(value, dict) else None
             if status != 'unknown' and not (isinstance(value, dict) and 'interactive_prompt_intent' in value):
                 continue                                   # not pending
+            if _settled(state, key, agent, status, pid, intent,
+                        frozenset(sid for sid, owners in bound.items() if key not in owners)):
+                found = True                               # old guards still count this preserved outbox
+                continue                                   # proven unsent: pending() does not count it either
+            with sqlite3.connect(db.as_uri() + '?mode=ro', uri=True) as proof_db:
+                carried = delivery_recovery.unknown_restored_unsent(
+                    proof_db, interactive.agent_dir(state, agent), key, agent, interactive.Tmux())
+            if carried:
+                found = True                               # still pending; the target owner reconciles it
+                continue
             if (status != 'unknown' or not isinstance(intent, dict) or intent.get('resolution') != 'session-unbound'
                     or intent.get('retryable') or intent.get('kind') != 'interactive' or intent.get('harness') != 'codex'):
                 return False
