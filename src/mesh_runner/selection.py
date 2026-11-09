@@ -210,25 +210,42 @@ def _task_via_others(mesh: MeshClient, task_id: str) -> dict | None:
 TYPED_CONDITIONS = frozenset({"shipped", "deployed", "accepted"})
 
 
-def satisfied(cats: StatusCategories, blocker: dict, edge: dict | None = None) -> bool:
-    """A blocker no longer blocks when its edge condition holds.
+def _released_by_state(condition: str, blocker: dict, cats: StatusCategories) -> bool:
+    """The server's release table (Mesh ``TaskDependency.Released``) applied to the blocker's
+    own state, for an edge whose verdict the server did not give.
+    is_shipped releases only the ``shipped`` / ``deployed`` conditions; a ``task_done`` edge
+    (and the evidence-only conditions) wait for done or cancelled. A recorded deploy is not
+    readable here, so ``deployed`` is released by is_shipped alone: unknown stays blocked."""
+    condition = condition.strip().lower()
+    shipped = blocker.get("is_shipped") is True
+    category = cats.category(blocker)
+    if condition == "shipped":
+        return shipped or category == "done"
+    if condition == "deployed":
+        return shipped
+    if condition == "accepted":
+        return category == "done"
+    return category in CLOSED
 
-    ``edge`` is the dependency row. Mesh computes ``condition_satisfied`` per edge, but its
-    meaning differs by server version: an older server derives it from evidence only and
-    leaves the blocker's status out (a task_done edge to a done blocker reads False there),
-    a newer one returns the full verdict. So the boolean is read in the one way that is
-    right on both: True always releases; False is the answer only for the conditions whose
-    point is to differ from "closed" (shipped, deployed, accepted: a cancelled blocker of an
-    ``accepted`` edge keeps blocking). Any other condition, or no field, falls back to the
-    older rule: the blocker is closed, or what it delivers has shipped (Mesh's is_shipped:
-    merged and deployed) while its card still waits for acceptance or a closing comment.
-    Dependants wait for the condition, not for the bookkeeping."""
+
+def satisfied(cats: StatusCategories, blocker: dict, edge: dict | None = None) -> bool:
+    """A blocker no longer blocks when the server's edge verdict says so.
+
+    ``condition_satisfied`` on the dependency row is Mesh's authoritative verdict: True
+    releases. False stays False for the typed conditions (shipped, deployed, accepted) and
+    is never turned into True by ``is_shipped``. For ``task_done``/untyped edges an older
+    server computes False from evidence only, so a closed blocker still releases them. With
+    no verdict the blocker's state is read through the server's own table (_released_by_state);
+    unknown is not fulfilled. Without an edge the condition is ``task_done``."""
     verdict = edge.get("condition_satisfied") if isinstance(edge, dict) else None
     if verdict is True:
         return True
-    if verdict is False and str(edge.get("condition") or "").strip().lower() in TYPED_CONDITIONS:
+    condition = str((edge or {}).get("condition") or "")
+    if verdict is False and condition.strip().lower() in TYPED_CONDITIONS:
         return False
-    return blocker.get("is_shipped") is True or cats.category(blocker) in CLOSED
+    if verdict is False:
+        return cats.category(blocker) in CLOSED
+    return _released_by_state(condition, blocker, cats)
 
 
 def open_blockers(mesh: MeshClient, cats: StatusCategories, task_id: str) -> list[str]:
@@ -252,11 +269,17 @@ def blocking_edges(mesh: MeshClient, cats: StatusCategories, task_id: str) -> li
         if (dep.get("dependency_type") or "blocks").lower() != "blocks" or not dep.get("depends_on_task_id"):
             continue
         bid = dep["depends_on_task_id"]
+        if dep.get("condition_satisfied") is True:
+            continue                  # released by the server: evidence or the blocker's state, no read needed
         try:
             blocker = mesh.task(bid)
         except MeshError as e:
             if e.status in (404, 410):
-                continue          # a deleted blocker cannot hold anything
+                # The edge is still listed and not released: a deleted or inaccessible blocker is
+                # a tombstone, not a removed edge. Held and named with the reason; only a released
+                # verdict or an edge no longer listed frees the dependant.
+                blockers.append(({"id": bid, "unavailable": e.status}, dep))
+                continue
             blocker = _task_via_others(mesh, bid) if e.status == 403 else None
             if blocker is None:
                 raise

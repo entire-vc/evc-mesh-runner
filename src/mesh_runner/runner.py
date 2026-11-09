@@ -65,6 +65,7 @@ from .adapters.codex import CodexAdapter
 from . import queue_wait
 from . import queue_order
 from . import native_result_wait, native_result_resume, native_result_rebind, native_result_config
+from . import ops_review_wait
 from . import receipt_wait
 from . import gmail_watch
 from . import lifecycle_wait
@@ -214,6 +215,7 @@ CHAT_CHECK_SECONDS = 60
 GATE_HOLD = 75                      # start gate exit code: hold starts of this agent (EX_TEMPFAIL)
 GATE_HOLD_TASK = 76                 # start gate exit code: hold this task only; try the agent's next
 GATE_HOLD_SECONDS = 120
+PAUSE_DENIAL = ": op_pause"      # note suffix of a launch refused because a pause landed mid-tick
 HOLD_RELOG_SECONDS = 1800
 _EVENTS_LOCK = threading.Lock()
 MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]]{0,63}")   # a name, never a flag
@@ -1456,6 +1458,8 @@ class AgentRunner:
         from . import access_recovery
         if access_recovery.held(self.store, self.agent.name, a.task_id):
             return self._deny_launch(a, intent, pending_wait, "access_hold")
+        if self.paused():                               # a pause that landed during admission/preparation
+            return self._deny_launch(a, intent, pending_wait, "op_pause", hold=False)
         if probed:
             # Observe the exact snapshot BEFORE any one-time reservation (before_spawn) is consumed; the
             # supervisor repeats it on the real Popen arguments (a late change still cannot start native).
@@ -1481,6 +1485,8 @@ class AgentRunner:
             if obs is not None and (not obs.available or (expected and obs.account_ref != expected)):
                 return self._deny_launch(a, intent, pending_wait,
                                          obs.reason if not obs.available else "snapshot_identity_mismatch")
+        if self.paused():                               # ... or during the (slow) probe: before any reservation
+            return self._deny_launch(a, intent, pending_wait, "op_pause", hold=False)
         reserved = False
         if before_spawn:
             before_spawn()     # reservation may consume input only after the durable outbox exists
@@ -1520,7 +1526,8 @@ class AgentRunner:
                  a.task8, a.title[:60], proc.pid)
         return True
 
-    def _deny_launch(self, a: Attempt, intent: dict, pending_wait: dict, reason: str, before_spawn=None) -> bool:
+    def _deny_launch(self, a: Attempt, intent: dict, pending_wait: dict, reason: str, before_spawn=None,
+                     hold: bool = True) -> bool:
         """Refuse a native start: same session, pending input retained, one-time reservations returned,
         only a bounded local hold (no WAIT, start_after or park)."""
         undo = getattr(before_spawn, "undo", None)
@@ -1533,7 +1540,8 @@ class AgentRunner:
         self.store.event(a.id, "launch_probe_denied", reason)
         self._release_gate(a, "launch-probe-denied")
         self._release_checkout(a)
-        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        if hold:                                        # a pause needs no timer: paused() gates the retry
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
         return False
 
     def _auth_hold_attempt(self, a: Attempt, profile: str) -> None:
@@ -1994,6 +2002,16 @@ class AgentRunner:
                 self._release_gate(a, "native-registration-held")
                 self._release_checkout(a)
                 return
+        ops_review_request = None
+        if outcome.kind == "ops-review":
+            try:
+                ops_review_request = self._ops_review_registration(a, outcome.target, task)
+            except (ValueError, OSError) as exc:
+                # Only fixed protocol reasons; never expose registry bytes, paths or JSON errors.
+                reason = str(exc) if type(exc) is ValueError else "private registry unavailable"
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line,
+                    note=ops_review_wait.WAIT_GUIDANCE + " Refused: " + reason))
+                return
         receipt_reg = None
         if outcome.kind == "receipt":
             receipt_reg = self._receipt_registration(a, outcome)
@@ -2182,6 +2200,8 @@ class AgentRunner:
             wait.update(kind="queue", until="", queue_request=queue_wait.new_request(a.task_id, queue_contract))
         if native_receiver is not None:
             wait["native_receiver"] = native_receiver
+        if ops_review_request:
+            wait["ops_review_request"] = outcome.target
         if receipt_reg:
             wait["receipt_reg"] = receipt_reg["reg_id"]
         if gmail_reg:
@@ -4834,6 +4854,49 @@ class AgentRunner:
             log.warning('workspace request failed for attempt %s; inspect checkpoint journal', a.id)
             return 'failed_preserved'
 
+    def _ops_review_registration(self, a: Attempt, identity: str, task: dict) -> dict:
+        if not self.cfg.ops_review_wait_registry or not self.cfg.ops_review_wait_notifier_id:
+            raise ValueError("observer not configured")
+        if a.mode != "work" or self.cats.category(task) not in ("todo", "in_progress"):
+            raise ValueError("requires a source work task in todo/in_progress")
+        row = ops_review_wait.registration(self.cfg.ops_review_wait_registry, identity, task, self.agent_id)
+        if self.store.mark(a.agent, a.task_id, ops_review_wait.delivered_key(identity)):
+            raise ValueError("this request's eligibility receipt was already delivered")
+        return row
+
+    def _wake_ops_review(self, a: Attempt, task: dict) -> None:
+        identity = a.wait.get("target")
+        if not identity or a.wait.get("ops_review_request") != identity:
+            return
+        try:
+            row = self._ops_review_registration(a, identity, task)
+            if row.get("state") != "notified":
+                return
+            evidence = ops_review_wait.receipt(identity, row, self.mesh.comments_all(a.task_id),
+                                               self.cfg.ops_review_wait_notifier_id)
+        except (ValueError, OSError, MeshError):
+            return                           # fail closed; no age/comment/time fallback
+        if not evidence:
+            return
+        # Board's notified row is immutable. Re-read it under Store's CAS fence so a
+        # changed binding/intent/receipt cannot race a stale observation. Admission
+        # and lease checks still run normally after this event reaches the ready outbox.
+        def still():
+            try:
+                source = self._task(a.task_id)
+                if self.cats.category(source) not in ("todo", "in_progress"):
+                    return False
+                current = ops_review_wait.registration(self.cfg.ops_review_wait_registry, identity,
+                                                       source, self.agent_id)
+                return current == row
+            except (ValueError, OSError, MeshError):
+                return False
+        if self.store.update_with_marks(a,
+                {ops_review_wait.delivered_key(identity): evidence["comment_id"], "met_wake": a.id},
+                expect="waiting", expect_wait=a.wait, validate=still,
+                state="ready", wake_text=prompts.wake_prompt(task, ops_review_wait.event_text(evidence))):
+            self.emit("wake", a, event="ops-review eligibility receipt delivered")
+
     def _receipt_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
         """The live, undelivered registration this card's ``WAIT receipt:`` may bind to, else None."""
         if not self.cfg.receipt_wait_v1 or a.mode != "work" or outcome.target != a.task8:
@@ -5617,6 +5680,9 @@ class AgentRunner:
         if quota_time_wait(a.wait):
             self._reject_quota_time_wait(a, task)
             return
+        if a.wait.get("kind") == "ops-review":
+            self._wake_ops_review(a, task)
+            return
         if a.wait.get("kind") == "native":
             self._wake_native(a, task)
             return
@@ -6082,6 +6148,8 @@ class AgentRunner:
             return room
         for a in self.store.by_state(self.agent.name, ("ready",)):
             if room <= 0:
+                break
+            if self.paused():                 # a pause that arrived while this loop was walking the queue
                 break
             if time.monotonic() < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold.get(a.id, 0)):
                 continue
@@ -7853,6 +7921,12 @@ class AgentRunner:
                 # either, no cooldown applies and the other holds below still decide.
                 if not event_ready and at.date() == now().date() and not self._new_comment_since(task["id"], at):
                     return "daily turn budget spent; waits for tomorrow (UTC) or a new comment"
+            elif (note.startswith(("gave up:", "no readable outcome:"))
+                  and "without a readable outcome" in note):
+                # The no-outcome notice promises input, not a timed retry. Keep legacy
+                # failed rows held across restart too; our own NEXT is not new input.
+                if not self._new_comment_since(task["id"], at):
+                    return "no readable outcome; waits for a comment from someone else"
             elif self._failed_recently(task["id"], at):
                 return "failed recently; waits for a new comment"
         cached = self._hold_cache.get(task["id"])
@@ -8009,9 +8083,9 @@ class AgentRunner:
             return room
         reviews = 0
         for task in self.candidates():
-            if room <= 0 or time.monotonic() < self._starts_paused_until:
+            if room <= 0 or time.monotonic() < self._starts_paused_until or self.paused():
                 self._break_review_streaks()
-                break                          # a start just paused the agent (workspace/identity)
+                break                          # a start just paused the agent, or an operator token landed
             if self._pool_full() and not metadata_only(task, task.get("_mode", "work")):
                 self._break_review_streaks()
                 continue                       # a later typed decision may need no Git slot
@@ -8256,7 +8330,8 @@ class AgentRunner:
                            **({"before_spawn": before_spawn} if before_spawn else {})):
             # Routing may reload the Attempt inside _spawn; the Store owns state.
             a = self.store.get(a.id) or a
-            if a.state == "ready" and a.note.startswith("launch readiness "):
+            if a.state == "ready" and (a.note.startswith("launch readiness ")
+                                       or a.note.endswith(PAUSE_DENIAL)):
                 # Only this cold start's fresh leases may be returned. Resume
                 # holds retain progress; unsafe fresh slots are held by release().
                 if not had_workspaces:

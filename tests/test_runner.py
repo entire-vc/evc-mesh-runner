@@ -461,6 +461,14 @@ class Loop(Bench):
         self.assertEqual(mesh.checkouts, {})
         r.tick()                                   # not retried while nobody wrote on the task
         self.assertEqual(r.store.by_state("builder", ("running", "starting")), [])
+        self.cfg.failed_cooldown_hours = 0          # time alone must not retry NO OUTCOME
+        mesh.add_comment(t["id"], "↻ NEXT: retry the same work", author=AGENT_ID)
+        r.store.db.close()
+        r = self.runner(mesh)                      # the hold survives restart and our own NEXT
+        for _ in range(3):
+            r.tick()
+            self.assertEqual(r.store.by_state("builder", ("running", "starting")), [])
+        self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
         mesh.add_comment(t["id"], "try again with the new spec", author="lead")
         r.tick()                                   # a new comment from someone else re-opens it
         self.assertEqual(len(r.store.by_state("builder", ("running", "starting"))), 1)
@@ -1523,11 +1531,11 @@ class MeshEffects(Bench):
         self.settle_all(r)
         self.assertEqual(calls(self.calls)[0]["effort"], "low")
 
-    def test_a_shipped_blocker_no_longer_blocks(self):
+    def test_a_shipped_blocker_releases_only_a_shipped_edge(self):
         blocker, t = task(9, cat="review"), task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         mesh.tasks[blocker["id"]] = blocker
-        mesh.deps[t["id"]] = [{"depends_on_task_id": blocker["id"], "dependency_type": "blocks"}]
+        mesh.deps[t["id"]] = [{"depends_on_task_id": blocker["id"], "dependency_type": "blocks", "condition": "shipped"}]
         r = self.runner(mesh)
         self.assertTrue(r.hold_reason(t, "work").startswith("blocked by"))
         blocker["is_shipped"] = True
@@ -2006,6 +2014,21 @@ class FastWaits(Bench):
         old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=31)
         self.assertTrue(r._failed_recently(t["id"], recent))
         self.assertFalse(r._failed_recently(t["id"], old))
+
+    def test_legacy_no_outcome_failures_need_input_but_other_failures_keep_the_cooldown(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        self.cfg.failed_cooldown_hours = 0
+        a = r.store.create("builder", t["id"], "claude", "t")
+        for note in ("gave up: the session ended without a readable outcome 3 turns in a row",
+                     "gave up: 2 turns in a row ended without a readable outcome",
+                     "no readable outcome: 3 turns in a row ended without a readable outcome"):
+            with self.subTest(note=note):
+                r.store.update(a, state="failed", note=note)
+                self.assertIn("no readable outcome", r.hold_reason(dict(t), "work"))
+        r.store.update(a, state="failed", note="harness executable unavailable")
+        self.assertEqual(r.hold_reason(dict(t), "work"), "")
 
     def test_an_expired_review_hold_does_not_come_back_from_the_cache(self):
         t = task(1, cat="review")

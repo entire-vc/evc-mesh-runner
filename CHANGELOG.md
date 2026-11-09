@@ -3,6 +3,26 @@
 
 ## Unreleased
 
+## 0.1.49
+
+- Observe registered deferred-review requests with an opt-in owner-bound wait and one receipt-bound wake; preserve ordinary admission and dispatch gates.
+
+## 0.1.48
+
+- Prefer the previous safe free workspace slot when restoring a checkpoint; preserve normal fallback for unavailable or unsafe slots.
+
+## 0.1.47
+
+- Align dependency admission with the server release table and retain unresolved dependencies.
+
+## 0.1.46
+
+- Stop new native starts when an operation pause arrives during admission, resume preparation or a launch probe; preserve other pause tokens.
+
+## 0.1.45
+
+- Keep failed no-outcome work held until new external input arrives.
+
 ## 0.1.44
 
 - Recover proven unsent requests after verified workspace migration while preserving pending delivery and fresh admission.
