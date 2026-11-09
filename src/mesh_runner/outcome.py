@@ -9,6 +9,7 @@ the attempt started and takes the last declaration line in it:
     ⏳ WAIT merge:<group>/<project>!<iid> after=<sha>      the runner runs the merge gate (opt-in)
     ⏳ WAIT card:#<8hex>                                   another task closes
     ⏳ WAIT decision:@<agent>                              another agent answers
+    ⏳ WAIT ops-review:<64hex request-id>                  registered source-owner eligibility receipt
     ⏳ WAIT gmail:gmr_<12hex>                              a registered Gmail observation fires (docs/gmail-watch.md)
     ⏳ WAIT <absoluteISO>: external=<reference> source=<https-url|card:#8hex> <why>
     ⏳ WAIT pipeline:<proj>#<id> until=success|change     a changed/successful pipeline (``after=`` optional)
@@ -64,6 +65,7 @@ _LIFECYCLE = re.compile(_WAIT_HEAD + r"lifecycle:#(?P<id>[0-9a-f]{8})\b" + _EXPL
 _STALL = re.compile(_WAIT_HEAD + r"stall:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _RECOVERY = re.compile(_WAIT_HEAD + r"recovery:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _GMAIL = re.compile(_WAIT_HEAD + r"gmail:(?P<id>gmr_[0-9a-f]{12})\b" + _EXPLANATION)
+_OPS_REVIEW = re.compile(_WAIT_HEAD + r"ops-review:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
 _NATIVE = re.compile(_WAIT_HEAD + r"native:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
 _CARD = re.compile(_WAIT_HEAD + r"card:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _QUEUE = re.compile(_WAIT_HEAD + r"queue:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
@@ -137,7 +139,7 @@ class Outcome:
 
     @property
     def is_wait(self) -> bool:
-        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native", "gmail"}
+        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native", "gmail", "ops-review"}
 
 
 def _explicit_wait_problem(line: str) -> str:
@@ -246,6 +248,10 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         return Outcome("pipeline", f"{m['project']}#{m['id']}", note=note(m), line=line)
     if m := _MR.match(line):
         return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line)
+    if m := _OPS_REVIEW.match(line):
+        return Outcome("ops-review", m["id"], note=note(m), line=line)
+    if re.match(_WAIT_HEAD + r"ops-review:", line):
+        return Outcome("unparsed", note="ops-review WAIT requires an exact 64-hex registered request id", line=line)
     if m := _NATIVE.match(line):
         return Outcome("native", m["id"], note=note(m), line=line)
     if re.match(_WAIT_HEAD + r"native:", line):
@@ -355,6 +361,7 @@ When you stop working on this task, post ONE comment on it whose last line decla
   ⏳ WAIT mr:<group>/<project>!<iid>        — a merge request must change
   ⏳ WAIT card:#<8hex>                      — another task must close
   ⏳ WAIT decision:@<agent>: <question>     — another agent must answer
+  ⏳ WAIT ops-review:<64hex request-id>     — this source owner’s registered Board eligibility receipt
   ⏳ WAIT queue:#<this-card-8hex>           — a fresh ready unit after the card's queue-request source
   ⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
       — only a specific external event with a known timestamp and cited source

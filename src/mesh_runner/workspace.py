@@ -527,18 +527,24 @@ class WorkspacePool:
             (str(path), self._pool(repo), attempt, state, note, iso()))
 
     # -- lease / release ---------------------------------------------------------------
-    def lease(self, attempt_id: str, repo_name: str) -> Path:
+    def lease(self, attempt_id: str, repo_name: str, *, preferred_path: str | None = None) -> Path:
         repo = self.repos[repo_name]
         with base_lock(repo.base):
-            return self._lease(attempt_id, repo_name, repo)
+            return self._lease(attempt_id, repo_name, repo, preferred_path=preferred_path)
 
-    def _lease(self, attempt_id: str, repo_name: str, repo: RepoSpec) -> Path:
+    def _lease(self, attempt_id: str, repo_name: str, repo: RepoSpec, *,
+               preferred_path: str | None = None) -> Path:
         self._check_disk()
         self._clean_staging(repo)
         self._fetch(repo)
         self._check_disk()
         start = f"{repo.remote}/{repo.branch}"
-        for slot in self._rows(repo_name, "free"):
+        slots = self._rows(repo_name, "free")
+        # Preference only reorders this pool's free inventory. Normal admission checks
+        # and the base lock still apply; held, foreign and unknown paths cannot enter.
+        if preferred_path:
+            slots.sort(key=lambda slot: slot["path"] != preferred_path)
+        for slot in slots:
             path = Path(slot["path"])
             reason = self.unsafe_reason(path, repo)
             if reason:
@@ -852,7 +858,8 @@ class WorkspacePool:
                 if row["phase"] == "released":
                     # lease is idempotent across a crash before the journal update.
                     owned = [r for r in self._rows(row["repo"], "leased") if r["attempt"] == attempt_id]
-                    target = Path(owned[0]["path"]) if owned else self.lease(attempt_id, row["repo"])
+                    target = (Path(owned[0]["path"]) if owned else
+                              self.lease(attempt_id, row["repo"], preferred_path=row["source"]))
                     self.store.db.execute("UPDATE workspace_checkpoints SET phase='restoring', target=? "
                         "WHERE owner=? AND attempt=? AND repo=?",
                         (str(target), self.owner, attempt_id, row["repo"]))

@@ -394,6 +394,8 @@ class RunnerConfig:
     recovery_wait_v1: bool = False     # `WAIT recovery:#<card8>` on an operator-armed future shared recovery card (docs/recovery-wait.md)
     lifecycle_wait_v1: bool = False    # `WAIT lifecycle:#<card8>` on an operator-armed native SessionStart registration (docs/lifecycle-wait.md)
     stall_wait_v1: bool = False        # `WAIT stall:#<card8>` on an operator-armed mesh-stall-control result registration
+    ops_review_wait_registry: Path | None = None  # private Board registry; observer off when absent
+    ops_review_wait_notifier_id: str = ""          # exact Board Mesh actor UUID, paired with registry
     receipt_wait_v1: bool = False      # `WAIT receipt:#<card8>` on an operator-armed Telegram receipt registration
     gmail_watch_v1: bool = False       # `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     gmail_watch_reader: tuple = ()     # fixed argv of the read-only wrapper (JSON on stdin/stdout); never a shell string
@@ -775,6 +777,13 @@ def load(path: str | Path) -> RunnerConfig:
         raise ConfigError("dead_slot_hours must be finite and nonnegative")
     if not r.get("mesh_url"):
         raise ConfigError("[runner] mesh_url is required")
+    ops_registry = r.get("ops_review_wait_registry")
+    ops_notifier = r.get("ops_review_wait_notifier_id")
+    if ops_registry is not None or ops_notifier is not None:
+        if (not isinstance(ops_registry, str) or not ops_registry or not _path(ops_registry).is_absolute()
+                or not isinstance(ops_notifier, str) or not re.fullmatch(
+                    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", ops_notifier)):
+            raise ConfigError("ops-review observer requires an absolute registry path and canonical notifier UUID")
     recipients = r.get("decision_request_metadata_only_recipients", [])
     if (not isinstance(recipients, list) or any(not isinstance(v, str) or not re.fullmatch(
             r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", v) for v in recipients)):
@@ -937,6 +946,8 @@ def load(path: str | Path) -> RunnerConfig:
         checkpoint_budget_gb=_idle_hours(r.get("checkpoint_budget_gb", 4.0), "checkpoint_budget_gb"),
         checkpoint_exclude_names=_exclude_names(r.get("checkpoint_exclude_names")),
         queue_wait_freshness_v1=r.get("queue_wait_freshness_v1") is True,
+        ops_review_wait_registry=_path(ops_registry),
+        ops_review_wait_notifier_id=ops_notifier or "",
         receipt_wait_v1=r.get("receipt_wait_v1") is True,
         gmail_watch_v1=r.get("gmail_watch_v1") is True,
         gmail_watch_reader=_argv(r.get("gmail_watch_reader"), "gmail_watch_reader"),
