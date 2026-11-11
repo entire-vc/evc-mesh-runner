@@ -93,6 +93,48 @@ missing, macOS may show its prompt: run the first preflight from the process con
 The pin values are a baseline captured from the running producer (metadata only, no transcript). They are never guessed
 from a hostname or taken from another host.
 
+### Transport `cmux` (local cmux, default off)
+
+For a native producer that already runs in a cmux terminal surface on this Mac. Set `transport = "cmux"`, drop the `tmux_*`
+and `iterm_*` keys (mixing them is refused) and pin the surface:
+
+```toml
+transport = "cmux"
+cmux_workspace_id = "11111111-..."   # cmux workspace UUID of the exact surface
+cmux_surface_id = "66666666-..."     # cmux terminal surface UUID
+cmux_tty = "/dev/ttys002"            # tty the surface's CURRENT runtime reported
+producer_pid = 0                     # the native producer reading that tty
+producer_started = "..."             # ps -o lstart= -p <producer_pid>
+# cmux_binary = "/Applications/cmux.app/Contents/Resources/bin/cmux"   # optional, the bundled CLI (default)
+# cmux_socket = ""                   # optional --socket path; empty = the CLI's default
+```
+
+Interface: one method `surface.exact_input` (contract `cmux.exact_input.v1`, modes probe/stage/submit) called through the
+bundled `cmux rpc` CLI with the request as one JSON argv element; the caller's `CMUX_*` routing variables are dropped. The
+socket access mode stays as it is (`cmuxOnly` admits exactly that CLI); nothing here changes cmux settings or asks for a
+grant. **cmux 0.65.2 does not have this method**: it needs a cmux built with `contrib/cmux/0001-surface-exact-input.patch`
+and, inside its `ghostty/` submodule, `contrib/cmux/0002-ghostty-text-bracketed-only.patch` (see `contrib/cmux/README.md`).
+A cmux without it answers `method_not_found`, which preflight reports as `terminal_binding: cmux_exact_input_unsupported`
+and the receiver refuses with zero input. The stock input verbs are never used: they resume a hibernated agent, queue on a
+surface without a live runtime, or queue per recipient surface without the native process.
+
+Binding proved before every injection, in one cmux main-actor call and again locally: literal workspace and surface (no
+focus, index or caller fallback; the panel and the live registry must own the same surface object); not hibernated (never
+resumed); a live runtime (never queued or started); the current runtime reported `cmux_tty`; the pinned PID has the pinned
+birth time, that controlling tty and is its foreground group; bracketed paste is on. Typed refusals: `exact_target_missing`,
+`exact_target_replacing`, `exact_target_hibernated`, `exact_surface_unavailable`, `exact_tty_unreported`,
+`exact_tty_mismatch`, `exact_producer_gone`, `exact_producer_changed`, `exact_producer_not_on_tty`,
+`exact_producer_not_foreground`, `exact_paste_unbracketed`, `exact_generation_changed`, `exact_queued_not_received`,
+`exact_invalid_params`. The digest of the pin plus `host_id`/`runner_id`/`session_id` is stored in the ledger pin and the
+admission record exactly as for `iterm`; `cmux_binary`/`cmux_socket` are client location, not binding.
+
+Delivery: the stage is written ONLY as a bracketed paste (`ESC[200~ … ESC[201~`; refused, not written raw, when the terminal
+has bracketed paste off) and the Enter is a separate submit bound to the stage's runtime generation. Between them the
+producer is re-proved; any change sends no Enter and the delivery is `uncertain` (inert unsubmitted text at most), never
+replayed. `received` needs `delivery: "received"` with `queued: false` and `resumed: false` echoing the exact pin for both
+calls; a queue acknowledgement is never `received`. `acknowledged` comes only from the producer's own ack file, as before.
+The QA assignment section (`qa_assignment`) stays `iterm`-only.
+
 ## Commands (run on the actual host with `PYTHONPATH=<release>/src`; no `-I`, which would ignore it)
 
 ```

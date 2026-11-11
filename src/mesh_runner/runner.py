@@ -999,7 +999,10 @@ class AgentRunner:
                             and DECISION_REQUEST_LABEL in ((task or {}).get("labels") or []))
         if note.get("observed_status") in ("done", "cancelled") and not reopened_request:
             return "", "ownership_return", note                # a terminal card in between
-        if sorted(a.workspaces) != sorted(note.get("workspaces") or []):
+        # the session may go on while every working copy it knew is leased to it again at the same path;
+        # copies added since (another repository joined the card's scope) are new to it and the start
+        # prompt names them. A path it knew and no longer holds is where it would write into other work.
+        if not set(note.get("workspaces") or []).issubset(a.workspaces):
             return "", "path_changed", note
         if reopened_request:
             return sid, "decision_request_reopened", note
@@ -2176,9 +2179,9 @@ class AgentRunner:
         if outcome is not None and outcome.note == QUOTA_TIME_WAIT_GUIDANCE:
             self._reject_quota_time_wait(a, task)
             return
-        if (a.mode == "work" and (outcome is None or outcome.kind in ("unparsed", "next"))
+        if ((outcome is None or outcome.kind in ("unparsed", "next"))
                 and (label := self._park_label(task))):
-            # todo + park:* is the turn's outcome; an NEXT on a parked card would only bypass the label
+            # park:* is the turn's outcome in work and review; NEXT must not bypass the label
             self._park(a, task, label, "turn end")
             return
         if outcome is None or outcome.kind == "unparsed":
@@ -6772,7 +6775,7 @@ class AgentRunner:
             self._retire_proven_unsent_intent(a)
             self._finish(self.store.get(a.id) or a, "completed", "task left the agent before resuming")
             return
-        if a.mode == "work" and (label := self._park_label(task)):
+        if label := self._park_label(task):
             # the start path holds a parked card; a ready attempt (NEXT, reprompt, wake) must not bypass it
             self._retire_proven_unsent_intent(a)
             self._park(self.store.get(a.id) or a, task, label, "resume")
@@ -9112,6 +9115,10 @@ class AgentRunner:
             self.store.update(a, session_id=keep, harness=self._routed_harness)
             a = self.store.get(a.id) or a
             first = prompt
+            added = sorted(set(a.workspaces) - set(loss.get("workspaces") or []))
+            if added:
+                prompt += ("\n\n[runner] More working copies are leased to this card now than your session had; "
+                           "the earlier ones are unchanged. New: " + ", ".join(added) + "\n")
             if why == "ownership_return_other_owner":
                 prompt += ("\n\n[runner] The card returned to this lane after another agent held it; this is "
                            "your own earlier session. What that agent wrote and did is new to you: read the "

@@ -1,0 +1,425 @@
+diff --git a/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlCommandCoordinator+ExactInput.swift b/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlCommandCoordinator+ExactInput.swift
+new file mode 100644
+index 00000000000..ff2575c0d70
+--- /dev/null
++++ b/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlCommandCoordinator+ExactInput.swift
+@@ -0,0 +1,114 @@
++import Foundation
++
++/// `surface.exact_input` (contract `cmux.exact_input.v1`): input that reaches
++/// exactly one EXISTING native process in one terminal surface, or nothing.
++///
++/// Additive and opt-in. Unlike `surface.send_text`/`send_key`/`terminal.paste`
++/// it never resumes a hibernated agent, never queues on a cold surface, never
++/// requests a runtime start, never defers behind a clipboard read and never
++/// falls back to the focused/selected surface. All checks and the write run in
++/// one main-actor turn. Every refusal is a typed `exact_*` error with zero input.
++public struct ControlSurfaceExactInputRequest: Sendable, Equatable {
++    public enum Mode: String, Sendable { case probe, stage, submit }
++    public let mode: Mode
++    public let workspaceID: UUID
++    public let surfaceID: UUID
++    public let expectedTTY: String
++    public let expectedPID: Int32
++    public let expectedPIDStart: Int64
++    /// stage: the text (bracketed paste, no Enter).
++    public let text: String?
++    /// submit: the named key (only `return` in v1).
++    public let submitKey: String?
++    /// submit: the runtime generation the stage answered with.
++    public let expectedRuntimeGeneration: UInt64?
++}
++
++public enum ControlSurfaceExactInputResolution: Sendable, Equatable {
++    /// Proved (probe) or written (stage/submit) on exactly the pinned target.
++    case done(tty: String, runtimeGeneration: UInt64)
++    /// Typed refusal; nothing was written, resumed, queued or started.
++    case refused(code: String)
++    /// The app conformance does not implement the contract.
++    case unsupported
++}
++
++extension ControlCommandCoordinator {
++    static let exactInputContract = "cmux.exact_input.v1"
++
++    /// Strict parse: literal UUIDs only (no `kind:N` refs, no focus fallback),
++    /// `no_resume`/`no_queue` must be literal `true`.
++    func parseExactInput(_ params: [String: JSONValue]) -> ControlSurfaceExactInputRequest? {
++        func literalUUID(_ key: String) -> UUID? {
++            guard case .string(let raw)? = params[key] else { return nil }
++            return UUID(uuidString: raw)
++        }
++        func literalInt(_ key: String) -> Int64? {
++            guard case .int(let value)? = params[key] else { return nil }
++            return value
++        }
++        guard case .string(Self.exactInputContract)? = params["contract"],
++              case .bool(true)? = params["no_resume"],
++              case .bool(true)? = params["no_queue"],
++              case .string(let rawMode)? = params["mode"],
++              let mode = ControlSurfaceExactInputRequest.Mode(rawValue: rawMode),
++              let workspaceID = literalUUID("workspace_id"),
++              let surfaceID = literalUUID("surface_id"),
++              case .string(let tty)? = params["expected_tty"], tty.hasPrefix("/dev/ttys"),
++              let pid = literalInt("expected_pid"), pid > 0, pid <= Int64(Int32.max),
++              let start = literalInt("expected_pid_start"), start > 0
++        else { return nil }
++        var text: String?
++        var submitKey: String?
++        var generation: UInt64?
++        switch mode {
++        case .probe:
++            break
++        case .stage:
++            guard case .string(let value)? = params["text"], !value.isEmpty,
++                  !value.contains("\u{1B}"), !value.contains("\u{0}") else { return nil }
++            text = value
++        case .submit:
++            guard case .string("return")? = params["submit_key"],
++                  case .string(let raw)? = params["expected_runtime_generation"],
++                  let parsed = UInt64(raw) else { return nil }
++            submitKey = "return"
++            generation = parsed
++        }
++        return ControlSurfaceExactInputRequest(
++            mode: mode, workspaceID: workspaceID, surfaceID: surfaceID, expectedTTY: tty,
++            expectedPID: Int32(pid), expectedPIDStart: start, text: text, submitKey: submitKey,
++            expectedRuntimeGeneration: generation
++        )
++    }
++
++    /// `surface.exact_input` — main-actor verb (default execution policy).
++    func surfaceExactInput(_ params: [String: JSONValue]) -> ControlCallResult {
++        guard let request = parseExactInput(params) else {
++            return .err(code: "exact_invalid_params", message: "Invalid exact_input request", data: nil)
++        }
++        guard let context else {
++            return .err(code: "unavailable", message: "TabManager not available", data: nil)
++        }
++        switch context.controlSurfaceExactInput(request) {
++        case .unsupported:
++            return .err(code: "method_not_found", message: "Unknown method", data: nil)
++        case .refused(let code):
++            return .err(code: "exact_" + code, message: "exact_input refused", data: nil)
++        case let .done(tty, generation):
++            return .ok(.object([
++                "contract": .string(Self.exactInputContract),
++                "mode": .string(request.mode.rawValue),
++                "delivery": .string(request.mode == .probe ? "probed" : "received"),
++                "workspace_id": .string(request.workspaceID.uuidString),
++                "surface_id": .string(request.surfaceID.uuidString),
++                "tty": .string(tty),
++                "producer_pid": .int(Int64(request.expectedPID)),
++                "producer_start": .int(request.expectedPIDStart),
++                "runtime_generation": .string(String(generation)),
++                "resumed": .bool(false),
++                "queued": .bool(false),
++            ]))
++        }
++    }
++}
+diff --git a/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlCommandCoordinator+Surface.swift b/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlCommandCoordinator+Surface.swift
+index 1e2161d4462..4ba8c01205f 100644
+--- a/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlCommandCoordinator+Surface.swift
++++ b/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlCommandCoordinator+Surface.swift
+@@ -55,6 +55,8 @@ extension ControlCommandCoordinator {
+             return surfaceSendText(request.params, context: context)
+         case "surface.send_key":
+             return surfaceSendKey(request.params, context: context)
++        case "surface.exact_input":
++            return surfaceExactInput(request.params)
+         case "surface.report_tty": return surfaceReportTTY(request.params)
+         case "surface.report_pwd": return surfaceReportPWD(request.params)
+         case "surface.report_git_branch": return surfaceReportGitBranch(request.params)
+diff --git a/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlSurfaceContext.swift b/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlSurfaceContext.swift
+index b2e8e5564b3..67d4dd8b0da 100644
+--- a/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlSurfaceContext.swift
++++ b/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Coordinator/Surface/ControlSurfaceContext.swift
+@@ -205,6 +205,15 @@ public protocol ControlSurfaceContext: AnyObject {
+     /// - Returns: The input strings.
+     nonisolated func controlSurfaceInputStrings() -> ControlSurfaceInputStrings
+ 
++    // MARK: - exact_input
++
++    /// `surface.exact_input` (contract `cmux.exact_input.v1`): checks and, for
++    /// stage/submit, writes in this one main-actor call. Must never resume,
++    /// queue, start a runtime, or resolve any surface but the exact one.
++    func controlSurfaceExactInput(
++        _ request: ControlSurfaceExactInputRequest
++    ) -> ControlSurfaceExactInputResolution
++
+     // MARK: - send_text / send_key
+ 
+     /// Sends literal text for `surface.send_text`. The coordinator selects each
+@@ -439,6 +448,13 @@ public protocol ControlSurfaceContext: AnyObject {
+ }
+ 
+ public extension ControlSurfaceContext {
++    /// Conformances without the contract answer `method_not_found`.
++    func controlSurfaceExactInput(
++        _ request: ControlSurfaceExactInputRequest
++    ) -> ControlSurfaceExactInputResolution {
++        .unsupported
++    }
++
+     /// Backward-compatible non-forced close for app-owned callers.
+     func controlSurfaceClose(
+         routing: ControlRoutingSelectors,
+diff --git a/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Hosting/TerminalSurfaceNativeViewing.swift b/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Hosting/TerminalSurfaceNativeViewing.swift
+index 9b70781b829..e6965fc4181 100644
+--- a/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Hosting/TerminalSurfaceNativeViewing.swift
++++ b/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Hosting/TerminalSurfaceNativeViewing.swift
+@@ -66,6 +66,11 @@ public protocol TerminalSurfaceNativeViewing: NSView, TerminalSurfaceHosting {
+         replay: @escaping () -> Void
+     ) -> Bool
+ 
++    /// Read-only: whether runtime input would be deferred behind a clipboard
++    /// read right now (a protocol requirement so the Ghostty view's answer is
++    /// dynamically dispatched; the extension default is `false`).
++    func hasRuntimeInputDeferral() -> Bool
++
+     /// Positions the native pointer at the center of a mobile-selected cell.
+     func positionMobilePointer(
+         on surface: ghostty_surface_t,
+@@ -103,6 +108,12 @@ public extension TerminalSurfaceNativeViewing {
+         false
+     }
+ 
++    /// Read-only: whether runtime input would be deferred behind a clipboard
++    /// read right now. Never enqueues anything. Synchronous hosts: `false`.
++    func hasRuntimeInputDeferral() -> Bool {
++        false
++    }
++
+     /// Uses Ghostty's point-space pointer API for the selected grid cell.
+     func positionMobilePointer(
+         on surface: ghostty_surface_t,
+diff --git a/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Surface/TerminalSurface+Input.swift b/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Surface/TerminalSurface+Input.swift
+index cb467fd1024..79de639234d 100644
+--- a/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Surface/TerminalSurface+Input.swift
++++ b/Packages/macOS/CmuxTerminal/Sources/CmuxTerminal/Surface/TerminalSurface+Input.swift
+@@ -142,6 +142,70 @@ extension TerminalSurface {
+         return .sent
+     }
+ 
++    /// Outcome of a live-runtime-only write (`surface.exact_input`).
++    public enum ExactInputWriteResult: Equatable, Sendable {
++        /// Written to the current live runtime.
++        case sent
++        /// No live runtime; nothing was queued and no runtime was started.
++        case notLive
++        /// A clipboard read would defer the input; nothing was queued.
++        case deferred
++        /// The runtime's child process already exited.
++        case processExited
++        /// The key name is not supported.
++        case unknownKey
++        /// The terminal has not enabled bracketed paste (DECSET 2004) or the
++        /// text carries ESC; nothing was written (an unframed paste could
++        /// submit at an interior newline).
++        case notBracketed
++    }
++
++    /// Read-only: whether the CURRENT live runtime would frame a paste right
++    /// now (bracketed paste, DECSET 2004). false when there is no live runtime.
++    @MainActor
++    public func liveRuntimeAcceptsBracketedPaste() -> Bool {
++        guard surface != nil,
++              let liveSurface = liveSurfaceForSocketWrite(reason: "socket.exactInputProbe") else { return false }
++        return ghostty_surface_bracketed_paste_active(liveSurface)
++    }
++
++    /// Writes text to the CURRENT live runtime ONLY as a bracketed paste, or
++    /// refuses. Unlike ``sendTextResult(_:)`` it never queues on a cold
++    /// surface, never requests a runtime start, never defers behind a
++    /// clipboard read and never sends an unframed paste.
++    @MainActor
++    public func writeTextToLiveRuntimeOnly(_ text: String) -> ExactInputWriteResult {
++        guard let data = text.data(using: .utf8), !data.isEmpty else { return .notLive }
++        guard surface != nil else { return .notLive }
++        guard !surfaceView.hasRuntimeInputDeferral() else { return .deferred }
++        guard let liveSurface = liveSurfaceForSocketWrite(reason: "socket.exactInput") else { return .notLive }
++        guard !ghostty_surface_process_exited(liveSurface) else { return .processExited }
++        TerminalPredictionCenter.shared.sentUntrackedInput(surfaceID: id)
++        let framed = data.withUnsafeBytes { rawBuffer -> Bool in
++            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: CChar.self) else { return false }
++            return ghostty_surface_text_bracketed_only(liveSurface, baseAddress, UInt(rawBuffer.count))
++        }
++        guard framed else { return .notBracketed }
++        didReceiveExplicitInput()
++        didAcceptExplicitInput()
++        return .sent
++    }
++
++    /// Sends one named key to the CURRENT live runtime or refuses (see
++    /// ``writeTextToLiveRuntimeOnly(_:)``).
++    @MainActor
++    public func sendNamedKeyToLiveRuntimeOnly(_ keyName: String) -> ExactInputWriteResult {
++        guard let event = pendingKeyEvent(for: keyName) else { return .unknownKey }
++        guard surface != nil else { return .notLive }
++        guard !surfaceView.hasRuntimeInputDeferral() else { return .deferred }
++        guard let liveSurface = liveSurfaceForSocketWrite(reason: "socket.exactInputKey") else { return .notLive }
++        guard !ghostty_surface_process_exited(liveSurface) else { return .processExited }
++        didReceiveExplicitInput()
++        sendKeyEvent(surface: liveSurface, keycode: event.keycode, mods: event.mods)
++        didAcceptExplicitInput()
++        return .sent
++    }
++
+     /// Sends raw key text as a single key event.
+     ///
+     /// - Returns: Whether the runtime handled the key.
+diff --git a/Sources/GhosttyNSView+ClipboardInputSequencing.swift b/Sources/GhosttyNSView+ClipboardInputSequencing.swift
+index f28a096ea97..c3fffe0bbac 100644
+--- a/Sources/GhosttyNSView+ClipboardInputSequencing.swift
++++ b/Sources/GhosttyNSView+ClipboardInputSequencing.swift
+@@ -127,6 +127,14 @@ extension GhosttyNSView {
+         )
+     }
+ 
++    /// Read-only twin of ``deferRuntimeInputDuringClipboardRead(estimatedBytes:replay:)``
++    /// for `surface.exact_input`: answers without registering a replay.
++    func hasRuntimeInputDeferral() -> Bool {
++        terminalClipboardInputSequencer.hasInputDeferral(
++            for: terminalSurface?.runtimeSurfaceGeneration ?? .max
++        )
++    }
++
+     func withPotentialClipboardPasteIntent<Result>(
+         _ body: () throws -> Result
+     ) rethrows -> Result {
+diff --git a/Sources/TerminalController+Capabilities.swift b/Sources/TerminalController+Capabilities.swift
+index 8cb8ec58267..78ca9b3d764 100644
+--- a/Sources/TerminalController+Capabilities.swift
++++ b/Sources/TerminalController+Capabilities.swift
+@@ -327,6 +327,7 @@ extension TerminalController {
+             "agent.message.settings",
+             "debug.terminals",
+             "surface.send_text",
++            "surface.exact_input",
+             "surface.send_key",
+             "surface.report_tty",
+             "surface.report_pwd",
+diff --git a/Sources/TerminalController+ControlSurfaceExactInput.swift b/Sources/TerminalController+ControlSurfaceExactInput.swift
+new file mode 100644
+index 00000000000..23674022c14
+--- /dev/null
++++ b/Sources/TerminalController+ControlSurfaceExactInput.swift
+@@ -0,0 +1,117 @@
++import CmuxControlSocket
++import CmuxTerminal
++import Darwin
++import Foundation
++
++/// App witness of `surface.exact_input` (contract `cmux.exact_input.v1`).
++///
++/// Everything below runs in ONE main-actor call: no check can be invalidated by
++/// a surface replacement, hibernation or runtime restart between the proof and
++/// the write. The write goes to the raw canonical `TerminalSurface` through the
++/// live-only writers (the stage only as a bracketed paste: ghostty
++/// `ghostty_surface_text_bracketed_only`, so an interior newline can never
++/// submit), never through `TerminalPanel`'s explicit-input wrappers
++/// (those resume hibernated agents) and never through the queueing
++/// `sendTextResult` paths. No focus, selection, index, remote-tmux projection or
++/// caller-context fallback is consulted: the workspace and surface are the
++/// literal UUIDs of the request.
++extension TerminalController {
++    func controlSurfaceExactInput(
++        _ request: ControlSurfaceExactInputRequest
++    ) -> ControlSurfaceExactInputResolution {
++        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: request.workspaceID),
++              let workspace = tabManager.tabs.first(where: { $0.id == request.workspaceID }),
++              let panel = workspace.panels[request.surfaceID] as? TerminalPanel,
++              panel.id == request.surfaceID else {
++            return .refused(code: "target_missing")
++        }
++        // Panel owner and live registry owner must be the same object: a
++        // registry-rebound surface is a replacement in progress.
++        guard let canonical = GhosttyApp.terminalSurfaceRegistry.terminalSurface(id: request.surfaceID),
++              canonical.tabId == request.workspaceID,
++              canonical === panel.surface else {
++            return .refused(code: "target_replacing")
++        }
++        guard !panel.isAgentHibernated else {
++            return .refused(code: "target_hibernated")       // never resumed
++        }
++        guard canonical.surface != nil else {
++            return .refused(code: "surface_unavailable")     // never queued, never started
++        }
++        guard workspace.hasCurrentRuntimeReportedTTY(panelId: request.surfaceID, terminal: panel),
++              let surfaceDevice = workspace.surfaceTTYDevices[request.surfaceID] else {
++            return .refused(code: "tty_unreported")
++        }
++        guard CmuxTopProcessSnapshot.deviceIdentifier(forTTYName: request.expectedTTY) == surfaceDevice else {
++            return .refused(code: "tty_mismatch")
++        }
++        if let refusal = Self.exactInputProducerRefusal(
++            pid: request.expectedPID,
++            start: request.expectedPIDStart,
++            surfaceDevice: surfaceDevice
++        ) {
++            return .refused(code: refusal)
++        }
++        let generation = canonical.runtimeSurfaceGeneration
++        // probe and stage: the metadata block is multi-line, so it may only
++        // ever arrive framed; refuse up front instead of failing at the write.
++        if request.mode != .submit, !canonical.liveRuntimeAcceptsBracketedPaste() {
++            return .refused(code: "paste_unbracketed")
++        }
++        switch request.mode {
++        case .probe:
++            return .done(tty: request.expectedTTY, runtimeGeneration: generation)
++        case .stage:
++            guard let text = request.text else { return .refused(code: "invalid_params") }
++            return Self.exactInputResolution(
++                canonical.writeTextToLiveRuntimeOnly(text),
++                tty: request.expectedTTY,
++                generation: generation
++            )
++        case .submit:
++            guard request.expectedRuntimeGeneration == generation else {
++                return .refused(code: "generation_changed")
++            }
++            guard let key = request.submitKey else { return .refused(code: "invalid_params") }
++            return Self.exactInputResolution(
++                canonical.sendNamedKeyToLiveRuntimeOnly(key),
++                tty: request.expectedTTY,
++                generation: generation
++            )
++        }
++    }
++
++    /// The pinned native producer as the kernel sees it right now: alive, same
++    /// birth time, controlling terminal = the surface's tty, and the foreground
++    /// process group of that terminal.
++    nonisolated static func exactInputProducerRefusal(
++        pid: Int32,
++        start: Int64,
++        surfaceDevice: Int64
++    ) -> String? {
++        var info = proc_bsdinfo()
++        let expectedSize = MemoryLayout<proc_bsdinfo>.stride
++        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(expectedSize)) == expectedSize else {
++            return "producer_gone"
++        }
++        guard Int64(info.pbi_start_tvsec) == start else { return "producer_changed" }
++        guard Int64(info.e_tdev) == surfaceDevice else { return "producer_not_on_tty" }
++        guard info.e_tpgid > 0, Int(info.pbi_pgid) == Int(info.e_tpgid) else { return "producer_not_foreground" }
++        return nil
++    }
++
++    nonisolated static func exactInputResolution(
++        _ result: TerminalSurface.ExactInputWriteResult,
++        tty: String,
++        generation: UInt64
++    ) -> ControlSurfaceExactInputResolution {
++        switch result {
++        case .sent: return .done(tty: tty, runtimeGeneration: generation)
++        case .notLive: return .refused(code: "surface_unavailable")
++        case .deferred: return .refused(code: "queued_not_received")
++        case .processExited: return .refused(code: "producer_gone")
++        case .unknownKey: return .refused(code: "invalid_params")
++        case .notBracketed: return .refused(code: "paste_unbracketed")
++        }
++    }
++}

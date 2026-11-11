@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.24 — 2026-11-11
+
+- Honor park labels at the end of review turns and before review resume, keeping the existing session.
+
+## 0.2.23 — 2026-11-11
+
+- Add the default-off cmux receiver transport with exact native process binding and typed refusal without fallback input. Optional terminal patches and their upstream license notices are included under contrib/cmux.
+- Reserve the names of pruned slots that suspended or returning work may need again.
+
+## 0.2.22 — 2026-11-11
+
+- Preserve a returning session when all its earlier working copies are leased again and additional repositories joined its scope.
+
 ## 0.2.21 — 2026-11-11
 
 - Add chat_workspace = "lane" so chat turns use the lane's configured tools without acquiring a worktree. Thread-scoped Mesh credentials remain enforced; the default is "none".

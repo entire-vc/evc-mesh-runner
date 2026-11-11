@@ -165,6 +165,25 @@ class RestoreSlotPreference(unittest.TestCase):
         self.assertEqual(pool.lease('newer-again', 'app', preferred_path=str(newer)), newer)
         self.assertEqual([r['path'] for r in pool._rows('app', 'free')], [str(extra)])
 
+    def test_a_new_slot_does_not_take_the_name_of_a_pruned_slot_somebody_may_come_back_to(self):
+        """The suspended attempt's slot was pruned while it was parked. Other work that needs a new slot gets
+        the next number, not that path; the attempt's restore then makes its slot again in place."""
+        import json
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=5)], owner='agent')
+        self.assertEqual(pool.lease('busy', 'app'), self.first)          # slot-1 is taken
+        self._prune(pool, self.source)                                    # slot-2: the suspended source, pruned
+        fresh = pool.lease('newcomer', 'app')
+        self.assertEqual(fresh.name, 'slot-3')
+        self.assert_restore(self.source, pool)                            # remade at slot-2
+        # the same for a card that left and may return: its pruned slot's name is not reused either
+        left = pool.lease('left', 'app')
+        self.assertEqual(left.name, 'slot-4')
+        pool.release('left')
+        self.store.mark('agent', 'task-left', 'ownership_loss', json.dumps({"attempt": "left", "observed_status": "review", "workspaces": [str(left)]}))
+        self._prune(pool, left)
+        self.assertEqual(pool.lease('other', 'app').name, 'slot-5')
+
     def test_a_gone_path_outside_the_pool_or_at_the_maximum_is_ignored(self):
         pool = WorkspacePool(self.store, self.root / 'pool',
                              [RepoSpec('app', self.base, max_slots=2)], owner='agent')

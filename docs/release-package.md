@@ -18,6 +18,7 @@ A release archive must contain, besides the rest of the tree:
 | `scripts/reviewer-canary.py` | read-only canary |
 | `docs/reviewer-merge.md` | operator contract and rollback |
 | `src/mesh_runner/session_receiver.py`, `docs/session-receiver.md` | the `session-receiver` command and its operator contract |
+| `src/mesh_runner/cmux_transport.py`, `contrib/cmux/0001-surface-exact-input.patch`, `contrib/cmux/0002-ghostty-text-bracketed-only.patch`, `contrib/cmux/README.md` | the default-off `transport = "cmux"` of the receiver and the cmux-side patches it needs |
 | `src/mesh_runner/qa_assignment.py`, `src/mesh_runner/qa_assignment_v1/conformance.json`, `docs/host-local-qa-assignment.md` | the default-off `host_local_qa_assignment_v1` capability, its pins (the frozen bytes stay private, loaded from the operator's `bundle_dir`) and operator contract |
 
 `tests/test_release_package.py` checks the version sync and, against `git ls-files`, that every

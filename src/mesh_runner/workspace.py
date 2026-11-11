@@ -627,7 +627,9 @@ class WorkspacePool:
         if len(self._rows(repo_name)) >= repo.max_slots:
             raise WorkspaceError(f"no free worktree for {repo_name} (max {repo.max_slots}; see `mesh-runner slots`)")
         self._check_disk()
-        path = again or self._new_path(repo)
+        # a new slot never takes the name of a slot somebody may come back to: the pruner removes such
+        # slots while their owner is parked, and the lowest free number would then be exactly that path
+        path = again or self._new_path(repo, avoid=waited | returning)
         # git names the admin dir after the basename it is given, and slot-N names repeat across the pools
         # sharing one base clone. Adding under an owner-prefixed name and moving it into place keeps an
         # owner-unique admin id while the directory stays slot-N.
@@ -1833,10 +1835,11 @@ class WorkspacePool:
         git(path, "checkout", "--quiet", "--detach", f"{repo.remote}/{repo.branch}", env=self.env)
         self._set(path, repo.name, "free")
 
-    def _new_path(self, repo: RepoSpec) -> Path:
+    def _new_path(self, repo: RepoSpec, avoid=()) -> Path:
         base = self.root / repo.name
         base.mkdir(parents=True, exist_ok=True)
         taken = {Path(s["path"]).name for s in self._rows(repo.name)}
+        taken |= {Path(p).name for p in avoid if Path(p).parent == base}
         n = 1
         while f"slot-{n}" in taken or (base / f"slot-{n}").exists():
             n += 1

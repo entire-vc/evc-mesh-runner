@@ -3596,6 +3596,67 @@ class ParkedCard(Bench):
         self.assertEqual(calls(self.calls), [])                   # the start path holds it, as before
 
 
+class ParkedReview(Bench):
+    """Review uses the same park boundary as work, with its session kept in a real Store."""
+
+    def start_review(self, reply='↻ NEXT'):
+        t = task(95, cat='review')
+        write_replies(self.replies, {t['id'][:8]: reply,
+                                     t['id'][:8] + ':resume': '↻ NEXT: continued review'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        a = r.store.by_state('builder', ('running',))[0]
+        self.assertEqual(a.mode, 'review')
+        return r, t, a
+
+    def assert_parked(self, r, t, a, where):
+        ended = r.store.get(a.id)
+        self.assertEqual((ended.state, ended.session_id), ('completed', a.session_id))
+        self.assertTrue(ended.session_id)
+        self.assertEqual(ended.note, 'parked: label park:external')
+        events = r.store.events(a.id)
+        self.assertEqual([json.loads(d)['at'] for _, k, d in events if k == 'parked'], [where])
+        self.assertNotIn('no_outcome', [k for _, k, _ in events])
+        mark = json.loads(r.store.mark('builder', t['id'], 'ownership_loss')[0])
+        self.assertEqual((mark['attempt'], mark['session_id']), (a.id, a.session_id))
+        self.assertEqual(r.mesh.category(r.mesh.tasks[t['id']]), 'review')
+        self.assertEqual(r.mesh.tasks[t['id']]['assignee_id'], AGENT_ID)
+        r.tick()  # the ordinary feed must not launch another harness while the label remains
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False])
+        self.assertEqual(r.store.by_state('builder', ('starting', 'running', 'ready', 'waiting')), [])
+
+    def test_review_next_with_park_closes_attempt_without_reprompt(self):
+        r, t, a = self.start_review()
+        r.mesh.tasks[t['id']]['labels'] = ['park:external']
+        self.finish_turn(r)
+        self.assert_parked(r, t, a, 'turn end')
+
+    def test_review_without_outcome_with_park_closes_attempt_without_reprompt(self):
+        r, t, a = self.start_review('review paused')
+        r.mesh.tasks[t['id']]['labels'] = ['park:external']
+        self.finish_turn(r)
+        self.assert_parked(r, t, a, 'turn end')
+
+    def test_ready_review_with_park_does_not_launch_harness(self):
+        r, t, a = self.start_review()
+        first = self.finish_turn(r)
+        self.assertEqual(first.state, 'ready')
+        r.mesh.tasks[t['id']]['labels'] = ['park:external']
+        r.tick()
+        self.assert_parked(r, t, first, 'resume')
+
+    def test_review_next_without_park_resumes_same_attempt_and_session(self):
+        r, t, a = self.start_review()
+        first = self.finish_turn(r)
+        self.assertEqual(first.state, 'ready')
+        r.tick()
+        second = self.finish_turn(r)
+        self.assertEqual((second.id, second.session_id, second.state),
+                         (first.id, first.session_id, 'ready'))
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False, True])
+        self.assertNotIn('parked', [k for _, k, _ in r.store.events(a.id)])
+
+
 class Limits(Bench):
     def test_limit_switch_command_retries_at_once_instead_of_pausing(self):
         t = task(1)
@@ -4198,6 +4259,27 @@ class WaitWorkspaceCheckpoint(Bench):
             note['workspaces'] = ['/elsewhere']
             r.store.mark('builder', task(87)['id'], 'ownership_loss', json.dumps(note))
         r, first, later, ret, launches = self._return_roundtrip(87, holder='agent-lead', mutate=other_paths)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'path_changed'))
+
+    def test_card_given_back_with_more_working_copies_keeps_the_session(self):
+        """Every path the session knew is leased to it again; one more was added since. The session goes on
+        (previously it started fresh with path_changed) and is told what is new."""
+        def fewer_then(r):
+            note = json.loads(r.store.mark('builder', task(88)['id'], 'ownership_loss')[0])
+            note['workspaces'] = []
+            r.store.mark('builder', task(88)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(88, holder='', mutate=fewer_then)
+        self.assertEqual(later.session_id, first.session_id)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason']),
+                         ('resume', 'ownership_return_same_lane', ''))
+
+    def test_card_given_back_without_a_path_the_session_knew_starts_fresh(self):
+        def one_lost(r):
+            note = json.loads(r.store.mark('builder', task(89)['id'], 'ownership_loss')[0])
+            note['workspaces'] = list(note['workspaces']) + ['/elsewhere/slot-9']
+            r.store.mark('builder', task(89)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(89, holder='', mutate=one_lost)
+        self.assertNotEqual(later.session_id, first.session_id)
         self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'path_changed'))
 
     def _return_roundtrip(self, n, holder=None, mutate=None):

@@ -478,11 +478,6 @@ def code_lines_of(added: str) -> str:
     return "\n".join(l for l in added.splitlines() if not l[1:].lstrip().startswith("//"))
 
 
-@unittest.skipUnless(
-    all((Path(__file__).resolve().parents[1] / "contrib" / "cmux" / name).is_file()
-        for name in ("0001-surface-exact-input.patch", "0002-ghostty-text-bracketed-only.patch")),
-    "optional third-party build material omitted from this export",
-)
 class CmuxPatchContractTest(unittest.TestCase):
     """The shipped cmux patch and this adapter speak the same contract."""
 

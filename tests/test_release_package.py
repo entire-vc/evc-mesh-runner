@@ -19,6 +19,10 @@ REQUIRED = [
     "scripts/reviewer-canary.py",
     "docs/reviewer-merge.md",
     "docs/release-package.md",
+    "src/mesh_runner/cmux_transport.py",
+    "contrib/cmux/0001-surface-exact-input.patch",
+    "contrib/cmux/0002-ghostty-text-bracketed-only.patch",
+    "contrib/cmux/README.md",
 ]
 PRIVATE = re.compile(r"#[0-9a-f]{8}\b|Mesh Doc [0-9a-f]{8}|/Users/|/Volumes/|~/ClaudeCowork|~/\.fiddler|\bbob's\b")
 
