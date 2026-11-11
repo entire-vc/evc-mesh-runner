@@ -3,7 +3,7 @@
 No timer holds a task in these paths. A task that stalls goes back to the queue and
 starts again when something new reaches it, or on another agent that is free.
 
-## Caps (`requeue_on_cap`)
+## Caps
 
 START CAP (`daily_start_cap` starts of one task by one agent per UTC day), TURN CAP
 (`daily_next_budget`, `daily_wait_budget`, `daily_step_budget`), LOOP (`loop_streak_limit`
@@ -42,13 +42,15 @@ consecutive turns without progress; see the README) and COMPACTION CAP
    with the same lane (`🔁 NO OUTCOME`, no peer reassignment) until its inputs change; the
    `no_outcome_route_after`-th in a row (default 3, reset by any readable outcome) goes to the lead.
 
-With the flag off the code path is the previous one.
+When the requeue cannot be done safely (the inputs are unreadable, or Mesh refuses the move to
+`todo`) the cap takes the older path: the task goes to the lead, or stays with the agent until the
+next UTC day when nobody can take it.
 
 ### What counts toward `daily_start_cap`
 
-With `requeue_on_cap` only restarts with nothing new behind them are counted: a crash or no-outcome
-restart, a failed-turn retry, a `failed_cooldown_hours` retry, a `turn_cap_continue_on_progress`
-restart, a `cap_wake_next_day` restart. A start that a real event woke is not counted, so a card that
+Only restarts with nothing new behind them are counted: a crash or no-outcome
+restart, a failed-turn retry, a `failed_cooldown_hours` retry, a turn-cap restart of a progressing
+attempt, the next-UTC-day restart of a capped task whose agent has no lead. A start that a real event woke is not counted, so a card that
 progresses, each start woken by something that happened, is never parked by the cap. The runner looks
 for such an event when it starts a session (a few reads of the task, none of them GitLab) and records
 it on the attempt as an `informed_start` event. Since the agent's previous session on the task:
@@ -73,7 +75,7 @@ the pause file, the asker itself, or a user listed in `unanswerable_users` or fl
 (agent `lead`, that lead's lead, then `[project_leads]`) with a comment naming whom and why. The
 asking task waits for a comment as before. Without any lead the older behaviour stands.
 
-## Questions to people (`soft_person_asks_to_lead`, default off)
+## Questions to people
 
 Where the runner turns `WAIT decision:@person` into a `❓ Blocking` ask it first classifies the
 question (`asks.py`). **Hard** questions stay a human gate: a keyword in the question or a task label
@@ -84,7 +86,7 @@ gate, with the comment "Decided by lead, owner may override by commenting here".
 person wakes the task like any foreign comment. A `❓ Blocking` line the agent wrote itself is not
 touched: Mesh has already raised that gate.
 
-## Review before switching on
+## Reviewing the classifier
 
     python -m mesh_runner.cli asks classify --config runner.toml [--json]
 

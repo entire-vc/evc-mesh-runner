@@ -30,9 +30,11 @@ if __package__ in (None, ""):                         # run as a file by the run
 
 from mesh_runner.adapters.base import STAMP_V2, precise_stamp  # noqa: E402
 
-from mesh_runner.interactive import (BACKGROUND_WAIT_MINUTES, CHAT_PREFIX, HOOK, Tmux, forget, pid_alive,  # noqa: E402
+from mesh_runner.interactive import (BACKGROUND_WAIT_MINUTES, CHAT_PREFIX, GUARD, HOOK, PATH_GUARD_ENV,  # noqa: E402
+                                     Tmux, forget, pid_alive,
                                      meta_path, read_meta, session_name, write_meta, write_progress,
                                      read_delivery, write_delivery)
+from mesh_runner import path_guard  # noqa: E402
 
 def read_own_meta(directory: Path, key: str) -> dict | None:
     """The window's metadata under this runner's state root, or None when the file is absent or
@@ -232,6 +234,11 @@ class Driver:
         self.env = {k: v for k, v in dict(os.environ if env is None else env).items() if not SCRUB_ENV.match(k)}
         self.prompt_intent = self.env.pop("_MESH_RUNNER_PROMPT_INTENT", "")
         self.prompt_sha256 = self.env.pop("_MESH_RUNNER_PROMPT_SHA256", "")
+        # The session's working copies moved: the runner kept it only because this launch installs the
+        # path guard. Read the map now, before a window rebuild's forget() drops the file; it is written
+        # back when the window starts. None: named but unreadable, so the window must not start.
+        self.moves_file = self.env.pop(PATH_GUARD_ENV, "")
+        self.moves = self.read_moves()
         self.python = python or sys.executable
         self.clock, self.sleep = clock, sleep
         self.t = {"ready": 180, "accept": 30, "poll": 1.0, "scan": 15, "interrupt": 6, "settle": 1.5,
@@ -267,6 +274,8 @@ class Driver:
         self.replied = False           # Codex: a model record was seen since the prompt was accepted
         self.turn_end: dict | None = None   # Codex: the task_complete of our turn, read from the rollout
         self.turn_id = ""              # Codex: the turn our prompt started, from the rollout's task_started
+        self.said: list[str] = []      # Codex: the assistant messages of our turn already written out
+        self.said_last = False         # Codex: the last message record read was written out, none skipped since
         # Claude: transcript records written out while the turn runs (stream_claude), by uuid
         self.streamed: set[str] = set()
         self.live_from = 0             # first transcript byte stream_claude has not read
@@ -383,7 +392,9 @@ class Driver:
             i = argv.index("resume")
             argv = argv[:i] + argv[i + 2:]
         env = [f"{k}={self.env[k]}" for k in sorted(self.env)]
-        return hashlib.sha256("\0".join(env + ["--"] + argv).encode()).hexdigest()[:16]
+        # a window started without this map's guard (or with another map) cannot take the turn
+        guard = ["--path-guard", str(self.moves)] if self.moves_file else []
+        return hashlib.sha256("\0".join(env + ["--"] + argv + guard).encode()).hexdigest()[:16]
 
     def died_in_bootstrap(self) -> str:
         """The harness's start-up error line when the window died before taking our prompt
@@ -521,6 +532,7 @@ class Driver:
             # a false "no first output" would cut a working turn, the dangerous direction for a watchdog.
             self.scan_from += len(chunk)
             self.skipping = True
+            self.said_last = False      # the skipped record may be a message: the last one said is not the last one
             return True
         self.scan_from += end
         lines = chunk[:end].splitlines()
@@ -531,6 +543,11 @@ class Driver:
             tool = self.codex_tool(line)
             if tool is not None:                          # streamed as it is seen: the chat shows it live
                 self.emit({"type": "item.completed", "item": {"type": "tool_call", **tool}})
+            said = self.codex_text(line)
+            if said:                                      # so is every assistant message, not only the last
+                self.emit_codex_text(said)
+            elif said is not None:                        # a message with no text: the last one said is not the last
+                self.said_last = False
             if self.codex_reply(line):
                 replied = True
                 continue
@@ -576,6 +593,22 @@ class Driver:
         if kind == "message":
             return item.get("role") == "assistant"
         return kind in CODEX_MODEL_ITEMS
+
+    @staticmethod
+    def codex_text(line: bytes) -> str | None:
+        """The text of a rollout line that is an assistant message (its output_text parts, '' when it has
+        none). None for any other line."""
+        if b'"response_item"' not in line or b'"assistant"' not in line:
+            return None
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        item = rec.get("payload") if isinstance(rec, dict) and rec.get("type") == "response_item" else None
+        if not isinstance(item, dict) or item.get("type") != "message" or item.get("role") != "assistant":
+            return None
+        return "".join(str(c.get("text") or "") for c in item.get("content") or []
+                       if isinstance(c, dict) and c.get("type") in ("output_text", "text"))
 
     @staticmethod
     def codex_tool(line: bytes) -> dict | None:
@@ -686,12 +719,35 @@ class Driver:
             pass
 
     # ------------------------------------------------------------------ session
+    def read_moves(self) -> str | None:
+        """The raw map of moved working copies ("" when the runner named none, None when it named one that
+        cannot be read). Kept raw: the guard, not the driver, judges its content."""
+        if not self.moves_file:
+            return ""
+        try:
+            return Path(self.moves_file).read_text()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    def guard_hooks(self) -> dict:
+        """The PreToolUse entry that refuses tool calls naming a moved-away working copy, for every tool;
+        {} when the session has no moves. The map file is (re)written first: a window rebuild forgot it."""
+        if not self.moves_file:
+            return {}
+        if self.moves is None:
+            raise DriverError("the map of moved working copies is missing; the session is not started "
+                              "without its path guard", close=True)
+        path_guard.write_text(Path(self.moves_file), self.moves)
+        guard = " ".join(shlex.quote(x) for x in (self.python, str(GUARD), self.moves_file))
+        return {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": guard}]}]}
+
     def harness_argv(self) -> list[str]:
         hook = f"{shlex.quote(self.python)} {shlex.quote(str(HOOK))} {shlex.quote(str(self.events))}"
         if self.harness == "claude":
             settings = self.dir / f"{self.key}.settings.json"
             entry = [{"hooks": [{"type": "command", "command": hook}]}]
             hooks = {name: entry for name in ("SessionStart", "UserPromptSubmit", "Stop", "StopFailure")}
+            hooks.update(self.guard_hooks())
             settings.write_text(json.dumps({"hooks": hooks, "skipDangerousModePermissionPrompt": True}))
             return [*self.argv, "--settings", str(settings)]
         notify = json.dumps([self.python, str(HOOK), str(self.events)])
@@ -1405,6 +1461,22 @@ class Driver:
         self.meta["session_id"] = sid
         return not error
 
+    def codex_thread_started(self, thread: str) -> None:
+        if not self.init_sent:
+            self.init_sent = True
+            self.emit({"type": "thread.started", "thread_id": thread, "launch_mode": "interactive"})
+
+    def emit_codex_text(self, text: str) -> None:
+        """One assistant message of the turn, written out when the rollout shows it: the chat gets each
+        message as a delta while the turn runs. The text goes out as written: the last one stays the
+        turn's final message for the task path (adapters.codex)."""
+        if not text:
+            return
+        self.codex_thread_started(self.rollout_thread() or self.meta.get("session_id") or self.sid)
+        self.emit({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+        self.said.append(text)
+        self.said_last = True
+
     def emit_codex(self, done: dict) -> bool:
         ev, before = done["event"], done["totals"] or {}
         # the notify can come before the watch read the rollout to the task's end: its tool calls go out first
@@ -1418,9 +1490,18 @@ class Driver:
         after = self.codex_totals()
         usage = {k: max(0, int(after.get(k) or 0) - int(before.get(k) or 0))
                  for k in ("input_tokens", "cached_input_tokens", "output_tokens")} if after else {}
-        self.emit({"type": "thread.started", "thread_id": thread, "launch_mode": "interactive"})
-        self.emit({"type": "item.completed", "item": {"type": "agent_message",
-                                                      "text": ev.get("last-assistant-message") or ""}})
+        self.codex_thread_started(thread)
+        final = str(ev.get("last-assistant-message") or "")
+        # The final message was streamed only when the rollout was read to the task's end and the last
+        # message read from it (none skipped after it) is exactly that text (Codex writes the same string
+        # to both); equal text of an earlier message proves nothing. Otherwise (a record longer than one
+        # read, a notify ahead of the file) it goes out now: a repeated paragraph beats a lost answer.
+        streamed = self.turn_end is not None and self.said_last and bool(self.said) and final == self.said[-1]
+        if final and not streamed:
+            self.emit_codex_text(final)
+        elif not self.said:
+            # no text at all: the turn still carries its (empty) message item, as before streaming
+            self.emit({"type": "item.completed", "item": {"type": "agent_message", "text": final}})
         # a turn without a final message says why (an API error, no model output); readers that do
         # not know the field see the same empty turn as before
         why = "" if ev.get("last-assistant-message") else str(ev.get("no-reply") or "no final message")

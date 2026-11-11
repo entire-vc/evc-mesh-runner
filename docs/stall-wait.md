@@ -1,9 +1,9 @@
 
-# Stall WAIT (`stall_wait_v1`)
+# Stall WAIT
 
 One native, durable wait for the FIRST new result of the mesh-stall-control notifier on the waiting
 card. The source card sleeps until the notifier posts its result comment; nothing else wakes it.
-Off by default. No timer, no polling turn, no self-dependency, no relay card, no Telegram receipt.
+Always available; nothing happens without an operator-armed registration. No timer, no polling turn, no self-dependency, no relay card, no Telegram receipt.
 State lives in Runner's store marks of the source card (`stall_reg`, `stall_pending`,
 `stall_delivered`, `stall_seen:*`).
 
@@ -13,7 +13,7 @@ State lives in Runner's store marks of the source card (`stall_reg`, `stall_pend
 ⏳ WAIT stall:#<this-card-8hex>
 ```
 
-Accepted only when `stall_wait_v1 = true`, the id is the declaring card, and a live undelivered
+Accepted only when the id is the declaring card and a live undelivered
 registration exists for this card and this lane's Mesh agent id. Otherwise the turn is sent back with
 guidance. `stall:soon` or another target stays unparsed.
 

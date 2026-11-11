@@ -109,8 +109,10 @@ class Parser(MergeBench):
         guidance = "⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>"
         self.assertIn(guidance, contract(True))
         self.assertIn("Do not re-run the merge gate in a loop yourself", contract(True))
+        self.assertIn("wait_for on=merge project_path=<group>/<project> mr_iid=<iid> after_sha=", contract(True))
         for text in (CONTRACT, contract(), contract(False)):
             self.assertNotIn("WAIT merge:", text)
+            self.assertNotIn("on=merge", text)
         self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, ""), CONTRACT)
         t = task(1)
         for merge in (True, False):
@@ -375,18 +377,17 @@ class Gate(MergeBench):
         self.assertIn("⏳ WAIT merge:", a.wake_text)
         self.assertIn("exit 3: ⏳ WAIT pipeline:g/app#77", a.wake_text)
 
-    def test_moved_head_wakes_without_running_the_gate(self):
+    def test_a_head_that_cannot_be_read_wakes_without_running_the_gate(self):
         r, a, t, gl = self.waiting()
-        gl.mr_rows[TARGET] = mr_row(sha=OTHER)
+        gl.mr_rows[TARGET] = mr_row(sha="")
         a = self.check(r, a)
         self.assertEqual(a.state, "ready")
-        self.assertIn("head moved to " + OTHER[:12], a.wake_text)
+        self.assertIn("head moved to an unknown commit", a.wake_text)
         self.assertIn("new review is needed", a.wake_text)
         self.assertEqual(self.runs(), [])
 
     def test_follow_head_runs_the_gate_on_the_rebased_head(self):
         # a clean server rebase woke the author for a new review before the gate could carry the SHIP
-        self.cfg.merge_follow_head = True
         r, a, t, gl = self.waiting()
         gl.mr_rows[TARGET] = mr_row(sha=OTHER)
         self.say("MR merged by the gate\n", rc=0)
@@ -397,7 +398,6 @@ class Gate(MergeBench):
 
     def test_follow_head_refusal_still_wakes_with_the_gate_tail(self):
         # own change to the MR: the wrapper refuses to carry the SHIP, the author is told why
-        self.cfg.merge_follow_head = True
         r, a, t, gl = self.waiting()
         gl.mr_rows[TARGET] = mr_row(sha=OTHER)
         self.say("HOLD: own changes differ from the reviewed head\n", rc=2)
@@ -407,14 +407,13 @@ class Gate(MergeBench):
         self.assertIn("own changes differ", a.wake_text)
 
     def test_follow_head_is_bounded(self):
-        self.cfg.merge_follow_head = True
         r, a, t, gl = self.waiting(follows=5)
         gl.mr_rows[TARGET] = mr_row(sha=OTHER)
         a = self.check(r, a)
         self.assertEqual((a.state, self.runs()), ("ready", []))
         self.assertIn("new review is needed", a.wake_text)
 
-    def test_head_moving_while_queued_wakes(self):
+    def test_head_moving_while_queued_is_followed_by_the_gate(self):
         r, a, t, gl = self.waiting()
         gl.pipeline_rows[QUEUE] = {"status": "running"}
         self.say("⏳ WAIT pipeline:g/app#77 — behind it\n", rc=3)
@@ -422,8 +421,9 @@ class Gate(MergeBench):
         a = self.check(r, a)
         gl.mr_rows[TARGET] = mr_row(sha=OTHER)
         a = self.check(r, a)
-        self.assertEqual(a.state, "ready")
-        self.assertIn("head moved", a.wake_text)
+        self.assertEqual(a.state, "waiting")              # not a wake: the gate decides on the new head
+        self.assertEqual((a.wait["merge"]["sha"], a.wait["merge"]["follows"]), (OTHER, 1))
+        self.assertEqual(self.runs(), [f"56 {PROJECT} {SHA}", f"56 {PROJECT} {OTHER}"])
 
     def test_refusal_wakes_with_the_tail(self):
         r, a, t, gl = self.waiting()
@@ -649,7 +649,6 @@ class IdleBudget(MergeBench):
 
     def setUp(self):
         super().setUp()
-        self.cfg.requeue_on_cap = True
         self.cfg.daily_wait_budget = 2
 
     def run_turn(self, line, waits=3, nexts=0, steps=0):

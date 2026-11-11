@@ -1,13 +1,15 @@
 """Supported release launch/rollback boundary; direct old-code invocation bypasses it.
 
 The guard owns the existing singleton through exec. Same exact activated target
-may restart to reconcile pending delivery; changing targets requires no pending
-intent or UNKNOWN rows. No registry/schema/lease mutation is performed here.
+may restart to reconcile pending delivery. A changed target or config may enter with
+pending intent or UNKNOWN rows when the entering target reads the delivery journal as the
+previous one wrote it (`journal_compatible`: the target's own guard, same state, same
+CAPABILITY); the rows stay pending and are reconciled by the target's ordinary tick.
+Bump CAPABILITY when the journal contract changes: such a target then needs the rows
+settled first. No registry/schema/lease mutation is performed here.
 
-One exception: legacy codex bootstrap rows (`unknown`, `session-unbound`). The target that carries the
-guard may be entered with them pending only when EVERY pending row is such a row and the target's own
-`delivery_recovery` proves it (typed bootstrap failure, no session, no rollout, no live process). The
-rows are then reconciled by the ordinary tick of that same target; any other pending row refuses.
+`--previous-config` is accepted and ignored: the additive-config proof it fed is covered
+by the rule above.
 """
 from __future__ import annotations
 
@@ -96,10 +98,11 @@ def _settled(state: Path, key: str, agent: str, status: str, pid: int, intent, o
         return False
 
 
-def pending(state: Path) -> bool:
+def pending_agents(state: Path) -> frozenset:
+    """Lanes owning at least one pending (unknown / send-intent, not proven unsent) row."""
     db = state / 'runner.sqlite'
     if not db.exists():
-        return False
+        return frozenset()
     if db.is_symlink():
         raise GuardRefused('registry-invalid')
     try:
@@ -112,6 +115,7 @@ def pending(state: Path) -> bool:
         for key, *_, sid in rows:
             if sid:
                 bound.setdefault(sid, set()).add(key)
+        found = set()
         for key, agent, status, pid, raw, _sid in rows:
             value = json.loads(raw)
             if not isinstance(value, dict):
@@ -120,66 +124,14 @@ def pending(state: Path) -> bool:
                 if _settled(state, key, agent, status, pid, value.get('interactive_prompt_intent'),
                             frozenset(s for s, owners in bound.items() if key not in owners)):
                     continue
-                return True
+                found.add(agent)
     except (sqlite3.Error, ValueError, TypeError):
         raise GuardRefused('registry-unreadable') from None
-    return False
+    return frozenset(found)
 
 
-def legacy_rows_covered(state: Path, release: Path) -> bool:
-    """True only if the guard IS the target (its own code proves the rows) and every pending row is proven."""
-    if Path(__file__).resolve().parents[2] != release.resolve():
-        return False
-    db = state / 'runner.sqlite'
-    try:
-        connection = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
-        try:
-            rows = connection.execute('SELECT id, agent, state, pid, wait, session_id FROM attempts').fetchall()
-        finally:
-            connection.close()
-        src = str(Path(__file__).resolve().parents[1])
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        from mesh_runner import delivery_recovery, interactive
-        bound: dict[str, set] = {}
-        for key, *_, sid in rows:
-            if sid:
-                bound.setdefault(sid, set()).add(key)
-        found = False
-        for key, agent, status, pid, raw, _sid in rows:
-            value = json.loads(raw)
-            intent = value.get('interactive_prompt_intent') if isinstance(value, dict) else None
-            if status != 'unknown' and not (isinstance(value, dict) and 'interactive_prompt_intent' in value):
-                continue                                   # not pending
-            if _settled(state, key, agent, status, pid, intent,
-                        frozenset(sid for sid, owners in bound.items() if key not in owners)):
-                found = True                               # old guards still count this preserved outbox
-                continue                                   # proven unsent: pending() does not count it either
-            with sqlite3.connect(db.as_uri() + '?mode=ro', uri=True) as proof_db:
-                carried = delivery_recovery.unknown_restored_unsent(
-                    proof_db, interactive.agent_dir(state, agent), key, agent, interactive.Tmux())
-            if carried:
-                found = True                               # still pending; the target owner reconciles it
-                continue
-            if (status != 'unknown' or not isinstance(intent, dict) or intent.get('resolution') != 'session-unbound'
-                    or intent.get('retryable') or intent.get('kind') != 'interactive' or intent.get('harness') != 'codex'):
-                return False
-            if pid:
-                try:
-                    os.kill(pid, 0)
-                    return False                           # a live process owns the row
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    return False
-            if not delivery_recovery.unbound_bootstrap_proof(
-                    interactive.agent_dir(state, agent), key, intent,
-                    frozenset(sid for sid, owners in bound.items() if key not in owners)):
-                return False
-            found = True
-        return found
-    except (sqlite3.Error, ValueError, TypeError, KeyError, ImportError, OSError):
-        return False
+def pending(state: Path) -> bool:
+    return bool(pending_agents(state))
 
 
 def publish_marker(state: Path, value: dict) -> None:
@@ -200,6 +152,41 @@ def publish_marker(state: Path, value: dict) -> None:
             os.unlink(name)
 
 
+def release_capability(release: Path) -> int | None:
+    """The delivery-journal contract version a release's guard declares; None when it cannot be read."""
+    try:
+        tree = ast.parse((release / 'src' / 'mesh_runner' / 'launch_guard.py').read_text())
+        found = [ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == 'CAPABILITY' for t in n.targets)]
+    except (OSError, ValueError, SyntaxError):
+        return None
+    return found[0] if len(found) == 1 and type(found[0]) is int else None
+
+
+def journal_compatible(state: Path, binding: dict, previous, release: Path | None) -> bool:
+    """Pending rows may cross a target or config change when the entering target reads the journal as written.
+
+    A pending row (UNKNOWN, or an unproven prompt-delivery intent) is reconciled by the ordinary tick from the
+    delivery journal. That reconciliation depends on the journal contract, which CAPABILITY versions, and not on
+    the release tree or the config bytes. So the guard that IS the target takes the rows over when the previously
+    activated release, on this same state, declared the same CAPABILITY. The rows are not inspected, altered or
+    declared safe here: they stay pending and stay fenced by the target's own tick, exactly as on a same-target
+    restart. A state never activated before, a previous release that is gone or unreadable, another state, or a
+    different CAPABILITY keeps the refusal.
+    """
+    if release is None or not isinstance(previous, dict) or previous.get('version') != 1:
+        return False
+    if Path(__file__).resolve().parents[2] != release.resolve():
+        return False                                       # only the target's own guard vouches for its reader
+    if previous.get('state') != binding['state']:
+        return False
+    try:
+        was = release_capability(Path(str(previous.get('release') or '')))
+    except (TypeError, ValueError):
+        return False
+    return was is not None and was == CAPABILITY
+
+
 def validate_pending_binding(state: Path, binding: dict, release: Path | None = None) -> None:
     marker = state / MARKER
     previous = None
@@ -210,9 +197,7 @@ def validate_pending_binding(state: Path, binding: dict, release: Path | None = 
             previous = json.loads(marker.read_text())
         except (OSError, ValueError):
             raise GuardRefused('activation-binding-unreadable') from None
-    if pending(state) and previous != binding:
-        if release is not None and legacy_rows_covered(state, release):
-            return
+    if pending(state) and previous != binding and not journal_compatible(state, binding, previous, release):
         raise GuardRefused('pending-delivery-target-change')
 
 
@@ -236,7 +221,7 @@ def assert_held(fd: int, path: Path):
     return info
 
 
-def check_locked(release: Path, config: Path, fd: int) -> dict:
+def check_locked(release: Path, config: Path, fd: int, previous_config: Path | None = None) -> dict:  # noqa: ARG001
     """Activation preflight under the operator's existing singleton; no binding write."""
     release, config = release.resolve(strict=True), config.resolve(strict=True)
     state, config_sha = configured_state(config)
@@ -250,7 +235,7 @@ def check_locked(release: Path, config: Path, fd: int) -> dict:
     return binding
 
 
-def prepare(release: Path, config: Path, *, bind: bool = True):
+def prepare(release: Path, config: Path, *, bind: bool = True, previous_config: Path | None = None):
     release, config = release.resolve(strict=True), config.resolve(strict=True)
     identity = target_identity(release)
     state, config_sha = configured_state(config)
@@ -315,12 +300,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target-release', required=True, type=Path)
     parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--previous-config', type=Path, default=None,
+                        help='accepted for compatibility; unused')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--log-level', default='INFO')
     args = parser.parse_args(argv)
     try:
-        lock, value = prepare(args.target_release, args.config, bind=not args.check)
+        lock, value = prepare(args.target_release, args.config, bind=not args.check,
+                            previous_config=args.previous_config)
         if args.check:
             lock.close()
             print(json.dumps({'eligible': True, 'activated': False}))

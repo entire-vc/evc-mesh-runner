@@ -307,8 +307,8 @@ class NoOutcomeRun(CapBench):
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
         self.assertNotIn("RUNNER GAVE UP", " ".join(self.bodies(mesh, t)))
 
-    def test_without_requeue_a_routed_card_stays_in_todo_and_an_unrouted_one_goes_up(self):
-        self.cfg.requeue_on_cap = False                               # no wait-for-input mechanism: as before
+    def test_when_the_requeue_cannot_be_done_a_routed_card_stays_in_todo_and_an_unrouted_one_goes_up(self):
+        self.requeue_unavailable()
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.agent.lead = "lead"
@@ -330,7 +330,6 @@ class NoOutcomeRun(CapBench):
         self.assertNotIn("RUNNER GAVE UP", " ".join(self.bodies(mesh2, t2)))
 
     def test_a_card_nobody_could_take_is_not_marked_as_routed(self):
-        self.cfg.requeue_on_cap = False
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)                        # no lead above this lane
         self.cfg.no_outcome_route_after = 2

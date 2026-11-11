@@ -98,6 +98,14 @@ class WorkspaceError(Exception):
     pass
 
 
+class CheckpointSuspendError(WorkspaceError):
+    """A failed suspension, bound to the exact generation it tried to release."""
+
+    def __init__(self, cause: WorkspaceError, binding: dict):
+        super().__init__(str(cause))
+        self.binding = binding
+
+
 class MaintenanceHeld(WorkspaceError):
     """An open maintenance window closes this operation; nothing was changed."""
 
@@ -527,19 +535,41 @@ class WorkspacePool:
             (str(path), self._pool(repo), attempt, state, note, iso()))
 
     # -- lease / release ---------------------------------------------------------------
-    def lease(self, attempt_id: str, repo_name: str) -> Path:
+    def lease(self, attempt_id: str, repo_name: str, *, preferred_path: str | None = None) -> Path:
         repo = self.repos[repo_name]
         with base_lock(repo.base):
-            return self._lease(attempt_id, repo_name, repo)
+            return self._lease(attempt_id, repo_name, repo, preferred_path=preferred_path)
 
-    def _lease(self, attempt_id: str, repo_name: str, repo: RepoSpec) -> Path:
+    def _suspended_sources(self, repo_name: str, attempt_id: str) -> set[str]:
+        """Slots that other attempts of this pool were suspended from and have not been restored to."""
+        if not self.store.db.execute("SELECT 1 FROM sqlite_master WHERE name='workspace_checkpoints'").fetchone():
+            return set()                  # nothing was ever suspended in this registry
+        return {r[0] for r in self.store.db.execute(
+            "SELECT source FROM workspace_checkpoints WHERE owner=? AND repo=? AND attempt<>? "
+            "AND phase IN ('releasing','released')", (self.owner, repo_name, attempt_id))}
+
+    def _lease(self, attempt_id: str, repo_name: str, repo: RepoSpec, *,
+               preferred_path: str | None = None) -> Path:
         self._check_disk()
+        self._keep_base_bare(repo)
         self._clean_staging(repo)
         self._fetch(repo)
         self._check_disk()
         start = f"{repo.remote}/{repo.branch}"
-        for slot in self._rows(repo_name, "free"):
+        slots = self._rows(repo_name, "free")
+        # Preference only reorders this pool's free inventory. Normal admission checks
+        # and the base lock still apply; held, foreign and unknown paths cannot enter.
+        # A slot that a suspended attempt of this pool left is the one path where that attempt's
+        # session can continue (a restore to any other path starts the session anew), so other
+        # work takes such a slot last. The attempt's own old slot stays first for its restore.
+        waited = self._suspended_sources(repo_name, attempt_id)
+        slots.sort(key=lambda slot: (slot["path"] != preferred_path, slot["path"] in waited))
+        for slot in slots:
             path = Path(slot["path"])
+            # Only this pool's free inventory is eligible for config repair. Validate
+            # the admin link before writing anything; never follow a foreign HEAD/index.
+            if path.is_dir() and not self._admin_reason(path, repo):
+                self._configure(path)
             reason = self.unsafe_reason(path, repo)
             if reason:
                 self._set(path, repo_name, "held", note=f"found while free: {reason}")
@@ -563,9 +593,35 @@ class WorkspacePool:
             self._set(path, repo_name, "held", note=f"{POOL_ADMIN_HOLD_NOTE}: {why}")
             self._warn_admin(path, repo)
             raise WorkspaceError(f"new worktree {path}: {why}")
+        # Inventory before configuration: a refused config write (another writer's config.lock) must
+        # leave a known free slot that the next lease repairs and reuses, not an unregistered directory
+        # that every later lease skips while failed retries pile up more of them.
+        self._set(path, repo_name, "free", note="new; configuration pending")
         self._configure(path)
+        self._keep_base_bare(repo)       # _configure may have just switched per-worktree config on
         self._set(path, repo_name, "leased", attempt_id)
         return path
+
+    def _keep_base_bare(self, repo: RepoSpec) -> None:
+        """With per-worktree config on, a bare base is bare for itself only.
+
+        ``extensions.worktreeConfig`` (switched on by ``_configure`` for the per-worktree identity) makes git
+        apply the shared ``core.bare`` to every linked worktree as well. On a bare base each slot then answers
+        "this operation must be run in a work tree": ``git status`` fails and its checkpoint cannot list files.
+        git's rule for this extension is to keep ``core.bare`` in the main worktree's ``config.worktree``.
+
+        It is written there first and removed from the shared file second, so the base is bare at every
+        moment. A base that is not bare, or has the extension off, is left alone; repeating the call changes
+        nothing, which also repairs a base an earlier runner left in the broken form."""
+        if git(repo.base, "config", "--get", "extensions.worktreeConfig", check=False, env=self.env) != "true":
+            return
+        common = Path(git(repo.base, "rev-parse", "--path-format=absolute", "--git-common-dir", env=self.env))
+        shared = str(common / "config")
+        if git(repo.base, "config", "--file", shared, "--get", "core.bare", check=False, env=self.env) != "true":
+            return
+        git(repo.base, "config", "--file", str(common / "config.worktree"), "core.bare", "true", env=self.env)
+        git(repo.base, "config", "--file", shared, "--unset-all", "core.bare", env=self.env)
+        log.info("%s: base %s: core.bare moved to config.worktree (per-worktree config is on)", self.owner, repo.base)
 
     def _owner_tag(self) -> str:
         """The owner as a git-safe admin id prefix."""
@@ -644,6 +700,21 @@ class WorkspacePool:
         return kept
 
     def suspend(self, attempt_id: str, metadata: dict, *, writer_stopped: bool = False) -> list[str]:
+        try:
+            return self._suspend(attempt_id, metadata, writer_stopped=writer_stopped)
+        except MaintenanceHeld:
+            raise
+        except WorkspaceError as exc:
+            # A capture can fail before creating its first journal. Keep both the
+            # intended sources and any partial generation, never infer recovery
+            # from a later arbitrary comment or from a different suspension.
+            binding = {"attempt": attempt_id, "generation": metadata.get("checkpoint_generation"),
+                       "sources": sorted(metadata.get("workspaces", [])),
+                       "checkpoints": {r["repo"]: r["checkpoint"] for r in self._checkpoint_rows(attempt_id)
+                                       if r["phase"] not in ("active", "restored")}}
+            raise CheckpointSuspendError(exc, binding) from exc
+
+    def _suspend(self, attempt_id: str, metadata: dict, *, writer_stopped: bool = False) -> list[str]:
         """Checkpoint every owned lease before release. Caller proves the process group stopped.
 
         A durable journal makes release and restore retryable after any runner restart.
@@ -852,7 +923,8 @@ class WorkspacePool:
                 if row["phase"] == "released":
                     # lease is idempotent across a crash before the journal update.
                     owned = [r for r in self._rows(row["repo"], "leased") if r["attempt"] == attempt_id]
-                    target = Path(owned[0]["path"]) if owned else self.lease(attempt_id, row["repo"])
+                    target = (Path(owned[0]["path"]) if owned else
+                              self.lease(attempt_id, row["repo"], preferred_path=row["source"]))
                     self.store.db.execute("UPDATE workspace_checkpoints SET phase='restoring', target=? "
                         "WHERE owner=? AND attempt=? AND repo=?",
                         (str(target), self.owner, attempt_id, row["repo"]))
@@ -1713,11 +1785,57 @@ class WorkspacePool:
             n += 1
         return base / f"slot-{n}"
 
+    def _enable_worktree_config(self, path: Path) -> None:
+        """Enable per-worktree config without changing existing worktrees' meaning.
+
+        With the extension off, Git treats shared core.bare/core.worktree as
+        main-only settings. Enabling it removes that exception. Move those keys
+        to the main config.worktree before atomically publishing the extension.
+        The caller holds base_lock; config.lock also excludes external Git writers.
+        """
+        common = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir", env=self.env))
+        config, pending = common / "config", common / "config.lock"
+        try:
+            fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            raise WorkspaceError("worktree config: shared config lock already exists") from None
+        published = False
+        try:
+            with os.fdopen(fd, "wb") as out:
+                original = config.read_bytes()
+                out.write(original)
+            for key in ("core.bare", "core.worktree"):
+                value = git(path, "config", "--file", str(config), "--get", key, check=False, env=self.env)
+                if key == "core.bare":
+                    value = git(path, "config", "--file", str(config), "--type=bool", "--get", key,
+                                check=False, env=self.env)
+                    if value != "true":
+                        continue
+                elif not value:
+                    continue
+                git(path, "config", "--file", str(common / "config.worktree"), key, value, env=self.env)
+                git(path, "config", "--file", str(pending), "--unset-all", key, env=self.env)
+            git(path, "config", "--file", str(pending), "extensions.worktreeConfig", "true", env=self.env)
+            if config.read_bytes() != original:
+                raise WorkspaceError("worktree config: shared config changed during migration")
+            pending.chmod(stat.S_IMODE(config.stat().st_mode))
+            os.replace(pending, config)
+            published = True
+        finally:
+            if not published:
+                pending.unlink(missing_ok=True)
+
     def _configure(self, path: Path) -> None:
+        enabled = git(path, "config", "--type=bool", "--get", "extensions.worktreeConfig",
+                      check=False, env=self.env) == "true"
+        if not enabled:
+            if not self.identity:
+                return
+            self._enable_worktree_config(path)
+        # Legacy bases may already have the extension and shared core.bare=true.
+        # Repair only this owned slot; the shared base and other slots stay untouched.
+        git(path, "config", "--worktree", "core.bare", "false", env=self.env)
         if not self.identity:
             return
-        # Per-worktree identity: never touch the shared config other worktrees read.
-        if git(path, "config", "--get", "extensions.worktreeConfig", check=False, env=self.env).strip() != "true":
-            git(path, "config", "extensions.worktreeConfig", "true", env=self.env)   # shared config: once
         git(path, "config", "--worktree", "user.name", self.identity[0], env=self.env)
         git(path, "config", "--worktree", "user.email", self.identity[1], env=self.env)

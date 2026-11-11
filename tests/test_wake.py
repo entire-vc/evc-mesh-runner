@@ -553,3 +553,28 @@ class CrossWorkspaceCardWait(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PersonAsk(unittest.TestCase):
+    """A question to a person is an event wait: the answer or the lifted gate ends it, its age does not."""
+
+    def wait(self, days):
+        asked = (NOW - dt.timedelta(days=days)).isoformat()
+        return {"kind": "blocking", "handle": "alice", "since": asked, "started": asked, "rechecks": 3}
+
+    def ask(self, wait, task, comments=()):
+        mine = StatusCategories(Denied())
+        return check(mine.mesh, mine, None, task, wait, "me", list(comments), NOW,
+                     max_wait=dt.timedelta(hours=6), first_recheck=dt.timedelta(hours=2))
+
+    def test_a_standing_gate_is_not_woken_by_age(self):
+        for days in (0.1, 1, 3, 14):
+            wait = self.wait(days)
+            self.assertEqual(self.ask(wait, {"human_gate": True}), "", days)
+            self.assertNotIn("recheck_due", wait)
+            self.assertNotIn("met", wait)
+
+    def test_the_lifted_gate_ends_the_wait(self):
+        wait = self.wait(3)
+        self.assertEqual(self.ask(wait, {"human_gate": False}), "the human gate was lifted")
+        self.assertTrue(wait["met"])

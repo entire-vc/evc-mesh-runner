@@ -2,7 +2,8 @@
 
 Pure observation. It never clones, leases, edits config or touches another actor's
 worktree. The required repository comes only from typed Mesh VCS links (a merge request
-link on this GitLab); task prose and arbitrary URLs never grant or name a repository.
+link on this GitLab) that is not merged/closed; task prose and arbitrary URLs never grant or name a
+repository, and a finished MR is history the start does not need (reported, never a reason).
 A refusal carries one structured reason, the next actor and the supported action, plus
 a fingerprint so the handoff is written once per generation of the same facts.
 """
@@ -27,6 +28,9 @@ CHECKPOINT = "checkpoint_conflict"
 NO_SLOT = "no_free_slot"
 
 MR_TYPES = ("pr", "pull_request", "mr", "merge_request")
+# A link whose Mesh status says the MR is finished names history, not work this start needs. Any other
+# status (open, draft, unknown, missing) stays a hard requirement: a lagging status only errs to holding.
+TERMINAL_STATUSES = ("merged", "closed")
 SAFE_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+")   # no markup can ride in a project path
 
 # The only state that clears by itself; every other reason needs a named actor to act.
@@ -54,6 +58,7 @@ class Verdict:
     action: str = ""
     fingerprint: str = ""
     also: tuple = ()          # further blocking (reason, project) pairs found in the same pass
+    historical: tuple = ()    # projects named only by merged/closed links: informational, never a reason
 
     @property
     def blocking(self) -> bool:
@@ -69,6 +74,8 @@ class Verdict:
                "next_actor": self.next_actor, "action": self.action}
         if self.also:
             out["also"] = [{"reason": r, "project": p} for r, p in self.also]
+        if self.historical:
+            out["historical"] = list(self.historical)
         return out
 
     def text(self) -> str:
@@ -77,17 +84,35 @@ class Verdict:
                 f"next_actor={self.next_actor}; action: {self.action}")
 
 
-def required_projects(links: list[dict], base_url: str) -> list[str]:
-    """``group/project`` of every typed MR link on this GitLab. Nothing is read from prose."""
+def _mr_links(links: list[dict], base_url: str) -> list[tuple[str, bool]]:
+    """``(group/project, terminal)`` of every typed MR link on this GitLab. Nothing is read from prose."""
     host = urllib.parse.urlsplit(base_url).netloc
-    out: list[str] = []
+    out: list[tuple[str, bool]] = []
     for link in links or []:
         if not isinstance(link, dict):
             continue
         m = re.match(r"^https?://([^/]+)/(.+?)/-/merge_requests/\d+", str(link.get("url") or ""))
-        if (link.get("link_type") in MR_TYPES and m and m[1] == host and SAFE_PATH.fullmatch(m[2])
-                and m[2] not in out):
-            out.append(m[2])
+        if link.get("link_type") in MR_TYPES and m and m[1] == host and SAFE_PATH.fullmatch(m[2]):
+            out.append((m[2], str(link.get("status") or "").strip().lower() in TERMINAL_STATUSES))
+    return out
+
+
+def required_projects(links: list[dict], base_url: str) -> list[str]:
+    """``group/project`` with at least one live (not merged/closed) typed MR link, whatever its role."""
+    out: list[str] = []
+    for project, terminal in _mr_links(links, base_url):
+        if not terminal and project not in out:
+            out.append(project)
+    return out
+
+
+def historical_projects(links: list[dict], base_url: str) -> list[str]:
+    """``group/project`` whose every typed MR link is merged/closed: the lane need not hold it to start."""
+    live = set(required_projects(links, base_url))
+    out: list[str] = []
+    for project, _ in _mr_links(links, base_url):
+        if project not in live and project not in out:
+            out.append(project)
     return out
 
 
@@ -128,8 +153,9 @@ def check(links: list[dict], base_url: str, *, agent_repos: list, approved_repos
     """
     project_of = project_of or (lambda spec: clone_project(spec.base, spec.remote))
     wanted = required_projects(links, base_url)
+    history = tuple(historical_projects(links, base_url))
     if not wanted:
-        return Verdict(NO_REPO, fingerprint=_digest(["none"]))
+        return Verdict(NO_REPO, fingerprint=_digest(["none"]), historical=history)
     mine = {project_of(s): s for s in agent_repos}
     theirs = {project_of(s): s for s in (approved_repos or [])}
     found: list[tuple[str, str, object]] = []        # every blocking fact, so one handoff names them all
@@ -150,7 +176,7 @@ def check(links: list[dict], base_url: str, *, agent_repos: list, approved_repos
         elif spec.name not in (leased_repos or set()) and pool_full(spec.name):
             found.append((NO_SLOT, project, spec))
     if not found:
-        return Verdict(OK, ",".join(wanted), fingerprint=_digest([OK, wanted]))
+        return Verdict(OK, ",".join(wanted), fingerprint=_digest([OK, wanted]), historical=history)
     # canonical order (durable before slot wait, then reason/project): link order never changes the handoff
     found.sort(key=lambda f: (f[0] in TRANSIENT, f[0], f[1]))
     reason, project, spec = found[0]
@@ -158,4 +184,5 @@ def check(links: list[dict], base_url: str, *, agent_repos: list, approved_repos
     repo = getattr(spec, "name", "")
     also = tuple((r, p) for r, p, _ in found[1:])
     fp = _digest([reason, project, repo] + ([sorted(also)] if also else []))
-    return Verdict(reason, project, repo, actor, action, fp, also)
+    # history is left out of the fingerprint: a finished MR never re-opens a handoff of the same blockers
+    return Verdict(reason, project, repo, actor, action, fp, also, history)

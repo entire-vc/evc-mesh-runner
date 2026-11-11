@@ -73,8 +73,10 @@ def translate(lines: Iterable[dict], harness: str) -> Iterator[dict]:
         elif t == "item.completed" and (ev.get("item") or {}).get("type") == "agent_message":
             text = ev["item"].get("text") or ""
             if text:
+                # each Codex message is whole; the chat joins deltas as they come, so the next one
+                # starts a new paragraph
+                yield {"type": "text_delta", "text": ("\n\n" + text) if texted else text}
                 texted = True
-                yield {"type": "text_delta", "text": text}
         elif t == "result":
             u = ev.get("usage") or {}
             tin = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens",

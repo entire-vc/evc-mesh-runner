@@ -14,12 +14,11 @@ class TurnCapBench(Bench):
         super().setUp()
         self.cfg.max_turns = 12
         self.cfg.daily_start_cap = 4
-        self.cfg.turn_cap_continue_on_progress = True
         self.agent.lead = "lead"
 
     def capped(self, r, t, outcomes, *, turns=None):
         """An attempt at its turn cap, the given outcomes already declared, about to resume
-        (the point where the cap is applied when the switch is on)."""
+        (the point where the cap of a work attempt is applied)."""
         r.refresh_me()
         a = r.store.create(self.agent.name, t["id"], "claude")
         for kind in outcomes:
@@ -110,15 +109,24 @@ class Continue(TurnCapBench):
         self.assertTrue(a.note.startswith("turn cap: continued in a fresh session"), a.note)
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
 
-    def test_flag_off_gives_up_at_settle_before_the_outcome_is_read(self):
-        t = task(1, cat="in_progress")
+    def test_a_review_attempt_is_capped_at_settle_before_the_outcome_is_read(self):
+        """Only a work attempt has its cap moved to the resume; a review is stopped when the turn settles."""
+        t = task(1, cat="review")
         mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.turn_cap_continue_on_progress = False
         r = self.runner(mesh)
-        a = self.last_turn(r, t, ["step"] * 5, f"idle\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak")
-        self.assertIn("routed to lead", a.note)
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
-        self.assertEqual(r.store.recent_outcomes(a.id, 1), ["step"])          # the wait was never recorded
+        r.refresh_me()
+        a = r.store.create(self.agent.name, t["id"], "claude", mode="review")
+        path = self.root / f"{a.id}.jsonl"
+        path.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                    "result": f"idle\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak",
+                                    "session_id": "s-cap"}) + "\n")
+        r.store.update(a, state="running", turns=self.cfg.max_turns, log_path=str(path))
+        r.settle(a)
+        a = r.store.get(a.id)
+        self.assertNotEqual(a.state, "waiting")
+        self.assertIn(f"stopped after {self.cfg.max_turns} turns", a.note)
+        self.assertEqual(r.store.recent_outcomes(a.id, 1), [])                 # the wait was never recorded
+        self.assertNotIn("turn_cap", [k for _, k, _ in r.store.events(a.id)])
 
     def test_stagnant_attempt_goes_to_the_lead_as_before(self):
         t = task(1, cat="in_progress")
@@ -145,17 +153,6 @@ class Continue(TurnCapBench):
         r = self.runner(mesh)
         a = self.capped(r, t, ["wait", "step", "wait", "next"])
         self.assertTrue(a.note.startswith("turn cap: continued"), a.note)
-
-    def test_flag_off_goes_to_the_lead_even_with_progress(self):
-        t = task(1, cat="in_progress")
-        mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.turn_cap_continue_on_progress = False
-        r = self.runner(mesh)
-        a = self.capped(r, t, ["step"] * 9)
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
-        self.assertIn("routed to lead", a.note)
-        self.assertTrue(any("RUNNER GAVE UP" in b for b in self.bodies(mesh, t)))
-        self.assertNotIn("turn_cap", [k for _, k, _ in r.store.events(a.id)])
 
     def test_spent_start_cap_stops_the_continuation(self):
         t = task(1, cat="in_progress")
@@ -205,12 +202,8 @@ class ConfigKeys(unittest.TestCase):
                      f'[[agents]]\nname = "a"\nkey_file = "{key}"\nprofile_dir = "{d.name}"\n')
         return config_mod.load(p)
 
-    def test_defaults_keep_todays_behaviour(self):
-        cfg = self.load()
-        self.assertFalse(cfg.turn_cap_continue_on_progress)
-        self.assertEqual(cfg.turn_cap_progress_min, 3)
+    def test_default_progress_min(self):
+        self.assertEqual(self.load().turn_cap_progress_min, 3)
 
-    def test_keys_are_read(self):
-        cfg = self.load("turn_cap_continue_on_progress = true\nturn_cap_progress_min = 5\n")
-        self.assertTrue(cfg.turn_cap_continue_on_progress)
-        self.assertEqual(cfg.turn_cap_progress_min, 5)
+    def test_progress_min_is_read(self):
+        self.assertEqual(self.load("turn_cap_progress_min = 5\n").turn_cap_progress_min, 5)

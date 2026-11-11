@@ -103,9 +103,8 @@ class CIIdleBudget(Bench):
             a = self.turn(r, t, f'⏳ WAIT pipeline:g/app#{count + 2}')
             if count <= 8:
                 self.assert_waiting(r, a)
-        self.assertEqual(a.state, 'completed')
-        self.assertIn('routed to lead', a.note)
-        self.assertEqual(r.mesh.tasks[t['id']]['assignee_id'], 'agent-lead')
+        self.assertEqual((a.state, a.note), ('completed', 'cap: requeued (turn budget)'))
+        self.assertEqual(r.mesh.tasks[t['id']]['assignee_id'], AGENT_ID)   # back in the queue, not handed up
 
     def test_repeat_pipeline_result_and_alias_do_not_reset_again(self):
         self.cfg.daily_wait_budget = 1
@@ -124,8 +123,7 @@ class CIIdleBudget(Bench):
         self.assert_waiting(r, a)
         self.wake_comment(r, a)
         a = self.turn(r, t, '⏳ WAIT pipeline:g/app#4')  # idle 2: duplicate result cannot reset
-        self.assertEqual(a.state, 'completed')
-        self.assertIn('routed to lead', a.note)
+        self.assertEqual((a.state, a.note), ('completed', 'cap: requeued (turn budget)'))
 
     def test_time_and_card_steps_do_not_reset_idle_budget(self):
         for kind in ('time', 'card', 'decision'):

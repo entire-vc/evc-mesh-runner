@@ -1,7 +1,155 @@
-
 # Changelog
 
 ## Unreleased
+
+## 0.2.6 — 2026-11-11
+
+- **A question asked with `ask_agent` reaches its addressee again.** Since 0.2.3 the Runner treated a typed
+  decision wait as already delivered by Mesh and filed no request card. Mesh only records the request: its comment
+  carries `wakes=false` and no queue lists open requests, so the addressee was never started.
+  The Runner now files the request card for a typed question as it does for a marker one,
+  quoting the question from the `ask_agent` comment, and files it on the next pass for waits already parked without
+  one. A question whose comment cannot be read is retried, never filed blind.
+
+## 0.2.5 — 2026-11-11
+
+- **An ended attempt whose prompt was provably delivered no longer blocks drains forever.** A Runner without the
+  intent protocol that ran over this store during a restart closed attempts as completed and left their consumed
+  `interactive_prompt_intent` behind; `launch_guard.pending()` counted them and config operations were undrainable.
+  The once-a-minute terminal settle now also retires such an intent, only on the exact native proof the ordinary
+  consumer uses: the driver's `prompt_ack` with the intent's token and sha256 in the intent's own log, the same turn
+  and log, the delivery journal for that token at `accepted`, and no live process group. Compare-and-set on the row,
+  event `prompt_intent_retired` (reason `proven-delivered`), no state change and no re-send; pending wake deliveries
+  become their marks as on the ordinary ack. A sent-but-unacknowledged (ambiguous) intent keeps blocking.
+
+## 0.2.4 — 2026-11-10
+
+- **Every typed wait form is read.** The typed outcome reader builds the Outcome for each wait Mesh's `wait_for`
+  and `ask_human` now record: `merge` waits, `registered` waits (ops-review, gmail, receipt, lifecycle, stall,
+  recovery, queue, native), mr/pipeline baselines (`after_sha`, `after_pipeline_id`, `after_status`),
+  `required_jobs` on mr waits, pipeline `until=changed`, GitHub Actions runs and the `human` wait. Each gives the
+  Outcome its marker line parses to; a combination the runner cannot act on is an `unparsed` naming the row and
+  the field. A typed question to a person is not raised again: Mesh already posted it and armed the gate.
+- **The runner resolves the Mesh wait it observed.** When an attempt stops waiting on a wait recorded through a
+  turn command, the runner calls `POST /tasks/:id/waits/:wait_id/resolve` (`met` when the event arrived,
+  `cancelled` when it was superseded or the card left the lane, cause = the wake text cut to 200 characters).
+  Best effort: one `mesh_wait_resolve_failed` event on failure, at most three sends, 404/409 final.
+- **The contract asks for a Mesh turn command.** Every agent is told to end a turn with one of `wait_for`,
+  `continue_next`, `ask_agent`, `ask_human`, `finish_task`, `hand_off`, with the MCP server's own parameter names;
+  the marker lines remain a compact fallback and are still parsed. Correction prompts ask for the command first.
+- **A fresh session knows where it stopped.** Its first prompt on a card the lane worked on carries the restart
+  reason, the lane's last comment in full (up to 4,000 characters), the last declared outcome, linked merge
+  requests and `git status --short` of each working copy.
+- **The lane option `project_ids` is removed.** Mesh membership decides which projects a lane serves; a config
+  that still lists it loads and logs one warning per lane.
+
+## 0.2.3 — 2026-11-10
+
+- **The installer recovers a job definition from before the launch guard.** `ops/install.py` rebuilt nothing when the
+  launchd plist had been replaced by an old-style one (`python -m mesh_runner.cli run`, release chosen by PYTHONPATH).
+  The installer now rewrites such a definition in the guarded form, and "already active" also requires that the live
+  process publishes a receipt from the target release (`--activate <version>` restarts a service that runs another tree).
+- **A Claude session survives a restore into another slot.** When a suspended attempt's old slot was leased to
+  other work, the restore lands on another path and the session used to start fresh (`restart_reason=path_changed`).
+  For an interactive Claude session the session is now kept
+  (`restore_session` intent `resume`, reason `workspace_restore_moved`, plus a `workspace_moved` event): the moves
+  (old path -> new path, chained across restores) are kept in the store per native session, and the session's
+  launch installs a `PreToolUse` hook (`path_guard.py`) that refuses any tool call naming an old path, since that
+  path may now hold another attempt's work. The first resumed turn after a move opens with the list of moves. A
+  launch that cannot carry the hook (headless `claude -p`, Codex, an unwritable map) never continues such a
+  session: it starts fresh with `restart_reason=path_changed`, as before. No new option.
+- **A typed turn outcome is read first and taken as it is.** The outcome an agent records through a Mesh turn
+  command (`wait_for`, `continue_next`, `ask_agent`) is now THE outcome of the turn, read before any marker line; a
+  marker line in the same turn is only compared, and when it says another kind or target an `outcome_disagree`
+  event records both while the typed one stands (before, the marker won and the wait Mesh already held, with the
+  checkout it had released, was left unreconciled). The outcome is built straight from Mesh's rows
+  (`outcome.from_typed`, a table of builders per wait kind: card, mr, pipeline, time, decision) instead of being
+  rendered as a marker line and parsed back, so a time wait whose source is `comment:<uuid>`, an `event_ref` with
+  spaces or a deadline with fractional seconds is no longer refused. `ask_agent` settles as a decision wait on the
+  request Mesh filed (the runner files no second request); it used to end the turn as "no outcome". A row the
+  runner cannot act on (a wait kind it does not have yet, such as `merge`, a superseded wait, a malformed field)
+  gives a correction that names the row and what was not understood. `outcome.typed_line` is removed.
+- **An unreadable typed outcome defers the settle.** When Mesh cannot be read for the turn's typed outcome (an HTTP
+  error other than 404, a transport error), the attempt is left as it is and settled on the next tick
+  (`outcome_read_deferred` event, once per turn) instead of asking the agent again for an outcome it may have
+  recorded. A Mesh without the read (404) still settles on the marker line.
+- **How turns end is counted.** Every settled turn emits `outcome_source` (`source` typed / comment / final_text /
+  none, `kind`, `harness`, `both`, `disagree`), and `status.json` carries `outcome_sources`, the totals since start
+  per source and harness. The marker line can be removed once nothing ends a turn with it. No new option.
+- **Manual wait.** `⏳ WAIT manual:#<this-card-8hex> — <why>` on a card a lead labelled `wake:manual` (no producer or
+  observable event exists): the session sleeps with no timer and no age re-check and resumes only on a comment by someone
+  else or the owner's own `↻ NEXT`. Without the label, or naming another card, the line is refused as unreadable.
+
+## 0.2.2 — 2026-11-10
+
+- **A wrong recovery gate can be superseded, once, by its owner.** `mesh-runner recovery-wait supersede --reg-id <generation>
+  --reason '<line>'` replaces exactly one registration generation (a stale, delivered or already superseded one is
+  refused). It is authorized by Mesh, not by the operator: the receipt author or an id in the new `[runner]
+  recovery_supersede_authors` must have written `supersede-recovery: <reg_id>` on the source card. The registration is
+  disarmed and the attempt that declared it resumes once in its own session; the gate itself is never satisfied by this
+ .
+- **A bare base stays bare when linked worktrees get their own config.** Before `extensions.worktreeConfig` is first
+  enabled, the pool moves `core.bare=true` and `core.worktree` into the base's `config.worktree`; every owned slot gets
+  `core.bare=false`. A base already switched on is repaired the same way before leasing. Failed checkpoint list operations
+  name the Git subcommand, exit code and a finite cause (`git-not-a-work-tree`, `git-other`).
+- **A finished merge request no longer holds a card's start.** The repository preflight requires only projects with an open
+  (not merged/closed) MR link; a project named only by finished links is reported as `historical` in the verdict and is
+  never a refusal reason. Open links, any role, stay hard requirements.
+
+## 0.2.1 — 2026-11-10
+
+- **Eleven `[runner]` options are removed; what they switched on is unconditional.** `mention_requests`,
+  `turn_cap_continue_on_progress`, `queue_wait_freshness_v1`, `recovery_wait_v1`, `lifecycle_wait_v1`, `stall_wait_v1`,
+  `requeue_on_cap`, `cap_wake_next_day`, `soft_person_asks_to_lead`, `merge_follow_head` and `checkpoint_gc` were all
+  `true` in production. The loader ignores keys it does not know, so a config file that still carries them loads
+  unchanged; the lines can be deleted. Three options nothing read (`time_wait_reason_after_minutes`,
+  `short_time_wait_series`, `quota_pause_minutes`) are gone the same way. The older hand-up path of a cap (the lead, or
+  the agent keeps the task until the next UTC day) remains only as the fallback when a capped task cannot be put back in
+  the queue.
+- **A suspended attempt finds its slot again.** New work leases a slot that another attempt of the pool was suspended
+  from only when no other free slot exists, so a restore lands on the path the session ran in and the session continues
+  (a restore to another path was a fresh start, `restart_reason=path_changed`).
+- **The attempt lifecycle is one table** (`lifecycle.TRANSITIONS`), asked by the store on every state write. A write on
+  an ended attempt is refused and recorded; a change between live states that the table does not name is applied and
+  recorded as `unlisted_transition`.
+- **A turn outcome recorded through Mesh's turn commands** (`continue_next`, `wait_for`) is read when the turn wrote no
+  marker line; the marker line stays the default form.
+- **A decision request is not closed under the addressee's running turn**: the close waits for the card's checkout to
+  end.
+- Side services (Agent Chat, the session-metadata receiver, the extension endpoint, the controller announcement) start
+  from `services.py`; behaviour unchanged.
+
+## 0.2.0 — 2026-11-10
+
+Versions 0.1.45-0.1.51 were not released; their changes are part of this one.
+
+- **Install without a drain.** `ops/install.py --source <tree>` copies a release into the catalog, loads the live config
+  with the new code, switches the launchd job and waits for the new process's receipt; without it the previous job
+  definition goes back. `--activate <version>` is the rollback. The attempt registry, leases, pause tokens and the config
+  are not touched.
+- **The launch guard no longer blocks a new release or a config change on a pending row.** A target enters with UNKNOWN or
+  unproven prompt-delivery rows still pending when the previously activated release on the same state declared the same
+  `CAPABILITY` (the delivery-journal contract); the rows are reconciled by the ordinary tick. The two narrower exceptions
+  (legacy bootstrap rows, additive repo delta) are covered by this and removed; `--previous-config` is accepted and unused.
+- **Slots of a bare base clone stay work trees.** With `extensions.worktreeConfig` on, `core.bare` moves to the base's
+  `config.worktree`; a base left in the broken form is repaired on the next lease.
+- **A card given back by another agent continues in the lane's own session** (same harness, native root and paths, card not
+  closed in between), with a start prompt that says another agent held it. Before, every such return was a fresh session.
+- **A question to a person is not woken by its age.** It ends on the answer or on the lifted gate.
+
+- An operation pause token (`pause.d`) that lands while a tick is already walking the queue now stops the later native starts and resumes: the pause is re-read between candidates and in `_spawn` before the launch probe and again before the one-time reservation is consumed. A denied launch returns the reservation, keeps the session and pending input, and sets no timer; the retry waits only for the token.
+
+- A card that returns to a lane routed to its alternate harness after a status-only roundtrip now resumes that lane's own session, as it already did for lanes on their
+  native harness. Before, every such return started a new session.
+
+- Optional external start order for a lane's ordinary work (default off). Per agent:
+  `queue_order_command` (argv), `queue_order_timeout_seconds` (3), `queue_order_cache_seconds` (60).
+  Applied in `_work_order` to the ordinary class only, with 2+ cards; any failure keeps the runner's own order.
+
+- Add the opt-in Gmail WAIT (`gmail_watch_v1`, `⏳ WAIT gmail:gmr_<12hex>`, `mesh-runner watch gmail register|status|cancel`): a read-only, header-only pull observer on Runner's own schedule that wakes the observer card exactly once per new matching inbound message, with a durable baseline/seen/receipt/outbox, idempotent comment delivery and no agent polling turns (docs/gmail-watch.md). Ships disabled.
+- Add operation-scoped pause tokens (`<state_dir>/pause.d/<name>/<token>`, host-wide `pause.d/_all/<token>`): an operation takes and releases only its own token, so removing it can never lift a foreign `pause/<name>` marker, config `paused` or another operation's token. Leftover tokens fail closed and are listed in status (`pause_tokens`) and metrics (`mesh_runner_agent_pause_tokens`).
+- Keep a `decision:@agent` question as a request when the addressee's live task itself waits on the asking card: converting it into a card wait formed a wait cycle whose notice asked for the same question again.
+- Tell a wait cycle once per card and per question on the other side: the runner remembers every cycle it already told a card (the last 64, kept across restarts and reassignment), so the same card wait declared again, replayed, or met again after the other side returns to an earlier question is kept without a new turn; a question not told before wakes once.
 
 ## 0.1.44
 

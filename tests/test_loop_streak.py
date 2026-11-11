@@ -58,6 +58,15 @@ class LoopBench(Bench):
     def looped(self):
         return [b for b in self.bodies() if "LOOP" in b]
 
+    def stopped(self, r):
+        """The loop ended the attempt: the task is back in the queue with the same agent and starts
+        again only on new input (the lead is not involved)."""
+        got = self.mesh.tasks[self.t["id"]]
+        self.assertEqual(got["assignee_id"], AGENT_ID)
+        self.assertEqual(self.mesh.category(got), "todo")
+        self.assertEqual((r._cap_wait(self.t["id"]) or {}).get("kind"), "loop")
+        self.assertEqual(r.store.by_state(self.agent.name, ("starting", "running", "ready", "waiting")), [])
+
     def turns(self):
         return len(calls(self.calls))
 
@@ -100,7 +109,7 @@ class LoopBench(Bench):
 
 
 class RunsOfNothing(LoopBench):
-    def test_a_run_of_empty_nexts_is_handed_up_at_the_limit(self):
+    def test_a_run_of_empty_nexts_is_stopped_at_the_limit(self):
         r = self.start("↻ NEXT")
         self.settle_all(r)
         self.assertEqual(self.turns(), 6)
@@ -108,9 +117,9 @@ class RunsOfNothing(LoopBench):
         self.assertEqual(len(banner), 1)
         self.assertIn("6 turns in a row without progress", banner[0])
         self.assertIn("NEXT", banner[0])
-        self.assertEqual(self.mesh.tasks[self.t["id"]]["assignee_id"], "agent-lead")
+        self.stopped(r)
 
-    def test_six_bounced_identical_waits_are_handed_up(self):
+    def test_six_bounced_identical_waits_are_stopped(self):
         # the runner sends the wait back each time (here the card-wait bounce, which has no
         # once-a-day limit) and the agent declares it again
         r = self.start("⏳ WAIT card:#00000002")
@@ -120,7 +129,7 @@ class RunsOfNothing(LoopBench):
         banner = self.looped()
         self.assertEqual(len(banner), 1)
         self.assertIn("sent back by the runner and declared again", banner[0])
-        self.assertEqual(self.mesh.tasks[self.t["id"]]["assignee_id"], "agent-lead")
+        self.stopped(r)
 
     def test_a_wait_declared_again_in_a_turn_started_by_its_own_next_extends_it(self):
         r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
@@ -447,7 +456,7 @@ class Routing(CapBench):
         self.mesh = FakeMesh([self.t], max_concurrent=1)
         write_replies(self.replies, {self.t["id"][:8]: "↻ NEXT"})
 
-    def test_a_loop_follows_requeue_on_cap(self):
+    def test_a_loop_is_requeued_like_any_cap(self):
         self.agent.lead = "lead"
         r = self.runner(self.mesh)
         r._work_digest = lambda a: "same"
@@ -459,8 +468,8 @@ class Routing(CapBench):
         self.assertTrue(r._cap_wait(self.t["id"]))
         self.assertNotIn(self.t["id"], r._task_backoff)
 
-    def test_a_loop_without_a_lead_waits_for_a_comment_not_for_tomorrow(self):
-        self.cfg.requeue_on_cap = False
+    def test_a_loop_that_cannot_be_requeued_waits_for_a_comment_not_for_tomorrow(self):
+        self.requeue_unavailable()
         r = self.runner(self.mesh)
         r._work_digest = lambda a: "same"
         self.settle_all(r)
@@ -471,7 +480,7 @@ class Routing(CapBench):
         self.assertNotIn(self.t["id"], r._task_backoff)
 
     def test_a_lead_that_cannot_take_it_does_not_hold_it_until_tomorrow(self):
-        self.cfg.requeue_on_cap = False
+        self.requeue_unavailable()
         self.agent.lead = "lead"
         r = self.runner(self.mesh)
         r._work_digest = lambda a: "same"

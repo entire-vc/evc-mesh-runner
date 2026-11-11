@@ -37,6 +37,10 @@ LAUNCH_MODES = ("interactive", "headless")
 SESSION_PREFIX = "mr-"
 DRIVER = Path(__file__).with_name("tui_driver.py")
 HOOK = Path(__file__).with_name("tui_hook.py")
+# PreToolUse hook of a Claude session whose working copies moved (see path_guard). The runner names the
+# window's map file in this variable of the driver's environment; the driver then installs the hook.
+GUARD = Path(__file__).with_name("path_guard.py")
+PATH_GUARD_ENV = "_MESH_RUNNER_PATH_GUARD"
 REAP_EVERY_SECONDS = 60
 CHAT_PREFIX = "chat-"                  # windows of chat sessions (see chat_delivery.window_key)
 # how long a turn's prompt waits for the session's running background agents (see tui_driver)
@@ -108,7 +112,7 @@ def write_delivery(directory: Path, key: str, data: dict) -> None:
 
 def forget(directory: Path, key: str) -> None:
     """Drop everything the runner kept for one window."""
-    for suffix in (".json", ".events.jsonl", ".settings.json", ".env", ".prompt", ".progress.json"):
+    for suffix in (".json", ".events.jsonl", ".settings.json", ".env", ".prompt", ".progress.json", ".moves.json"):
         (directory / f"{key}{suffix}").unlink(missing_ok=True)
 
 
@@ -190,6 +194,21 @@ class Tmux:
             s, _, w = line.partition("\t")
             if s.startswith(SESSION_PREFIX) and w:
                 out.append((s, w))
+        return out
+
+    def panes_strict(self) -> dict[tuple[str, str], bool] | None:
+        """(session, window) -> pane alive of every runner window; None when tmux could not be read
+        (as in ``windows_strict``: an unreadable list is not an empty one)."""
+        res = self.run("list-windows", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_dead}")
+        if res.returncode != 0:
+            gone = "no server running" in res.stderr or (
+                "error connecting to" in res.stderr and "No such file or directory" in res.stderr)
+            return {} if gone else None
+        out = {}
+        for line in res.stdout.splitlines():
+            s, w, dead = (line.split("\t") + ["", ""])[:3]
+            if s.startswith(SESSION_PREFIX) and w:
+                out[(s, w)] = dead.strip() != "1"
         return out
 
     def windows_strict(self) -> list[tuple[str, str]] | None:

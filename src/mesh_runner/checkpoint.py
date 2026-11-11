@@ -471,7 +471,7 @@ def find_excludes(source: Path, names: tuple) -> list:
         return []
     r = _run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
     if r.returncode:
-        raise WorkspaceError('checkpoint: cannot list tracked files')
+        raise _CheckpointListError('tracked', 'ls-files', r)
     tracked = set()  # tracked directories, and gitlinks (a submodule's own files are not listed here)
     for item in r.stdout.split(b'\0'):
         if not item:
@@ -576,6 +576,7 @@ _SLIM_GIT_ERRORS = (
     (('bad object', 'unable to read', 'missing', 'not a valid', 'could not read', 'did not receive',
       'packfile', 'pack file', 'loose object', 'corrupt', 'invalid object', 'unable to parse'), 'object-unreadable'),
     (('not a git repository',), 'not-a-repository'),
+    (('this operation must be run in a work tree',), 'not-a-work-tree'),
     (('unknown revision', 'ambiguous argument', 'bad revision', 'invalid reference'), 'revision-unknown'),
 )
 SLIM_REASONS = frozenset({kind for _, kind in _SLIM_FIXED} | {'git-' + kind for _, kind in _SLIM_GIT_ERRORS}
@@ -583,13 +584,33 @@ SLIM_REASONS = frozenset({kind for _, kind in _SLIM_FIXED} | {'git-' + kind for 
 _GIT_MESSAGE = re.compile(r'git (\S+)(?: .*?)? in .*?: (.*)\Z', re.S)
 
 
+class _CheckpointListError(WorkspaceError):
+    """Keep the failing operation/exit and a finite cause, never raw Git stderr."""
+
+    def __init__(self, kind: str, command: str, result: subprocess.CompletedProcess):
+        said = result.stderr.decode('utf-8', 'replace').lower()
+        reason = next((kind for fragments, kind in _SLIM_GIT_ERRORS
+                       if any(fragment in said for fragment in fragments)), 'other')
+        self.reason = 'git-' + reason
+        self.command = command
+        # A process exit status: a small integer (negative = killed by that signal).
+        code = result.returncode
+        self.exit = code if isinstance(code, int) and -255 <= code <= 255 else None
+        super().__init__(f'checkpoint: cannot list {kind} files: git={command} '
+                         f'exit={result.returncode} reason={self.reason}')
+
+
 def _mark(stage: str) -> None:
     _TRACE.stage = stage
 
 
 def slim_failure_cause(error: Exception, stage: str | None = None) -> dict:
-    """{'reason', 'stage', 'git'} of a failed slim capture: finite allowlisted values only, never
-    exception text, paths or command output. `git` is the failing git subcommand, or None."""
+    """{'reason', 'stage', 'git', 'exit'} of a failed slim capture: finite allowlisted values only,
+    never exception text, paths or command output. `git` is the failing git subcommand, or None;
+    `exit` is its exit status when the failure carries one, or None."""
+    if isinstance(error, _CheckpointListError):
+        return {'reason': error.reason, 'stage': stage if stage in SLIM_STAGES else 'unknown',
+                'git': error.command, 'exit': error.exit}
     message = str(error)
     reason, command = 'other', None
     lowered = message.lower()
@@ -608,7 +629,12 @@ def slim_failure_cause(error: Exception, stage: str | None = None) -> dict:
         reason = 'timeout'
     stage = stage if stage in SLIM_STAGES else 'unknown'
     reason = reason if reason in SLIM_REASONS else 'other'
-    return {'reason': reason, 'stage': stage, 'git': command}
+    return {'reason': reason, 'stage': stage, 'git': command, 'exit': None}
+
+
+def _exit_suffix(cause: dict) -> str:
+    code = cause.get('exit')
+    return f' exit={code}' if isinstance(code, int) else ''
 
 
 def _slim_failure_reason(error: WorkspaceError) -> str:
@@ -666,7 +692,7 @@ def _status_entries(source: Path) -> list:
     r = _run(['git', '-C', str(source), 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
                        capture_output=True)
     if r.returncode:
-        raise WorkspaceError('checkpoint: cannot list changed files')
+        raise _CheckpointListError('changed', 'status', r)
     parts = r.stdout.split(b'\0')
     out, i = [], 0
     while i < len(parts):
@@ -689,7 +715,7 @@ def find_ignored(source: Path, covered: list) -> list:
     r = _run(['git', '-C', str(source), 'ls-files', '-z', '--others', '--ignored', '--exclude-standard',
                         '--directory'], capture_output=True)
     if r.returncode:
-        raise WorkspaceError('checkpoint: cannot list ignored files')
+        raise _CheckpointListError('ignored', 'ls-files', r)
     found = []
     for item in r.stdout.split(b'\0'):
         name = item.decode('utf-8', 'surrogateescape').rstrip('/')
@@ -729,7 +755,7 @@ def _delta_plan(source: Path, before: dict, excludes: list, ignored: list) -> di
             deleted.add(name)
     r = _run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
     if r.returncode:
-        raise WorkspaceError('checkpoint: cannot list tracked files')
+        raise _CheckpointListError('tracked', 'ls-files', r)
     tracked_dirs = set()
     for item in r.stdout.split(b'\0'):
         parts = Path(item.decode('utf-8', 'surrogateescape')).parts
@@ -837,7 +863,8 @@ class Checkpoints:
         # There the lease is kept instead (the slot stays where it is, the next suspend pass retries).
         if not _same_volume(source, self.root):
             self._log_slim_fallback(metadata, cause, 'lease-retained')
-            raise WorkspaceError(f"checkpoint: slim capture failed ({cause['stage']}/{cause['reason']}); "
+            raise WorkspaceError(f"checkpoint: slim capture failed ({cause['stage']}/{cause['reason']}"
+                                 f"{_exit_suffix(cause)}); "
                                  "a full copy would cross volumes; lease retained")
         path = self._create(key, source, metadata, slim=False, slim_failed=True, slim_failure=cause)
         self._log_slim_fallback(metadata, cause, 'full-form')
@@ -850,9 +877,12 @@ class Checkpoints:
             return text if re.fullmatch(r'[0-9a-f]{1,8}', text) else '-'
         repo = str(metadata.get('repo') or '')
         repo = repo if re.fullmatch(r'[A-Za-z0-9._-]{1,64}', repo) else '-'
-        log.warning("checkpoint slim fallback: agent=%s card=%s attempt=%s repo=%s stage=%s reason=%s git=%s outcome=%s",
+        code = cause.get('exit')
+        log.warning("checkpoint slim fallback: agent=%s card=%s attempt=%s repo=%s stage=%s reason=%s git=%s "
+                    "exit=%s outcome=%s",
                     self.root.name, ident(metadata.get('task')), ident(metadata.get('attempt')), repo,
-                    cause['stage'], cause['reason'], cause['git'] or '-', outcome)
+                    cause['stage'], cause['reason'], cause['git'] or '-',
+                    code if isinstance(code, int) else '-', outcome)
 
     def _create(self, key: str, source: Path, metadata: dict, slim: bool = False, slim_failed: bool = False,
                 slim_failure: dict | None = None) -> Path:
@@ -938,6 +968,8 @@ class Checkpoints:
                 manifest['slim_failure_stage'] = cause['stage']
                 if cause.get('git'):
                     manifest['slim_failure_git'] = cause['git']
+                if isinstance(cause.get('exit'), int):
+                    manifest['slim_failure_exit'] = cause['exit']
             if delta is not None:
                 manifest['delta'] = delta
                 manifest['stored_bytes'] = stored
@@ -997,6 +1029,7 @@ class Checkpoints:
             out.parent.mkdir(parents=True, exist_ok=True)
             if src.is_symlink():
                 os.symlink(os.readlink(src), out)
+                shutil.copystat(src, out, follow_symlinks=False)
             else:
                 _copy_file(src, out)
         for name in sorted(dirs, key=lambda n: -len(Path(n).parts)):

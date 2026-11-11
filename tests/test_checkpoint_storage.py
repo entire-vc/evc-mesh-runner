@@ -121,7 +121,7 @@ class CheckpointStorage(unittest.TestCase):
         lines = [l for l in logs.output if 'checkpoint slim fallback' in l]
         self.assertEqual(len(lines), 1)
         self.assertIn('agent=cp card=0f1e2d3c attempt=a1b2c3d4 repo=example-repo stage=verify-overlay '
-                      'reason=git-object-unreadable git=checkout-index outcome=full-form', lines[0])
+                      'reason=git-object-unreadable git=checkout-index exit=- outcome=full-form', lines[0])
         for leak in ('/private', 'secret', '0123abcd'):
             self.assertNotIn(leak, lines[0])
             self.assertNotIn(leak, (path / 'manifest.json').read_text())

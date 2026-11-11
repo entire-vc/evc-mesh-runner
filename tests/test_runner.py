@@ -54,6 +54,13 @@ class Bench(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def requeue_unavailable(self):
+        """A capped task could not be put back in the queue (the move to todo was refused), so the
+        caller keeps the hand-up path: to the lead, or held by the agent when nobody can take it."""
+        refused = mock.patch.object(AgentRunner, "_back_to_todo", return_value=False)
+        refused.start()
+        self.addCleanup(refused.stop)
+
     def tearDown(self):
         stuck = self.stop_live_groups()
         if stuck:
@@ -453,14 +460,22 @@ class Loop(Bench):
         r.tick()
         self.assertEqual(self.finish_turn(r).state, "ready")  # asked once, same session
         r.tick()
-        self.finish_turn(r)       # the second unreadable outcome exhausts the correction
-        self.assertEqual(self.states(r)[t["id"][:8]], "failed")
+        ended = self.finish_turn(r)       # the second unreadable outcome exhausts the correction
+        self.assertEqual((ended.state, ended.note), ("completed", "cap: requeued (no outcome)"))
         self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
         self.assertTrue(any("without a readable outcome" in c["body"] for c in mesh.comment_log[t["id"]]))
         self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")   # not left looking taken
         self.assertEqual(mesh.checkouts, {})
         r.tick()                                   # not retried while nobody wrote on the task
         self.assertEqual(r.store.by_state("builder", ("running", "starting")), [])
+        self.cfg.failed_cooldown_hours = 0          # time alone must not retry NO OUTCOME
+        mesh.add_comment(t["id"], "↻ NEXT: retry the same work", author=AGENT_ID)
+        r.store.db.close()
+        r = self.runner(mesh)                      # the hold survives restart and our own NEXT
+        for _ in range(3):
+            r.tick()
+            self.assertEqual(r.store.by_state("builder", ("running", "starting")), [])
+        self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
         mesh.add_comment(t["id"], "try again with the new spec", author="lead")
         r.tick()                                   # a new comment from someone else re-opens it
         self.assertEqual(len(r.store.by_state("builder", ("running", "starting"))), 1)
@@ -929,14 +944,18 @@ class ReviewFindings(Bench):
         started = time.time()
         self.settle_all(r, timeout=20)
         self.assertLess(time.time() - started, 15)
-        # The limit is 0 min, so the kill can land before the fake harness has passed its
-        # UserPromptSubmit hook (a slow interpreter start): the runner then rightly holds the
-        # turn as `unknown` (delivery unproven, no replay) instead of `failed`. Both mean the
-        # session was killed; `running` is the only wrong state. The `unknown` rows are not in
-        # states(), so read them directly.
-        attempts = {a.task8: a.state for a in r.store.by_state(self.agent.name, (
+        # Each killed turn ends without an outcome; the second in a row puts the task back in the
+        # queue. The limit is 0 min, so the kill can also land before the fake harness has passed
+        # its UserPromptSubmit hook (a slow interpreter start): the runner then rightly holds the
+        # turn as `unknown` (delivery unproven, no replay). Both mean the session was killed;
+        # `running` is the only wrong state. The `unknown` rows are not in states(), so read them
+        # directly.
+        attempts = {a.task8: a for a in r.store.by_state(self.agent.name, (
             "starting", "running", "waiting", "ready", "completed", "failed", "aborted", "unknown"))}
-        self.assertIn(attempts[t["id"][:8]], ("failed", "unknown"))
+        a = attempts[t["id"][:8]]
+        self.assertTrue(any(kind == "kill" and "turn exceeded" in detail for _, kind, detail in r.store.events(a.id)))
+        if a.state != "unknown":
+            self.assertEqual((a.state, a.note), ("completed", "cap: requeued (no outcome)"))
 
     def test_children_left_behind_are_killed_after_the_grace(self):
         t = task(1)
@@ -1222,7 +1241,8 @@ class Operations(Bench):
         self.settle_all(runner.agents[0])
         runner.tick()
         kinds = [json.loads(l)["kind"] for l in (self.cfg.state_dir / "events.jsonl").read_text().splitlines()]
-        self.assertEqual(kinds[:3], ["start", "prompt_native_result_recovered", "wait"])
+        # every settled turn records how it ended (outcome_source) before the outcome itself
+        self.assertEqual(kinds[:4], ["start", "prompt_native_result_recovered", "outcome_source", "wait"])
         self.assertIn('mesh_runner_attempts{agent="builder",state="waiting"} 1', self.cfg.metrics_file.read_text())
         self.assertTrue((self.cfg.state_dir / "status.json").exists())
 
@@ -1413,7 +1433,7 @@ class MeshEffects(Bench):
         self.assertEqual(mesh.created, [])
         self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))
 
-    def test_unreadable_declaration_is_quoted_back_then_the_task_goes_to_the_lead(self):
+    def test_unreadable_declaration_is_quoted_back_then_the_task_waits_for_new_input(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.agent.lead = "lead"
@@ -1426,9 +1446,11 @@ class MeshEffects(Bench):
         self.assertEqual(len(prompts_seen), 2)
         self.assertIn("⏳ WAIT card:soon-ish", prompts_seen[1])     # the agent sees what was wrong
         self.assertIn("⏳ WAIT card:#<8hex>", prompts_seen[1])      # and the forms that work
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)      # the second miss is not a give-up
         self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")
-        self.assertTrue(any("RUNNER GAVE UP" in c["body"] for c in mesh.comment_log[t["id"]]))
+        self.assertEqual((r._cap_wait(t["id"]) or {}).get("kind"), "no outcome")
+        self.assertTrue(any("NO OUTCOME" in c["body"] for c in mesh.comment_log[t["id"]]))
+        self.assertFalse(any("RUNNER GAVE UP" in c["body"] for c in mesh.comment_log[t["id"]]))
 
     def test_resume_shows_every_comment_since_the_last_turn_not_only_the_wake_event(self):
         t = task(1)
@@ -1453,7 +1475,6 @@ class MeshEffects(Bench):
     def test_an_address_on_someone_elses_task_becomes_a_request_card(self):
         mine, theirs = task(1), task(2, assignee_id="agent-lead")
         mesh = FakeMesh([mine, theirs], max_concurrent=1)
-        self.cfg.mention_requests = True
         # recent rows: older than the lookback on a fresh start they would be history
         at = lambda minutes: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat()  # noqa: E731
         mesh.mention_rows = [
@@ -1484,7 +1505,6 @@ class MeshEffects(Bench):
     def test_a_failed_mark_seen_never_files_the_card_twice(self):
         theirs = task(2, assignee_id="agent-lead")
         mesh = FakeMesh([theirs], max_concurrent=1)
-        self.cfg.mention_requests = True
         mesh.mention_rows = [{"comment_id": "c1", "task_id": theirs["id"], "author_id": "agent-lead",
                               "author_name": "lead", "comment_body": "@builder. please look",
                               "extracted_at": "2099-01-01T00:00:00Z", "mentioned_slug": "builder"}]
@@ -1504,7 +1524,6 @@ class MeshEffects(Bench):
     def test_a_reply_inside_a_conversation_the_agent_is_in_files_nothing(self):
         theirs = task(2, assignee_id="agent-lead")
         mesh = FakeMesh([theirs], max_concurrent=1)
-        self.cfg.mention_requests = True
         mesh.add_comment(theirs["id"], "@reviewer: could you check?", author=AGENT_ID)   # builder asked first
         mesh.mention_rows = [{"comment_id": "c9", "task_id": theirs["id"], "author_id": "agent-reviewer",
                               "author_name": "reviewer", "comment_body": "@builder done, looks fine",
@@ -1523,11 +1542,11 @@ class MeshEffects(Bench):
         self.settle_all(r)
         self.assertEqual(calls(self.calls)[0]["effort"], "low")
 
-    def test_a_shipped_blocker_no_longer_blocks(self):
+    def test_a_shipped_blocker_releases_only_a_shipped_edge(self):
         blocker, t = task(9, cat="review"), task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         mesh.tasks[blocker["id"]] = blocker
-        mesh.deps[t["id"]] = [{"depends_on_task_id": blocker["id"], "dependency_type": "blocks"}]
+        mesh.deps[t["id"]] = [{"depends_on_task_id": blocker["id"], "dependency_type": "blocks", "condition": "shipped"}]
         r = self.runner(mesh)
         self.assertTrue(r.hold_reason(t, "work").startswith("blocked by"))
         blocker["is_shipped"] = True
@@ -1735,7 +1754,7 @@ class MeshEffects(Bench):
         self.assertFalse(r._start_one(review))
         self.assertTrue(r.store.mark("builder", t["id"], "review_gate_hold")[0])
 
-    def test_turn_budget_routes_the_task_to_the_lead(self):
+    def test_turn_budget_puts_the_task_back_in_the_queue(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
@@ -1748,7 +1767,9 @@ class MeshEffects(Bench):
             if turn < 2:
                 self.assertEqual(finished.state, "ready")
                 r.tick()
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
+        self.assertEqual(finished.note, "cap: requeued (turn budget)")
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)      # the lead is not involved
+        self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")
         self.assertEqual(len(calls(self.calls)), 3)
         self.assertTrue(any("TURN CAP" in c["body"] for c in mesh.comment_log[t["id"]]))
 
@@ -1914,7 +1935,8 @@ class FastWaits(Bench):
         r._last_wake_check.clear()
         r.tick()
         self.settle_all(r)
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
+        self.assertEqual((r._cap_wait(t["id"]) or {}).get("kind"), "turn budget")
+        self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")
         self.assertTrue(any("1 steps" in c["body"] for c in mesh.comment_log[t["id"]]))
 
 
@@ -1983,8 +2005,8 @@ class FastWaits(Bench):
         from mesh_runner.config import RunnerConfig, load
         d = RunnerConfig(mesh_url="x", state_dir=Path("/tmp"), agents=[])
         self.assertEqual((d.failed_cooldown_hours, d.wait_first_recheck_hours, d.max_wait_hours,
-                          d.time_wait_reason_after_minutes, d.review_unstartable_retry_minutes,
-                          d.review_refeed_hours), (0.5, 2.0, 6.0, 60.0, 60.0, 4.0))
+                          d.review_unstartable_retry_minutes,
+                          d.review_refeed_hours), (0.5, 2.0, 6.0, 60.0, 4.0))
         with tempfile.TemporaryDirectory() as tmp:
             key = Path(tmp) / "k"
             key.write_text("secret\n")
@@ -1994,8 +2016,8 @@ class FastWaits(Bench):
                            f'[[agents]]\nname = "a"\nkey_file = "{key}"\nharness = "claude"\nprofile_dir = "{tmp}"\n')
             c = load(cfg)
         self.assertEqual((c.failed_cooldown_hours, c.wait_first_recheck_hours, c.max_wait_hours,
-                          c.time_wait_reason_after_minutes, c.review_unstartable_retry_minutes,
-                          c.review_refeed_hours), (0.5, 2.0, 6.0, 60.0, 60.0, 4.0))
+                          c.review_unstartable_retry_minutes,
+                          c.review_refeed_hours), (0.5, 2.0, 6.0, 60.0, 4.0))
 
     def test_a_failed_task_is_retried_after_half_an_hour_without_a_comment(self):
         t = task(1)
@@ -2006,6 +2028,21 @@ class FastWaits(Bench):
         old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=31)
         self.assertTrue(r._failed_recently(t["id"], recent))
         self.assertFalse(r._failed_recently(t["id"], old))
+
+    def test_legacy_no_outcome_failures_need_input_but_other_failures_keep_the_cooldown(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        self.cfg.failed_cooldown_hours = 0
+        a = r.store.create("builder", t["id"], "claude", "t")
+        for note in ("gave up: the session ended without a readable outcome 3 turns in a row",
+                     "gave up: 2 turns in a row ended without a readable outcome",
+                     "no readable outcome: 3 turns in a row ended without a readable outcome"):
+            with self.subTest(note=note):
+                r.store.update(a, state="failed", note=note)
+                self.assertIn("no readable outcome", r.hold_reason(dict(t), "work"))
+        r.store.update(a, state="failed", note="harness executable unavailable")
+        self.assertEqual(r.hold_reason(dict(t), "work"), "")
 
     def test_an_expired_review_hold_does_not_come_back_from_the_cache(self):
         t = task(1, cat="review")
@@ -2050,15 +2087,17 @@ class FastWaits(Bench):
         self.assertNotIn("rechecks", a.wait)
         self.assertEqual(r.store.outcomes_today(self.agent.name, t["id"]).get("wait"), 1)
 
-    def test_a_persons_ask_is_rechecked_only_after_a_day(self):
+    def test_a_persons_ask_is_not_rechecked_by_age(self):
         from mesh_runner.wake import check
         w = {"kind": "blocking", "handle": "person", "since": "2026-10-18T00:00:00+00:00",
              "started": "2026-10-18T00:00:00+00:00"}
         gated = {"human_gate": True}
         at = lambda h: dt.datetime(2026, 10, 18, tzinfo=dt.timezone.utc) + dt.timedelta(hours=h)  # noqa: E731
         kw = dict(max_wait=dt.timedelta(hours=6), first_recheck=dt.timedelta(hours=2))
-        self.assertEqual(check(None, None, None, gated, dict(w), "me", [], at(7), **kw), "")
-        self.assertIn("re-check", check(None, None, None, gated, dict(w), "me", [], at(25), **kw))
+        for hours in (7, 25, 24 * 14):
+            self.assertEqual(check(None, None, None, gated, dict(w), "me", [], at(hours), **kw), "")
+        self.assertEqual(check(None, None, None, {"human_gate": False}, dict(w), "me", [], at(25), **kw),
+                         "the human gate was lifted")
 
     def test_a_daily_claim_is_taken_once(self):
         r = self.runner(FakeMesh([task(1)], max_concurrent=1))
@@ -2365,24 +2404,6 @@ class Hardening(Bench):
         self.assertIn(a["id"], r._gate_hold)
         self.assertNotIn(b["id"], r._gate_hold)    # not asked: the pool answer holds for all
 
-    def test_start_cap_routes_the_task_to_the_lead(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.daily_start_cap = 2
-        write_replies(self.replies, {t["id"][:8]: "handed on"})
-        r = self.runner(mesh)
-        for _ in range(2):                          # two starts, each ends without an outcome -> released
-            r.tick()
-            self.settle_all(r)
-            mesh.tasks[t["id"]]["assignee_id"] = AGENT_ID
-            mesh.add_comment(t["id"], "again", author="someone")
-            r._task_backoff.clear()
-        self.agent.lead = "lead"
-        r.tick()                                    # the third start is the cap
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
-        self.assertTrue(any("START CAP" in c["body"] for c in mesh.comment_log[t["id"]]))
-        self.assertEqual(r.store.starts_today("builder", t["id"]), 2)
-
     def test_decision_request_is_not_bound_by_the_daily_start_cap(self):
         # one request card is reopened for every new question of the same requester, so each
         # answer is a fresh start; a cap would leave the requester waiting for an answer
@@ -2401,7 +2422,7 @@ class Hardening(Bench):
         self.assertEqual(r.store.starts_today("builder", t["id"]), 3)
         self.assertFalse(any("START CAP" in c["body"] for c in mesh.comment_log[t["id"]]))
 
-    def test_compaction_cap_hands_the_task_up(self):
+    def test_compaction_cap_stops_the_task(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.max_compactions = 2
@@ -2410,7 +2431,9 @@ class Hardening(Bench):
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
+        self.assertEqual((r._cap_wait(t["id"]) or {}).get("kind"), "compaction cap")
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)      # back in the queue, not handed up
+        self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")
         self.assertTrue(any("COMPACTION CAP" in c["body"] for c in mesh.comment_log[t["id"]]))
 
     def _gate_scripts(self, verdicts: dict):
@@ -2635,6 +2658,7 @@ class Hardening(Bench):
         self.assertEqual(calls(self.calls)[0]["model"], "")
 
     def test_project_lead_map_is_used_when_the_agent_has_no_lead(self):
+        self.requeue_unavailable()
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 1
@@ -2665,6 +2689,7 @@ class Hardening(Bench):
         self.assertEqual([x["name"] for x in leads], ["00000042"])
 
     def test_refused_hand_off_is_reported_as_such(self):
+        self.requeue_unavailable()
         t = task(1, pinned=True)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 1
@@ -3254,7 +3279,12 @@ class SkipStates(Bench):
 
 class HandOffs(Bench):
     """A task handed up must not circle: a capped lead is skipped, a task that came back
-    stays, a lead the hand-off cannot reach is said so."""
+    stays, a lead the hand-off cannot reach is said so. A cap hands a task up only when it could
+    not be put back in the queue, so that is the situation here."""
+
+    def setUp(self):
+        super().setUp()
+        self.requeue_unavailable()
 
     def lead_agent(self, name, lead=""):
         self.cfg.agents.append(AgentConfig(name=name, key="k", harness="claude", profile_dir=self.root,
@@ -3486,6 +3516,86 @@ class Holds(Bench):
                                 f"INFO:mesh_runner:builder: #{t['id'][:8]} held: label park:later"])
 
 
+class ParkedCard(Bench):
+    """A card parked with ``park:*`` (todo + label, the lead's ``park:external``) is held by the
+    start path; the turn end and the resume path must honour the same label."""
+
+    def _unpark_and_start_once(self, r, t, first):
+        mark = json.loads(r.store.mark('builder', t['id'], 'ownership_loss')[0])
+        self.assertEqual((mark['attempt'], mark['session_id']), (first.id, first.session_id))
+        r.tick()                                                  # still parked: held by the start path
+        from mesh_runner.effects import skip_state
+        reason = r.hold_reason(dict(r.mesh.tasks[t['id']], _mode='work'), 'work')
+        self.assertEqual((reason, skip_state(reason, 'builder')['reason_code']), ('label park:external', 'park'))
+        self.assertEqual([x.id for x in r.store.by_state('builder', ('starting', 'running', 'ready', 'waiting'))], [])
+        before = len(calls(self.calls))
+        r.mesh.tasks[t['id']]['labels'] = []
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        self.settle_all(r)
+        later = [x for x in r.store.by_state('builder', ('waiting', 'running', 'starting', 'ready', 'completed'))
+                 if x.task_id == t['id'] and x.id != first.id]
+        self.assertEqual(len(later), 1)                           # exactly one start after the label is gone
+        self.assertEqual(later[0].session_id, first.session_id)
+        ret = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'ownership_return']
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('resume', 'ownership_return_same_lane'))
+        self.assertEqual([c['resume'] for c in calls(self.calls)[before:]], [True])
+
+    def test_turn_that_parks_the_card_is_its_outcome(self):
+        t = task(91)
+        write_replies(self.replies, {t['id'][:8]: 'parked until the next op_pause',
+                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 x'})
+        r = self.runner(FakeMesh([t]))
+        with self.assertLogs('mesh_runner', 'INFO') as logs:
+            r.tick()
+            r.mesh.tasks[t['id']]['labels'] = ['park:external']   # the turn moved it to todo + park:external
+            first = self.finish_turn(r)
+        self.assertEqual(first.state, 'completed')
+        self.assertTrue(first.note.startswith('parked: label park:external'), first.note)
+        kinds = [k for _, k, _ in r.store.events(first.id)]
+        self.assertIn('parked', kinds)
+        self.assertNotIn('no_outcome', kinds)
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False])   # no "ended without an outcome" turn
+        self.assertTrue(any('held: label park:external (turn end' in l for l in logs.output))
+        self._unpark_and_start_once(r, t, first)
+
+    def test_next_on_a_parked_card_does_not_resume_it(self):
+        t = task(92)
+        write_replies(self.replies, {t['id'][:8]: '↻ NEXT',
+                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 x'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        r.mesh.tasks[t['id']]['labels'] = ['park:external']
+        first = self.finish_turn(r)
+        self.assertEqual(first.state, 'completed')
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False])
+        self._unpark_and_start_once(r, t, first)
+
+    def test_ready_attempt_of_a_card_parked_meanwhile_is_not_resumed(self):
+        t = task(93)
+        write_replies(self.replies, {t['id'][:8]: '↻ NEXT',
+                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 x'})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        first = self.finish_turn(r)
+        self.assertEqual(first.state, 'ready')                    # NEXT before the park
+        r.mesh.tasks[t['id']]['labels'] = ['park:external']
+        with self.assertLogs('mesh_runner', 'INFO') as logs:
+            r.tick()
+        first = r.store.get(first.id)
+        self.assertEqual(first.state, 'completed')
+        self.assertEqual([json.loads(d)['at'] for _, k, d in r.store.events(first.id) if k == 'parked'], ['resume'])
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False])
+        self.assertTrue(any('held: label park:external (resume' in l for l in logs.output))
+        self._unpark_and_start_once(r, t, first)
+
+    def test_start_path_still_holds_a_parked_card(self):
+        t = task(94, labels=['park:external'])
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.assertEqual(r.store.by_state('builder', ('starting', 'running', 'ready', 'waiting', 'completed')), [])
+        self.assertEqual(calls(self.calls), [])                   # the start path holds it, as before
+
+
 class Limits(Bench):
     def test_limit_switch_command_retries_at_once_instead_of_pausing(self):
         t = task(1)
@@ -3532,6 +3642,14 @@ class Plan(Bench):
 
 
 class CappedEventObservation(Bench):
+    """A capped task that could neither be put back in the queue nor handed to a lead stays with
+    its agent as a failed attempt; the wait it declared is still observed and its event (or an
+    addressed instruction of the project lead) grants one more turn."""
+
+    def setUp(self):
+        super().setUp()
+        self.requeue_unavailable()
+
     def unresolved_card(self):
         blocker = task(2, assignee_id="someone-else")
         self.cfg.daily_wait_budget = 0
@@ -4029,14 +4147,16 @@ class WaitWorkspaceCheckpoint(Bench):
         self.assertEqual([(l['intent'], l['restart_reason']) for k, l in evs if k == 'launch'][-2:],
                          [('resume', ''), ('start', 'session_missing')])
 
-    def test_ownership_return_starts_new_attempt_without_foreign_session(self):
+    def test_card_given_back_by_another_agent_continues_in_the_lanes_own_session(self):
+        # work -> another agent holds the card (a review returned with remarks, a lead's look) -> back.
+        # Returning ownership must resume the existing session rather than start a fresh one.
         t = task(73)
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work',
+                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
         r = self.runner(FakeMesh([t]))
         r.tick()
         self.settle_all(r)
         first = r.store.by_state('builder', ('waiting',))[0]
-        # Another agent works the card meanwhile: this lane's attempt ends, its session is not carried back.
         r.mesh.tasks[t['id']]['assignee_id'] = 'agent-lead'
         r.tick()
         self.assertEqual(r.store.get(first.id).state, 'completed')
@@ -4049,15 +4169,36 @@ class WaitWorkspaceCheckpoint(Bench):
         self.assertTrue(later, 'ownership return admitted no new attempt')
         launches = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'launch']
         self.assertEqual([(l['intent'], l['restart_reason'], l['attempt']) for l in launches[:1]],
-                         [('start', 'ownership_return', later[0].id)])   # explicit reason, not first_start
+                         [('resume', '', later[0].id)])
         self.assertEqual(launches[0]['turn'], 1)
-        self.assertNotEqual(later[0].session_id, first.session_id)
+        self.assertEqual(later[0].session_id, first.session_id)          # its own session, nobody else's
+        self.assertTrue(calls(self.calls)[-1]['resume'])
+        self.assertIn('after another agent held it', calls(self.calls)[-1]['prompt'])
         loss = [json.loads(d) for _, k, d in r.store.events(first.id) if k == 'ownership_loss']
         self.assertEqual((loss[0]['observed_assignee'], loss[0]['task']), ('agent-lead', t['id']))
         self.assertNotIn('session_id', loss[0])
         ret = [json.loads(d) for _, k, d in r.store.events(later[0].id) if k == 'ownership_return']
-        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['previous_attempt'], ret[0]['observed_assignee']),
-                         ('start', 'ownership_return', first.id, 'agent-lead'))
+        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason'], ret[0]['previous_attempt'],
+                          ret[0]['observed_assignee']),
+                         ('resume', 'ownership_return_other_owner', '', first.id, 'agent-lead'))
+
+    def test_card_closed_while_another_agent_held_it_starts_fresh(self):
+        def closed(r):
+            note = json.loads(r.store.mark('builder', task(86)['id'], 'ownership_loss')[0])
+            note['observed_status'] = 'done'
+            r.store.mark('builder', task(86)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(86, holder='agent-lead', mutate=closed)
+        self.assertNotEqual(later.session_id, first.session_id)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'ownership_return'))
+        self.assertEqual((launches[0]['intent'], launches[0]['restart_reason']), ('start', 'ownership_return'))
+
+    def test_card_given_back_into_other_paths_starts_fresh(self):
+        def other_paths(r):
+            note = json.loads(r.store.mark('builder', task(87)['id'], 'ownership_loss')[0])
+            note['workspaces'] = ['/elsewhere']
+            r.store.mark('builder', task(87)['id'], 'ownership_loss', json.dumps(note))
+        r, first, later, ret, launches = self._return_roundtrip(87, holder='agent-lead', mutate=other_paths)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'path_changed'))
 
     def _return_roundtrip(self, n, holder=None, mutate=None):
         t = task(n)
@@ -4270,7 +4411,7 @@ class WaitWorkspaceCheckpoint(Bench):
             r._suspend_waiting(a)
             self.assertEqual(bool(r.pool.leased_to(a.id)), keeps, wait)
             r.pool.release(a.id)
-            r.store.update(a, state='done')
+            r.store.update(a, state='completed')
 
     def test_partial_multirepo_capture_reconciles_after_restart_before_spawn(self):
         from unittest.mock import patch

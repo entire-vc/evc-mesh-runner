@@ -700,6 +700,9 @@ class EditorBridge:
         req_hash, attempt = request_hash_of(env), env["attempt"] - 1      # the ledger counts attempts from 0
         budget = sha256(canonical([env["project_id"], env["publication_id"], env["publication_version"]]))
         with self.ledger.lock:
+            # The controller closes SQLite under this lock after draining; authentication may have outlived that stop.
+            if self.closed:
+                return 503, {"error": "shutting_down"}
             row = self.ledger.get(idem)
             if row is not None:
                 if row[2] != req_hash:

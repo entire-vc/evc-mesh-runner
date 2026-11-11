@@ -125,12 +125,17 @@ class UnknownRestore(Bench):
         before = r.store.get(a.id).wait
         source = Path(launch_guard.__file__).resolve().parents[2]
         self.assertTrue(launch_guard.pending(self.cfg.state_dir))
-        self.assertTrue(launch_guard.legacy_rows_covered(self.cfg.state_dir, source))
+        # The target's own guard takes the row over from a release with the same journal contract;
+        # the row is neither settled nor changed by that.
+        binding = {'version': 1, 'release': str(source), 'tree': 'new', 'config': 'c', 'config_sha256': 's',
+                   'state': str(self.cfg.state_dir)}
+        previous = dict(binding, tree='old')
+        self.assertTrue(launch_guard.journal_compatible(self.cfg.state_dir, binding, previous, source))
         self.assertTrue(launch_guard.pending(self.cfg.state_dir))
         self.assertEqual(r.store.get(a.id).wait, before)
-        self.windows = [(interactive.session_name('builder'), a.id)]
-        self.assertFalse(launch_guard.legacy_rows_covered(self.cfg.state_dir, source))
-        self.assertFalse(launch_guard.legacy_rows_covered(self.cfg.state_dir, source.parent))
+        # ... and not from another state, nor for a target this guard does not belong to
+        self.assertFalse(launch_guard.journal_compatible(self.cfg.state_dir, binding, dict(previous, state='/elsewhere'), source))
+        self.assertFalse(launch_guard.journal_compatible(self.cfg.state_dir, binding, previous, source.parent))
 
     def test_crash_after_reserved_journal_before_outbox_retries_once(self):
         import os

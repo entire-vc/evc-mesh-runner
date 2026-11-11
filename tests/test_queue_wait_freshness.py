@@ -13,7 +13,7 @@ from mesh_runner.store import Store, iso
 from mesh_runner.selection import parse_time
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import Runner
-from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT, write_replies
+from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT, write_replies, calls
 from test_runner import Bench
 
 NOW = 1792500000
@@ -43,7 +43,6 @@ def proof(req, verified=NOW):
 class QueueWait(Bench):
     def setUp(self):
         super().setUp()
-        self.cfg.queue_wait_freshness_v1 = True
         clock = mock.patch('mesh_runner.runner.time.time', return_value=NOW)
         clock.start()
         self.addCleanup(clock.stop)
@@ -610,17 +609,11 @@ class QueueWait(Bench):
         self.assertEqual(q.publish(r.store,path,receipt_path),persisted)
         self.assertIsNotNone(q.pending(r.store,a,a.wait['queue_request'],r.agent_id))
 
-    def test_default_off_and_ordinary_timer_have_no_queue_intent(self):
-        r,a,t=self.setup_wait()
-        self.cfg.queue_wait_freshness_v1=False
-        r._wake_one(a)
-        self.assertNotEqual(a.wait.get('kind'),'queue')
-        self.assertEqual(r.store.db.execute('SELECT count(*) FROM marks WHERE key LIKE ?', (q.PREFIX+'%',)).fetchone()[0],0)
-        self.cfg.queue_wait_freshness_v1=True
-        r.store.update(a,state='completed')
+    def test_ordinary_timer_has_no_queue_intent(self):
         r,b,t=self.setup_wait(labels=[],description='queue is empty')
         r._wake_one(b)
         self.assertNotEqual(b.wait.get('kind'),'queue')
+        self.assertEqual(r.store.db.execute('SELECT count(*) FROM marks WHERE key LIKE ?', (q.PREFIX+'%',)).fetchone()[0],0)
 
     def test_private_files_reject_symlink_world_readable_and_oversized(self):
         path=self.root/'state.json'
@@ -920,12 +913,13 @@ class FirstMove(QueueWait):
             return real_iso(*args)
 
         write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window'})
+        r.store.update(a, state='ready')                  # the wake: a waiting attempt is spawned from ready
         with mock.patch('mesh_runner.runner.iso', side_effect=clock), \
                 mock.patch('mesh_runner.runner.now', side_effect=lambda: at or dt.datetime.now(dt.timezone.utc)):
             if spawn_error:
-                self.refused_spawn(r, a, ('waiting',))
+                self.refused_spawn(r, a, ('ready',))
                 return r, r.store.get(a.id)
-            self.native_delivery(r, a, prompt=f'#{t["id"][:8]} prompt', expect=('waiting',))
+            self.native_delivery(r, a, prompt=f'#{t["id"][:8]} prompt', expect=('ready',))
         a = r.store.get(a.id)
         r.settle(a)
         return r, r.store.get(a.id)
@@ -944,6 +938,37 @@ class FirstMove(QueueWait):
         self.at(r, a)
         self.assertEqual(a.state, 'ready')
         self.assertIn('queue refill', a.wake_text)
+
+    def test_refill_resumes_the_same_session_once_and_repeat_source_adds_no_second_refill(self):
+        # the first turn was spawned BEFORE the request (NOW-600), so the new source is owed one refill
+        r, a = self.spawn_then_settle(spawn_clock=NOW - 1200)
+        t = a.task_id
+        write_replies(self.replies, {t[:8]: f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window',
+                                     t[:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window'})
+        first = calls(self.calls)
+        self.assertEqual([c['resume'] for c in first], [False])
+        sid = first[0]['sid']
+        self.assertTrue(sid)
+        self.assertEqual(a.session_id, sid)
+        self.at(r, a)
+        self.assertEqual(a.state, 'ready')
+        self.assertIn('queue refill', a.wake_text)
+        r._resume_hold.clear()
+        r.resume_ready(1)                                   # the real refill spawn
+        a = r.store.get(a.id)
+        self.assertEqual(r.procs[a.id].wait(timeout=10), 0)
+        self.assertTrue(r._reconcile_interactive_prompt(a))
+        r.settle(r.store.get(a.id))
+        a = r.store.get(a.id)
+        both = calls(self.calls)
+        self.assertEqual([c['resume'] for c in both], [False, True])   # exactly one refill turn
+        self.assertEqual(both[1]['sid'], sid)                          # in the same session
+        self.assertEqual(a.session_id, sid)
+        self.assertTrue(q.delivered(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
+        for seconds in (600, 3600):                                    # the same source again: no second refill
+            self.at(r, a, seconds)
+            self.assertEqual(a.state, 'waiting')
+        self.assertEqual(len(calls(self.calls)), 2)
 
     def test_failed_spawn_leaves_no_read_evidence(self):
         r, a = self.spawn_then_settle(spawn_error=OSError('not started'))
@@ -1038,7 +1063,6 @@ class ExplicitQueueWait(Bench):
     """`⏳ WAIT queue:#<card>`: an event wait on the card's own machine source, no timer."""
     def setUp(self):
         Bench.setUp(self)
-        self.cfg.queue_wait_freshness_v1 = True
         clock = mock.patch('mesh_runner.runner.time.time', return_value=NOW)
         clock.start()
         self.addCleanup(clock.stop)
@@ -1065,8 +1089,7 @@ class ExplicitQueueWait(Bench):
         self.assertEqual(q.request(a.wait['queue_request'])['task_id'], t['id'])
         self.assertEqual(json.loads(r.store.mark(a.agent, a.task_id, q.key(a.wait['queue_request']))[0])['state'], 'pending')
 
-    def sent_back(self, line, flag=True, **changes):
-        self.cfg.queue_wait_freshness_v1 = flag
+    def sent_back(self, line, **changes):
         r, a, t = self.settle_line(line, **changes)
         self.assertNotEqual(a.wait.get('kind'), 'queue')
         self.assertFalse(r.store.db.execute("SELECT 1 FROM marks WHERE key LIKE 'queue_wait:%'").fetchall())
@@ -1076,9 +1099,6 @@ class ExplicitQueueWait(Bench):
 
     def test_other_card_id_is_sent_back(self):
         self.sent_back('⏳ WAIT queue:#abcdef12')
-
-    def test_flag_off_is_sent_back(self):
-        self.sent_back('⏳ WAIT queue:#' + task(1)['id'][:8], flag=False)
 
     def test_served_source_cannot_be_waited_again(self):
         r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8])

@@ -12,12 +12,8 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # review_verdict_pattern = '' # regex of a review verdict line that feeds the author ('' = off)
     # review_own_verdict_pattern = ''   # the same for the author's own comments
     # review_label_prefix = "verified-by:"   # MR label recording a review verdict ('' = off)
-    # turn_cap_continue_on_progress = false  # at max_turns a progressing attempt restarts fresh on the same agent
     # turn_cap_progress_min = 3        # step/next outcomes among the last 10 that count as progress
     # loop_streak_limit = 6            # consecutive turns without progress before a task is handed up as a LOOP (0 = off)
-    # requeue_on_cap = false           # a capped task returns to todo and restarts on new input, not a clock
-    # cap_wake_next_day = false        # a capped task of an agent without a lead restarts on the next UTC day
-    # soft_person_asks_to_lead = false # a question to a person that no hard rule matches goes to the lead
     # unanswerable_ask_to_lead = true  # a question to an agent that cannot answer goes to the lead
     # decision_live_task_card_wait = true  # a question about the addressee's own live task waits on that task
     # decision_identical_no_reopen = true  # the same question again is attached to its request, never reopened
@@ -30,12 +26,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # merge_timeout_minutes = 15       # one run of merge_command
     # merge_rerun_minutes = 5          # re-run a queued merge at least this often even if nothing changed
     # merge_max_runs = 30              # deprecated, ignored: a queued run always ends in a wake or another poll
-    # merge_follow_head = false        # a moved head (server rebase) runs the gate on it instead of waking the author;
-    #                                  # the gate alone decides whether the review carries over (fail-closed)
     # merge_queue_hours = 24           # a wait that stays queued this long wakes the agent too
-    # recovery_wait_v1 = false         # enables `WAIT recovery:#<card8>` on an operator-armed shared recovery card registration (docs/recovery-wait.md)
-    # lifecycle_wait_v1 = false        # enables `WAIT lifecycle:#<card8>` (docs/lifecycle-wait.md)
-    # stall_wait_v1 = false            # enables `WAIT stall:#<card8>` on an operator-armed mesh-stall-control registration (docs/stall-wait.md)
     # receipt_wait_v1 = false          # enables `WAIT receipt:#<card8>` on an operator-armed receipt registration (docs/receipt-wait.md)
     # gmail_watch_v1 = false           # enables `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     # gmail_watch_reader = ["ssh", "-o", "BatchMode=yes", "<host>", "<readonly-wrapper>"]   # fixed argv; JSON request on stdin
@@ -68,7 +59,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     args = ["--model", "sonnet"]
     max_parallel = 0              # 0: use the agent's max_concurrent_tasks in Mesh
     # review_own_hold_hours = 2   # per agent; overrides [runner]
-    # pool = "dev"                # agents with the same pool take each other's capped tasks (requeue_on_cap)
+    # pool = "dev"                # agents with the same pool take each other's capped tasks
 
       [[agents.repos]]
       name = "app"
@@ -76,6 +67,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -86,6 +78,8 @@ from pathlib import Path
 from . import asks, catalog_launch
 from .selection import Policy
 from .workspace import RepoSpec
+
+log = logging.getLogger("mesh_runner")
 
 
 def _default_state_dir() -> str:
@@ -210,7 +204,7 @@ class AgentConfig:
     paused: bool = False
     lead: str = ""                     # agent name that gets the task when a turn budget runs out
     # agents with the same non-empty ``pool`` are interchangeable for a task that hit a cap
-    # (requeue_on_cap). Unset: another agent with the same repos and the same lead is a peer.
+    # Unset: another agent with the same repos and the same lead is a peer.
     pool: str = ""
     review_prompt_file: str = ""       # replaces the default review protocol text
     feed_review: bool = True           # feed the agent's own tasks in review
@@ -338,13 +332,11 @@ class RunnerConfig:
     max_no_outcome: int = 1            # immediate corrections (same session) after an unreadable outcome
     # Consecutive turns without a readable outcome on one task (any lane; a readable outcome resets the
     # count) after which it is routed to the lead. The second miss in a row puts the task back in todo
-    # with the same lane until new input arrives (``requeue_on_cap`` inputs, no timer; needs
-    # ``requeue_on_cap``, else it is handed up as before). A task already routed up for this reason is
+    # with the same lane until new input arrives (no timer). A task already routed up for this reason is
     # only held by the receiving lead, never handed further, until a readable outcome.
     no_outcome_route_after: int = 3
     daily_start_cap: int = 0           # starts of one task by one agent per UTC day; past it -> lead (0 = off).
-                                       # With requeue_on_cap a start an event woke does not count (docs/requeue-on-event.md)
-    mention_requests: bool = False     # an @-address on someone else's task becomes a request card
+                                       # A start an event woke does not count (docs/requeue-on-event.md)
     max_compactions: int = 0           # context compactions in one attempt; past it -> lead (0 = off)
     max_failures: int = 3
     provider_outage_giveup_minutes: int = 360   # continuous provider outage before a task goes up (0 = never)
@@ -354,11 +346,10 @@ class RunnerConfig:
     max_startup_failures: int = 2      # failed turns that never created a session before the task goes up
     failed_cooldown_hours: float = 0.5   # a failed task is retried this soon even without a new comment
     max_turns: int = 30
-    # At max_turns an attempt that still made progress (>= turn_cap_progress_min of its last 10 turn
+    # At max_turns a work attempt that still made progress (>= turn_cap_progress_min of its last 10 turn
     # outcomes were step/next) ends and the same agent starts the task again in a fresh session instead
     # of handing it to the lead. Needs daily_start_cap > 0: the restart counts as a start, so the loop
-    # is bounded by it. False: today's behaviour (RUNNER GAVE UP -> lead).
-    turn_cap_continue_on_progress: bool = False
+    # is bounded by it. Without progress, or without a start cap: RUNNER GAVE UP -> lead.
     turn_cap_progress_min: int = 3
     max_turn_minutes: int = 180
     straggler_grace_minutes: int = 30
@@ -382,18 +373,17 @@ class RunnerConfig:
     # attempt on the task; 0 = only the first two reasons
     dead_slot_hours: float = 24.0
     workspace_wait_release_minutes: float = 0.0  # 0 disables durable WAIT suspension
+    workspace_readiness_v1: bool = False  # signed private observations, existing owner tick only
     ignored_cleanup: bool = False      # opt-in; sizes are du estimates, not Data.free gain. drop regenerable ignored dirs (node_modules, target...) in idle free slots
     ignored_cleanup_idle_hours: float = 24.0     # idle = since the slot became free (slots.updated_at)
     ignored_cleanup_interval_minutes: float = 30.0
-    checkpoint_gc: bool = False        # opt-in; drop checkpoints of ended attempts and superseded generations
     checkpoint_gc_grace_hours: float = 6.0       # since the attempt ended / the generation was replaced
     checkpoint_budget_gb: float = 4.0            # total size of all WAIT snapshots; over it = warning + gauge, never a deletion
     # Directory names a WAIT snapshot leaves out (when nothing under them is tracked): build caches.
     checkpoint_exclude_names: tuple = (".gocache", "node_modules", "target", ".venv", "__pycache__", "var")
-    queue_wait_freshness_v1: bool = False  # machine refill WAIT only; shared state_dir protocol files
-    recovery_wait_v1: bool = False     # `WAIT recovery:#<card8>` on an operator-armed future shared recovery card (docs/recovery-wait.md)
-    lifecycle_wait_v1: bool = False    # `WAIT lifecycle:#<card8>` on an operator-armed native SessionStart registration (docs/lifecycle-wait.md)
-    stall_wait_v1: bool = False        # `WAIT stall:#<card8>` on an operator-armed mesh-stall-control result registration
+    recovery_supersede_authors: tuple = ()   # Mesh agent ids besides the receipt author whose comment may supersede a recovery gate
+    ops_review_wait_registry: Path | None = None  # private Board registry; observer off when absent
+    ops_review_wait_notifier_id: str = ""          # exact Board Mesh actor UUID, paired with registry
     receipt_wait_v1: bool = False      # `WAIT receipt:#<card8>` on an operator-armed Telegram receipt registration
     gmail_watch_v1: bool = False       # `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     gmail_watch_reader: tuple = ()     # fixed argv of the read-only wrapper (JSON on stdin/stdout); never a shell string
@@ -435,12 +425,7 @@ class RunnerConfig:
     # request: the question is posted on the asking task for the addressee to object, and the asker
     # continues with its default at once. False: a request is filed.
     decision_default_proceeds: bool = True
-    # Obsolete: read so existing configs still load. Time WAITs need a sourced external
-    # timestamp (outcome.TIME_WAIT_GUIDANCE); relative intervals are rejected outright.
-    time_wait_reason_after_minutes: float = 60.0
-    short_time_wait_series: int = 3
     time_wait_ignore_names: list[str] = field(default_factory=list)
-    quota_pause_minutes: int = 30
     abort_backoff_minutes: int = 15
     gitlab_url: str = ""
     gitlab_token: str = field(default="", repr=False)
@@ -543,18 +528,12 @@ class RunnerConfig:
     tgpeek_editor: object = None                # EditorConfig of [tgpeek_editor]; None = the editor-job routes are off
     tgpeek_editor_control_secret_file: str = ""  # [tgpeek_editor_control] secret_file; empty = operator editor lifecycle off
     config_path: str = ""                       # the file this config was read from (the source of an operator reconfigure)
-    # A task that hits START CAP, TURN CAP or COMPACTION CAP goes back to todo with the same assignee
-    # (or to a free peer of its pool) and restarts on new input, never on a clock. False: the task goes
-    # to the lead, or waits for the next UTC day without one (RUNNER GAVE UP is not a cap and always
-    # goes to the lead).
-    requeue_on_cap: bool = False
-    # A capped task of an agent with no lead (the top of the chain) has nobody to hand it to and no input
-    # that would wake it: it restarts in the first tick of the next UTC day after its cap (the restart is
-    # a start, so daily_start_cap still bounds the loop). False: it waits for new input only.
-    cap_wake_next_day: bool = False
-    # A question to a person that no hard rule (asks.py) matches is put to the project lead as an agent
-    # decision request instead of raising a human gate. False: every such question raises the gate.
-    soft_person_asks_to_lead: bool = False
+    # Not options (always so): a task that hits START CAP, TURN CAP, LOOP or COMPACTION CAP goes back to
+    # todo with the same assignee (or to a free peer of its pool) and restarts on new input, never on a
+    # clock (RUNNER GAVE UP is not a cap and always goes to the lead); a capped task of an agent with no
+    # lead restarts in the first tick of the next UTC day (a start, so daily_start_cap bounds the loop);
+    # a question to a person that no hard rule (asks.py) matches is put to the project lead as an agent
+    # decision request instead of raising a human gate.
     # A `WAIT decision:@x` whose addressee cannot answer (not run by this runner, paused, not resolvable,
     # a configured test or service user) goes to the project lead instead of waiting for ever.
     unanswerable_ask_to_lead: bool = True
@@ -584,7 +563,6 @@ class RunnerConfig:
     merge_rerun_minutes: float = 5.0
     merge_max_runs: int = 30
     merge_queue_hours: float = 24.0
-    merge_follow_head: bool = False
     source: Path | None = field(default=None, compare=False, repr=False)   # file this was loaded from
 
     @property
@@ -775,6 +753,13 @@ def load(path: str | Path) -> RunnerConfig:
         raise ConfigError("dead_slot_hours must be finite and nonnegative")
     if not r.get("mesh_url"):
         raise ConfigError("[runner] mesh_url is required")
+    ops_registry = r.get("ops_review_wait_registry")
+    ops_notifier = r.get("ops_review_wait_notifier_id")
+    if ops_registry is not None or ops_notifier is not None:
+        if (not isinstance(ops_registry, str) or not ops_registry or not _path(ops_registry).is_absolute()
+                or not isinstance(ops_notifier, str) or not re.fullmatch(
+                    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", ops_notifier)):
+            raise ConfigError("ops-review observer requires an absolute registry path and canonical notifier UUID")
     recipients = r.get("decision_request_metadata_only_recipients", [])
     if (not isinstance(recipients, list) or any(not isinstance(v, str) or not re.fullmatch(
             r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", v) for v in recipients)):
@@ -831,6 +816,10 @@ def load(path: str | Path) -> RunnerConfig:
                                   branch=x.get("branch", "main"), max_slots=int(x.get("max_slots", 4)),
                                   fetch_url_overrides=tuple(overrides.items())))
         ident = a.get("identity")
+        if "project_ids" in a:
+            # removed lane option: Mesh membership decides which projects a lane serves
+            log.warning("agent %s: project_ids is no longer read and is ignored; Mesh project membership "
+                        "decides which cards this lane serves", a.get("name"))
         agents.append(AgentConfig(
             name=a["name"],
             key=("" if ext_token is not None and not (a.get("key_file") or a.get("key_env"))
@@ -879,7 +868,6 @@ def load(path: str | Path) -> RunnerConfig:
                 skip_labels=tuple(a.get("skip_labels", ("no-runner",))),
                 skip_label_prefixes=tuple(a.get("skip_label_prefixes", ("park:",))),
                 require_label=a.get("require_label", ""),
-                project_ids=tuple(a.get("project_ids", ())),
                 human_gate=bool(a.get("human_gate_flag_holds", True)),
             ),
         ))
@@ -898,7 +886,6 @@ def load(path: str | Path) -> RunnerConfig:
         max_no_outcome=int(r.get("max_no_outcome", 1)),
         no_outcome_route_after=max(int(r.get("no_outcome_route_after", 3)), 1),
         daily_start_cap=int(r.get("daily_start_cap", 0)),
-        mention_requests=bool(r.get("mention_requests", False)),
         comment_wake=comment_wake,
         comment_wake_always_from=[v.strip() for v in always_from],
         decision_wake=_decision_wake(r.get("decision_wake", "any"), "[runner]"),
@@ -915,7 +902,6 @@ def load(path: str | Path) -> RunnerConfig:
         max_startup_failures=int(r.get("max_startup_failures", 2)),
         failed_cooldown_hours=float(r.get("failed_cooldown_hours", 0.5)),
         max_turns=int(r.get("max_turns", 30)),
-        turn_cap_continue_on_progress=r.get("turn_cap_continue_on_progress", False) is True,
         turn_cap_progress_min=max(1, int(r.get("turn_cap_progress_min", 3))),
         max_turn_minutes=int(r.get("max_turn_minutes", 180)),
         straggler_grace_minutes=int(r.get("straggler_grace_minutes", 30)),
@@ -929,27 +915,23 @@ def load(path: str | Path) -> RunnerConfig:
         archive_require_mount=_path(r.get("archive_require_mount")),
         dead_slot_hours=dead_hours,
         workspace_wait_release_minutes=float(r.get("workspace_wait_release_minutes", 0.0)),
+        workspace_readiness_v1=r.get("workspace_readiness_v1") is True,
         ignored_cleanup=r.get("ignored_cleanup", False) is True,
         ignored_cleanup_idle_hours=_idle_hours(r.get("ignored_cleanup_idle_hours", 24.0)),
         ignored_cleanup_interval_minutes=float(r.get("ignored_cleanup_interval_minutes", 30.0)),
-        checkpoint_gc=r.get("checkpoint_gc", False) is True,
         checkpoint_gc_grace_hours=_idle_hours(r.get("checkpoint_gc_grace_hours", 6.0), "checkpoint_gc_grace_hours"),
         checkpoint_budget_gb=_idle_hours(r.get("checkpoint_budget_gb", 4.0), "checkpoint_budget_gb"),
         checkpoint_exclude_names=_exclude_names(r.get("checkpoint_exclude_names")),
-        queue_wait_freshness_v1=r.get("queue_wait_freshness_v1") is True,
+        ops_review_wait_registry=_path(ops_registry),
+        ops_review_wait_notifier_id=ops_notifier or "",
         receipt_wait_v1=r.get("receipt_wait_v1") is True,
         gmail_watch_v1=r.get("gmail_watch_v1") is True,
         gmail_watch_reader=_argv(r.get("gmail_watch_reader"), "gmail_watch_reader"),
         gmail_watch_interval_seconds=max(30.0, _idle_hours(r.get("gmail_watch_interval_seconds", 120.0), "gmail_watch_interval_seconds")),
         gmail_watch_timeout_seconds=_idle_hours(r.get("gmail_watch_timeout_seconds", 60.0), "gmail_watch_timeout_seconds"),
-        stall_wait_v1=r.get("stall_wait_v1") is True,
-        lifecycle_wait_v1=r.get("lifecycle_wait_v1") is True,
-        recovery_wait_v1=r.get("recovery_wait_v1") is True,
+        recovery_supersede_authors=tuple(str(x) for x in (r.get("recovery_supersede_authors") or [])),
         max_wait_hours=float(r.get("max_wait_hours", 6.0)),
-        time_wait_reason_after_minutes=float(r.get("time_wait_reason_after_minutes", 60.0)),
-        short_time_wait_series=int(r.get("short_time_wait_series", 3)),
         time_wait_ignore_names=[str(n) for n in (r.get("time_wait_ignore_names") or [])],
-        quota_pause_minutes=int(r.get("quota_pause_minutes", 30)),
         abort_backoff_minutes=int(r.get("abort_backoff_minutes", 15)),
         metrics_file=_path(r.get("metrics_file")),
         mesh_effects=bool(r.get("mesh_effects", True)),
@@ -993,9 +975,6 @@ def load(path: str | Path) -> RunnerConfig:
         tgpeek_editor=tgpeek_editor,
         tgpeek_editor_control_secret_file=control_secret_file,
         config_path=str(Path(path).resolve()),
-        requeue_on_cap=r.get("requeue_on_cap", False) is True,
-        cap_wake_next_day=r.get("cap_wake_next_day", False) is True,
-        soft_person_asks_to_lead=r.get("soft_person_asks_to_lead", False) is True,
         unanswerable_ask_to_lead=r.get("unanswerable_ask_to_lead", True) is not False,
         login_ask_check=tuple(_string_list(r.get("login_ask_check"), "login_ask_check", ())),
         hard_ask_patterns=_ask_patterns(r.get("hard_ask_patterns")),
@@ -1014,7 +993,6 @@ def load(path: str | Path) -> RunnerConfig:
         merge_rerun_minutes=_positive(r.get("merge_rerun_minutes", 5.0), "merge_rerun_minutes"),
         merge_max_runs=_positive(r.get("merge_max_runs", 30), "merge_max_runs", integer=True),
         merge_queue_hours=_positive(r.get("merge_queue_hours", 24.0), "merge_queue_hours"),
-        merge_follow_head=bool(r.get("merge_follow_head", False)),
         memory_release_free_pct=float(r.get("memory_release_free_pct", 0)),
         memory_hold_swap_mb=float(r.get("memory_hold_swap_mb", 0)),
         memory_release_swap_mb=float(r.get("memory_release_swap_mb", 0)),

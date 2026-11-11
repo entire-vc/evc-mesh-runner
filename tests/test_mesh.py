@@ -32,6 +32,16 @@ class BasicAuth(unittest.TestCase):
         self.assertNotIn("agent-key", repr(c))
 
 
+class MoveSource(unittest.TestCase):
+    def test_move_declares_the_runner_as_producer(self):
+        op = Opener()
+        MeshClient("https://mesh.example", "k", opener=op).move("t1", "s1", expected_version=3,
+                                                                 expected_status_id="s0")
+        self.assertTrue(op.req.full_url.endswith("/tasks/t1/move"))
+        self.assertEqual(json.loads(op.req.data), {"status_id": "s1", "source": "mesh-runner",
+                                                   "expected_version": 3, "expected_status_id": "s0"})
+
+
 class Flaky:
     def __init__(self, fails):
         self.fails, self.calls = fails, 0

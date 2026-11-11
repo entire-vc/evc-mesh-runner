@@ -182,15 +182,21 @@ class IgnoredCleanup(unittest.TestCase):
     def test_runner_flag_off_skips_cleanup(self):
         from mesh_runner.runner import Runner
         runner = Runner.__new__(Runner)
+        # the periodic pass always runs (checkpoint cleanup is unconditional); this option only adds
+        # the regenerable-directory cleanup to it
         runner.cfg = type('C', (), {'ignored_cleanup': False, 'ignored_cleanup_idle_hours': 0,
-                                    'ignored_cleanup_interval_minutes': 1})()
+                                    'ignored_cleanup_interval_minutes': 1, 'checkpoint_gc_grace_hours': 24.0,
+                                    'checkpoint_budget_gb': 0.0, 'pool_root': self.pool.root.parent})()
         runner._ignored_next = 0.0
         runner.ignored_freed_bytes = 0
         runner.agents = [type('A', (), {'pool': self.pool, 'agent': type('N', (), {'name': 'x'})()})()]
         slot = self.slot()
         runner._prune_ignored_if_due()
+        runner._ignored_worker.join(30)
         self.assertTrue((slot / 'node_modules' / 'blob').exists())
+        self.assertEqual(runner.ignored_freed_bytes, 0)
         runner.cfg.ignored_cleanup = True
+        runner._ignored_next = 0.0                  # the next pass is due
         runner._prune_ignored_if_due()
         runner._ignored_worker.join(30)
         self.assertFalse((slot / 'node_modules').exists())

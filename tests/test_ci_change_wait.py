@@ -152,8 +152,8 @@ class TypedCI(Bench):
     def test_review_delivery_ack_only_after_native_ack(self):
         r,a,t,gl=self.setup_wait()
         key=ci_delivery_key(a.wait['target'],14845)
-        r.store.update(a,wait={**a.wait,'ci_delivery':{'key':key,'value':'fresh'}})
-        self.refused_spawn(r, a, ('waiting',))
+        r.store.update(a,state='ready',wait={**a.wait,'ci_delivery':{'key':key,'value':'fresh'}})   # woken
+        self.refused_spawn(r, a, ('ready',))
         self.assertIsNone(r.store.mark(self.agent.name,t['id'],key))
         self.assertEqual(a.wait['ci_delivery']['value'], 'fresh')
         self.native_delivery(r, a)
@@ -164,9 +164,9 @@ class TypedCI(Bench):
     def test_receipt_failure_after_native_ack_retains_durable_outbox(self):
         r,a,t,gl=self.setup_wait()
         key=ci_delivery_key(a.wait['target'],14845)
-        r.store.update(a,wait={**a.wait,'ci_delivery':{'key':key,'value':'fresh'}})
+        r.store.update(a,state='ready',wait={**a.wait,'ci_delivery':{'key':key,'value':'fresh'}})   # woken
         write_replies(self.replies, {})
-        self.assertTrue(r._spawn(a, 'prompt', False, ('waiting',)))
+        self.assertTrue(r._spawn(a, 'prompt', False, ('ready',)))
         self.assertIsNone(r.store.mark(a.agent, a.task_id, key))
         self.assertEqual(r.procs[a.id].wait(timeout=10), 0)
         original=r.store.mark
@@ -460,7 +460,7 @@ class OwnPlay(TypedCI):
 
     def test_agent_contract_and_manual_notice_tell_owner_to_wait_for_result(self):
         from mesh_runner.outcome import CONTRACT
-        self.assertIn('until=success on that pipeline', CONTRACT)
+        self.assertIn('wait for its result\nwith until=green on that pipeline', CONTRACT)
 
 
 class ExplicitWaitDiagnosisTests(unittest.TestCase):
@@ -627,4 +627,5 @@ class JobsParsing(unittest.TestCase):
 
     def test_contract_names_the_jobs_field(self):
         from mesh_runner.outcome import CONTRACT
-        self.assertIn('jobs=[<job>,<job>]', CONTRACT)
+        self.assertIn('required_jobs=[<job>,<job>]', CONTRACT)
+        self.assertIn('then optionally jobs=[<job>,<job>]', CONTRACT)      # the marker fallback

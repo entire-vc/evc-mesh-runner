@@ -1,8 +1,8 @@
 """Read-only review of the human gates that are open now, with the hard/soft verdict of asks.py.
 
-Meant for the owner, before ``soft_person_asks_to_lead`` is switched on: it shows which of the
-questions waiting on a person the classifier would have kept as a gate (hard) and which it would
-have put to the project lead (soft), and the rule that decided each. Only GET requests are made
+Meant for the owner, to check the classifier: it shows which of the questions waiting on a person
+it keeps as a gate (hard) and which it puts to the project lead (soft), and the rule that decided
+each. Only GET requests are made
 (task lists and comments); nothing is written, moved or commented.
 """
 from __future__ import annotations

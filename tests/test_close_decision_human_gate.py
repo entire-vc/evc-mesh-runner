@@ -86,6 +86,22 @@ class CloseDecisionHumanGate(Bench):
         self.assertEqual(move.calls, 2)
         self.assertFalse([line for line in logs.output if 'awaiting human sign-off' in line], logs.output)
 
+    def test_request_is_not_closed_under_the_addressees_running_turn(self):
+        # The asker's lane closed the request while the addressee's turn held its checkout;
+        # the addressee's heartbeat got 403 and its session was killed.
+        r, mesh, source, attempt, wait = self.setup_question()
+        request = wait['request']['id']
+        mesh.tasks[request]['checked_out_by'] = 'agent-addressee'
+        r.effects.on_end(attempt, wait, 'answered', close_request=True)
+        for _ in range(3):
+            self.tick(r)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'todo')
+        self.assertFalse(any('[runner] closed' in c['body'] for c in mesh.comment_log.get(request, [])))
+        self.assertEqual(r.effects._decision(source['id'])['state'], 'closing')
+        mesh.tasks[request]['checked_out_by'] = None           # the addressee's turn ended
+        self.tick(r)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'done')
+
     def test_unchanged_card_is_retried_after_the_retry_interval(self):
         r, mesh, source, attempt, wait, request, move = self.gated()
         r.effects.on_end(attempt, wait, 'answered', close_request=True)

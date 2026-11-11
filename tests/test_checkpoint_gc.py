@@ -167,37 +167,34 @@ class CheckpointGC(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, 'checkpoint_gc_grace_hours'):
             _idle_hours(-1, 'checkpoint_gc_grace_hours')
 
-    def test_runner_pass_runs_gc_only_when_enabled(self):
+    def test_runner_pass_runs_gc(self):
         from mesh_runner.runner import Runner
         cp = self.suspend(state='completed', ended_hours_ago=8)
         runner = Runner.__new__(Runner)
-        runner.cfg = type('C', (), {'ignored_cleanup': False, 'checkpoint_gc': False,
+        runner.cfg = type('C', (), {'ignored_cleanup': False,
                                     'checkpoint_gc_grace_hours': 6, 'ignored_cleanup_interval_minutes': 1,
                                     # the pass ends with _measure_checkpoints(): without these the worker
                                     # thread died with AttributeError after the test body had passed
                                     'pool_root': self.root / 'pool', 'checkpoint_budget_gb': 0})()
-        runner._ignored_next = 0.0
+        runner._ignored_next = time.monotonic() + 60
         runner.agents = [type('A', (), {'pool': self.pool, 'agent': type('N', (), {'name': 'agent'})()})()]
-        runner._prune_ignored_if_due()
+        runner._prune_ignored_if_due()                 # not due yet: no pass
         self.assertIsNone(getattr(runner, '_ignored_worker', None))
         self.assertTrue(cp.exists())
-        runner.cfg.checkpoint_gc = True
+        runner._ignored_next = 0.0
         runner._prune_ignored_if_due()
         runner._ignored_worker.join(30)
         self.assertFalse(cp.exists())
         self.assertGreater(runner.checkpoint_gc_freed_bytes, 0)
 
-    def test_config_default_off_and_grace_validated(self):
+    def test_grace_is_read_and_validated(self):
         from unittest.mock import patch
         from mesh_runner import cli
         from mesh_runner.config import RunnerConfig, load
-        self.assertFalse(RunnerConfig.__dataclass_fields__['checkpoint_gc'].default)
         cfg = self.root / 'r.toml'
-        cfg.write_text('[runner]\nmesh_url = "x"\nstate_dir = "%s"\ncheckpoint_gc = true\ncheckpoint_gc_grace_hours = 2\n' % self.root)
+        cfg.write_text('[runner]\nmesh_url = "x"\nstate_dir = "%s"\ncheckpoint_gc_grace_hours = 2\n' % self.root)
         loaded = load(cfg)
-        self.assertTrue(loaded.checkpoint_gc)
         self.assertEqual(loaded.checkpoint_gc_grace_hours, 2.0)
-        self.assertFalse(load(self._toml('checkpoint_gc = "yes"')).checkpoint_gc)
         for bad in ('-1', 'nan', '"6"', 'true'):
             with self.assertRaisesRegex(ConfigError, 'checkpoint_gc_grace_hours'):
                 load(self._toml('checkpoint_gc_grace_hours = %s' % bad))

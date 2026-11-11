@@ -6,7 +6,7 @@ while it runs, the Mesh checkout. It survives runner restarts: the harness
 process writes its event stream to a file, so a restarted runner re-attaches
 by pid and log path instead of starting a second writer.
 
-States:
+States (the changes between them are one table: ``lifecycle.TRANSITIONS``):
     starting   process spawned, native session id not yet confirmed
     running    a turn is in progress
     waiting    turn ended with a WAIT; slot free, session and workspace kept
@@ -20,15 +20,20 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from . import lifecycle
 from .selection import parse_time
+
+log = logging.getLogger("mesh_runner")
 
 ACTIVE = ("starting", "running", "unknown")          # occupy a slot
 OPEN = ACTIVE + ("waiting", "ready")                  # hold the task for this agent
+assert set(OPEN) == set(lifecycle.LIVE)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS attempts (
@@ -222,6 +227,22 @@ class Store:
     def update(self, a: Attempt, expect: str | tuple[str, ...] | None = None, **changes) -> bool:
         """Write ``changes``. With ``expect``, only if the stored state is one of
         those; returns False (and leaves ``a`` untouched) when it is not."""
+        if "state" in changes:
+            verdict = lifecycle.check(a.state, changes["state"])
+            if verdict == lifecycle.REFUSED:
+                # an ended attempt never runs again: a new execution of the task is a new attempt
+                self.event(a.id, "refused_transition", f"{a.state}->{changes['state']}")
+                log.error("attempt %s: refused state change %s -> %s (the attempt has ended)",
+                          a.id[:8], a.state, changes["state"])
+                return False
+            if verdict == lifecycle.UNLISTED and lifecycle.STRICT and lifecycle.seed(a):
+                verdict = lifecycle.OK
+            if verdict == lifecycle.UNLISTED:
+                if lifecycle.STRICT:
+                    raise lifecycle.UnlistedTransition(f"{a.state} -> {changes['state']} is not in lifecycle.TRANSITIONS")
+                self.event(a.id, "unlisted_transition", f"{a.state}->{changes['state']}")
+                log.warning("attempt %s: state change %s -> %s is not in the lifecycle table; applied",
+                            a.id[:8], a.state, changes["state"])
         keys = list(changes) + ["updated_at"]
         stamp = iso()
         vals = [json.dumps(changes[k]) if k in _JSON else changes[k] for k in changes] + [stamp]
@@ -303,7 +324,7 @@ class Store:
 
     def other_sessions(self, attempt_id: str) -> frozenset:
         """Bound session ids that belong to attempts other than `attempt_id`; an id this attempt also owns is
-        excluded. Same set `launch_guard.legacy_rows_covered` builds for the pre-activation screen."""
+        excluded."""
         bound: dict[str, set] = {}
         for key, sid in self.db.execute("SELECT id, session_id FROM attempts WHERE session_id != ''"):
             bound.setdefault(sid, set()).add(key)
@@ -459,6 +480,13 @@ class Store:
         except ValueError:
             wait = {}
         return at, wait if isinstance(wait, dict) else {}, row[2] or ""
+
+    def previous_work(self, agent: str, task_id: str, exclude: str) -> "Attempt | None":
+        """This agent's newest other work attempt on the task that ran at least one turn; None if none."""
+        row = self.db.execute("SELECT * FROM attempts WHERE agent=? AND task_id=? AND id!=? AND turns>0 "
+                              "AND mode='work' ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                              (agent, task_id, exclude)).fetchone()
+        return self._row(row) if row else None
 
     def active_count(self, agent: str) -> int:
         return len(self.by_state(agent, ACTIVE))

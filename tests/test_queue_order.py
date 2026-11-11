@@ -52,7 +52,7 @@ def runner(argv=None, waiting=(), **kw):
     r = AgentRunner.__new__(AgentRunner)
     r.agent = NS(name="A", queue_order_command=argv or [], queue_order_timeout_seconds=kw.get("timeout", 3.0),
                  queue_order_cache_seconds=kw.get("cache", 60.0))
-    r.cfg = NS(requeue_on_cap=True)
+    r.cfg = NS()
     r.store = NS(marked=lambda agent, kind: list(waiting))
     return r
 

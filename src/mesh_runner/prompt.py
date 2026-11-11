@@ -84,14 +84,15 @@ def delivery_note(task: dict) -> str:
 
 
 def start_prompt(task: dict, agent_name: str, workspaces: list[str], comments: list[dict],
-                 preamble: str = "", merge: bool = False, harness: str = "") -> str:
+                 preamble: str = "", merge: bool = False, harness: str = "", stopped: str = "") -> str:
+    """``stopped``: the ``where_you_stopped_block`` of a fresh session on a card this lane worked on."""
     short = task["id"][:8]
     where = "\n".join(f"  - {p}" for p in workspaces) or "  - (no repository configured)"
     return f"""{preamble.strip()}
 
 [runner] Task #{short} — {task.get('title', '')}
 Mesh task id: {task['id']} · priority {task.get('priority', '')}
-
+{stopped}
 You are {harness_note(agent_name, harness)}. This session belongs to this one task. Your writable checkouts for it:
 {where}
 Work only in these checkouts; other clones of the same repositories belong to other sessions.
@@ -104,6 +105,42 @@ Latest comments:
 {_comments_block(comments)}
 
 {contract(merge)}{delivery_note(task)}""".strip() + "\n"
+
+
+CLOSING_COMMENT_MAX = 4000
+STATUS_LINES = 20
+
+
+def where_you_stopped_block(reason: str, closing: dict | None, outcome_line: str, merge_requests: list[str],
+                            statuses: list[tuple[str, list[str] | None]]) -> str:
+    """Opens a fresh session on a card this lane already worked on. A new session has none of the old one's
+    memory: without this it re-read the card and redid or contradicted its own last turn. ``closing``: the
+    lane's own last comment on the card, shown whole up to ``CLOSING_COMMENT_MAX``; ``statuses``: (path,
+    ``git status --short`` lines, or None when it could not be read) per working copy."""
+    rows = ["", f"[runner] Where you stopped. This lane worked on this card before; this session is new because "
+                f"{reason}. It has none of the earlier session's memory:"]
+    if closing:
+        body = (closing.get("body") or "").strip()
+        cut = (f"\n[… cut at {CLOSING_COMMENT_MAX} of {len(body)} characters; fetch the comment for the rest]"
+               if len(body) > CLOSING_COMMENT_MAX else "")
+        rows += [f"Your last comment on the card ({closing.get('id', '?')}, {closing.get('created_at', '')}):",
+                 body[:CLOSING_COMMENT_MAX] + cut]
+    if outcome_line:
+        rows.append(f"Your last declared outcome: {outcome_line.strip()[:400]}")
+    if merge_requests:
+        rows.append("Linked merge requests:")
+        rows += [f"  - {mr}" for mr in merge_requests]
+    for path, lines in statuses:
+        if lines is None:
+            rows.append(f"Working copy {path}: git status unavailable")
+        elif not lines:
+            rows.append(f"Working copy {path}: clean (git status --short)")
+        else:
+            more = f"\n    (+{len(lines) - STATUS_LINES} more)" if len(lines) > STATUS_LINES else ""
+            rows.append(f"Working copy {path} (git status --short):\n"
+                        + "\n".join(f"    {line}" for line in lines[:STATUS_LINES]) + more)
+    rows.append("Check this against the card's latest comments before you act; do not redo finished work.")
+    return "\n".join(rows) + "\n"
 
 
 REVIEW_PROTOCOL = """This task is in REVIEW and assigned to you. Decide it in this turn:
@@ -171,10 +208,30 @@ def wake_prompt(task: dict, event: str) -> str:
 What changed: {event}
 
 The new comments by others are listed below when there are any; read older ones only for a concrete gap
-({FETCH_HINT}). Continue from where you stopped, and end the turn with the same
-outcome contract (a closing comment with ⏳ WAIT / ↻ NEXT / ❓ Blocking, or move the task on).
+({FETCH_HINT}). Continue from where you stopped, and end the turn with one Mesh
+turn command (wait_for, continue_next, ask_agent, ask_human, finish_task or hand_off; the marker line only if
+the command fails).
 
 {DECISION_WAIT_GUIDANCE}{delivery_note(task)}"""
+
+
+def wake_event(text: str) -> str:
+    """The event a ``wake_prompt`` names ("What changed: ..."), '' when ``text`` is not one."""
+    m = re.search(r"^What changed: (.*)$", text or "", re.M)
+    return m.group(1).strip() if m else ""
+
+
+def moved_workspaces_block(moves: dict[str, str]) -> str:
+    """Opens the first resumed turn after the session's working copies moved to other slots. The
+    session's history still names the old paths, which may now hold someone else's work; the path
+    guard refuses them, and this says why before the agent runs into the refusal."""
+    if not moves:
+        return ""
+    lines = ["[runner] Your working copies moved while the task waited:"]
+    lines += [f"  {old} -> {new}" for old, new in sorted(moves.items())]
+    lines.append("Paths in earlier messages are stale: use the new ones; the old ones belong to other work "
+                 "and tool calls naming them are refused.")
+    return "\n".join(lines) + "\n\n"
 
 
 def new_comments_block(comments: list[dict], limit: int = 8, size: int = 1500) -> str:
@@ -201,7 +258,9 @@ def no_outcome_prompt(task: dict, line: str = "", why: str = "", merge: bool = F
                 f"cannot read:\n  {line.strip()[:300]}\n" + (f"({why})\n" if why else ""))
     else:
         head = f"[runner] Your last turn on task #{task['id'][:8]} ended without an outcome.\n"
-    return head + f"""Post the closing comment now; its last line must be exactly one of these forms:
+    return head + f"""End the turn now with ONE Mesh turn command (wait_for, continue_next, ask_agent, ask_human,
+finish_task or hand_off). Only if the command is unavailable or fails, post the closing comment with the marker
+line instead.
 {contract(merge)}{delivery_note(task)}"""
 
 
@@ -212,14 +271,16 @@ def ask_not_raised_prompt(task: dict, handle: str, refusal: str = "") -> str:
         return head + f"""Mesh refused it as already answered:
 {refusal.strip()[:600]}
 
-Work from that answer. A new question needs a different subject and a line
-`supersedes: <what the earlier answer does not cover>` in the same comment.
-Do not raise the gate any other way. End the turn with the outcome contract.
+Work from that answer. A new question needs a different subject and
+`ask_human ... supersedes=<what the earlier answer does not cover>` (marker fallback: a line
+`supersedes: <...>` in the same comment). Do not raise the gate any other way. End the turn with one Mesh
+turn command.
 """
-    return head + f"""A person is asked only by a comment on this task whose last line is
-  ❓ Blocking @{handle}: <one question, with your recommended default>
-Mesh raises the human gate from that line and checks that the question was not answered before.
-`⏳ WAIT decision:@<handle>` is for agents. If the decision is yours to make, make it and continue.
+    return head + f"""A person is asked with the Mesh turn command
+  ask_human to={handle} question=<one question, with your recommended default>
+Mesh posts it as a Blocking question, arms the human gate and checks that it was not answered before. Only if
+the command fails, post a comment whose last line is `❓ Blocking @{handle}: <question>`.
+`ask_agent` (`⏳ WAIT decision:@<handle>`) is for agents. If the decision is yours to make, make it and continue.
 """
 
 

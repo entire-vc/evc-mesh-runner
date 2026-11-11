@@ -440,9 +440,11 @@ class RunnerGmail(Bench):
     def test_declaration_binds_only_to_a_live_registration_of_this_card_and_lane(self):
         self.declare('gmr_000000000000')                                  # unknown id
         self.assertNotEqual(self.a.wait.get('kind'), 'gmail')
+        self.r.store.update(self.a, no_outcome=0)      # a second refusal in a row would end the attempt
         foreign = self.reg(observer=OTHER_OBS)                            # registered for another card
         self.declare(foreign)
         self.assertNotEqual(self.a.wait.get('kind'), 'gmail')
+        self.assertEqual(self.a.state, 'ready')                           # sent back, still live
         gw.cancel(self.r.store, foreign)
         mine = self.reg(observer=self.obs)
         self.declare(mine)                                                # control: binds

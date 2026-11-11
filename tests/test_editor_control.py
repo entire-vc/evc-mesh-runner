@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -381,8 +382,113 @@ class FailClosed(Rig):
         scratch.rmdir()
         self.assertEqual(self.call("disable", **self.bind())[0], 200)
 
+    def test_disable_during_auth_refuses_submit_before_its_first_ledger_read(self):
+        bridge, bind = self.svc.editor, self.bind()
+        authenticating, release = threading.Event(), threading.Event()
+        fetch = bridge.auth.fetch
+
+        def delayed_fetch(token):
+            # External boundary: pause the GitLab response while using the real authenticator and SQLite ledger.
+            authenticating.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release authentication")
+            return fetch(token)
+
+        bridge.auth.fetch = delayed_fetch
+        result, errors = [], []
+        env = self.envelope()
+
+        def submit():
+            try:
+                result.append(bridge.submit({"JOB-TOKEN": TOKEN, "Idempotency-Key": ej.job_id_of(env)},
+                                            json.dumps(env).encode()))
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=submit)
+        worker.start()
+        try:
+            self.assertTrue(authenticating.wait(5), "submit did not reach authentication")
+            self.assertEqual(bridge.live, {})
+            status, out = self.call("disable", **bind)
+            self.assertEqual((status, out["state"]), (200, "disabled"))
+            self.assertIsNone(self.svc.editor)
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "submit did not finish after disable")
+        self.assertEqual(errors, [])
+        self.assertEqual(result, [(503, {"error": "shutting_down"})])
+
+    def test_disable_waits_for_a_submit_already_reading_the_ledger(self):
+        bridge, bind = self.svc.editor, self.bind()
+        reading, release, stopped, boundary, contended = (threading.Event() for _ in range(5))
+        ledger_lock = bridge.ledger.lock
+
+        class ObservedLock:
+            # Timing instrumentation around the real RLock; SQLite and every ledger operation remain real.
+            def __enter__(self):
+                if not ledger_lock.acquire(blocking=False):
+                    contended.set()
+                    boundary.set()
+                    ledger_lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                ledger_lock.release()
+
+        bridge.ledger.lock = ObservedLock()
+        results, errors = {}, []
+        env = self.envelope()
+
+        def pause_read(frame, event, arg):
+            if event == "call" and frame.f_code is ej.Ledger.get.__code__:
+                reading.set()                       # submit owns the outer ledger lock, but is not in ``live`` yet
+                if not release.wait(5):
+                    raise TimeoutError("test did not release the ledger reader")
+            return pause_read
+
+        def submit():
+            sys.settrace(pause_read)
+            try:
+                results["submit"] = bridge.submit({"JOB-TOKEN": TOKEN, "Idempotency-Key": ej.job_id_of(env)},
+                                                  json.dumps(env).encode())
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                sys.settrace(None)
+
+        def disable():
+            try:
+                results["disable"] = self.call("disable", **bind)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                stopped.set()
+                boundary.set()
+
+        reader, stopper = threading.Thread(target=submit), threading.Thread(target=disable)
+        reader.start()
+        try:
+            self.assertTrue(reading.wait(5), "submit did not reach its first ledger read")
+            self.assertEqual(bridge.live, {})
+            stopper.start()
+            self.assertTrue(boundary.wait(5), "disable neither waited for the ledger nor finished")
+            self.assertTrue(contended.is_set(), "disable closed SQLite without waiting for the ledger reader")
+            self.assertFalse(stopped.is_set(), "disable finished while a ledger reader still held the lock")
+        finally:
+            release.set()
+            reader.join(5)
+            if stopper.ident is not None:
+                stopper.join(5)
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["submit"], (503, {"error": "shutting_down"}))
+        self.assertEqual((results["disable"][0], results["disable"][1]["state"]), (200, "disabled"))
+
     def test_submits_racing_a_disable_never_succeed_after_it(self):
-        results, stop = [], threading.Event()
+        results, errors, stop = [], [], threading.Event()
 
         def hammer(i):
             n = 0
@@ -396,8 +502,9 @@ class FailClosed(Rig):
                 env = self.envelope(publication_id=f"race-{i}-{n}")
                 try:
                     _, out = bridge.submit({"JOB-TOKEN": TOKEN, "Idempotency-Key": ej.job_id_of(env)}, json.dumps(env).encode())
-                except Exception as e:                                  # the ledger of a closed bridge is gone: still a refusal
-                    out = {"error": "detached:" + type(e).__name__}
+                except Exception as e:
+                    errors.append(e)
+                    break
                 results.append((out.get("status") or out.get("error"), time.monotonic()))
                 time.sleep(0.005)                                       # a client does not spin on a refusal
         threads = [threading.Thread(target=hammer, args=(i,)) for i in range(4)]
@@ -414,8 +521,9 @@ class FailClosed(Rig):
         for th in threads:
             th.join(5)
         self.assertEqual(status, 200, res)
-        self.assertEqual([r for r, at in results if at > done and r != "detached" and r != "shutting_down"
-                          and not str(r).startswith("detached:")], [])
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not th.is_alive() for th in threads))
+        self.assertEqual([r for r, at in results if at > done and r not in ("detached", "shutting_down")], [])
         self.assertIn("completed", [r for r, _ in results])             # the hammer did reach the executor before the stop
         self.assertIsNone(self.svc.editor)
 

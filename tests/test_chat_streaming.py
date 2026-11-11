@@ -174,6 +174,98 @@ class CodexToolCalls(unittest.TestCase):
         self.assertEqual(evs[-1]["type"], "final")
 
 
+    def say(self, text, phase=None):
+        item = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}
+        if phase:
+            item["phase"] = phase
+        return roll("response_item", item)
+
+    def finish(self, final):
+        self.d.emit_codex({"event": {"type": "agent-turn-complete", "thread-id": "th-1",
+                                     "last-assistant-message": final}, "totals": {}})
+        return list(translate(self.lines(), "codex"))
+
+    def test_each_assistant_message_goes_out_as_it_is_written(self):
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}),
+                   self.say("Looking at the files first.", "commentary"), self.call())
+        self.assertTrue(self.d.reply_started(self.rollout.stat().st_size))
+        live = list(translate(self.lines(), "codex"))
+        self.assertEqual([e["text"] for e in live if e["type"] == "text_delta"], ["Looking at the files first."])
+        self.assertEqual(live[0]["type"], "session")              # the session is named before any text
+        self.write(self.say("Done: two files changed.", "final_answer"),
+                   roll("event_msg", {"type": "task_complete", "last_agent_message": "Done: two files changed."}))
+        self.assertTrue(self.d.reply_started(self.rollout.stat().st_size))
+        evs = self.finish("Done: two files changed.")
+        deltas = [e["text"] for e in evs if e["type"] == "text_delta"]
+        self.assertEqual(deltas, ["Looking at the files first.", "\n\nDone: two files changed."])
+        self.assertEqual([e["type"] for e in evs].count("session"), 1)
+        self.assertEqual(evs[-1]["type"], "final")
+        said = [x["item"]["text"] for x in self.lines() if (x.get("item") or {}).get("type") == "agent_message"]
+        self.assertEqual(said[-1], "Done: two files changed.")   # the task path reads the last one as is
+
+    def test_final_message_the_watch_had_not_read_goes_out_once(self):
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}), self.say("Step one."),
+                   self.say("All done."),
+                   roll("event_msg", {"type": "task_complete", "last_agent_message": "All done."}),
+                   self.say("next turn: never ours"))
+        evs = self.finish("All done.")
+        self.assertEqual([e["text"] for e in evs if e["type"] == "text_delta"], ["Step one.", "\n\nAll done."])
+
+    def test_final_message_missing_from_the_rollout_still_goes_out(self):
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}), self.say("Step one."),
+                   roll("event_msg", {"type": "task_complete", "last_agent_message": "Answer."}))
+        evs = self.finish("Answer.")
+        self.assertEqual([e["text"] for e in evs if e["type"] == "text_delta"], ["Step one.", "\n\nAnswer."])
+
+
+    def test_same_text_earlier_does_not_stand_for_an_unseen_final(self):
+        # the rollout shows "Done." once, then not (yet) the task's end: the final is not proven seen
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}), self.say("Done."))
+        self.assertTrue(self.d.reply_started(self.rollout.stat().st_size))
+        evs = self.finish("Done.")
+        self.assertEqual([e["text"] for e in evs if e["type"] == "text_delta"], ["Done.", "\n\nDone."])
+
+    def test_a_skipped_record_after_the_same_text_does_not_hide_the_final(self):
+        from mesh_runner import tui_driver
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}), self.say("Done."))
+        self.assertTrue(self.d.reply_started(self.rollout.stat().st_size))
+        self.write(self.say("Done." + " " * (tui_driver.SCAN_CHUNK + 10)),      # over-long: skipped unread
+                   roll("event_msg", {"type": "task_complete", "last_agent_message": "Done."}))
+        for _ in range(3):                                   # one read per chunk: past the skipped record
+            if self.d.turn_end is None:
+                self.d.reply_started(self.rollout.stat().st_size)
+        self.assertIsNotNone(self.d.turn_end)
+        evs = self.finish("Done.")
+        self.assertEqual([e["text"] for e in evs if e["type"] == "text_delta"], ["Done.", "\n\nDone."])
+
+
+    def test_a_final_that_differs_only_in_whitespace_still_goes_out(self):
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}), self.say("answer"),
+                   roll("event_msg", {"type": "task_complete", "last_agent_message": "answer\n"}))
+        self.assertTrue(self.d.reply_started(self.rollout.stat().st_size))
+        evs = self.finish("answer\n")
+        self.assertEqual([e["text"] for e in evs if e["type"] == "text_delta"], ["answer", "\n\nanswer\n"])
+        said = [x["item"]["text"] for x in self.lines() if (x.get("item") or {}).get("type") == "agent_message"]
+        self.assertEqual(said[-1], "answer\n")                  # the task path gets the raw final text
+
+
+    def test_a_message_without_text_after_the_same_text_does_not_hide_the_final(self):
+        empty = roll("response_item", {"type": "message", "role": "assistant", "content": []})
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}), self.say("Done."), empty,
+                   roll("event_msg", {"type": "task_complete", "last_agent_message": "Done."}))
+        self.assertTrue(self.d.reply_started(self.rollout.stat().st_size))
+        evs = self.finish("Done.")
+        self.assertEqual([e["text"] for e in evs if e["type"] == "text_delta"], ["Done.", "\n\nDone."])
+
+    def test_a_whitespace_message_is_streamed_as_written(self):
+        self.write(roll("event_msg", {"type": "task_started", "turn_id": "turn-1"}), self.say("Step."), self.say("\n"),
+                   roll("event_msg", {"type": "task_complete", "last_agent_message": "\n"}))
+        self.assertTrue(self.d.reply_started(self.rollout.stat().st_size))
+        self.finish("\n")
+        said = [x["item"]["text"] for x in self.lines() if (x.get("item") or {}).get("type") == "agent_message"]
+        self.assertEqual(said, ["Step.", "\n"])                   # each record once, the final not repeated
+
+
 class LiveDelivery(unittest.TestCase):
     INIT = json.dumps({"type": "system", "subtype": "init", "session_id": "s"})
     TEXT = json.dumps({"type": "assistant", "message": {"content": text("partial")}})
