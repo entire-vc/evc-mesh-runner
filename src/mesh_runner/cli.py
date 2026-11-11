@@ -32,6 +32,7 @@ from . import workspace_requests
 from . import git_index_admission
 from .native_result_ledger import identity as native_wait_identity
 from . import auth
+from . import delivery_recovery
 from .runner import AlreadyRunning, Runner
 from .store import OPEN, Store
 from .workspace import WorkspaceError
@@ -54,6 +55,39 @@ def _idle_hours_arg(text: str) -> float:
     if not math.isfinite(hours) or hours < 0:
         raise argparse.ArgumentTypeError(f"must be >= 0, got {text!r}")     # never a cutoff in the future
     return hours
+
+
+def _workspace_readiness(argv: list[str]) -> int:
+    """Submit/read only private files; never open the consumer's registry."""
+    from . import workspace_readiness as ready
+    p = argparse.ArgumentParser(prog="mesh-runner workspace-readiness")
+    p.add_argument('action', choices=['submit', 'receipt'])
+    p.add_argument('--config', required=True)
+    p.add_argument('--agent', required=True)
+    p.add_argument('--request', help='immutable unsigned JSON request file, including exact pins/deadline')
+    p.add_argument('--request-id')
+    args = p.parse_args(argv)
+    cfg = config_mod.load(args.config)
+    agent = next((a for a in cfg.agents if a.name == args.agent), None)
+    if not cfg.workspace_readiness_v1 or agent is None:
+        p.error('enabled workspace_readiness_v1 and an exact configured lane required')
+    try:
+        if args.action == 'submit':
+            if not args.request:
+                p.error('--request required')
+            request = json.loads(ready._read(Path(args.request)))
+            if not isinstance(request, dict) or request.get('agent') != agent.name or 'signature' in request:
+                raise ready.Refused('request_scope')
+            result = ready.submit(cfg.state_dir, request, agent.key)
+        else:
+            if not args.request_id:
+                p.error('--request-id required')
+            result = ready.receipt(cfg.state_dir, agent.name, args.request_id)
+    except (ValueError, OSError, TypeError):
+        print(json.dumps({'error': 'readiness_request_rejected'}))
+        return 2
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 def _asks(argv: list[str]) -> int:
@@ -279,9 +313,6 @@ def _stall_wait(argv: list[str]) -> int:
     p.add_argument("--owner-id", help="arm: Mesh agent id of that lane (the notifier's comment author)")
     args = p.parse_args(argv)
     cfg = config_mod.load(args.config)
-    if not cfg.stall_wait_v1:
-        print(json.dumps({"error": "stall_wait_v1 is off in this config"}))
-        return 2
     lane = next((a for a in cfg.agents if a.name == args.agent), None)
     if lane is None:
         p.error("--agent must name an exact configured lane")
@@ -309,20 +340,19 @@ def _recovery_wait(argv: list[str]) -> int:
     import time
     from . import recovery_wait as rw
     p = argparse.ArgumentParser(prog="mesh-runner recovery-wait")
-    p.add_argument("action", choices=["arm", "inspect", "disarm"])
+    p.add_argument("action", choices=["arm", "inspect", "disarm", "supersede"])
     p.add_argument("--config", required=True)
     p.add_argument("--agent", required=True, help="the lane that owns the source card")
     p.add_argument("--task", required=True, help="full UUID of the source card (the card that will wait)")
+    p.add_argument("--reg-id", help="supersede: the exact registration generation (from inspect)")
+    p.add_argument("--reason", help="supersede: one line, why the recovery gate is replaced")
     p.add_argument("--owner-id", help="arm: Mesh agent id of that lane; must match at declaration and wake")
     p.add_argument("--project-id", help="arm: UUID of the project the recovery card is created in")
-    p.add_argument("--marker", help="arm: exact text the recovery card's title/description carries")
+    p.add_argument("--marker", help="arm: exact text the recovery card's title carries")
     p.add_argument("--recovery-owner-id", help="arm: Mesh agent id the recovery card is assigned to")
     p.add_argument("--receipt-author-id", help="arm: Mesh agent id whose `carrier-receipt: <ref>` comment completes it")
     args = p.parse_args(argv)
     cfg = config_mod.load(args.config)
-    if not cfg.recovery_wait_v1:
-        print(json.dumps({"error": "recovery_wait_v1 is off in this config"}))
-        return 2
     if args.agent not in {a.name for a in cfg.agents}:
         p.error("--agent must name an exact configured lane")
     store = Store(cfg.state_dir / "runner.sqlite")
@@ -334,8 +364,16 @@ def _recovery_wait(argv: list[str]) -> int:
             rw.arm(store, args.agent, args.task, *need, time.time())
         elif args.action == "disarm":
             rw.disarm(store, args.agent, args.task)
+        elif args.action == "supersede":
+            if not (args.reg_id and args.reason):
+                p.error("supersede needs --reg-id --reason")
+            from .mesh import MeshClient
+            lane = next(a for a in cfg.agents if a.name == args.agent)
+            mesh = MeshClient(cfg.mesh_url, lane.key, basic_auth=cfg.mesh_basic_auth, bearer=cfg.extension_token)
+            rw.supersede(store, args.agent, args.task, args.reg_id, mesh.comments_all(args.task),
+                         cfg.recovery_supersede_authors, args.reason, time.time())
         out = rw.inspect(store, args.agent, args.task)
-    except (ValueError, OSError) as exc:
+    except Exception as exc:    # noqa: BLE001 - a Mesh read failure refuses the supersede (fail closed)
         print(json.dumps({"error": str(exc)[:200]}))
         return 1
     print(json.dumps(out, sort_keys=True))
@@ -359,9 +397,6 @@ def _lifecycle_wait(argv: list[str]) -> int:
     p.add_argument("--journal", help="arm: absolute path of khan-lifecycle.jsonl (may not exist yet)")
     args = p.parse_args(argv)
     cfg = config_mod.load(args.config)
-    if not cfg.lifecycle_wait_v1:
-        print(json.dumps({"error": "lifecycle_wait_v1 is off in this config"}))
-        return 2
     if args.agent not in {a.name for a in cfg.agents}:
         p.error("--agent must name an exact configured lane")
     store = Store(cfg.state_dir / "runner.sqlite")
@@ -425,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         return _lifecycle_wait(args_in[1:])
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
+    if args_in and args_in[0] == "workspace-readiness":
+        return _workspace_readiness(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
     p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "quarantine-list", "quarantine-restore", "pool", "suspend-wait-workspace", "admit-workspace-repo", "admit-git-index", "workspace-maintenance", "clear-auth-hold", "rearm-cap"])
     p.add_argument("--config", required=True)
@@ -624,7 +661,9 @@ def main(argv: list[str] | None = None) -> int:
                             **({"prompt_delivery": {"pending": True,
                                    "turn": a.wait["interactive_prompt_intent"].get("turn"),
                                    "resolution_required": a.state == "unknown",
-                                   "reason": a.wait["interactive_prompt_intent"].get("resolution", "") }}
+                                   "reason": a.wait["interactive_prompt_intent"].get("resolution", ""),
+                                   **({"explanation": delivery_recovery.explain(a.wait["interactive_prompt_intent"].get("resolution", ""))}
+                                      if a.state == "unknown" else {}) }}
                                if isinstance(a.wait.get("interactive_prompt_intent"), dict) else {})})
         # Keep the existing top-level list and expose durable holds even when no
         # attempt is currently open on the profile.

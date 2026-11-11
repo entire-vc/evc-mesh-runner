@@ -27,10 +27,6 @@ def clear_attempts(mesh):
 
 
 class ContractBench(Bench):
-    def setUp(self):
-        super().setUp()
-        self.cfg.requeue_on_cap = True
-
     def waiting(self, wait, mesh=None, **extra):
         t = task(1, cat="in_progress", **extra)
         mesh = mesh or RealisticMesh([t])

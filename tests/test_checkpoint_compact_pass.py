@@ -7,38 +7,33 @@ from mesh_runner.runner import Runner
 
 
 class CompactInGcPass(unittest.TestCase):
-    def _runner(self, gc):
-        cfg = SimpleNamespace(checkpoint_gc=gc, checkpoint_gc_grace_hours=6.0, ignored_cleanup=False)
+    def _runner(self):
+        cfg = SimpleNamespace(checkpoint_gc_grace_hours=6.0, ignored_cleanup=False)
         ar = SimpleNamespace(agent=SimpleNamespace(name='a'), pool=object())
         return SimpleNamespace(cfg=cfg, agents=[ar], _measure_checkpoints=lambda: None)
 
-    def test_gc_pass_compacts_old_snapshots_when_gc_is_on(self):
+    def test_gc_pass_compacts_old_snapshots(self):
         calls = []
         with patch.object(pool_ops, 'prune_checkpoints', return_value={'freed_bytes': 0}), \
                 patch.object(pool_ops, 'compact_checkpoints',
                              side_effect=lambda pool, **kw: calls.append(kw) or {'freed_bytes': 5}):
-            r = self._runner(True)
+            r = self._runner()
             Runner._prune_ignored_pass(r)
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0]['apply'])
         self.assertEqual(r.checkpoint_gc_freed_bytes, 5)
 
-    def test_gc_pass_leaves_snapshots_alone_when_gc_is_off(self):
-        with patch.object(pool_ops, 'compact_checkpoints') as compact:
-            Runner._prune_ignored_pass(self._runner(False))
-        compact.assert_not_called()
-
     def test_returned_errors_are_logged(self):
         with patch.object(pool_ops, 'prune_checkpoints', return_value={'freed_bytes': 0}), \
                 patch.object(pool_ops, 'compact_checkpoints', return_value={'freed_bytes': 0, 'errors': 2}), \
                 self.assertLogs('mesh_runner', 'WARNING') as logs:
-            Runner._prune_ignored_pass(self._runner(True))
+            Runner._prune_ignored_pass(self._runner())
         self.assertTrue(any('2 error' in line for line in logs.output))
 
     def test_a_failing_compact_does_not_break_the_pass(self):
         with patch.object(pool_ops, 'prune_checkpoints', return_value={'freed_bytes': 0}), \
                 patch.object(pool_ops, 'compact_checkpoints', side_effect=RuntimeError('x')):
-            Runner._prune_ignored_pass(self._runner(True))
+            Runner._prune_ignored_pass(self._runner())
 
 
 class CompactablePhases(unittest.TestCase):

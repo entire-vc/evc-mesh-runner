@@ -16,7 +16,7 @@ import uuid
 import urllib.request
 from typing import Any
 
-from . import coalesced_http
+from . import coalesced_http, main_route
 from .mesh import MeshClient, MeshError
 
 PROTOCOL = 1
@@ -60,7 +60,7 @@ class _TimedHandler(urllib.request.HTTPSHandler):
 
 def _timed_open(req, timeout=None):
     _PHASES.d = {"t0": time.monotonic()}
-    return urllib.request.build_opener(_TimedHandler()).open(req, timeout=timeout)
+    return urllib.request.build_opener(*main_route.with_route([_TimedHandler()])).open(req, timeout=timeout)
 
 
 def _phase_note() -> str:

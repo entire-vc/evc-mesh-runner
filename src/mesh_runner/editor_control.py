@@ -157,10 +157,11 @@ class EditorController:
             raise Refused(504, "drain_timeout")
         if bridge.residue():
             raise Refused(500, "cleanup_failed")
-        try:
-            bridge.ledger.db.close()
-        except Exception:
-            pass
+        with bridge.ledger.lock:                         # a submit may be reading the ledger before joining ``live``
+            try:
+                bridge.ledger.db.close()
+            except Exception:
+                pass
         self.service.editor = None
         if self.applied is not None:
             self.previous = self.applied                 # the rollback target, kept even if the next attach fails

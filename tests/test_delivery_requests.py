@@ -170,3 +170,83 @@ class DeliveryRecheck(Bench):
         result = self.consume(self.submit(observed))
         self.assertTrue(result.startswith('unresolved:'))
         self.assert_pending()
+
+
+class UnprovenIsolation(DeliveryRecheck):
+    """S2: unresolved acceptance stays honest, isolated, idempotent and explained; never replayed."""
+
+    def comments(self):
+        return [c for c in self.r.mesh.comments if 'MANDATORY DELIVERY PENDING' in str(c)] \
+            if hasattr(self.r.mesh, 'comments') else []
+
+    def restart(self):
+        self.r.store.db.close()
+        self.r = AgentRunner(self.cfg, self.agent, Store(self.cfg.state_dir / 'runner.sqlite'),
+                             mesh=FakeMesh([self.t]), adapter=self.adapter)
+        self.r.refresh_me()
+
+    def test_missing_ack_and_empty_log_never_prove_unsent(self):
+        Path(self.intent['log_path']).write_text('')          # empty transcript
+        for _ in range(2):                                     # recheck is repeatable
+            self.assertEqual(self.consume(self.submit()), 'unresolved:headless-exec-unconfirmed')
+            a = self.assert_pending()
+            self.assertEqual(a.state, 'unknown')
+            self.assertNotIn('retryable', a.wait['interactive_prompt_intent'])
+        self.assertEqual(self.r.procs, {})
+
+    def test_foreign_and_conflicting_terminals_stay_unresolved(self):
+        self.completed_native()
+        path = Path(self.intent['log_path'])
+        line = path.read_text()
+        path.write_text(line + line)                           # two terminals: conflicting evidence
+        self.assertTrue(self.consume(self.submit()).startswith('unresolved:'))
+        path.write_text(line.replace(self.intent['session_id'], str(uuid.uuid4())))  # foreign session
+        self.assertTrue(self.consume(self.submit()).startswith('unresolved:'))
+        self.assert_pending()
+
+    def test_stale_request_after_new_evidence_is_rejected_not_applied(self):
+        stale = self.submit()
+        Path(self.intent['log_path']).write_text('{"type":"noise"}\n')
+        self.assertEqual(self.consume(stale), 'rejected_evidence_changed')
+        self.assertEqual(self.assert_pending().state, 'unknown')
+
+    def test_recheck_without_new_evidence_is_idempotent_across_restart(self):
+        self.consume(self.submit())
+        before = self.r.store.get(self.a.id)
+        events = len(self.r.store.db.execute('SELECT 1 FROM events WHERE attempt=?', (self.a.id,)).fetchall()) \
+            if self._has_events() else 0
+        self.restart()
+        self.consume(self.submit())
+        self.r.tick()
+        after = self.r.store.get(self.a.id)
+        self.assertEqual((after.state, after.wait['interactive_prompt_intent']['token']),
+                         (before.state, before.wait['interactive_prompt_intent']['token']))
+        self.assertEqual(self.r.procs, {})
+        if self._has_events():
+            self.assertEqual(len(self.r.store.db.execute('SELECT 1 FROM events WHERE attempt=?', (self.a.id,)).fetchall()), events)
+        self.assert_pending()
+
+    def _has_events(self):
+        return bool(self.r.store.db.execute("SELECT 1 FROM sqlite_master WHERE name='events'").fetchone())
+
+    def test_status_explains_missing_evidence_and_next_action(self):
+        observed = self.observed()
+        self.assertEqual(observed['state'], 'unknown')
+        info = observed['explanation']
+        self.assertEqual(info['replay'], 'forbidden')
+        self.assertIn('recheck-delivery', info['next_action'])
+        self.assertIn('other lanes keep running', info['scope'])
+        row = next(x for x in self.r.status()['attempts'] if x['task_id'] == self.t['id'])
+        self.assertEqual(row['prompt_delivery']['explanation'], delivery_explain(row['prompt_delivery']['reason']))
+
+    def test_explanation_never_appears_for_resolved_ready_attempt(self):
+        self.journal('received')
+        self.consume(self.submit())
+        row = next(x for x in self.r.status()['attempts'] if x['task_id'] == self.t['id'])
+        self.assertNotIn('explanation', row['prompt_delivery'])
+        self.assertEqual(row['state'], 'ready')
+
+
+def delivery_explain(reason):
+    from mesh_runner import delivery_recovery
+    return delivery_recovery.explain(reason)

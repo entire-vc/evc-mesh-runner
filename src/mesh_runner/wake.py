@@ -574,26 +574,43 @@ def request_answer(mesh: MeshClient, cats: StatusCategories, wait: dict, agent_i
     return "", False
 
 
-def _watched_comment(mesh: MeshClient, target: dict, wait: dict, since: dt.datetime) -> str:
+def _watched_comment(mesh: MeshClient, target: dict, wait: dict, since: dt.datetime,
+                     delivery_reader=None) -> str:
     """A card wait made from a question to the target's own holder (``watch_comments_by``) also
     ends when that holder comments on the target: its handback or verdict is the answer."""
     watch = wait.get("watch_comments_by") or {}
     rid, tid = str(watch.get("id") or ""), str(target.get("id") or "")
     if not rid or not tid:
         return ""
+    key = "card_comment_delivery:" + hashlib.sha256(f"{tid}:{rid}".encode()).hexdigest()
+    previous = str(delivery_reader(key) or "") if delivery_reader else ""
+    cursor = json.loads(previous) if previous else {}
+    after = parse_time(cursor.get("at")) if cursor else since
+    if after is None:
+        raise ValueError("invalid watched-comment delivery cursor")
+    seen = set(cursor.get("ids", []))
     name = str(watch.get("name") or "").casefold()
-    for c in reversed(mesh.comments(tid)):
+    candidates = []
+    for c in mesh.comments(tid):
         at = parse_time(c.get("created_at"))
-        if at is None or at <= since:
-            break
+        if at is None or at < after or (not cursor and at == after):
+            continue
         author = c.get("author_id") or (c.get("author") or {}).get("id")
         who = str(c.get("author_name") or (c.get("author") or {}).get("name") or "")
         if author == rid or (name and who.casefold() == name):
-            return f"{who or watch.get('name') or 'the holder'} commented on #{tid[:8]}: {(c.get('body') or '')[:300]}"
-    return ""
-
-
-HUMAN_ASK_RECHECK = dt.timedelta(hours=24)
+            identity = str(c.get("id") or hashlib.sha256(json.dumps(c, sort_keys=True).encode()).hexdigest())
+            if at > after or identity not in seen:
+                candidates.append((at, identity, who, c.get("body") or ""))
+    if not candidates:
+        return ""
+    at, _, who, body = max(candidates)
+    # Coalesce the observed generation, retaining IDs for equal Mesh timestamps.
+    ids = seen if at == after else set()
+    ids.update(identity for timestamp, identity, _, _ in candidates if timestamp == at)
+    wait["card_comment_observation"] = {
+        "key": key, "previous": previous,
+        "value": json.dumps({"at": at.isoformat(), "ids": sorted(ids)}, sort_keys=True)}
+    return f"{who or watch.get('name') or 'the holder'} commented on #{tid[:8]}: {body[:300]}"
 
 
 def _hours(d: dt.timedelta) -> str:
@@ -1148,11 +1165,12 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
         return str(wait["settled"])          # the awaited result was final when the wait began
     since = parse_time(wait.get("since")) or now
     kind = wait.get("kind")
-    if kind in ("time", "card", "decision", "pipeline", "mr") and (c := own_next_after(comments, agent_id, since)):
+    if kind in ("time", "card", "decision", "pipeline", "mr", "manual") and (c := own_next_after(comments, agent_id, since)):
         # (a blocking ask is left out on purpose: a person's gate is lifted by the person, not by a NEXT)
         # the agent's newest word after the wait was declared is "continue now": the old WAIT line
-        # (and its until) no longer stands
-        wait["met"] = True
+        # (and its until) no longer stands. "met" counts the next declaration as a step of the work;
+        # "superseded" tells the runner the awaited event itself did not arrive (a Mesh wait is cancelled)
+        wait["met"] = wait["superseded"] = True
         return f"you declared ↻ NEXT after this wait ({(c.get('created_at') or '')[:16]}): the wait is superseded"
     foreign = foreign_comments(comments, agent_id, since)
     if comment_wake == "addressed":
@@ -1193,10 +1211,6 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
             who = held[0].get("author_name") or (held[0].get("author") or {}).get("name") or "someone"
             return (f"re-check: {who} commented {_hours(now - at)} ago on the waiting card without an answer "
                     "marker, an @-mention of you or the request card id; read the thread, it may be the answer")
-    if kind == "blocking":
-        # a person's ask stands behind the human gate, which wakes it on the answer: an early
-        # re-check only spends a turn and risks the question being asked again
-        interval = max(interval, HUMAN_ASK_RECHECK)
     if (kind == "decision" and wait.get("person_ask") and not wait.get("recipient_id")
             and task.get("human_gate") is False):
         # A question to a person that stands behind no gate (cancelled, refused, or never raised by
@@ -1218,6 +1232,10 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
                     f"#{wait['attached_closed']}, which is closed and was not reopened, so nobody was asked again. "
                     "Continue with what the thread holds, or ask a materially different question")
         return ""
+    if kind == "manual":
+        # A lead-decided passive wait: nothing to observe and no age re-check. Only the comment
+        # (above) or the owner's own NEXT ends it.
+        return ""
     if kind == "time":
         until = parse_time(wait.get("until"))
         if until and now >= until:
@@ -1226,10 +1244,9 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
         return ""
     if kind == "blocking":
         if task.get("human_gate"):
-            if now - started >= interval:
-                wait["recheck_due"] = True
-                return (f"re-check: the wait ({kind} {wait.get('target') or wait.get('handle') or ''}) has lasted "
-                        f"{_hours(now - started)} with no change; re-check and decide")
+            # A question to a person ends when the person answers (a comment, above) or the gate is
+            # lifted. Its age is not an event: the daily re-check spent a model turn per gated card
+            # only to re-declare the same question.
             return ""
         wait["met"] = True
         return "the human gate was lifted"
@@ -1315,7 +1332,7 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
             elif satisfied(cats, target):
                 event = f"task #{wait['target']} has shipped (still {cat})"
             else:
-                event = _watched_comment(mesh, target, wait, since)
+                event = _watched_comment(mesh, target, wait, since, delivery_reader)
         elif kind in ("pipeline", "mr"):
             if gitlab is None:
                 wait["integration_blocked"] = "GitLab observer unavailable"

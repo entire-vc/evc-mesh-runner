@@ -187,8 +187,7 @@ class DeadSlots(Bench):
     def test_attempt_of_another_agent_or_unfinished_attempt_is_untouched(self):
         t = task(1, cat="done")
         r = self.fresh(FakeMesh([t]))
-        a, slot = self.hold(r, t)
-        r.store.update(a, state="ready")                          # not finished
+        a, slot = self.hold(r, t, state="ready")                  # not finished
         self.assertEqual(r.free_dead_slots(), [])
         self.assert_untouched(r, slot)
 

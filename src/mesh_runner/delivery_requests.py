@@ -87,8 +87,12 @@ def snapshot(state: Path, agent: str, attempt: str) -> dict:
     if row is None:
         raise ValueError('attempt-not-owned-by-agent')
     a = SimpleNamespace(id=row[0], agent=row[1], task_id=row[2], wait=json.loads(row[3]))
-    return {**identity(a), 'evidence_sha256': evidence(state, a), 'state': row[4],
-            'reason': a.wait['interactive_prompt_intent'].get('resolution', '')}
+    reason = a.wait['interactive_prompt_intent'].get('resolution', '')
+    out = {**identity(a), 'evidence_sha256': evidence(state, a), 'state': row[4], 'reason': reason}
+    if row[4] == 'unknown':
+        from . import delivery_recovery
+        out['explanation'] = delivery_recovery.explain(reason)
+    return out
 
 
 def validate(r: dict, agent: str) -> None:

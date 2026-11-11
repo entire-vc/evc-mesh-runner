@@ -1,8 +1,8 @@
 # Queue WAIT freshness v1
 
-Default OFF. Enable `[runner] queue_wait_freshness_v1 = true` only together with
-board-services `queue_wait_freshness_v1.enabled=true`, matching protocol versions,
-and the same private state directory. This change alters no live configuration.
+Always on in the Runner (it has no switch); it takes effect only together with the
+board-services side of this protocol enabled, matching protocol versions, and the same
+private state directory.
 Runner owns `queue-wait-requests.json`; board-services alone writes
 `queue-wait-receipts.json`. Both are regular effective-user-owned private files;
 writers fsync a random 0600 temporary, replace atomically and fsync the directory.
@@ -15,7 +15,7 @@ insufficient. Current assignee, explicit human_gate=false, labels, human/park
 holds and checkout ownership must permit it. The newest exact typed source is
 used; ambiguous or malformed input remains unknown. Existing parked machine
 time WAITs can be adopted without executing a turn. Other timers keep their
-existing behavior. Existing queue WAITs stay parked if this flag is disabled.
+existing behavior. Existing queue WAITs stay parked while the observer side is disabled.
 
 Each new WAIT gets a fresh UUID generation even for the same card/contract.
 SQLite persists its owning WAIT and exact pending intent together before the
@@ -76,19 +76,20 @@ is introduced. The consumer has no direct Mesh queue reads.
 
 ## Operator recovery and rollback
 
-Turning either flag OFF pauses this protocol; it does not restore ordinary
+Turning the observer (board-services) side OFF pauses this protocol; the Runner side has no
+switch. A pause does not restore ordinary
 timer semantics for an existing queue WAIT. An older Runner binary is not a
 recovery mechanism for these WAITs. Preserve the Runner database, manifest,
 receipt and their revision/generation watermarks throughout any outage.
 
 If the observer fails, retain the compatible Runner and pending intents. Check
 the observer service, the configured private file paths/permissions and protocol
-versions; repair the cause, then enable both flags and verify fresh receipts
+versions; repair the cause, then re-enable the observer and verify fresh receipts
 for the current manifest generations. UNKNOWN or an expired receipt is not
 permission to force a wake. Healthy observation resumes on the durable
 300-second cadence; every ready transition still requires a current source and
-unexpired proof. If an emergency flag-OFF pause was used, explicitly re-enable
-both compatible components after repair; OFF alone leaves demand parked.
+unexpired proof. If an emergency observer-OFF pause was used, explicitly re-enable
+it after repair; OFF alone leaves demand parked.
 
 Before enabling, record the compatible source versions and private state paths.
 Before a binary rollback, stop the existing owner through its normal service

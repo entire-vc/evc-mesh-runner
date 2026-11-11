@@ -14,7 +14,9 @@ class DecisionTimerAdoption(Bench):
         # reproduce a forbidden timer loop. This is no language-model simulation.
         script = FAKE_AGENT.replace('if reply.startswith("GATE:"):', f'''
 if reply == "PENDING_ANSWER":
-    guided = "WAIT decision:@" in prompt and "same question" in prompt
+    # the wake prompt carries the decision guidance: ask the same open question again with ask_agent; this
+    # fixture cannot call the Mesh tool, so it takes the contract's marker fallback for that command
+    guided = "ask_agent" in prompt and "same open question again" in prompt
     reply = ("⏳ WAIT decision:@lead: approve the plan?" if guided
              else "⏳ WAIT 2h: awaiting response")
 if reply == "SCHEDULED_WORK":

@@ -32,6 +32,8 @@ GET_RETRY_DELAYS = (1.0, 3.0)
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_MAX_SLEEP = 30.0
 RATE_LIMIT_DEFAULT_SLEEP = 2.0
+# producer the Runner declares on POST /tasks/:id/move (activity_log.source)
+MOVE_SOURCE = "mesh-runner"
 
 
 def _parse_retry_after(value: Any) -> float | None:
@@ -287,6 +289,28 @@ class MeshClient:
     def dependencies(self, task_id: str) -> dict:
         return self.request("GET", f"/tasks/{task_id}/dependencies") or {}
 
+    def turn_outcomes(self, task_id: str, limit: int = 5) -> list[dict]:
+        """Typed turn outcomes of the task (Mesh turn commands), newest first."""
+        out = self.request("GET", f"/tasks/{task_id}/turn-outcomes", query={"limit": limit})
+        return out if isinstance(out, list) else list((out or {}).get("items") or [])
+
+    def active_wait(self, task_id: str, agent_id: str) -> dict | None:
+        """The agent's active typed wait on the task; None when it has none."""
+        try:
+            out = self.request("GET", f"/tasks/{task_id}/wait", query={"agent_id": agent_id})
+        except MeshError as e:
+            if e.status == 404:
+                return None
+            raise
+        return out if isinstance(out, dict) else None
+
+    def resolve_wait(self, task_id: str, wait_id: str, resolution: str, cause: str) -> dict:
+        """End the agent's typed wait on Mesh: ``resolution`` met or cancelled (expired and invalid are
+        Mesh's too), ``cause`` 1-200 characters. 200 also for a repeat of the same resolution; 409 when
+        the wait already ended another way, 404 when there is no such wait."""
+        body = {"resolution": resolution, "cause": (cause or resolution)[:200]}
+        return self.request("POST", f"/tasks/{task_id}/waits/{wait_id}/resolve", body) or {}
+
     def next_action(self, task_id: str) -> dict:
         return self.request("GET", f"/tasks/{task_id}/next-action") or {}
 
@@ -314,8 +338,9 @@ class MeshClient:
     def move(self, task_id: str, status_id: str, expected_version: int | None = None,
              expected_status_id: str | None = None) -> dict:
         """Move a task. With ``expected_*`` the server writes only if the card is still as read
-        (atomic; otherwise 409 cas_conflict and no write)."""
-        body = {"status_id": status_id}
+        (atomic; otherwise 409 cas_conflict and no write). ``source`` names the Runner as the
+        producer in Mesh's activity_log; without it the move reads as a plain ``api`` call."""
+        body = {"status_id": status_id, "source": MOVE_SOURCE}
         if expected_version is not None:
             body["expected_version"] = int(expected_version)
         if expected_status_id:
@@ -349,9 +374,11 @@ class MeshClient:
             if e.status not in (403, 404, 409, 422):   # closed or no longer ours: nothing to clear
                 raise
 
-    def add_dependency(self, task_id: str, depends_on: str) -> dict:
-        return self.request("POST", f"/tasks/{task_id}/dependencies",
-                            {"depends_on_task_id": depends_on, "dependency_type": "blocks"}) or {}
+    def add_dependency(self, task_id: str, depends_on: str, condition: str | None = None) -> dict:
+        body = {"depends_on_task_id": depends_on, "dependency_type": "blocks"}
+        if condition:
+            body["condition"] = condition        # absent: Mesh's default, task_done
+        return self.request("POST", f"/tasks/{task_id}/dependencies", body) or {}
 
     def delete_dependency(self, task_id: str, edge_id: str) -> None:
         try:

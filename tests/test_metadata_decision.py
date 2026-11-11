@@ -25,7 +25,6 @@ class MetadataDecision(Bench):
         from mesh_runner import queue_wait as q
         from test_queue_wait_freshness import NOW, description, proof
 
-        self.cfg.queue_wait_freshness_v1 = True
         self.agent.repos[0] = replace(self.agent.repos[0], max_slots=1)
         t = decision(description=description(), human_gate=False)
         t["labels"].append("fleet-starvation-wake")

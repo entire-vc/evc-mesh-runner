@@ -112,13 +112,13 @@ class TypedTimeSettlement(Bench):
 
     def test_programmatic_time_outcome_cannot_bypass_the_schema_or_queue_contract(self):
         from mesh_runner.outcome import Outcome
+        from mesh_runner.runner import OutcomeRead
         t=task(1); mesh=FakeMesh([t],max_concurrent=1)
         write_replies(self.replies,{t['id'][:8]:'ignored'})
-        self.cfg.queue_wait_freshness_v1=True
         r=self.runner(mesh)
         forged=Outcome('time', until=dt.datetime.now(dt.timezone.utc)+dt.timedelta(hours=6),
                        line='⏳ WAIT 6h: poll: queue', extra={'external_time': {'event':'fake'}})
-        with mock.patch.object(r,'_read_outcome',return_value=(forged,'')):
+        with mock.patch.object(r,'_read_outcome',return_value=OutcomeRead(forged,'','comment')):
             r.tick(); self.settle_all(r)
         self.assertFalse(r.store.by_state(self.agent.name,('waiting',)))
         self.assertFalse(mesh.tasks[t['id']].get('start_after'))

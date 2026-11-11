@@ -12,6 +12,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+# a stopped session stays in the runtime snapshot (process_alive=false) this long, so Mesh sees the stop
+# itself and not only an absence; past it an absent thread reads as stopped anyway
+STOPPED_KEEP = 600.0
+STOPPED_MAX = 200
+
 
 @dataclass
 class Slot:
@@ -42,7 +47,13 @@ class ChatPool:
         # agent id -> Stop of the service that owns that agent's sessions (windows are known only to it):
         # an eviction caused by another agent's host is stopped through the owner
         self.owners: dict[str, object] = {}
+        self.stopped: dict[tuple[str, str], tuple[float, float]] = {}   # key -> (last_end, stopped at)
         self.lock = threading.Lock()
+
+    def _stopped(self, slot: Slot) -> None:
+        self.stopped[(slot.agent, slot.thread)] = (slot.last_end, self.clock())
+        while len(self.stopped) > STOPPED_MAX:
+            self.stopped.pop(min(self.stopped, key=lambda k: self.stopped[k][1]))
 
     def _count(self, agent: str | None = None) -> int:
         return sum(1 for s in self.slots.values() if agent is None or s.agent == agent)
@@ -73,8 +84,9 @@ class ChatPool:
                 self._enqueue(key)
                 return Admission(False, reason, position=self._pos(key))
             if evict is not None:
-                del self.slots[(evict.agent, evict.thread)]       # the caller stops its session
+                self._stopped(self.slots.pop((evict.agent, evict.thread)))   # the caller stops its session
             self.slots[key] = Slot(agent, thread, busy=True, started=self.clock())
+            self.stopped.pop(key, None)
             self._unqueue(key)
             return Admission(True, reason, evict)
 
@@ -88,10 +100,27 @@ class ChatPool:
         """Put back an idle slot whose session could not be stopped, so it is stopped again later."""
         with self.lock:
             self.slots.setdefault((slot.agent, slot.thread), slot)
+            self.stopped.pop((slot.agent, slot.thread), None)
 
     def release(self, agent: str, thread: str) -> bool:
         with self.lock:
-            return self.slots.pop((agent, thread), None) is not None
+            slot = self.slots.pop((agent, thread), None)
+            if slot is not None:
+                self._stopped(slot)
+            return slot is not None
+
+    def sessions(self) -> list[dict]:
+        """Every session holding a slot plus those stopped within ``STOPPED_KEEP``: the rows of the runtime
+        snapshot (``slot_held`` false for a stopped one). Liveness of the process is not known here."""
+        now = self.clock()
+        with self.lock:
+            for k in [k for k, (_, at) in self.stopped.items() if now - at > STOPPED_KEEP]:
+                del self.stopped[k]
+            rows = [{"agent": s.agent, "thread": s.thread, "busy": s.busy, "last_end": s.last_end,
+                     "slot_held": True} for s in self.slots.values()]
+            rows += [{"agent": a, "thread": t, "busy": False, "last_end": end, "slot_held": False}
+                     for (a, t), (end, _) in self.stopped.items() if (a, t) not in self.slots]
+            return rows
 
     def expired(self) -> list[Slot]:
         """Idle longer than the limit: the caller stops these sessions and calls ``release``."""

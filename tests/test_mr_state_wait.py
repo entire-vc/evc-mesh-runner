@@ -164,8 +164,8 @@ class MRStateWait(Bench):
         self.assertIn('closed without merge', r._review_event(t, old, last, []))
         delivery = r._review_ci_delivery[t['id']]
         self.assertIsNone(r.store.mark(self.agent.name, t['id'], KEY))
-        r.store.update(a, wait={**a.wait, 'ci_delivery': delivery})
-        self.refused_spawn(r, a, ('waiting',))
+        r.store.update(a, state='ready', wait={**a.wait, 'ci_delivery': delivery})   # woken
+        self.refused_spawn(r, a, ('ready',))
         self.assertIsNone(r.store.mark(self.agent.name, t['id'], KEY))
         self.native_delivery(r, a)
         self.assertEqual(r._review_event(t, old, last, []), '')

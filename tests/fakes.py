@@ -11,9 +11,14 @@ import time
 import uuid
 from pathlib import Path
 
+from mesh_runner import lifecycle
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.adapters.codex import CodexAdapter
 from mesh_runner.mesh import Checkout, MeshError
+
+# Every test that drives a runner through these doubles also checks the lifecycle table: a state change
+# the table does not name raises instead of being recorded (see mesh_runner.lifecycle).
+lifecycle.STRICT = True
 
 # A moment ahead of the real clock for time-WAIT fixtures: the parser refuses a past or bare
 # timestamp, so a fixed calendar date would turn these tests red once it passes.
@@ -83,9 +88,9 @@ class FakeMesh:
             raise MeshError(503, "unavailable")
         self.runtime.pop(tid, None)
 
-    def add_dependency(self, tid, dep):
+    def add_dependency(self, tid, dep, condition=None):
         e = {"id": f"edge-{len(self.edges) + 1}", "task_id": tid, "depends_on_task_id": dep,
-             "dependency_type": "blocks", "condition": "task_done", "condition_satisfied": False}
+             "dependency_type": "blocks", "condition": condition or "task_done", "condition_satisfied": False}
         self.edges.setdefault(tid, []).append(e)
         return e
 
@@ -195,6 +200,30 @@ class FakeMesh:
              "created_at": (at or dt.datetime.now(dt.timezone.utc)).isoformat()}
         self.comment_log.setdefault(tid, []).append(c)
         return c
+
+    def turn_outcomes(self, tid, limit=5):
+        """Typed turn outcomes (Mesh turn commands), newest first; set ``mesh.outcomes[tid]``.
+        ``mesh.typed_error`` (a MeshError or OSError) makes the read fail; ``typed_reads`` counts reads."""
+        self.typed_reads = getattr(self, "typed_reads", 0) + 1
+        if getattr(self, "typed_error", None) is not None:
+            raise self.typed_error
+        return list(getattr(self, "outcomes", {}).get(tid, []))[:limit]
+
+    def active_wait(self, tid, agent_id):
+        self.typed_reads = getattr(self, "typed_reads", 0) + 1
+        if getattr(self, "wait_error", None) is not None:
+            raise self.wait_error
+        return getattr(self, "waits", {}).get(tid)
+
+    def resolve_wait(self, tid, wait_id, resolution, cause):
+        """POST /tasks/:id/waits/:wait_id/resolve: recorded in ``mesh.resolved``; ``mesh.resolve_errors``
+        (a list of MeshError/OSError, consumed in order) makes calls fail."""
+        self.resolved = getattr(self, "resolved", [])
+        self.resolved.append((tid, wait_id, resolution, cause))
+        errors = getattr(self, "resolve_errors", [])
+        if errors:
+            raise errors.pop(0)
+        return {"wait": {"id": wait_id, "resolution": resolution}, "resolved": True}
 
     def vcs_links(self, tid):
         return [dict(link) for link in getattr(self, "links", {}).get(tid, [])]

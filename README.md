@@ -66,8 +66,8 @@ The fields enforce an evidence contract; they do not prove the external source i
 Or moves the task to its review/done status. No outcome → the runner asks once
 in the same session (`max_no_outcome`). A second turn in a row without a readable
 outcome puts the task back in todo with the same lane until new input arrives (a comment,
-a change to a linked merge request or pipeline, a closed dependency: the `requeue_on_cap`
-inputs; no timer; without `requeue_on_cap` it is handed up as before). The
+a change to a linked merge request or pipeline, a closed dependency: the same inputs that
+restart a capped task; no timer). The
 `no_outcome_route_after`-th turn in a row without a readable outcome on the task (default 3,
 any lane; a readable outcome resets the count) hands it to the lead. A task that was handed up
 for this reason is only ever kept by the lead that receives it, never handed further up.
@@ -81,7 +81,7 @@ ask to a person retains its separate one-day re-check. A pipeline or MR wait wit
 GitLab/GitHub observer is not re-checked by age: it stays integration-blocked until the
 observer is restored. A `card:` wait whose card is itself waiting on this agent is woken as a cycle.
 
-With `queue_wait_freshness_v1` enabled, a parked typed refill can adopt queue
+A parked typed refill can adopt queue
 WAIT without a turn. The newest machine timestamp selects the source; its typed
 contract must be strictly valid and all sources at that timestamp must agree.
 A newer integer source can supersede an older malformed contract without editing
@@ -634,7 +634,8 @@ task is held for is logged once (`<agent>: #<task> held: <reason>`).
 
 `loop_streak_limit` (6, `0` = off) is the loop guard. The runner keeps, per task and agent, a streak
 of consecutive turns that made no progress (a store mark, so it survives attempts and restarts). At
-the limit the task is handed up like any other cap (`requeue_on_cap` or the lead chain) under the
+the limit the task is stopped like any other cap (back to the queue until new input; the lead chain
+only when that cannot be done) under the
 banner `🔁 LOOP`, whose text lists the last turns (NEXT, which wait was sent back and declared again).
 A loop is never held to the next UTC day by this path.
 
@@ -681,26 +682,27 @@ fleet that relies on the streak sets them high.
 
 ### Caps without a clock, questions without a wait
 
-Three switches in `[runner]` change what happens when work stalls on a cap or a question.
-Everything here restarts on an event, never on a timer. Details: `docs/requeue-on-event.md`.
+What happens when work stalls on a cap or a question. Everything here restarts on an event,
+never on a timer. Details: `docs/requeue-on-event.md`.
 
-- `requeue_on_cap = false`: when true, a task that hit START CAP, TURN CAP, LOOP or COMPACTION CAP goes
+- A task that hit START CAP, TURN CAP, LOOP or COMPACTION CAP goes
   back to `todo` with the same assignee (no `start_after`, no backoff) and starts again only when
   its inputs change (a comment by someone else, a linked merge request's state, pipeline status or
   head commit, a closed dependency, a new assignee). A free peer of the agent's pool (`pool` in the
   agent block; without it, another agent with the same repos and the same `lead`) takes it at once
-  for a fresh start. `RUNNER GAVE UP` still goes to the lead.
-- `turn_cap_continue_on_progress = false`: when true, an attempt that reaches `max_turns` but kept
+  for a fresh start. `RUNNER GAVE UP` still goes to the lead. A capped task of an agent without a
+  lead also restarts on the next UTC day.
+- A work attempt that reaches `max_turns` but kept
   making progress (at least `turn_cap_progress_min`, default 3, of its last 10 declared outcomes are
   `step` or `next`) ends as `turn cap: continued in a fresh session` and the same agent starts the
   task again in a new session instead of `RUNNER GAVE UP` to the lead. The restart counts as a start,
   so `daily_start_cap` (required, > 0) bounds the loop; with no recent progress, a spent start cap or
-  `daily_start_cap = 0` the task goes to the lead as before. With the switch on the cap is applied
+  `daily_start_cap = 0` the task goes to the lead. The cap is applied
   when the attempt resumes, after the capped turn's own outcome is recorded (a `WAIT` waits first). Both paths log `turn cap: ...` and record
   a `turn_cap` attempt event.
 - `unanswerable_ask_to_lead = true`: a `WAIT decision:@x` whose addressee cannot answer (not run by
   this runner, paused, itself, or a user listed in `unanswerable_users`) is put to the project lead.
-- `soft_person_asks_to_lead = false`: when true, a `WAIT decision:@person` that no hard rule matches
+- A `WAIT decision:@person` that no hard rule matches
   (`hard_ask_patterns`, `hard_ask_labels`: money, secrets and access, irreversible actions, publishing, legal, actions only the person can take)
   is put to the project lead instead of raising a human gate; the person can still override by
   commenting on the card.
@@ -747,49 +749,59 @@ rotate_days = 30                                       # POST /ext/me/token/rota
 
 ### Updating the runner
 
-The version this host runs is the version installed in Mesh. A new release reaches the host in one
-way only:
-
-1. The release is published to the extension catalog (signed artifact, `mesh-extension.json`
-   `version` = `mesh_runner.__version__` = `pyproject.toml` `version`).
-2. Stage the verified artifact next to the previous release. Prepare the service's mandatory
-   guarded launch below, using an absolute config path with an explicit `[runner].state_dir`.
-   Check target capability, config/state and pending delivery before metadata update or rollback;
-   repeat the check under the existing singleton after the controller has drained.
-3. An instance admin updates Agent Runner in **Extensions → Updates**
-   (`POST /api/v1/extensions/agent-runner/update`; new permissions ask for consent first).
-   Activate exactly that artifact through the guarded launch; metadata success alone does not
-   activate code. A race that creates pending delivery stops activation and needs owner reconciliation.
-4. Check: `python3 -c 'import mesh_runner; print(mesh_runner.__version__)'` under the service's
-   `PYTHONPATH` equals the Installed version, and the runner's lease in Mesh reports it.
-
-Never update the host from a git checkout or a hand-copied directory: Mesh would keep showing the
-old version. Rollback uses the same capability/pending preflight and guarded launch before
-and after **Updates → Roll back**. Restoring a historical unguarded plist is unsupported.
-
-The service's `ProgramArguments` must invoke a retained capable guard, including on rollback:
+One command on the runner's host installs a release and one command goes back. No fleet drain is
+needed: agent turns run in their own sessions and write their event stream to a file, the attempt
+registry is SQLite, and a restarted runner re-attaches to live turns. Stopping the runner stops
+scheduling, not work.
 
 ```sh
-python3 /absolute/capable-release/src/mesh_runner/launch_guard.py \
-  --target-release /absolute/target-release --config /absolute/runner.toml
+# install: a release tree exported from the repository (git archive <ref> | tar -x -C <dir>)
+python3 <dir>/ops/install.py --source <dir>            # catalog name = mesh_runner.__version__
+# go back to a version already in the catalog
+python3 ops/install.py --activate 0.1.44
+# what is configured, what runs, what the catalog holds
+python3 ops/install.py --status
 ```
 
-`mesh-runner-guarded-launch` is the equivalent installed executable. Both existing
-`mesh-runner run/once` and `python -m mesh_runner.cli run/once` automatically enter this
-guard before opening the registry; the exec child validates the inherited singleton. `--check` performs the
-exclusive preflight without changing the activation binding; it refuses while the controller
-owns `runner.lock`. The launch guard holds that same lock across exec into the normal CLI;
-Runner validates the inherited fd, inode, held lock, config and runtime source tree before opening
-its registry. There is no extra persistent lock. Capability-less or unknown target releases are
-refused. Pending prompt intent or any UNKNOWN row prevents a target/config/tree change, while
-restart of the exact previously activated capable target remains allowed for reconciliation.
-The `activated-release.json` binding is fsynced; do not edit or delete it to force a downgrade.
+`install.py` copies the tree into the catalog (`~/.mesh-runner-catalog/agent-runner/<version>`),
+loads the live config with the new code, points the launchd job at the new release, stops and
+starts it, and waits for the new process to publish its receipt in `status.json`. If the receipt
+does not appear, the previous job definition goes back and the command exits non-zero. It never
+reads or writes the attempt registry, leases, pause tokens or the config. Tests:
+`tests/test_ops_install.py`.
 
-This guarantee covers the supported launch/update/rollback path. Direct invocation of old code,
-a manual `PYTHONPATH` override or a historical unguarded service definition bypasses that path
-and is unsupported; an old binary does not protect itself. The guard does not retrofit evidence
-for attempts created before durable launch intent existed. Keep the capable release until pending
-attempts have reconciled; never clear queues, set READY or replay a possibly accepted prompt.
+The job always starts through the release's own launch guard:
+
+```sh
+python3 /absolute/release/src/mesh_runner/launch_guard.py \
+  --target-release /absolute/release --config /absolute/runner.toml
+```
+
+The guard holds `runner.lock` across exec into the normal CLI and binds the state to the release
+tree and the config bytes (`activated-release.json`, fsynced). Both `mesh-runner run/once` and
+`python -m mesh_runner.cli run/once` enter it before opening the registry. `--check` performs the
+preflight without changing the binding; it refuses while a runner owns the lock.
+
+**Pending delivery rows across an update.** A row is pending when its prompt delivery could not be
+proven (state UNKNOWN, or an unproven `interactive_prompt_intent`). The ordinary tick reconciles
+such rows from the delivery journal. That depends on the journal contract, which
+`launch_guard.CAPABILITY` versions, and not on the release tree or the config bytes: a target
+enters with the rows still pending when the previously activated release on the same state
+declared the same `CAPABILITY`. Nothing is declared safe; the rows stay fenced by the target's own
+tick, as on a same-target restart. A never-activated state, a previous release that is gone or
+unreadable, another state, or another `CAPABILITY` is refused with
+`pending-delivery-target-change`. Bump `CAPABILITY` when the journal contract changes.
+
+Releases up to 0.1.44 refuse any change of target or config while a row is pending. `install.py`
+keeps the activation marker of the release it leaves (`activated-release.<version>.json`) and
+puts it back before such a release starts, so going back to one works with a row pending; the
+config must be the one that release was activated with.
+
+Never clear queues, set READY by hand or replay a possibly accepted prompt.
+
+The Mesh extension catalog (`Extensions → Updates`) records which version an instance wants; a
+host on another version is reported as `version_mismatch` in the catalog state and nothing else
+follows from it.
 
 A fresh Codex session has no thread id before its first input: the installed CLI (0.159.x) creates
 the rollout together with the first user message (no rollout without a user message in 400 local

@@ -46,10 +46,12 @@ class TypedDependencySatisfaction(unittest.TestCase):
         ids, _ = run(edge(condition="artifact_published", condition_satisfied=True), {"status_category": "review"})
         self.assertEqual(ids, [])
 
-    def test_old_server_without_the_field_keeps_the_closed_or_shipped_rule(self):
+    def test_old_server_without_the_field_keeps_the_closed_rule_and_is_shipped_no_longer_releases(self):
         self.assertEqual(run(edge(), {"status_category": "done"})[0], [])
         self.assertEqual(run(edge(), {"status_category": "cancelled"})[0], [])
-        self.assertEqual(run(edge(), {"status_category": "review", "is_shipped": True})[0], [])
+        # is_shipped releases only shipped/deployed edges (server table), never task_done
+        self.assertEqual(run(edge(), {"status_category": "review", "is_shipped": True})[0], ["b1"])
+        self.assertEqual(run(edge(condition="shipped"), {"status_category": "review", "is_shipped": True})[0], [])
         self.assertEqual(run(edge(), {"status_category": "in_progress"})[0], ["b1"])
 
     def test_false_on_an_untyped_condition_falls_back_to_the_blocker_state(self):
@@ -85,7 +87,7 @@ class TypedDependencySatisfaction(unittest.TestCase):
     def test_satisfied_without_an_edge_is_the_older_rule(self):
         cats = StatusCategories(Mesh(edge(), {}))
         self.assertTrue(satisfied(cats, {"status_category": "done"}))
-        self.assertTrue(satisfied(cats, {"status_category": "todo", "is_shipped": True}))
+        self.assertFalse(satisfied(cats, {"status_category": "todo", "is_shipped": True}))
         self.assertFalse(satisfied(cats, {"status_category": "todo"}))
         self.assertFalse(satisfied(cats, {"status_category": "done"}, {"condition": "accepted", "condition_satisfied": False}))
         self.assertTrue(satisfied(cats, {"status_category": "done"}, {"condition_satisfied": False}))

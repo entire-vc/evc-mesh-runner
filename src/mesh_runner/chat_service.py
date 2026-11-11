@@ -31,8 +31,10 @@ class ChatService:
                  stop_session: Callable[[str, str], None],
                  delete_transcript: Callable[[str, str], bool],
                  token_path: Callable[[dict], Path | None] = lambda turn: None,
-                 spawn: Callable[[Callable[[], None]], None] | None = None):
+                 spawn: Callable[[Callable[[], None]], None] | None = None,
+                 on_release: Callable[[], None] = lambda: None):
         self.client, self.agents, self.pool = client, list(agents), pool
+        self.on_release = on_release             # a slot was given back: the runtime snapshot is announced now
         self.delivery_for, self.stop_session, self.delete_transcript = delivery_for, stop_session, delete_transcript
         self.token_path = token_path
         for a in self.agents:
@@ -46,6 +48,12 @@ class ChatService:
         self._next_orders = 0.0                  # idle rounds fetch orders no more often than ORDERS_EVERY
         self.hold_until = 0.0                    # no claiming until then (a pool refusal must not spin)
         self.claim_s: float | None = None        # how long the last round's claim took (None: no claim sent)
+
+    def _released(self) -> None:
+        try:
+            self.on_release()
+        except Exception as e:                   # the report is best effort, the stop itself is done
+            log.warning("chat release report: %s", type(e).__name__)
 
     def free_slots(self) -> int:
         with self.lock:
@@ -113,13 +121,19 @@ class ChatService:
                 return
             if kind == "stop_session":
                 had = self.pool.release(agent, thread)
-                self.stop_session(agent, thread)
+                try:
+                    self.stop_session(agent, thread)
+                finally:
+                    self._released()
                 result = "done" if had else "not_found"
             elif kind == "delete_transcript":
                 if not self._end_turns_of(agent, thread):
                     raise RuntimeError("turn still running")       # acked failed: Mesh retries the delete
                 self.pool.release(agent, thread)
-                self.stop_session(agent, thread)
+                try:
+                    self.stop_session(agent, thread)
+                finally:
+                    self._released()
                 result = "done" if self.delete_transcript(agent, thread) else "not_found"
             else:
                 return                                   # unknown kind: ignored, stays pending
@@ -175,6 +189,7 @@ class ChatService:
                 except ChatError:
                     pass
                 return 0
+            self._released()
         with self.lock:
             self.running.add(turn["turn_id"])
             self.running_on[turn["turn_id"]] = (agent, thread)
@@ -212,9 +227,11 @@ class ChatService:
                 if out.state != "released":
                     self.pool.release(agent, thread)
                     self.stop_session(agent, thread)
+                    self._released()
         except Exception as e:
             log.warning("chat turn %s crashed: %s", tid[:8], type(e).__name__)
             self.pool.release(agent, thread)
+            self._released()
         finally:
             self.pool.end_turn(agent, thread)
             with self.lock:
@@ -233,7 +250,10 @@ class ChatService:
             if s.agent not in self.agents:
                 continue
             self.pool.release(s.agent, s.thread)
-            self.stop_session(s.agent, s.thread)
+            try:
+                self.stop_session(s.agent, s.thread)
+            finally:
+                self._released()             # a failed stop still freed the slot; report actual process liveness
             stopped.append(s.thread)
         return stopped
 

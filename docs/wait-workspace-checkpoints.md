@@ -1,13 +1,3 @@
----
-created: 2026-11-05T15:52:43+03:00
-updated: 2026-11-05T15:52:43+03:00
-author: Codex-Mesh
-status: review
-project: mesh
-type: guide
-tags: [mesh]
----
-
 # WAIT workspace suspension
 
 `runner.workspace_wait_release_minutes` defaults to zero (disabled).
@@ -124,7 +114,9 @@ A snapshot stores only what the repository cannot give back:
   when the slot lives on another volume a full form would be a real copy of the whole worktree on
   every failure, so the capture fails with `lease retained` instead and the next suspend pass
   retries (the step's usual growing backoff). Each fallback logs one line
-  `checkpoint slim fallback: agent=… card=… attempt=… repo=… stage=… reason=… git=… outcome=full-form|lease-retained`.
+  `checkpoint slim fallback: agent=… card=… attempt=… repo=… stage=… reason=… git=… exit=… outcome=full-form|lease-retained`
+  (`exit` is the failing Git exit status, `-` when the failure has none; the manifest keeps it as
+  `slim_failure_exit`).
 
 Measured on the reference workspace: 135 MB and 48 s before, 1 MB and 4 s after.
 
@@ -152,9 +144,9 @@ evicted to meet the budget: a snapshot is the only copy of a waiting card's unco
 
 Without it, checkpoints accumulate: every later WAIT of a resumed attempt
 publishes a new generation and keeps the previous one, and an attempt that
-ends keeps all of its generations. `runner.checkpoint_gc = true` (default
-false) removes, from the same background pass as the ignored-directory
-cleanup and within its shared time budget:
+ends keeps all of its generations. The runner removes, from the same
+background pass as the ignored-directory cleanup and within its shared time
+budget:
 
 - every checkpoint of an attempt that ended (any state other than `starting`,
   `running`, `unknown`, `waiting`, `ready`) more than

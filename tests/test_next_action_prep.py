@@ -196,6 +196,31 @@ class SelectorIntegration(Bench):
         self.assertEqual(len(self.starts()), 1)
         self.assertEqual(self.mark(r)["generation"], "v1:aa")
 
+    def test_new_generation_wakes_the_waiting_attempt_once(self):
+        """After the first prep the attempt stands in a card WAIT and the selector skips it; a new
+        generation must still reach the consumer: one wake, same attempt, edge stays open."""
+        self.agent.next_action_prep = True
+        self.edge["task_id"] = self.t["id"]            # a well-formed Mesh row, as the stale-observation guard requires
+        write_replies(self.replies, {self.t["id"][:8]: f"⏳ WAIT card:#{self.blocker['id'][:8]}"})
+        r = self.runner(self.mesh)
+        self.settle_all(r)
+        first = self.mark(r)
+        self.assertEqual(first["generation"], "v1:aa")
+        att = r.store.get(first["attempt"])
+        self.assertEqual(att.state, "waiting")
+        r.tick()
+        self.assertEqual(r.store.get(first["attempt"]).state, "waiting")     # same generation: no wake
+        self.proj = dict(self.proj, generation="v1:bb")
+        r._last_wake_check.clear()
+        r._hold_cache.clear()
+        r.tick()
+        again = self.mark(r)
+        self.assertEqual((again["generation"], again["attempt"]), ("v1:bb", first["attempt"]))
+        self.assertIn(r.store.get(first["attempt"]).state, ("ready", "running", "starting"))
+        self.assertEqual(r.store.events_on_task(self.t["id"], "next_action_prep"), 2)   # first prep + this wake
+        self.assertEqual(self.mesh.deps[self.t["id"]][0]["condition_satisfied"], False)
+        self.assertFalse(r._wake_prep_generation(r.store.get(first["attempt"]), self.t, []))   # same generation again
+
 
 if __name__ == "__main__":
     unittest.main()

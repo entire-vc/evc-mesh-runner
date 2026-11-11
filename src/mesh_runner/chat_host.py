@@ -23,6 +23,7 @@ import uuid
 from pathlib import Path
 
 from . import interactive
+from .chat_announce import build_snapshot
 from .chat_delivery import DriverDelivery, window_key
 from .chat_machine import build_prompt, chat_dir, delete_chat, fetch_attachments, stop_window
 from .chat_pool import ChatPool
@@ -44,6 +45,20 @@ def claim_key(ar, fallback: str) -> str:
     """The key a chat claim for agent ``ar`` is made with: Mesh authorises a claim per agent key, so the
     agent's own key; ``fallback`` (``[chat] credential_file``) only for an agent with no key of its own."""
     return getattr(ar.agent, "key", "") or fallback
+
+
+def runtime_snapshot(pool: ChatPool, tmux, names: dict[str, str]) -> dict | None:
+    """The chat runtime snapshot the announcement carries. ``names``: Mesh agent id -> runner agent name.
+    A process is alive when its chat window is listed with a live pane; card windows are never looked at.
+    An unreadable tmux list gives no snapshot (Mesh ages the last one to unknown), never "nothing alive"."""
+    panes = tmux.panes_strict()
+    if panes is None:
+        return None
+
+    def alive(agent: str, thread: str) -> bool:
+        name = names.get(agent)
+        return bool(name) and panes.get((interactive.session_name(name), window_key(thread)), False)
+    return build_snapshot(pool.sessions(), alive, pool.max_per_agent)
 
 
 class ChatRefused(Exception):

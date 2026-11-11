@@ -283,7 +283,6 @@ class Recovery(unittest.TestCase):
             ar = other.agents[0]
             ar.refresh_me()
             other.cfg.mesh_effects = False
-            other.cfg.mention_requests = False
             from mesh_runner.interactive import Tmux
             ar._tmux = Tmux('/nonexistent-auth-fixture-tmux')
             self.on_tasks = stop.set  # external Mesh response ends one full tick

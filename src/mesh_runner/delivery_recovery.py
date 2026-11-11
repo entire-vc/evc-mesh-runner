@@ -279,6 +279,36 @@ def unknown_restored_unsent(db, directory: Path, key: str, agent: str, tmux: Tmu
         return False
 
 
+_NEEDS_NATIVE = ("the exact native acceptance record for this token and prompt hash "
+                 "(a single UserPromptSubmit/turn-complete bound to this session, then its terminal event)")
+EXPLAIN = {
+    'acceptance-unproven': _NEEDS_NATIVE + " is missing or ambiguous in the native event stream",
+    'codex-acceptance-unproven': _NEEDS_NATIVE + " is missing or ambiguous in the codex notify stream",
+    'session-unbound': "no native session is bound to this send and no typed bootstrap-failure proof exists",
+    'cursor-mismatch': "the native event stream no longer matches the cursor recorded before the send",
+    'native-evidence-unreadable': "the journal or native evidence could not be read",
+    'native-running-or-incomplete': "the native turn has no terminal event yet or is still settling",
+    'native-evidence-changing': "native evidence changed while it was being read",
+    'later-native-prompt': "a later native prompt follows this one, so its result cannot be attributed",
+    'headless-exec-unconfirmed': "the headless exec left neither a bound terminal nor a native acceptance receipt",
+    'ack-identity-mismatch': "no driver acknowledgement for this exact token and prompt hash",
+}
+
+
+def explain(resolution: str) -> dict:
+    """Operator-facing meaning of an unresolved delivery. Descriptive only: grants no authority and is never
+    read back as evidence. Missing ACK, a vanished driver and an empty transcript are never proof of non-delivery."""
+    return {
+        'missing_evidence': EXPLAIN.get(resolution) or ("native proof incomplete (" + (resolution or 'no resolution recorded') + ")"),
+        'replay': 'forbidden',
+        'scope': 'this attempt and its own lane workspace/lease only; other tasks of the lane and other lanes keep running',
+        'next_action': ("mesh-runner recheck-delivery --agent <lane> --attempt <attempt> (read-only), then --submit with the "
+                        "printed task/token/turn/evidence_sha256 once the evidence hash differs from the last unresolved "
+                        "recheck; the owner tick validates and consumes it. Without new native evidence there is no "
+                        "supported resolution, the attempt stays unresolved:" + (resolution or 'native-proof-incomplete')),
+    }
+
+
 def proven_unsent(directory: Path, key: str, intent: dict, other_sessions: frozenset = frozenset()) -> bool:
     """True only when the durable journal itself proves the native send never began for THIS intent: the
     token/sha match and the phase precedes every paste (`reserved`/`received` or the typed pre-send quota failure), or the typed bootstrap proofs

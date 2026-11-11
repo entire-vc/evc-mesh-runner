@@ -1,8 +1,9 @@
-# Lifecycle WAIT (`lifecycle_wait_v1`)
+# Lifecycle WAIT
 
 One native, bounded event wait: the source card sleeps until the **first new, correlated
 SessionStart lifecycle event** (native `startup` or `compact`) of one lane profile appears in the
-lifecycle journal an operator registered. Off by default. Not a second scheduler: state lives in
+lifecycle journal an operator registered. Always available; nothing happens without an
+operator-armed registration. Not a second scheduler: state lives in
 Runner's store marks of the source card, journal machinery is shared with `receipt_wait`.
 
 ## Declaration
@@ -11,7 +12,7 @@ Runner's store marks of the source card, journal machinery is shared with `recei
 ⏳ WAIT lifecycle:#<this-card-8hex>
 ```
 
-Accepted only when `lifecycle_wait_v1 = true`, the card id matches the declaring card, and a live
+Accepted only when the card id matches the declaring card and a live
 undelivered registration exists for this card and this lane's Mesh agent id. Otherwise the turn is
 sent back with guidance. No timer, no `start_after`.
 
@@ -82,5 +83,4 @@ does not prove that a producer is installed or that any event has been emitted.
 
 ## Rollback
 
-`disarm`, then `lifecycle_wait_v1 = false` (or route to the previous catalog). Nothing is written to the
-journal, ACKs or rollouts.
+`disarm`. Nothing is written to the journal, ACKs or rollouts.

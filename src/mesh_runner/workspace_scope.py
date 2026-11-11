@@ -14,6 +14,27 @@ WORKSPACE_REQUIRED = "runner:workspace-required"
 RECEIPT_KEY = "workspace_scope"
 
 
+def assignment_problem(task: dict, *, lane: str, workspace_id: str, mode: str = "work") -> dict | None:
+    """Explain configured scope; metadata-only admission never expands identity.
+
+    A missing task workspace is unknown, not a reason to route across workspaces.
+    Which projects a lane serves is Mesh's membership, not a lane option: the per-lane
+    ``project_ids`` allow-list silently held cards Mesh admitted, and was removed.
+    The caller still applies every ordinary gate after this check succeeds.
+    """
+    workspace = task.get("workspace_id")
+    project = task.get("project_id")
+    common = {"lane": lane, "workspace_id": workspace_id, "task_workspace_id": workspace,
+              "project_id": project,
+              "requested_scope": "metadata-only" if metadata_only(task, mode) else "workspace",
+              "next_actor": "operator", "eligible_owner": None}
+    if workspace and workspace_id and workspace != workspace_id:
+        return dict(common, reason="workspace_scope_mismatch", required_delta=None,
+                    action="route the existing card to an admitted owner in its workspace; "
+                           "no cross-workspace identity or grant is inferred")
+    return None
+
+
 def recorded_scope(value: str | None, attempt_id: str) -> str:
     """Only this exact attempt can inherit either side of a scope transition."""
     try:

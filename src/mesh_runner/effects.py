@@ -42,7 +42,7 @@ import re
 import time
 import uuid
 
-from . import card_wait_reconcile
+from . import card_wait_reconcile, outcome
 from .mesh import MeshClient, MeshError
 from .blocking_path import BlockingPath, Budget
 
@@ -332,8 +332,12 @@ def skip_state(reason: str, lane: str) -> dict | None:
                 "reason": "blocker card is not readable by this agent",
                 "constraints": [_constraint("write_acl", "dependencies_unreadable", "acl:dependencies", "mesh_acl",
                                             reason="a blocker card is not readable by this agent")]}
-    if r.startswith("project not served") or (r.startswith("label ") and r.endswith(" missing")):
+    if r.startswith("label ") and r.endswith(" missing"):
         return _stopped("outside_lane_scope", "outside this agent's scope")
+    if r.startswith("repository preflight: "):
+        # held until an operator adds the repository to this lane, or the card's merge request links change
+        return _stopped("outside_lane_scope", ("the card's repository is not in this agent's configuration ("
+                                               + r[len("repository preflight: "):] + ")")[:200])
     return None                                # a transient read error etc.: say nothing
 
 
@@ -600,16 +604,61 @@ class Effects:
         if kind == "card":
             self._add_edge(a, wait)
         if kind == "decision" and wait.get("handle"):
+            if wait.get("decision_request_id") and not self._typed_question(a, wait):
+                return                      # the question could not be read: adopt() retries
+            # ``ask_agent`` records the question on Mesh, but its comment wakes nobody and no queue
+            # shows the addressee an open request: the request card is still what starts the addressee
             self._file_decision(a, task, wait, me)
+            if wait.get("decision_request_id") and wait.get("fx"):
+                wait["ask_filed"] = True
+
+    def _typed_question(self, a: Attempt, wait: dict) -> bool:
+        """Put the words of an ``ask_agent`` question on its wait. The typed wait carries only
+        ``asked <agent>``; the question is in the comment Mesh wrote for the request (its metadata
+        names the request). True when the wait holds the question; a failed or empty read leaves
+        ``fx`` off so the wait is adopted again."""
+        if wait.get("question"):
+            return True
+        rid = str(wait["decision_request_id"])
+        try:
+            comments = self.mesh.comments_all(a.task_id)
+        except MeshError as e:
+            wait["fx"] = False
+            log.warning("%s: decision request #%s: question read HTTP %s", self.lane, a.task8, e.status)
+            return False
+        asked = next((c for c in reversed(comments)
+                      if str((c.get("metadata") or {}).get("decision_request_id") or "") == rid
+                      and (c.get("metadata") or {}).get("command") == "ask_agent"), None)
+        if asked is None:
+            wait["fx"] = False
+            log.warning("%s: decision request #%s: no ask_agent comment names request %s", self.lane, a.task8,
+                        rid[:8])
+            return False
+        head, _, text = (asked.get("body") or "").partition("\n\n")
+        question = " ".join((text or head).split())
+        handle = str(wait.get("handle") or "").lstrip("@")
+        wait["question"] = question
+        wait["asked_note"] = wait.get("note") or ""
+        # the shape a marker question has: what the request card quotes and what a repeat is compared by
+        wait["note"] = question
+        wait["line"] = f"⏳ WAIT decision:@{handle}: {question}"
+        return True
 
     def adopt(self, a: Attempt, task: dict, wait: dict, me: dict) -> bool:
         """Apply on_wait to a wait that began while effects were off (an older runner,
         or mesh_effects=false): its addressee was never asked and nothing is scheduled.
         True when it did so."""
-        if not self.enabled or wait.get("fx"):
+        if not self.enabled or (wait.get("fx") and not self._typed_ask_unfiled(wait)):
             return False
         self.on_wait(a, task, wait, me)
         return True
+
+    @staticmethod
+    def _typed_ask_unfiled(wait: dict) -> bool:
+        """An ``ask_agent`` wait whose addressee was never given a request card: parked by a runner
+        that left the asking to Mesh, which delivers nothing."""
+        return bool(wait.get("kind") == "decision" and wait.get("handle") and wait.get("decision_request_id")
+                    and not wait.get("request") and not wait.get("ask_filed"))
 
     def renew(self, a: Attempt, wait: dict) -> None:
         """Nothing is renewed: an event wait writes no hold. What an older runner wrote for one
@@ -897,7 +946,8 @@ class Effects:
             raise MeshError(502, "edge set unreadable")
         for e in outgoing:
             if e.get("id") == wait["edge"]:
-                if e.get("dependency_type") == "blocks" and e.get("condition") == "task_done":
+                if (e.get("dependency_type") == "blocks"
+                        and e.get("condition") == (wait.get("edge_condition") or "task_done")):
                     return True
                 log.info("%s: edge #%s %s is %s/%s now (changed by its owner); left in place",
                          self.lane, a.task8, wait["edge"], e.get("dependency_type"), e.get("condition"))
@@ -930,10 +980,15 @@ class Effects:
             if self.store is not None and self.store.mark(self.lane, a.task_id, f"{EDGE_REMOVED_MARK}:{wait.get('target')}"):
                 log.info("%s: edge #%s → #%s was removed by a user; not restored", self.lane, a.task8, wait.get("target"))
                 return
-            edge = self.mesh.add_dependency(a.task_id, target_id)
+            # `WAIT card:#X until=<typed>` names the condition it waits for; the plain form stays task_done
+            condition = outcome.card_condition(wait.get("line") or "")
+            edge = (self.mesh.add_dependency(a.task_id, target_id, condition) if condition
+                    else self.mesh.add_dependency(a.task_id, target_id))
             edge_id = edge.get("id") or (edge.get("dependency") or {}).get("id")
             if edge_id:
                 wait["edge"] = edge_id
+                if condition:
+                    wait["edge_condition"] = condition
         except MeshError as e:
             if e.status == 403:            # a card of a workspace this key cannot see: asked once
                 self._deny_edge(a.task_id, "add:" + str(wait.get("target")))
@@ -1646,6 +1701,11 @@ class Effects:
             if self.cats.category(card) not in ("done", "cancelled"):
                 if blocked and not self._close_retry_due(blocked, card):
                     return              # still behind a human gate: no write until the card changes
+                if card.get("checked_out_by"):
+                    # The addressee's turn on the request is still running. Closing the card under its
+                    # live checkout makes its next heartbeat fail and the turn is killed. Its
+                    # own outcome moves the card; this close is tried again on a later pass.
+                    return
                 done = next((s["id"] for s in self.mesh.statuses(req["project_id"]) if s.get("category") == "done"),
                             None)
                 if not done:

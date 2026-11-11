@@ -1,7 +1,7 @@
 """Opt-in recovery WAIT: one durable observer of a FUTURE shared recovery card.
 
 ``⏳ WAIT recovery:#<this-card-8hex>`` sleeps until the shared recovery card that a producer is
-allowed to create (title/description carries the registered marker, assigned to the registered
+allowed to create (its TITLE carries the registered marker, assigned to the registered
 recovery owner) has been created, bound, finished as ``done`` AND carries an explicit receipt
 comment by the registered receipt author. Nothing about the future card is guessed: no UUID, no
 timer, no relay card. State lives in Runner's own store (marks of the source card):
@@ -32,6 +32,7 @@ REG_KEY = "recovery_reg"
 BOUND_KEY = "recovery_bound"
 PENDING_KEY = "recovery_pending"
 DELIVERED_KEY = "recovery_delivered"
+SUPERSEDED_KEY = "recovery_superseded"
 _RECEIPT_LINE = re.compile(r"(?m)^[ \t]*carrier-receipt:[ \t]*(?P<ref>[\w][\w.:/#@+-]{3,127})[ \t]*$")
 _MARKER = re.compile(r"[^\n\r]{3,80}")
 
@@ -124,7 +125,8 @@ def arm(store, agent: str, task_id: str, owner_id: str, project_id: str, marker:
             or not _MARKER.fullmatch(marker):
         raise ValueError("owner must be a Mesh agent id; project/recovery-owner/receipt-author UUIDs; marker 3..80 chars, one line")
     old = registration(store, agent, task_id)
-    if old and not delivered(store, agent, task_id, old["reg_id"]):
+    if old and not delivered(store, agent, task_id, old["reg_id"]) \
+            and not superseded(store, agent, task_id, old["reg_id"]):
         if any(old[k] != v for k, v in contract.items()):
             raise ValueError("a live registration for this card has another contract: disarm it first")
         if old["state"] == "disarmed":
@@ -145,6 +147,92 @@ def disarm(store, agent: str, task_id: str) -> dict | None:
     return reg
 
 
+_SUPERSEDE_LINE = re.compile(r"(?m)^[ \t]*supersede-recovery:[ \t]*(?P<reg>[0-9a-f-]{36})[ \t]*$")
+
+
+def supersede_authorization(comments, reg: dict, authorities) -> dict | None:
+    """The first Mesh comment on the source card that authenticates a supersede of exactly this
+    generation: written by the registered root owner (receipt author) or a configured authority, with
+    the line ``supersede-recovery: <reg_id>``. The author id comes from Mesh, never from the caller."""
+    allowed = {reg["receipt_author_id"], *[a for a in (authorities or ()) if _uuid(a)]}
+    for c in comments or []:
+        if not isinstance(c, dict) or c.get("author_id") not in allowed:
+            continue
+        m = _SUPERSEDE_LINE.search(c.get("body") or "")
+        if m and m["reg"] == reg["reg_id"] and c.get("id"):
+            return {"by": c["author_id"], "comment_id": str(c["id"])}
+    return None
+
+
+def supersede(store, agent: str, task_id: str, reg_id: str, comments, authorities, reason: str, now: float) -> dict:
+    """Authorized replacement of a wrong recovery gate for ONE registration generation.
+
+    ``reg_id`` is the compare-and-set: a stale or other generation, an already delivered or already
+    superseded registration is refused. Authorization is a Mesh comment by the root owner or a
+    configured authority naming that generation (``supersede_authorization``). The registration is
+    disarmed and the attempt that declared exactly this generation is released once by
+    ``_wake_superseded`` (the delivered mark makes it one-shot across restart; a re-arm before that
+    wake does not strand it). Nothing is cleared: a later ``arm`` starts a new generation and the
+    separate security activation gate of the card is untouched."""
+    reg = registration(store, agent, task_id)
+    if reg is None:
+        raise ValueError("no recovery registration for this card")
+    if reg["reg_id"] != reg_id:
+        raise ValueError("stale generation: the registration is " + reg["reg_id"])
+    if delivered(store, agent, task_id, reg_id) or superseded(store, agent, task_id, reg_id):
+        raise ValueError("registration already delivered or superseded")
+    prev = _load_safe(store, agent, task_id, SUPERSEDED_KEY)
+    if prev and not delivered(store, agent, task_id, prev.get("reg_id")):
+        raise ValueError("an earlier supersede is still waiting to be delivered")
+    auth = supersede_authorization(comments, reg, authorities)
+    if auth is None:
+        raise ValueError("no authorizing comment: the root owner or a configured authority must write "
+                         f"`supersede-recovery: {reg_id}` on the card")
+    if not isinstance(reason, str) or not 8 <= len(reason.strip()) <= 300 or "\n" in reason:
+        raise ValueError("reason: one line, 8..300 chars")
+    owned = not store.db.in_transaction
+    if owned:
+        store.db.execute("BEGIN IMMEDIATE")
+    try:
+        if registration(store, agent, task_id) != reg or delivered(store, agent, task_id, reg_id):
+            raise ValueError("registration changed concurrently")
+        reg["state"] = "disarmed"
+        _put(store, agent, task_id, REG_KEY, reg)
+        _put(store, agent, task_id, SUPERSEDED_KEY, {"reg_id": reg_id, "by": auth["by"],
+                                                    "comment_id": auth["comment_id"],
+                                                    "reason": reason.strip(), "at": int(now)})
+    except BaseException:
+        if owned and store.db.in_transaction:
+            store.db.execute("ROLLBACK")
+        raise
+    if owned and store.db.in_transaction:
+        store.db.execute("COMMIT")
+    return reg
+
+
+def _load_safe(store, agent, task_id, key):
+    try:
+        return _load(store, agent, task_id, key)
+    except ValueError:
+        return None
+
+
+def superseded(store, agent: str, task_id: str, reg_id: str) -> dict | None:
+    try:
+        value = _load(store, agent, task_id, SUPERSEDED_KEY)
+    except ValueError:
+        return None
+    return value if value and value.get("reg_id") == reg_id else None
+
+
+def supersede_text(sup: dict) -> str:
+    return (f"the recovery gate of this card was superseded on the authority of {sup['by']} (comment "
+            f"{sup['comment_id']}): {sup['reason']}. This is a "
+            "decision about the next action, not recovery evidence and not a security clearance: do the "
+            "work the new next action allows; the separate activation/security gate stays closed until "
+            "its own real receipt")
+
+
 def inspect(store, agent: str, task_id: str) -> dict:
     """Metadata only."""
     try:
@@ -157,14 +245,17 @@ def inspect(store, agent: str, task_id: str) -> dict:
     return {"registered": True, **{k: reg[k] for k in ("reg_id", "state", "owner_id", "project_id", "marker",
             "recovery_owner_id", "receipt_author_id", "installed_at")},
             "bound": b, "pending": pending(store, agent, task_id, reg["reg_id"]),
-            "delivered": delivered(store, agent, task_id, reg["reg_id"])}
+            "delivered": delivered(store, agent, task_id, reg["reg_id"]),
+            "superseded": superseded(store, agent, task_id, reg["reg_id"])}
 
 
 def _candidate(task: dict, reg: dict) -> bool:
-    """An actual shared recovery card: right project, marker, and the registered recovery owner."""
-    text = (task.get("title") or "") + "\n" + (task.get("description") or "")
+    """An actual shared recovery card: right project, marker in the TITLE, and the registered
+    recovery owner. The producer writes the marker into the title; a card that only mentions it in
+    its description (a defect report about the producer, say) is not the recovery card and must
+    not take the binding the real one needs."""
     return (_uuid(task.get("id")) is not None and task["id"] != reg["source_task_id"]
-            and task.get("project_id") == reg["project_id"] and reg["marker"] in text
+            and task.get("project_id") == reg["project_id"] and reg["marker"] in (task.get("title") or "")
             and task.get("assignee_id") == reg["recovery_owner_id"])
 
 

@@ -13,14 +13,12 @@ from mesh_runner.config import AgentConfig
 from mesh_runner.effects import UNSCHEDULE_MARK
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import CAP_REASSIGNED, CAP_WAIT
-from mesh_runner.selection import Policy
 from mesh_runner.workspace import RepoSpec
 
 
 class CapBench(Bench):
     def setUp(self):
         super().setUp()
-        self.cfg.requeue_on_cap = True
         self.cfg.daily_start_cap = 2
 
     def peer(self, name="peer", **kw):
@@ -307,7 +305,7 @@ class Peers(CapBench):
                 self.assertTrue(r._cap_wait(t["id"]))
                 self.tmp.cleanup()
 
-    def test_a_paused_busy_capped_or_unserving_peer_is_skipped(self):
+    def test_a_paused_busy_or_capped_peer_is_skipped(self):
         def paused_file(r):
             (self.cfg.state_dir / "pause").mkdir(parents=True, exist_ok=True)
             (self.cfg.state_dir / "pause" / "peer").write_text("")
@@ -324,8 +322,7 @@ class Peers(CapBench):
 
         for label, prep, kw in (("pause file", paused_file, {}), ("config pause", lambda r: None, {"paused": True}),
                                 ("no free slot", busy, {"max_parallel": 1}), ("capped itself", capped_on_it, {}),
-                                ("waiting for input", waiting_on_it, {}),
-                                ("another project", lambda r: None, {"policy": Policy(project_ids=("other",))})):
+                                ("waiting for input", waiting_on_it, {})):
             with self.subTest(label):
                 self.setUp()
                 t = task(1)
@@ -464,10 +461,9 @@ class OtherCaps(CapBench):
         self.assertIn("routed to lead", r.store.get(a.id).note)
         self.assertFalse(r._cap_wait(t["id"]))
 
-    def test_cap_wake_next_day_restarts_a_leadless_agent_only_on_a_new_utc_day(self):
+    def test_a_leadless_agent_restarts_a_capped_task_only_on_a_new_utc_day(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.cap_wake_next_day = True
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
@@ -480,32 +476,30 @@ class OtherCaps(CapBench):
         with self.assertLogs("mesh_runner", "INFO") as lg:
             self.assertEqual(r.hold_reason(cur, "work"), "")
         self.assertTrue(any("cap wake" in m for m in lg.output))
-        self.agent.lead = "lead"                       # a lead takes the cap path, no clock
-        self.assertIn("waiting for new input", r.hold_reason(cur, "work"))
-        self.agent.lead = ""
-        self.cfg.cap_wake_next_day = False             # rollback flag
+        self.agent.lead = "lead"                       # an agent with a lead waits for input, no clock
         self.assertIn("waiting for new input", r.hold_reason(cur, "work"))
 
 
-class FlagOff(CapBench):
+class RequeueRefused(CapBench):
+    """The move back to todo was refused, so the requeue could not be done: the cap takes the
+    hand-up path instead (the lead, or the agent keeps it until tomorrow)."""
+
     def setUp(self):
         super().setUp()
-        self.cfg.requeue_on_cap = False
+        self.requeue_unavailable()
 
-    def test_start_cap_hands_to_the_lead_as_before(self):
+    def test_start_cap_hands_to_the_lead(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.agent.lead = "lead"
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
-        with mock.patch.object(r, "_requeue_on_event") as requeue:
-            r._start_cap(dict(mesh.tasks[t["id"]]), 2)
-        requeue.assert_not_called()
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
         self.assertFalse(r._cap_wait(t["id"]))
 
-    def test_start_cap_without_a_lead_keeps_it_until_tomorrow_as_before(self):
+    def test_start_cap_without_a_lead_keeps_it_until_tomorrow(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
@@ -514,8 +508,9 @@ class FlagOff(CapBench):
         r._start_cap(dict(mesh.tasks[t["id"]]), 2)
         self.assertGreater(r._task_backoff[t["id"]], time.monotonic() + 60)
         self.assertIn("Not started again before tomorrow", self.bodies(mesh, t)[0])
+        self.assertFalse(r._cap_wait(t["id"]))
 
-    def test_turn_budget_routes_to_the_lead_as_before(self):
+    def test_turn_budget_routes_to_the_lead(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
@@ -530,21 +525,11 @@ class FlagOff(CapBench):
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
         self.assertTrue(any(a.note.startswith("routed to lead") for a in r.store.by_state("builder", ("completed",))))
 
-    def test_old_marks_do_not_hold_when_the_flag_is_off(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        r = self.runner(mesh)
-        r.refresh_me()
-        r.store.mark("builder", t["id"], CAP_WAIT, json.dumps({"kind": "start cap", "fp": {}, "at": "x"}))
-        self.assertEqual(r.hold_reason(dict(mesh.tasks[t["id"]]), "work"), "")
-        self.assertEqual([x["id"] for x in r.candidates()], [t["id"]])
-
 
 class StartCapStaleSnapshot(CapBench):
     def test_second_hand_up_from_a_stale_snapshot_is_skipped(self):
         t = task(7, cat="todo")
         mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.requeue_on_cap = False
         self.agent.lead = "lead"
         r = self.runner(mesh)
         r.refresh_me()
@@ -560,7 +545,6 @@ class StartCapStaleSnapshot(CapBench):
             with self.subTest(assignee=missing):
                 t = task(9, cat="todo")
                 mesh = FakeMesh([t], max_concurrent=1)
-                self.cfg.requeue_on_cap = False
                 self.agent.lead = "lead"
                 r = self.runner(mesh)
                 r.refresh_me()
@@ -571,40 +555,52 @@ class StartCapStaleSnapshot(CapBench):
                 self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], missing)
                 self.assertEqual(self.bodies(mesh, t), [])
 
-    def test_fresh_read_showing_this_agent_hands_up_exactly_once(self):
+    def test_fresh_read_showing_this_agent_applies_the_cap_exactly_once(self):
         t = task(10, cat="todo")
         mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.requeue_on_cap = False
         self.agent.lead = "lead"
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
         r._start_cap(dict(mesh.tasks[t["id"]]), 2)
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)   # requeued in place, not handed up
+        self.assertTrue(r._cap_wait(t["id"]))
         self.assertEqual(len(self.bodies(mesh, t)), 1)
         self.assertIn("START CAP", self.bodies(mesh, t)[0])
 
-    def test_unreadable_task_defers_the_hand_up(self):
+    def test_unreadable_task_defers_the_cap(self):
         t = task(11, cat="todo")
         mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.requeue_on_cap = False
         self.agent.lead = "lead"
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
         with mock.patch.object(mesh, "task", side_effect=MeshError(503, "down")):
             r._start_cap(dict(mesh.tasks[t["id"]]), 2)
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
+        self.assertFalse(r._cap_wait(t["id"]))
         self.assertEqual(self.bodies(mesh, t), [])
-        r._start_cap(dict(mesh.tasks[t["id"]]), 2)              # readable again: hands up once
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)              # readable again: the cap is applied once
+        self.assertTrue(r._cap_wait(t["id"]))
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
+        self.assertEqual(len(self.bodies(mesh, t)), 1)
+
+    def test_fresh_read_showing_this_agent_hands_up_once_when_the_requeue_is_refused(self):
+        t = task(12, cat="in_progress")
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.agent.lead = "lead"
+        self.requeue_unavailable()
+        r = self.runner(mesh)
+        r.refresh_me()
+        self.started(r, t)
+        r._start_cap(dict(mesh.tasks[t["id"]]), 2)
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
         self.assertEqual(len(self.bodies(mesh, t)), 1)
+        self.assertIn("START CAP", self.bodies(mesh, t)[0])
 
     def test_checked_out_by_another_writer_is_skipped(self):
         t = task(8, cat="todo")
         mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.requeue_on_cap = False
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)

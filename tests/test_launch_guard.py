@@ -78,9 +78,11 @@ class LaunchGuard(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         changed = self.config.read_text() + '\n# changed configured target binding\n'
         self.config.write_text(changed)
-        refused = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
-        self.assertEqual(refused.returncode, 2)
-        self.assertIn('pending-delivery-target-change', refused.stderr)
+        # the same release reads its own journal: a config change enters with the row still pending
+        third = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(json.loads((self.state / guard.MARKER).read_text())['config_sha256'],
+                         guard.digest(changed.encode()))
         self.assertTrue(guard.pending(self.state))
 
     def test_actual_controller_sigkill_then_same_target_exec(self):
@@ -113,9 +115,57 @@ class LaunchGuard(unittest.TestCase):
         self.assertEqual((self.state / guard.MARKER).read_bytes(), before)
         store = Store(self.state / 'runner.sqlite')
         for a in store.by_state('fixture', ('unknown',)):
-            store.update(a, state='done', wait={})
+            store.update(a, state='completed', wait={})
         store.db.close()
         self.assertEqual(self.invoke(other, '--once').returncode, 0)
+
+    def own_guard(self, release, *extra):
+        program = release / 'src/mesh_runner/launch_guard.py'
+        return subprocess.run([sys.executable, str(program), '--target-release', str(release),
+                               '--config', str(self.config), *extra], text=True, capture_output=True, timeout=15)
+
+    def test_new_target_takes_pending_rows_over_through_its_own_guard(self):
+        self.assertEqual(self.invoke(None, '--once').returncode, 0)
+        other = self.root / 'other'
+        shutil.copytree(self.release, other)
+        # a different tree: the next release
+        module = other / 'src/mesh_runner/__init__.py'
+        module.write_text(module.read_text() + '\n# next release\n')
+        self.make_pending()
+        self.make_pending(intent=False)
+        result = self.own_guard(other, '--once')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = json.loads((self.state / guard.MARKER).read_text())
+        self.assertEqual(marker['release'], str(other.resolve()))
+        self.assertEqual(marker['tree'], guard.target_identity(other))
+        self.assertTrue(guard.pending(self.state))          # nothing was declared safe: the rows stay pending
+        # and the way back is the same move
+        back = self.own_guard(self.release, '--once')
+        self.assertEqual(back.returncode, 0, back.stderr)
+        self.assertEqual(json.loads((self.state / guard.MARKER).read_text())['release'], str(self.release.resolve()))
+
+    def test_pending_rows_do_not_cross_a_journal_contract_change(self):
+        self.assertEqual(self.invoke(None, '--once').returncode, 0)
+        other = self.root / 'other'
+        shutil.copytree(self.release, other)
+        self.make_pending()
+        marker = self.state / guard.MARKER
+        activated = json.loads(marker.read_text())
+        # the previously activated release declared another journal contract
+        foreign = self.root / 'foreign'
+        (foreign / 'src/mesh_runner').mkdir(parents=True)
+        (foreign / 'src/mesh_runner/launch_guard.py').write_text('CAPABILITY = 2\n')
+        marker.write_text(json.dumps({**activated, 'release': str(foreign)}))
+        result = self.own_guard(other, '--once')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('pending-delivery-target-change', result.stderr)
+        # ... or is gone, so nobody can say what it wrote
+        marker.write_text(json.dumps({**activated, 'release': str(self.root / 'removed')}))
+        self.assertEqual(self.own_guard(other, '--once').returncode, 2)
+        # ... or belonged to another state
+        marker.write_text(json.dumps({**activated, 'state': str(self.root / 'elsewhere')}))
+        self.assertEqual(self.own_guard(other, '--once').returncode, 2)
+        self.assertTrue(guard.pending(self.state))
 
     def test_unknown_row_without_intent_also_fences_target_change(self):
         self.assertEqual(self.invoke(None, '--once').returncode, 0)

@@ -5,13 +5,16 @@ separate body segment after the TLS handshake is sometimes lost (in 600 POSTs pe
 form hung 13 times, headers+body in one write 0 times). For a bounded ``bytes`` body both parts go out in one write.
 
 Nothing else changes: same bytes on the wire, TLS/SNI/certificate checks, proxy handling, redirect policy,
-timeouts and retries stay with the caller. File objects, iterables, chunked bodies, GET and bodies above
+timeouts and retries stay with the caller. The one proxy addition is the explicit opt-in route for main Mesh
+(``main_route``): absent or disabled activation leaves the caller's proxy policy exactly as it was. File objects, iterables, chunked bodies, GET and bodies above
 ``COALESCE_MAX`` take the stock ``http.client`` path.
 """
 from __future__ import annotations
 
 import http.client
 import urllib.request
+
+from . import main_route
 
 COALESCE_MAX = 64 * 1024        # the memory bound of the extra copy
 
@@ -39,8 +42,12 @@ class CoalescingHTTPSHandler(urllib.request.HTTPSHandler):
 
 
 def build_opener(*handlers) -> urllib.request.OpenerDirector:
-    """``urllib.request.build_opener`` with the coalescing HTTPS handler in place of the stock one."""
-    return urllib.request.build_opener(*handlers, CoalescingHTTPSHandler())
+    """``urllib.request.build_opener`` with the coalescing HTTPS handler in place of the stock one.
+
+    The caller's proxy policy (none given: the environment's; ``ProxyHandler({})``: no proxy) is kept for
+    every origin; only main Mesh additionally honours the explicit route activation (``main_route``).
+    """
+    return urllib.request.build_opener(*main_route.with_route(handlers), CoalescingHTTPSHandler())
 
 
 _default = None

@@ -159,7 +159,6 @@ class AgentAddressee(AskBench):
 class PersonAsk(AskBench):
     def test_a_payment_question_stays_a_human_gate(self):
         self.setup_route("person", "Should we pay for the annual plan?")
-        self.cfg.soft_person_asks_to_lead = True
         self.route()
         self.assertEqual(len(self.blocking_comments()), 1)
         self.assertTrue(self.wait["person_ask"])
@@ -168,7 +167,6 @@ class PersonAsk(AskBench):
 
     def test_a_design_question_goes_to_the_lead_without_a_gate(self):
         self.setup_route("person", "Which variant of the settings page, A or B? I suggest A.")
-        self.cfg.soft_person_asks_to_lead = True
         self.assertEqual(self.route(), "")
         self.assertEqual(self.blocking_comments(), [])
         self.assertEqual((self.wait["kind"], self.wait["handle"], self.wait["asked_handle"]),
@@ -180,7 +178,6 @@ class PersonAsk(AskBench):
 
     def test_a_later_comment_by_the_person_wakes_the_card(self):
         self.setup_route("person", "Which variant, A or B?")
-        self.cfg.soft_person_asks_to_lead = True
         self.route()
         self.r.effects.on_wait(self.a, self.source, self.wait, self.r.me)
         self.mesh.add_comment(self.source["id"], "no, take C", author="user-person",
@@ -195,60 +192,42 @@ class PersonAsk(AskBench):
             with self.subTest(label):
                 self.setUp()
                 self.setup_route("person", "Which variant, A or B?", labels=[label])
-                self.cfg.soft_person_asks_to_lead = True
                 self.route()
                 self.assertEqual(len(self.blocking_comments()), 1)
                 self.tmp.cleanup()
 
-    def test_the_flag_off_raises_the_gate_as_today(self):
-        self.setup_route("person", "Which variant of the settings page, A or B?")
-        self.assertFalse(self.cfg.soft_person_asks_to_lead)
-        self.route()
-        self.assertEqual(len(self.blocking_comments()), 1)
-        self.assertEqual(self.wait["handle"], "person")
-        self.assertTrue(self.wait["person_ask"])
-        self.assertEqual(self.mesh.created, [])
-
     def test_an_ask_the_agent_raised_itself_is_not_touched(self):
         self.setup_route("person", "Which variant, A or B?")
-        self.cfg.soft_person_asks_to_lead = True
         self.route(kind="blocking")
         self.assertEqual(self.wait["handle"], "person")
         self.assertEqual(self.mesh.created, [])
 
     def test_without_a_lead_a_soft_question_stays_a_gate(self):
         self.setup_route("person", "Which variant, A or B?")
-        self.cfg.soft_person_asks_to_lead = True
         self.agent.lead = ""
         self.route()
         self.assertEqual(len(self.blocking_comments()), 1)
 
     def test_an_empty_question_raises_nothing_and_falls_to_the_bounded_recheck(self):
-        for soft in (False, True):
-            with self.subTest(soft_person_asks_to_lead=soft):
-                self.setUp()
-                self.setup_route("person", note="")
-                self.cfg.soft_person_asks_to_lead = soft
-                self.route()
-                self.assertEqual(self.bodies(), [])                      # no `❓ Blocking`, no notice
-                self.assertEqual(self.mesh.created, [])                  # no decision request
-                self.assertEqual((self.wait["kind"], self.wait["handle"], self.wait["person_ask"]),
-                                 ("decision", "person", True))
-                self.assertNotIn("asked_handle", self.wait)             # not redirected to the lead
-                self.r.effects.on_wait(self.a, self.source, self.wait, self.r.me)
-                self.assertEqual(self.mesh.created, [])
-                started = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
-                wait = dict(self.wait, since=AT, started=started.isoformat())
-                task = dict(self.source, human_gate=False)           # Mesh reports an explicit "no gate"
-                event = wake_check(self.mesh, self.r.cats, None, task, wait, self.r.agent_id, [],
-                                   dt.datetime.now(dt.timezone.utc), first_recheck=dt.timedelta(hours=2))
-                self.assertIn("no human gate or agent request stands behind it", event)
-                self.assertTrue(wait["recheck_due"])
-                self.tmp.cleanup()
+        self.setup_route("person", note="")
+        self.route()
+        self.assertEqual(self.bodies(), [])                      # no `❓ Blocking`, no notice
+        self.assertEqual(self.mesh.created, [])                  # no decision request
+        self.assertEqual((self.wait["kind"], self.wait["handle"], self.wait["person_ask"]),
+                         ("decision", "person", True))
+        self.assertNotIn("asked_handle", self.wait)             # not redirected to the lead
+        self.r.effects.on_wait(self.a, self.source, self.wait, self.r.me)
+        self.assertEqual(self.mesh.created, [])
+        started = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)
+        wait = dict(self.wait, since=AT, started=started.isoformat())
+        task = dict(self.source, human_gate=False)           # Mesh reports an explicit "no gate"
+        event = wake_check(self.mesh, self.r.cats, None, task, wait, self.r.agent_id, [],
+                           dt.datetime.now(dt.timezone.utc), first_recheck=dt.timedelta(hours=2))
+        self.assertIn("no human gate or agent request stands behind it", event)
+        self.assertTrue(wait["recheck_due"])
 
     def test_the_question_is_posted_to_the_lead_once(self):
         self.setup_route("person", "Which variant, A or B?")
-        self.cfg.soft_person_asks_to_lead = True
         self.route()
         self.route()
         self.assertEqual(sum("Decided by lead" in b for b in self.bodies()), 1)
@@ -297,7 +276,6 @@ class LoginAskCheck(AskBench):
     def test_the_registry_answers_before_a_soft_question_goes_to_the_lead(self):
         self.setup_route("person", "Please sign in to GitHub, which profile is better, A or B?")
         self.cfg.login_ask_check = ("check",)
-        self.cfg.soft_person_asks_to_lead = True
         with self.fake_run(10):
             told = self.route()
         self.assertIn("registry already knows", told)
@@ -362,10 +340,8 @@ class ConfigFlags(unittest.TestCase):
                      f'[[agents]]\nname = "a"\nkey_file = "{key}"\nprofile_dir = "{d.name}"\n')
         return config_mod.load(p), p
 
-    def test_defaults_keep_todays_behaviour(self):
+    def test_defaults(self):
         cfg, _ = self.load()
-        self.assertFalse(cfg.requeue_on_cap)
-        self.assertFalse(cfg.soft_person_asks_to_lead)
         self.assertTrue(cfg.unanswerable_ask_to_lead)
         self.assertEqual(cfg.hard_ask_labels, asks.DEFAULT_HARD_LABELS)
         self.assertEqual(cfg.hard_ask_patterns, asks.DEFAULT_HARD_PATTERNS)
@@ -378,11 +354,9 @@ class ConfigFlags(unittest.TestCase):
             os.mkdir(os.path.join(home, ".mesh-runner"))
             self.assertEqual(config_mod._default_state_dir(), os.path.join(home, ".mesh-runner"))
 
-    def test_flags_and_lists_are_read(self):
-        cfg, _ = self.load('requeue_on_cap = true\nsoft_person_asks_to_lead = true\n'
-                           'hard_ask_patterns = ["codename"]\nhard_ask_labels = ["x"]\n'
+    def test_lists_are_read(self):
+        cfg, _ = self.load('hard_ask_patterns = ["codename"]\nhard_ask_labels = ["x"]\n'
                            'unanswerable_users = ["Example"]\n')
-        self.assertTrue(cfg.requeue_on_cap and cfg.soft_person_asks_to_lead)
         self.assertEqual((cfg.hard_ask_patterns, cfg.hard_ask_labels, cfg.unanswerable_users),
                          (("codename",), ("x",), ("example",)))
 

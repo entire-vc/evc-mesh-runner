@@ -1,6 +1,7 @@
 """Chat windows count against interactive_max_sessions but are never closed by make_room."""
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from mesh_runner import tui_driver
@@ -82,7 +83,7 @@ class WindowGauges(unittest.TestCase):
             metrics = Path(tmp) / "m.prom"
             r = rn.Runner.__new__(rn.Runner)
             r.store = None
-            r.cfg = SimpleNamespace(state_dir=Path(tmp), metrics_file=metrics, queue_wait_freshness_v1=False,
+            r.cfg = SimpleNamespace(state_dir=Path(tmp), metrics_file=metrics,
                                     pool_root=Path(tmp), checkpoint_budget_gb=1, tmux_binary="tmux",
                                     interactive_max_sessions=22)
             import mesh_runner.pool_ops as po
@@ -90,7 +91,8 @@ class WindowGauges(unittest.TestCase):
             orig = interactive.Tmux.all_windows
             interactive.Tmux.all_windows = lambda self: [("mr-a", "card-1"), ("mr-a", "chat-x"), ("mr-b", "card-2")]
             try:
-                r.write_status([])
+                with mock.patch.object(rn.queue_wait, "publish"):      # the queue manifest is not this test's subject
+                    r.write_status([])
             finally:
                 interactive.Tmux.all_windows = orig
                 po.summary = real_summary
