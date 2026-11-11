@@ -19,7 +19,7 @@ import test_interactive as ti
 
 from mesh_runner import interactive
 from mesh_runner import tui_driver
-from mesh_runner.config import ConfigError, load
+from mesh_runner.config import load
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.tui_driver import Driver, background_agents
 from mesh_runner.watchdog import Signal, judge
@@ -265,14 +265,13 @@ class Config(unittest.TestCase):
                             f'[[agents]]\nname = "a"\nkey_file = "{key}"\nprofile_dir = "{tmp}"\n')
             return load(path)
 
-    def test_default_and_values(self):
+    def test_default_and_a_retired_key_is_ignored(self):
+        # background_wait_minutes is no longer a [runner] option: the value stays 45 whatever a file says
         self.assertEqual(self.load().background_wait_minutes, 45.0)
-        self.assertEqual(self.load("background_wait_minutes = 0\n").background_wait_minutes, 0.0)
-        self.assertEqual(self.load("background_wait_minutes = 12.5\n").background_wait_minutes, 12.5)
-        for bad in ("background_wait_minutes = -1\n", 'background_wait_minutes = "45"\n',
-                    "background_wait_minutes = true\n"):
-            with self.assertRaises(ConfigError):
-                self.load(bad)
+        for value in ("0\n", "12.5\n", "-1\n", '"45"\n', "true\n"):
+            with self.subTest(value=value), self.assertLogs("mesh_runner", "WARNING") as logs:
+                self.assertEqual(self.load("background_wait_minutes = " + value).background_wait_minutes, 45.0)
+            self.assertIn("background_wait_minutes is no longer an option", "\n".join(logs.output))
 
     def test_the_value_reaches_the_driver(self):
         w = interactive.wrap(ClaudeAdapter(), "builder", "interactive", Path("/state"), "tmux", 20,

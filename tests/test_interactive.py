@@ -17,7 +17,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from mesh_runner import interactive
+from mesh_runner import interactive, tui_driver
 from mesh_runner.adapters.base import Adapter, Launch
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.adapters.codex import CodexAdapter
@@ -687,6 +687,20 @@ class DriverTurns(unittest.TestCase):
         self.assertIn("hit your usage limit", self.events(out)[-1]["result"])
         self.assertEqual(self.tmux.windows(interactive.session_name("builder")), {})
 
+    def test_a_notice_of_how_much_of_a_window_is_left_is_not_a_limit(self):
+        """Codex keeps "N% left" of a usage window on screen once it runs low. It names a limit and a reset
+        time, and it ended live turns as a limit banner (2026-11-11, Codex CLI 0.167). Only a real limit or
+        an auth notice is a banner."""
+        banner = tui_driver.Driver.banner
+        left = "⚠ weekly limit: 25% left · resets at 14:10 on 15 Nov · /status"
+        self.assertEqual(banner("some output\n" + left + "\n› Ask Codex to do anything"), "")
+        self.assertEqual(banner("5h limit: 100% left · resets at 09:00"), "")
+        for limit in ("⚠ weekly limit: 0% left · resets at 14:10 on 15 Nov · /status",
+                      "You've hit your usage limit. Upgrade to Pro or try again at 3:05 PM.",
+                      "Usage limit reached · resets at 12pm"):
+            self.assertEqual(banner("x\n" + limit), limit, limit)
+        self.assertEqual(banner(left + "\nNot logged in · Please run /login"), "Not logged in · Please run /login")
+
     def test_a_blocked_stop_waits_for_the_real_end_of_the_turn(self):
         d, out = self.driver("claude", sid="s-1", FAKE_BLOCKED="1")
         self.assertEqual(d.run("hello"), 0)
@@ -1110,12 +1124,19 @@ class AdapterAndConfig(unittest.TestCase):
             cfg = load(path)
             self.assertEqual(cfg.launch_mode, "interactive")
             self.assertEqual(cfg.agents[0].launch_mode, "")
-            path.write_text(base.format(runner='launch_mode = "headless"\n', agent='launch_mode = "interactive"\n'))
+            path.write_text(base.format(runner="", agent='launch_mode = "headless"\n'))
             cfg = load(path)
-            self.assertEqual((cfg.launch_mode, cfg.agents[0].launch_mode), ("headless", "interactive"))
-            path.write_text(base.format(runner='launch_mode = "tui"\n', agent=""))
+            self.assertEqual((cfg.launch_mode, cfg.agents[0].launch_mode), ("interactive", "headless"))
+            path.write_text(base.format(runner="", agent='launch_mode = "tui"\n'))
             with self.assertRaises(ConfigError):
                 load(path)
+            # [runner] launch_mode is no longer an option: whatever a file says, the runner stays interactive
+            for runner in ('launch_mode = "headless"\n', 'launch_mode = "tui"\n'):
+                path.write_text(base.format(runner=runner, agent='launch_mode = "interactive"\n'))
+                with self.subTest(runner=runner), self.assertLogs("mesh_runner", "WARNING") as logs:
+                    cfg = load(path)
+                self.assertEqual((cfg.launch_mode, cfg.agents[0].launch_mode), ("interactive", "interactive"))
+                self.assertIn("launch_mode is no longer an option", "\n".join(logs.output))
 
     def test_load_gate_knobs_default_on_and_can_be_changed(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -99,20 +99,41 @@ def load_runner_id(state_dir) -> str:
     """The stable id of this runner instance (``X-Chat-Runner-Id``): kept in ``chat-runner-id`` so a
     restart keeps the identity the turn leases are fenced against."""
     path = os.path.join(os.path.expanduser(str(state_dir)), "chat-runner-id")
+    missing = False
     try:
         with open(path) as fh:
             rid = str(uuid.UUID(fh.read().strip()))
         os.chmod(path, 0o600)
         return rid
+    except FileNotFoundError:
+        missing = True
     except (OSError, ValueError):
         pass
-    rid = str(uuid.uuid4())
+    return str(uuid.UUID(_create_once(path, str(uuid.uuid4()) + "\n", replace=not missing).strip()))
+
+
+def _create_once(path: str, text: str, replace: bool) -> str:
+    """Write ``text`` to ``path`` unless another process created it first, and return what the file holds.
+
+    The runner and its service processes (``service_processes``) start together on one state directory; a
+    plain replace would let the second writer change an identity the first one already uses. A missing file
+    is created by a hard link (fails when it exists: the first writer wins); one the caller found unreadable
+    (``replace``) is replaced."""
     tmp = f"{path}.{os.getpid()}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
-        fh.write(rid + "\n")
-    os.replace(tmp, path)
-    return rid
+        fh.write(text)
+    if replace:
+        os.replace(tmp, path)
+        return text
+    try:
+        os.link(tmp, path)
+    except FileExistsError:
+        pass
+    finally:
+        os.unlink(tmp)
+    with open(path) as fh:
+        return fh.read()
 
 
 def load_runner_credential(state_dir, register, agent: str = "") -> tuple[str, str]:
@@ -125,6 +146,7 @@ def load_runner_credential(state_dir, register, agent: str = "") -> tuple[str, s
     import json
     name = "chat-runner-%s.json" % urllib.parse.quote(agent, safe="") if agent else "chat-runner.json"
     path = os.path.join(os.path.expanduser(str(state_dir)), name)
+    missing = False
     try:
         with open(path) as fh:
             cur = json.load(fh)
@@ -132,16 +154,14 @@ def load_runner_credential(state_dir, register, agent: str = "") -> tuple[str, s
         if token:
             os.chmod(path, 0o600)
             return rid, token
+    except FileNotFoundError:
+        missing = True
     except (OSError, ValueError, KeyError, TypeError):
         pass
     got = register()
     rid, token = str(uuid.UUID(str(got["runner_id"]))), str(got["token"])
-    tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump({"runner_id": rid, "token": token}, fh)
-    os.replace(tmp, path)
-    return rid, token
+    won = json.loads(_create_once(path, json.dumps({"runner_id": rid, "token": token}), replace=not missing))
+    return str(uuid.UUID(str(won["runner_id"]))), str(won["token"])     # another process's, if it wrote first
 
 
 class ChatClient:

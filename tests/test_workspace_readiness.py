@@ -3,6 +3,7 @@
 FakeMesh substitutes the external HTTP service, never the registry or producer.
 """
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -10,8 +11,10 @@ from pathlib import Path
 import time
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
+from mesh_runner import config as config_mod
 from mesh_runner import workspace_readiness as ready, workspace_requests
 from mesh_runner.store import iso
 from mesh_runner.workspace import RepoSpec
@@ -20,19 +23,31 @@ from fakes import FakeMesh, task
 
 
 class Readiness(Bench):
+    def setUp(self):
+        super().setUp()
+        # workspace_readiness_v1 is no longer a [runner] option (fixed off). The producer still re-reads
+        # the config file on every request; each such read gets the switch from `readiness_on` on top of
+        # what the shipped loader returned, so turning it off between requests is still observed.
+        self.readiness_on = True
+        shipped = config_mod.load
+        loader = mock.patch.object(config_mod, 'load', side_effect=lambda path: dataclasses.replace(
+            shipped(path), workspace_readiness_v1=self.readiness_on))
+        loader.start()
+        self.addCleanup(loader.stop)
+
     def parked(self, count=1):
         self.root = Path(tempfile.mkdtemp(dir=self.tmp.name))
         self.cfg.state_dir = self.root / "state"
         base = self.agent.repos[0].base
         self.agent.repos = [RepoSpec('app' if i == 0 else f'app{i}', base, max_slots=4)
                             for i in range(count)]
-        self.cfg.workspace_readiness_v1 = True
+        self.cfg.workspace_readiness_v1 = self.readiness_on = True
         key = self.root / 'key'
         key.write_text(self.agent.key)
         key.chmod(0o600)
         self.cfg.source = self.root / 'runner.toml'
         self.cfg.source.write_text(
-            '[runner]\nmesh_url="http://mesh"\nworkspace_readiness_v1=true\n'
+            '[runner]\nmesh_url="http://mesh"\n'
             f'state_dir={json.dumps(str(self.cfg.state_dir))}\n'
             '[[agents]]\nname="builder"\nharness="claude"\n'
             f'key_file={json.dumps(str(key))}\n'
@@ -146,7 +161,7 @@ class Readiness(Bench):
                 elif control == 'key':
                     (self.root / 'key').write_text('revoked-key-replacement')
                 elif control == 'disabled':
-                    self.cfg.source.write_text(self.cfg.source.read_text().replace('workspace_readiness_v1=true', 'workspace_readiness_v1=false'))
+                    self.readiness_on = False
                 elif control == 'config':
                     self.cfg.source.write_text(self.cfg.source.read_text() + '\n# drift\n')
                 elif control == 'checkout_session':

@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     mode TEXT NOT NULL DEFAULT 'work',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT ''
+    note TEXT NOT NULL DEFAULT '',
+    queue_order TEXT
 );
 CREATE INDEX IF NOT EXISTS attempts_agent_state ON attempts(agent, state);
 CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
@@ -108,13 +109,14 @@ class Attempt:
     created_at: str = ""
     updated_at: str = ""
     note: str = ""
+    queue_order: dict = field(default_factory=dict)
 
     @property
     def task8(self) -> str:
         return self.task_id[:8]
 
 
-_JSON = {"workspaces", "checkout", "wait"}
+_JSON = {"workspaces", "checkout", "wait", "queue_order"}
 
 
 class Store:
@@ -131,6 +133,9 @@ class Store:
         for col, default in (("stamp", ""), ("leader_done_at", ""), ("mode", "work"), ("source_read_at", "")):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE attempts ADD COLUMN {col} TEXT NOT NULL DEFAULT '{default}'")
+        if "queue_order" not in cols:
+            # NULL identifies attempts written before the runner recorded dispatch evidence.
+            self.db.execute("ALTER TABLE attempts ADD COLUMN queue_order TEXT")
 
     def _row(self, row: sqlite3.Row) -> Attempt:
         # columns this version does not know come from a newer runner sharing the
@@ -191,11 +196,12 @@ class Store:
         return {r[0] for r in rows}
 
     def create(self, agent: str, task_id: str, harness: str, title: str = "", mode: str = "work",
-               cap_rearm: str | None = None) -> Attempt:
+               cap_rearm: str | None = None, queue_order: dict | None = None) -> Attempt:
         """Reserve a new attempt. Raises sqlite3.IntegrityError when the agent
         already holds an open attempt on this task (one writer per task)."""
         a = Attempt(id=str(uuid.uuid4()), agent=agent, task_id=task_id, harness=harness,
-                    state="starting", title=title, created_at=iso(), updated_at=iso(), mode=mode)
+                    state="starting", title=title, created_at=iso(), updated_at=iso(), mode=mode,
+                    queue_order=queue_order or {})
         cols = [f.name for f in fields(Attempt)]
         vals = [json.dumps(getattr(a, c)) if c in _JSON else getattr(a, c) for c in cols]
         if cap_rearm is not None:

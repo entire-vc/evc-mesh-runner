@@ -69,6 +69,27 @@ class Plan(unittest.TestCase):
         self.assertEqual(session_id_for("th-1"), session_id_for("th-1"))
         self.assertNotEqual(session_id_for("th-1"), session_id_for("th-2"))
 
+    def test_a_claude_chat_session_may_read_its_attachment_directory(self):
+        # the files are saved under the state directory, outside the session's cwd: without the directory in
+        # its scope a Claude session asks for a read permission nobody in a chat window answers
+        from mesh_runner.chat_machine import chat_dir
+        from mesh_runner.interactive import InteractiveAdapter
+        ad = Stub(self.state)
+        ad.__class__ = type("A", (Stub, InteractiveAdapter), {})
+        make_plan(runner(self.state, ad), self.client, "read")(self.turn)
+        files = chat_dir(self.state, "th-1") / "files"
+        self.assertEqual(ad.seen, [[files]])
+        self.assertTrue(files.is_dir())
+
+    def test_a_codex_chat_gets_no_extra_directory(self):
+        from mesh_runner.interactive import InteractiveAdapter
+        ad = Stub(self.state)
+        ad.__class__ = type("A", (Stub, InteractiveAdapter), {})
+        ar = runner(self.state, ad)
+        ar._route_env = lambda raw: (dict(raw), "codex", None)
+        make_plan(ar, self.client, "read")(self.turn)
+        self.assertEqual(ad.seen, [[]])
+
     def test_warm_chat_resumes_by_recorded_session(self):
         from mesh_runner.interactive import InteractiveAdapter
         ad = Stub(self.state)
@@ -94,6 +115,21 @@ class Plan(unittest.TestCase):
         argv, *_ = make_plan(runner(self.state, ad), self.client, "read")(self.turn)
         self.assertIn("--resume", argv)
         self.assertIn("--disallowedTools", argv)
+
+    def test_lane_workspace_keeps_the_lanes_own_tools(self):
+        """``chat_workspace = "lane"``: no checkout and no denial added by the chat; the session still gets the
+        chat's Mesh token in place of the agent key."""
+        from mesh_runner.interactive import InteractiveAdapter
+        ad = Stub(self.state)
+        ad.__class__ = type("A", (Stub, InteractiveAdapter), {})
+        argv, cwd, env, *_ = make_plan(runner(self.state, ad), self.client, "lane")(self.turn)
+        self.assertNotIn("--disallowedTools", argv)
+        self.assertNotIn("MESH_AGENT_KEY", env)
+        self.assertIn("MESH_CHAT_TOKEN_FILE", env)
+        write_meta(ad.dir, window_key("th-1"), {"session_id": "sess-9"})
+        argv, *_ = make_plan(runner(self.state, ad), self.client, "lane")(self.turn)
+        self.assertIn("--resume", argv)
+        self.assertNotIn("--disallowedTools", argv)
 
     def adapter(self):
         from mesh_runner.interactive import InteractiveAdapter
@@ -393,6 +429,7 @@ class Cfg(unittest.TestCase):
 
     def test_write_workspace_parsed_and_unknown_rejected(self):
         self.assertEqual(self.load('[chat]\nchat_workspace = "write"\n').chat_workspace, "write")
+        self.assertEqual(self.load('[chat]\nchat_workspace = "lane"\n').chat_workspace, "lane")
         with self.assertRaises(config.ConfigError):
             self.load('[chat]\nchat_workspace = "rw"\n')
 

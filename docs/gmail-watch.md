@@ -72,7 +72,7 @@ mailbox, and return headers only (no subject, no body). It is the install-time p
 
 ## Schedule, capture and failures
 
-* Every `gmail_watch_interval_seconds` (default 120, floor 30) per active registration, with jitter, at most
+* Every 120 seconds per active registration, with jitter, at most
   one read in flight per registration (the guard is empty after a restart).
 * Each read asks for `after = high_water - 600 s`; the overlap absorbs provider time skew and late indexing,
   and `gmail_seen` makes it harmless.
@@ -85,6 +85,11 @@ mailbox, and return headers only (no subject, no body). It is the install-time p
   (30 s doubling, cap 30 min). Baseline, seen and state are untouched; nothing wakes and no turn starts.
   After 5 consecutive failures one `gmail_alert` event and log line per error class until recovery;
   `status` shows `error`.
+* Where the reads run: by default inside each lane's tick, so a read waits up to 60 seconds
+  in that tick. With `service_processes = ["gmail"]` (README "Service processes") the same pass
+  (`gmail_watch.scan`) runs in `mesh-runner service gmail` every `poll_seconds` for every lane, and the lanes
+  spawn no reader: they only bind declarations and wake on the wake rows. Both processes use the shared
+  `runner.sqlite` (WAL, 30 s busy timeout, every write in `BEGIN IMMEDIATE`).
 
 ## Delivery
 

@@ -1,8 +1,8 @@
 # Owner-native workspace readiness v1
 
 This is an observation protocol inside the existing owner `AgentRunner.tick`,
-disabled by default (`[runner] workspace_readiness_v1 = true` is separately
-admitted configuration). It does not install anything, restore a checkpoint,
+disabled: `workspace_readiness_v1` is a retired `[runner]` option fixed at
+`false` (README "Retired options"), so a config file can no longer turn it on. It does not install anything, restore a checkpoint,
 reserve a pool slot, alter a lease, wake a task, or grant operational authority.
 The consumer never opens Store, SQLite, another lane's pool, or checkpoint files.
 

@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fakes import AGENT_ID, STATUSES, task
 from mesh_runner import observation_budget as budget
-from mesh_runner.config import ConfigError, load
+from mesh_runner.config import load
 from mesh_runner.mesh import MeshClient, MeshError
 from mesh_runner.runner import AgentRunner
 from mesh_runner.store import Store
@@ -345,15 +345,13 @@ class BudgetConfig(unittest.TestCase):
                             f'[[agents]]\nname = "a"\nkey_file = "{key}"\nprofile_dir = "{tmp}"\n')
             return load(path)
 
-    def test_default_value_and_floor(self):
+    def test_default_value_and_a_retired_key_is_ignored(self):
+        # wake_budget_seconds is no longer a [runner] option: the budget stays 45 s whatever a file says
         self.assertEqual(self.load().wake_budget_seconds, 45.0)
-        self.assertEqual(self.load('wake_budget_seconds = 20').wake_budget_seconds, 20.0)
-        self.assertEqual(self.load('wake_budget_seconds = 0.2').wake_budget_seconds, 1.0)
-
-    def test_non_finite_or_non_positive_budget_is_refused(self):
-        for bad in ('inf', 'nan', '-5', '0', '"x"'):
-            with self.subTest(bad=bad), self.assertRaises(ConfigError):
-                self.load('wake_budget_seconds = ' + bad)
+        for value in ('20', '0.2', 'inf', 'nan', '-5', '0', '"x"'):
+            with self.subTest(value=value), self.assertLogs('mesh_runner', 'WARNING') as logs:
+                self.assertEqual(self.load('wake_budget_seconds = ' + value).wake_budget_seconds, 45.0)
+            self.assertIn('wake_budget_seconds is no longer an option', '\n'.join(logs.output))
 
 
 class StageRedaction(unittest.TestCase):

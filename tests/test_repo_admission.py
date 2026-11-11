@@ -192,10 +192,19 @@ class RepoAdmission(AdmissionFixture):
 
 class RealConfigFixture(AdmissionFixture):
     """Runner config comes from a real TOML read by the shipped loader: the first runner, the
-    restarted runner and the admission's fresh read all use it. Nothing replaces the loader."""
+    restarted runner and the admission's fresh read all use it. Nothing replaces the loader: every read
+    goes through it, and only the two bench timings below are laid on top of its result."""
 
     def setUp(self):
         super().setUp()
+        # wake_poll_seconds and heartbeat_seconds are no longer [runner] options; the bench polls and
+        # beats on every tick, so each read of the file (the fixture's and the admission's fresh read
+        # alike) gets the same two values on top of what the shipped loader returned
+        shipped = config_mod.load
+        loader = patch.object(config_mod, 'load', side_effect=lambda path: replace(
+            shipped(path), wake_poll_seconds=0, heartbeat_seconds=0))
+        loader.start()
+        self.addCleanup(loader.stop)
         key = self.root / 'agent.key'
         key.write_text('k')
         key.chmod(0o600)
@@ -210,7 +219,7 @@ class RealConfigFixture(AdmissionFixture):
         if extra:
             repos.append((self.extra.name, self.extra.base, self.extra.max_slots))
         text = (f'[runner]\nmesh_url = "http://mesh"\nstate_dir = "{self.cfg.state_dir}"\n'
-                'wake_poll_seconds = 0\nheartbeat_seconds = 0\nload_hold_per_cpu = 0\n\n'
+                'load_hold_per_cpu = 0\n\n'
                 f'[[agents]]\nname = "{a.name}"\nkey_file = "{self.key}"\nharness = "claude"\n'
                 f'profile_dir = "{profile_dir or a.profile_dir}"\n'
                 f'\n[agents.env]\nFAKE_REPLIES = "{self.replies}"\nFAKE_CALLS = "{self.calls}"\n')

@@ -86,9 +86,13 @@ class Config(unittest.TestCase):
                          (0.0, 0.0, 0.0))
 
     def test_limits_are_read_and_validated(self):
-        cfg = self.load("turn_first_output_minutes = 20\nturn_idle_minutes = 45\nturn_external_wait_minutes = 90.5\n")
-        self.assertEqual((cfg.turn_first_output_minutes, cfg.turn_idle_minutes, cfg.turn_external_wait_minutes),
-                         (20.0, 45.0, 90.5))
+        cfg = self.load("turn_first_output_minutes = 20\nturn_idle_minutes = 45\n")
+        self.assertEqual((cfg.turn_first_output_minutes, cfg.turn_idle_minutes), (20.0, 45.0))
+        # turn_external_wait_minutes is no longer a [runner] option: it stays 0 (off) whatever a file says
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            cfg = self.load("turn_external_wait_minutes = 90.5\n")
+        self.assertEqual(cfg.turn_external_wait_minutes, 0.0)
+        self.assertIn("turn_external_wait_minutes is no longer an option", "\n".join(logs.output))
         for bad in ("turn_idle_minutes = -1\n", 'turn_idle_minutes = "45"\n', "turn_idle_minutes = true\n"):
             with self.assertRaises(ConfigError):
                 self.load(bad)

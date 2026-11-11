@@ -23,6 +23,7 @@ Safety rules:
 """
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -548,6 +549,33 @@ class WorkspacePool:
             "SELECT source FROM workspace_checkpoints WHERE owner=? AND repo=? AND attempt<>? "
             "AND phase IN ('releasing','released')", (self.owner, repo_name, attempt_id))}
 
+    RETURNING_HOURS = 3         # an ownership-loss note older than this no longer keeps its slots aside
+
+    def _returning_sources(self) -> set[str]:
+        """Working copies named by this lane's ownership-loss notes (``runner.OWNERSHIP_LOSS`` marks that
+        no return has spent yet): the paths on which a card that left the lane (to a review, to another
+        agent) continues its session if it comes back. A card that was closed (done, cancelled) when it left
+        is not expected back and names nothing: on a busy lane those notes cover nearly every slot and the
+        order would say nothing. Unreadable notes and notes older than ``RETURNING_HOURS`` name nothing."""
+        since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=self.RETURNING_HOURS)).isoformat()
+        out: set[str] = set()
+        try:
+            rows = self.store.db.execute(
+                "SELECT value FROM marks WHERE agent=? AND key='ownership_loss' AND value<>'' AND at>=?",
+                (self.owner, since)).fetchall()
+        except Exception:                                # noqa: BLE001 - an ordering hint never fails a lease
+            return out
+        for (value,) in rows:
+            try:
+                note = json.loads(value)
+                paths = note.get("workspaces") or []
+                closed = note.get("observed_status") in ("done", "cancelled")
+            except (ValueError, AttributeError):
+                continue
+            if not closed:
+                out.update(p for p in paths if isinstance(p, str))
+        return out
+
     def _lease(self, attempt_id: str, repo_name: str, repo: RepoSpec, *,
                preferred_path: str | None = None) -> Path:
         self._check_disk()
@@ -563,8 +591,25 @@ class WorkspacePool:
         # session can continue (a restore to any other path starts the session anew), so other
         # work takes such a slot last. The attempt's own old slot stays first for its restore.
         waited = self._suspended_sources(repo_name, attempt_id)
-        slots.sort(key=lambda slot: (slot["path"] != preferred_path, slot["path"] in waited))
-        for slot in slots:
+        # The same holds, one step weaker, for a slot a card of this lane left when it went away and may
+        # come back to (``_returning_sources``): other work takes it after the plain free slots.
+        returning = self._returning_sources()
+        slots.sort(key=lambda slot: (slot["path"] != preferred_path, slot["path"] in waited,
+                                     slot["path"] in returning))
+        # While the pool may still grow, such a kept-aside slot is not taken at all: a new slot costs one
+        # checkout, taking the old one costs its owner the session (a returning card starts fresh on another
+        # path; a restore that has to move keeps the session only where the harness is confined). At the
+        # maximum it is taken as before, and a caller that names the path gets it.
+        room = len(self._rows(repo_name)) < repo.max_slots
+        aside = {slot["path"] for slot in slots if room and slot["path"] != preferred_path
+                 and (slot["path"] in returning or slot["path"] in waited)}
+        # The slot a returning card names may be gone from the inventory: the slot pruner removes free slots
+        # of long waits. While the pool may grow, the new slot is made at that very path, so the card finds
+        # its paths and keeps its session; the free slots are left for other work.
+        again = self._gone_preferred(repo, repo_name, preferred_path) if room else None
+        for slot in ([] if again else slots):
+            if slot["path"] in aside:
+                continue
             path = Path(slot["path"])
             # Only this pool's free inventory is eligible for config repair. Validate
             # the admin link before writing anything; never follow a foreign HEAD/index.
@@ -582,7 +627,7 @@ class WorkspacePool:
         if len(self._rows(repo_name)) >= repo.max_slots:
             raise WorkspaceError(f"no free worktree for {repo_name} (max {repo.max_slots}; see `mesh-runner slots`)")
         self._check_disk()
-        path = self._new_path(repo)
+        path = again or self._new_path(repo)
         # git names the admin dir after the basename it is given, and slot-N names repeat across the pools
         # sharing one base clone. Adding under an owner-prefixed name and moving it into place keeps an
         # owner-unique admin id while the directory stays slot-N.
@@ -600,6 +645,18 @@ class WorkspacePool:
         self._configure(path)
         self._keep_base_bare(repo)       # _configure may have just switched per-worktree config on
         self._set(path, repo_name, "leased", attempt_id)
+        return path
+
+    def _gone_preferred(self, repo: RepoSpec, repo_name: str, preferred_path: str | None) -> Path | None:
+        """``preferred_path`` when it is a slot path of this pool that neither the inventory nor the disk
+        has any more; otherwise None (the ordinary order applies)."""
+        if not preferred_path:
+            return None
+        path = Path(preferred_path)
+        if path.parent != self.root / repo.name or not re.fullmatch(r"slot-[1-9]\d*", path.name):
+            return None
+        if path.exists() or path.is_symlink() or any(r["path"] == preferred_path for r in self._rows(repo_name)):
+            return None
         return path
 
     def _keep_base_bare(self, repo: RepoSpec) -> None:

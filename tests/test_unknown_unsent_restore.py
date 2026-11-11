@@ -16,7 +16,8 @@ class UnknownRestore(Bench):
         r, a, prompt, directory, capacity = self.prepared()
         r.pool.suspend(a.id, r._suspend_metadata(a), writer_stopped=True)
         other = r.store.create('builder', 'other-task', 'claude')
-        r.pool.lease(other.id, 'app')
+        # the other task names the suspended slot: a pool that may still grow would otherwise leave it alone
+        r.pool.lease(other.id, 'app', preferred_path=a.workspaces[0])
         r._resume_one(a)
         a = r.store.get(a.id)
         self.assertEqual(a.state, 'unknown')

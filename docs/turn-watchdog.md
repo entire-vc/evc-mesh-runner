@@ -1,7 +1,6 @@
 # Turn progress watchdog
 
-A turn counts as running while its process lives, and is cut at `max_turn_minutes`
-(default 180). Inside that window a turn can be stuck without anything saying so: the
+A turn counts as running while its process lives, and is cut after 180 minutes. Inside that window a turn can be stuck without anything saying so: the
 interactive session waits on a dialog nobody answers, the harness never started
 replying, the end-of-turn hook was lost. The card stays checked out and the worktree
 slot stays held for up to three hours.
@@ -33,13 +32,15 @@ does not apply to headless turns; `turn_idle_minutes` does.
 |-----|---------|--------------------|
 | `turn_first_output_minutes` | 0 | the harness has not replied this long after the turn started (phases `launcher`, `ready`, `sent`). Keep it above start-up (about 2 minutes, up to 8 on a loaded host: Codex waits up to 3 minutes to be ready and 5 more for a queued prompt) and above `busy_wait` (30 minutes) if a previous cut-off turn may still occupy the session |
 | `turn_idle_minutes` | 0 | no progress this long while nothing is running on the screen (a dialog, a dead prompt, a lost hook). For a headless turn this is the quiet time of the log: set it above the longest silent tool call |
-| `turn_external_wait_minutes` | 0 | no progress this long while the harness runs a tool or background task. 0 leaves such a turn to `max_turn_minutes` |
+
+No progress while the harness runs a tool or background task is not judged: such a turn is left to the
+180-minute cut (`turn_external_wait_minutes` is a retired option, fixed at 0; README "Retired options").
 
 ## What happens
 
 1. The runner records a `watchdog` event with the reason and phase (and a `kill` event
    `turn watchdog: ...`), and logs a warning.
-2. The turn's process group is terminated, as for `max_turn_minutes`. The driver
+2. The turn's process group is terminated, as at the 180-minute cut. The driver
    interrupts the session and exits.
 3. Only after the driver is gone, an interactive attempt's window is closed, so a stuck
    session cannot write beside the one the next turn resumes (a new window, same session id).
@@ -50,4 +51,4 @@ does not apply to headless turns; `turn_idle_minutes` does.
    such turn is handed to the lead.
 
 A driver of a runner that predates this feature reports nothing; its turns are not
-judged (only `max_turn_minutes` applies) until they end.
+judged (only the 180-minute cut applies) until they end.

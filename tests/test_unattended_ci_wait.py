@@ -309,7 +309,7 @@ class UnattendedWait(Bench):
 
 
 class ReviewLabelConfig(unittest.TestCase):
-    def test_review_label_prefix_defaults_and_loads(self):
+    def test_review_label_prefix_is_fixed(self):
         import tempfile
         from pathlib import Path
         from mesh_runner import config
@@ -317,8 +317,11 @@ class ReviewLabelConfig(unittest.TestCase):
             path = Path(d) / 'runner.toml'
             path.write_text('[runner]\nmesh_url = "http://mesh"\n')
             self.assertEqual(config.load(path).review_label_prefix, 'verified-by:')
+            # no longer a [runner] option: a file that sets it keeps the fixed prefix
             path.write_text('[runner]\nmesh_url = "http://mesh"\nreview_label_prefix = ""\n')
-            self.assertEqual(config.load(path).review_label_prefix, '')
+            with self.assertLogs('mesh_runner', 'WARNING') as logs:
+                self.assertEqual(config.load(path).review_label_prefix, 'verified-by:')
+            self.assertIn('review_label_prefix is no longer an option', '\n'.join(logs.output))
 
 
 def _raise(*_a, **_k):

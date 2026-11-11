@@ -2,12 +2,12 @@
 
 One wake of one waiting attempt reads Mesh (task, comments, dependencies, statuses, targets) and
 GitLab/GitHub. All reads and all retry backoff of that wake share **one monotonic deadline**,
-`wake_budget_seconds` (default `45`, minimum `1`, `[runner]` table).
+45 seconds (`wake_budget_seconds`, a retired `[runner]` option: the value is fixed).
 
 **Why 45s.** A single `MeshClient` GET allows a 30s socket timeout, and the permitted GET retries
 (1s, 3s) made one request cost up to ~94s with no shared limit, so one slow Mesh held a lane's
 tick for minutes. A healthy wake is a few sub-second reads; 45s covers one full-timeout read plus
-margin, and stays well under `wake_poll_seconds` (120).
+margin, and stays well under the two-minute wake poll.
 
 **What the budget does.**
 - Every read's socket timeout is `min(own timeout, time left)`; a spent budget fails the next read

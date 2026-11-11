@@ -145,16 +145,22 @@ class Config(MergeBench):
 
     def test_reads_and_validates_the_keys(self):
         c = self.load('merge_command = ["gate", "{iid}", "{project}", "{sha}", "{target}"]\n'
-                      'merge_command_cwd = "/srv/tools"\nmerge_timeout_minutes = 3\n'
-                      'merge_rerun_minutes = 2.5\nmerge_queue_hours = 7')
+                      'merge_command_cwd = "/srv/tools"\nmerge_rerun_minutes = 2.5')
         self.assertEqual(c.merge_command, ("gate", "{iid}", "{project}", "{sha}", "{target}"))
-        self.assertEqual((str(c.merge_command_cwd), c.merge_timeout_minutes, c.merge_rerun_minutes,
-                          c.merge_queue_hours), ("/srv/tools", 3.0, 2.5, 7.0))
+        self.assertEqual((str(c.merge_command_cwd), c.merge_rerun_minutes), ("/srv/tools", 2.5))
         for bad in ('merge_command = "gate"', 'merge_command = ["gate", ""]',
-                    'merge_command = ["gate", "{branch}"]', 'merge_max_runs = 0', 'merge_max_runs = 1.5', 'merge_queue_hours = 0',
-                    'merge_timeout_minutes = -1', 'merge_rerun_minutes = "5"'):
+                    'merge_command = ["gate", "{branch}"]', 'merge_rerun_minutes = "5"', 'merge_rerun_minutes = 0'):
             with self.subTest(bad=bad), self.assertRaises(config.ConfigError):
                 self.load(bad)
+
+    def test_retired_keys_keep_their_fixed_values(self):
+        # merge_timeout_minutes, merge_queue_hours and merge_max_runs are no longer [runner] options
+        for extra in ('merge_timeout_minutes = 3\nmerge_queue_hours = 7\nmerge_max_runs = 5',
+                      'merge_timeout_minutes = -1\nmerge_queue_hours = 0\nmerge_max_runs = 1.5'):
+            with self.subTest(extra=extra), self.assertLogs("mesh_runner", "WARNING") as logs:
+                c = self.load(extra)
+            self.assertEqual((c.merge_timeout_minutes, c.merge_queue_hours, c.merge_max_runs), (15.0, 24.0, 30))
+            self.assertEqual(len([m for m in logs.output if "is no longer an option" in m]), 3)
 
 
 class Declaration(MergeBench):

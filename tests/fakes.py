@@ -225,6 +225,40 @@ class FakeMesh:
             raise errors.pop(0)
         return {"wait": {"id": wait_id, "resolution": resolution}, "resolved": True}
 
+    def open_decision(self, rid, tid, question, to="agent-lead", sender=(AGENT_ID, "builder")):
+        """A decision request ``ask_agent`` opened (the server side of it): listed for ``to`` until answered."""
+        t = self.tasks[tid]
+        self.decision_rows = getattr(self, "decision_rows", [])
+        self.decision_rows.append({"id": rid, "task_id": tid, "question": question, "state": "open",
+                                   "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "to_agent_id": to,
+                                   "from_agent": {"id": sender[0], "name": sender[1], "slug": sender[1]},
+                                   "task": {"id": tid, "title": t.get("title"), "project_id": t.get("project_id"),
+                                            "workspace_id": "ws1", "status_category": self.category(t)}})
+
+    def decision_requests(self, state="open", limit=100, to=None):
+        """GET /agents/me/decision-requests: the requests addressed to the caller (``to``, default ``me``),
+        oldest first. ``decision_error`` (a MeshError) makes the read fail; ``decision_reads`` counts reads."""
+        self.decision_reads = getattr(self, "decision_reads", 0) + 1
+        if getattr(self, "decision_error", None) is not None:
+            raise self.decision_error
+        to = to or self.me()["id"]
+        return [{k: v for k, v in r.items() if k != "to_agent_id"} for r in getattr(self, "decision_rows", [])
+                if r["to_agent_id"] == to and r["state"] == state][:limit]
+
+    def answer_decision(self, rid, answer, author="agent-lead"):
+        """POST /decision-requests/:id/answer: the answer is a comment on the asking card."""
+        row = next((r for r in getattr(self, "decision_rows", []) if r["id"] == rid), None)
+        if row is None:
+            raise MeshError(404, "not found")
+        if row["to_agent_id"] != author:
+            raise MeshError(403, "forbidden")
+        if row["state"] != "open":
+            raise MeshError(409, "conflict")
+        row["state"] = "answered"
+        c = self.add_comment(row["task_id"], f"💬 **Answer to question** `{rid}`\n\n{answer}", author=author)
+        c["metadata"] = {"answers": rid}
+        return {"decision_request": dict(row), "comment_id": c["id"]}
+
     def vcs_links(self, tid):
         return [dict(link) for link in getattr(self, "links", {}).get(tid, [])]
 
@@ -338,6 +372,22 @@ class FakeMesh:
 
     def release(self, co):
         self.checkouts.pop(co.task_id, None)
+
+
+class AgentView:
+    """The same fake Mesh seen through another agent's key (its ``me`` and its decision-request list)."""
+
+    def __init__(self, mesh: FakeMesh, agent_id: str, name: str, workspace_id: str = "ws1"):
+        self.mesh, self.agent_id, self.name, self.workspace_id = mesh, agent_id, name, workspace_id
+
+    def __getattr__(self, name):
+        return getattr(self.mesh, name)
+
+    def me(self):
+        return {"id": self.agent_id, "name": self.name, "workspace_id": self.workspace_id}
+
+    def decision_requests(self, state="open", limit=100):
+        return self.mesh.decision_requests(state, limit, to=self.agent_id)
 
 
 class HarnessGate:

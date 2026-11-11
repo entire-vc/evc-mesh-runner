@@ -15,7 +15,7 @@ from test_runner import Bench
 
 from mesh_runner import ask_audit, asks, cli
 from mesh_runner import config as config_mod
-from mesh_runner.config import AgentConfig, ConfigError
+from mesh_runner.config import AgentConfig
 from mesh_runner.outcome import Outcome
 from mesh_runner.wake import check as wake_check
 
@@ -75,8 +75,8 @@ class AgentAddressee(AskBench):
     def test_a_paused_addressee_sends_the_request_to_the_lead_with_a_comment(self):
         self.setup_route("reviewer")
         self.agent_cfg("reviewer")
-        (self.cfg.state_dir / "pause").mkdir(parents=True)
-        (self.cfg.state_dir / "pause" / "reviewer").write_text("")
+        from mesh_runner import op_pause
+        op_pause.take(self.cfg.state_dir, "reviewer", "maintenance")
         self.assertEqual(self.route(), "")
         self.assertEqual((self.wait["kind"], self.wait["handle"], self.wait["asked_handle"]),
                          ("decision", "lead", "reviewer"))
@@ -354,17 +354,19 @@ class ConfigFlags(unittest.TestCase):
             os.mkdir(os.path.join(home, ".mesh-runner"))
             self.assertEqual(config_mod._default_state_dir(), os.path.join(home, ".mesh-runner"))
 
-    def test_lists_are_read(self):
-        cfg, _ = self.load('hard_ask_patterns = ["codename"]\nhard_ask_labels = ["x"]\n'
-                           'unanswerable_users = ["Example"]\n')
+    def test_the_retired_lists_are_ignored(self):
+        # hard_ask_patterns, hard_ask_labels and unanswerable_users are no longer [runner] options
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            cfg, _ = self.load('hard_ask_patterns = ["codename"]\nhard_ask_labels = ["x"]\n'
+                               'unanswerable_users = ["Example"]\n')
         self.assertEqual((cfg.hard_ask_patterns, cfg.hard_ask_labels, cfg.unanswerable_users),
-                         (("codename",), ("x",), ("example",)))
+                         (asks.DEFAULT_HARD_PATTERNS, asks.DEFAULT_HARD_LABELS, ()))
+        self.assertEqual(len([m for m in logs.output if "is no longer an option" in m]), 3)
 
-    def test_a_bad_pattern_is_refused(self):
-        with self.assertRaises(ConfigError):
-            self.load('hard_ask_patterns = ["(unclosed"]\n')
-        with self.assertRaises(ConfigError):
-            self.load('hard_ask_labels = "money"\n')
+    def test_a_bad_value_of_a_retired_list_no_longer_fails_the_load(self):
+        with self.assertLogs("mesh_runner", "WARNING"):
+            cfg, _ = self.load('hard_ask_patterns = ["(unclosed"]\nhard_ask_labels = "money"\n')
+        self.assertEqual(cfg.hard_ask_patterns, asks.DEFAULT_HARD_PATTERNS)
 
 
 class FakeReader:

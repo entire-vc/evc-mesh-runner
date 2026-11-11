@@ -126,6 +126,7 @@ def read_log(path: Path) -> list[dict]:
 _DRIVER_LEADIN = re.compile(
     r"(interactive session [a-z ]+|the session [a-z ]+|prompt could not be [a-z ]+|driver failed"
     r"|host session cap reached|\w+ start-up stalled)(?=:|$| \(| for )")
+_LOGIN_EXPIRED = re.compile(r"Login expired\s*[·.—-]?\s*Please run /login[.!]?", re.I)
 
 
 def _withheld(msg: str) -> str:
@@ -133,6 +134,8 @@ def _withheld(msg: str) -> str:
     lead-in and a fingerprint, so the cause is classifiable and the turn log can be matched."""
     m = _DRIVER_LEADIN.match(msg)
     kind = m.group(1) if m else "unclassified"
+    if _LOGIN_EXPIRED.fullmatch(msg.strip()):
+        kind = "authentication_failed: Login expired; run /login"
     return "(text withheld: may carry the screen; kind=%s sha256=%s)" % (
         kind, hashlib.sha256(msg.encode()).hexdigest()[:12])
 

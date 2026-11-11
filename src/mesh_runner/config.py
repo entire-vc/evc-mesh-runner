@@ -4,32 +4,23 @@ Secrets are referenced by file path or environment variable name, never
 written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
 ``token_file`` / ``token_env`` for the GitLab token.
 
+    # service_processes = ["chat", "editor", "gmail"]   # top-level (above [runner]): these side services run as
+    #                                                   # processes of their own, supervised by `run` (README)
     [runner]
     mesh_url = "https://mesh.example.com"
     state_dir = "~/.local/state/mesh-runner"
-    review_gate_hold_minutes = 30  # a review the start gate keeps refusing: one notice, then no retries
     review_own_hold_hours = 1     # the agent's own work in review waits this long for someone else
-    # review_verdict_pattern = '' # regex of a review verdict line that feeds the author ('' = off)
-    # review_own_verdict_pattern = ''   # the same for the author's own comments
-    # review_label_prefix = "verified-by:"   # MR label recording a review verdict ('' = off)
-    # turn_cap_progress_min = 3        # step/next outcomes among the last 10 that count as progress
-    # loop_streak_limit = 6            # consecutive turns without progress before a task is handed up as a LOOP (0 = off)
-    # unanswerable_ask_to_lead = true  # a question to an agent that cannot answer goes to the lead
-    # decision_live_task_card_wait = true  # a question about the addressee's own live task waits on that task
-    # decision_identical_no_reopen = true  # the same question again is attached to its request, never reopened
-    # decision_default_proceeds = true     # a question carrying the asker's default proceeds; the addressee may object
-    # hard_ask_patterns = [...]        # replaces the keyword list (see asks.py); hard_ask_labels likewise
-    # unanswerable_users = ["example"]    # test or service users nobody answers for
     # merge_command = ["merge-gate", "{iid}", "{project}", "--expected-sha", "{sha}"]   # enables `WAIT merge:`
     # reviewer_select_command = ["python3", "select-reviewer.py", "{project_id}", "{author}"]   # enables `reviewer-merge`
     # merge_command_cwd = "~/tools"    # working directory of merge_command
-    # merge_timeout_minutes = 15       # one run of merge_command
     # merge_rerun_minutes = 5          # re-run a queued merge at least this often even if nothing changed
-    # merge_max_runs = 30              # deprecated, ignored: a queued run always ends in a wake or another poll
-    # merge_queue_hours = 24           # a wait that stays queued this long wakes the agent too
-    # receipt_wait_v1 = false          # enables `WAIT receipt:#<card8>` on an operator-armed receipt registration (docs/receipt-wait.md)
     # gmail_watch_v1 = false           # enables `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     # gmail_watch_reader = ["ssh", "-o", "BatchMode=yes", "<host>", "<readonly-wrapper>"]   # fixed argv; JSON request on stdin
+
+    # The [runner] table has 39 operator options (README "[runner] options") plus native_result_dir /
+    # native_result_channels_dir, which the native-result adoption protocol reads from this file
+    # (docs/native-result-config.md). Keys that used to be options are listed in RETIRED_RUNNER_OPTIONS
+    # below: a file that still sets one loads with a warning, and the value stays fixed.
 
     [catalog]                     # optional: apply the runtime catalog and report on it (off by default)
     enabled = false
@@ -114,6 +105,82 @@ DEFAULT_VERDICT_PATTERN = (r"^\W*(?:verify|verdict|review)\b[^\n]*?\b(?P<verdict
 DEFAULT_OWN_VERDICT_PATTERN = r"^\W*(?:verify|verdict)\b\W*(?P<verdict>(?-i:SHIP|DO-NOT-SHIP))\b" + _SHA
 
 
+# [runner] keys that are no longer options: no config of this deployment set them to anything but their
+# default. The loader does not read them; each RunnerConfig field keeps the value an absent key gave (its
+# dataclass default). A file that still carries one loads, with one warning per key. Name -> why / the
+# value it is fixed at. The single list: the loader and tests/test_retired_options.py read it.
+RETIRED_RUNNER_OPTIONS: dict[str, str] = {
+    "abort_backoff_minutes": "its value is fixed at 15",
+    "background_wait_minutes": "its value is fixed at 45.0",
+    "basic_auth_env": "set basic_auth_file instead",
+    "checkout_ttl_minutes": "its value is fixed at 120",
+    "checkpoint_budget_gb": "its value is fixed at 4.0",
+    "checkpoint_exclude_names": "its value is fixed at the built-in build-cache names",
+    "checkpoint_gc_grace_hours": "its value is fixed at 6.0",
+    "completion_comment": "its value is fixed at true",
+    "dead_slot_hours": "its value is fixed at 24.0",
+    "decision_default_proceeds": "its value is fixed at true",
+    "decision_identical_no_reopen": "its value is fixed at true",
+    "decision_live_task_card_wait": "its value is fixed at true",
+    "decision_reuse_hours": "its value is fixed at 24.0",
+    "decision_wake": 'its value is fixed at "any"; the per-agent decision_wake still applies',
+    "failed_cooldown_hours": "its value is fixed at 0.5",
+    "gmail_watch_interval_seconds": "its value is fixed at 120.0",
+    "gmail_watch_timeout_seconds": "its value is fixed at 60.0",
+    "hard_ask_labels": "its value is fixed at the built-in list in asks.py",
+    "hard_ask_patterns": "its value is fixed at the built-in list in asks.py",
+    "heartbeat_seconds": "its value is fixed at 300",
+    "ignored_cleanup": "its value is fixed at false",
+    "ignored_cleanup_idle_hours": "its value is fixed at 24.0",
+    "ignored_cleanup_interval_minutes": "its value is fixed at 30.0",
+    "launch_mode": 'its value is fixed at "interactive"; the per-agent launch_mode still applies',
+    "loop_streak_limit": "its value is fixed at 6",
+    "max_failures": "its value is fixed at 3",
+    "max_no_outcome": "its value is fixed at 1",
+    "max_startup_failures": "its value is fixed at 2",
+    "max_turn_minutes": "its value is fixed at 180",
+    "max_turns": "its value is fixed at 30",
+    "max_wait_hours": "its value is fixed at 6.0",
+    "merge_max_runs": "its value is fixed at 30",
+    "merge_queue_hours": "its value is fixed at 24.0",
+    "merge_timeout_minutes": "its value is fixed at 15.0",
+    "mesh_effects": "its value is fixed at true",
+    "metrics_file": "its value is fixed at none (no metrics file)",
+    "no_outcome_route_after": "its value is fixed at 3",
+    "provider_outage_backoff_cap_seconds": "its value is fixed at 7200",
+    "provider_outage_backoff_seconds": "its value is fixed at 120",
+    "provider_outage_giveup_minutes": "its value is fixed at 360",
+    "provider_outage_lanes": "its value is fixed at 3",
+    "receipt_wait_v1": "its value is fixed at false",
+    "recovery_supersede_authors": "its value is fixed at an empty list",
+    "review_gate_hold_minutes": "its value is fixed at 30.0",
+    "review_gate_hold_pattern": "its value is fixed at the built-in pattern",
+    "review_label_prefix": 'its value is fixed at "verified-by:"',
+    "review_own_verdict_pattern": "its value is fixed at the built-in pattern; the per-agent "
+                                  "review_own_verdict_pattern still applies",
+    "review_refeed_hours": "its value is fixed at 4.0",
+    "review_starts_per_tick": "its value is fixed at 1",
+    "review_unstartable_retry_minutes": "its value is fixed at 60.0",
+    "review_verdict_pattern": "its value is fixed at the built-in pattern; the per-agent review_verdict_pattern "
+                              "still applies",
+    "session_reports": "its value is fixed at true",
+    "straggler_grace_minutes": "its value is fixed at 30",
+    "turn_cap_progress_min": "its value is fixed at 3",
+    "turn_external_wait_minutes": "its value is fixed at 0.0 (off)",
+    "unanswerable_ask_to_lead": "its value is fixed at true",
+    "unanswerable_users": "its value is fixed at an empty list",
+    "wait_first_recheck_hours": "its value is fixed at 2.0",
+    "wake_budget_seconds": "its value is fixed at 45.0",
+    "wake_poll_seconds": "its value is fixed at 120",
+    "workspace_readiness_v1": "its value is fixed at false",
+}
+
+
+def _warn_retired(r: dict) -> None:
+    for key in sorted(RETIRED_RUNNER_OPTIONS.keys() & r.keys()):
+        log.warning("[runner] %s is no longer an option and is ignored (%s)", key, RETIRED_RUNNER_OPTIONS[key])
+
+
 def _pattern(value, where: str) -> str:
     if value is None:
         return value
@@ -129,9 +196,9 @@ def _path(value: str | None) -> Path | None:
 
 
 def _basic_auth(r: dict) -> str:
-    if not (r.get("basic_auth_file") or r.get("basic_auth_env")):
+    if not r.get("basic_auth_file"):
         return ""
-    value = read_secret(r.get("basic_auth_file"), r.get("basic_auth_env"), "mesh basic auth")
+    value = read_secret(r.get("basic_auth_file"), None, "mesh basic auth")
     if ":" not in value:
         raise ConfigError("mesh basic auth: expected user:password")
     return value
@@ -440,14 +507,20 @@ class RunnerConfig:
     chat_max_per_agent: int = 3             # max_chat_sessions per agent
     chat_host_cap: int = 6                  # live sessions on this host, chats and cards together
     chat_idle_minutes: float = 10.0
-    chat_workspace: str = "none"            # none | read | write (a slot of the card pool)
+    chat_workspace: str = "none"            # none | read | write (a slot of the card pool) | lane (the lane's own tools)
     # Mesh MCP of a chat session: stdio command (binary + args) run with the chat's session token
     # (MESH_CHAT_TOKEN_FILE), never the agent key; empty = the session gets no Mesh MCP from the runner
     chat_mcp_command: tuple = ()
     chat_mcp_url: str = ""                  # MESH_API_URL for it; empty = [runner] mesh_url
+    # side services run as their own processes (`mesh-runner service <name>`), supervised by `run`; empty =
+    # every service is a thread of the runner, as before (top-level key, see service_process.py)
+    service_processes: tuple = ()
     metrics_file: Path | None = None   # Prometheus textfile (node_exporter textfile collector)
     mesh_effects: bool = True          # runtime state, schedules, edges, decision requests
     decision_request_metadata_only_recipients: list[str] = field(default_factory=list)  # resolved agent UUIDs; new requests only
+    # lanes whose questions from other lanes of this runner are answered without a request card
+    # (answer_desk.py); ["*"] = every lane, [] = off
+    cardless_question_lanes: list[str] = field(default_factory=list)
     session_reports: bool = True      # spend of every turn reported to Mesh (agents/me/sessions/report)
     completion_comment: bool = True    # time, turns and cost on the task when an attempt completes
     review_starts_per_tick: int = 1    # a backlog of old review tasks must not crowd out work
@@ -484,8 +557,8 @@ class RunnerConfig:
     # progresses (a release QA card with 12 waits stopped at 8). With loop_streak_limit on they are a
     # backstop only: a rollback path and a bound against a loop the streak cannot see (an agent that
     # alternates between two waits, or writes a different comment each turn). Set them high
-    # (e.g. 100000) to leave the streak as the only loop guard; they stay config-driven so the fleet
-    # can roll back to the counters alone with loop_streak_limit = 0.
+    # (e.g. 100000) to leave the streak as the only loop guard. (loop_streak_limit itself is no longer
+    # a [runner] option: RETIRED_RUNNER_OPTIONS.)
     daily_next_budget: int = 6
     daily_wait_budget: int = 8
     # waits declared right after the previous wait was met (CI finished, a card closed, the
@@ -634,15 +707,6 @@ def _github_hosted(section: dict) -> tuple:
     return tuple(_string_list(section.get("orgs"), "[github] orgs", ())) + repos
 
 
-def _ask_patterns(value) -> tuple:
-    patterns = _string_list(value, "hard_ask_patterns", asks.DEFAULT_HARD_PATTERNS)
-    try:
-        asks.validate_patterns(patterns)
-    except re.error as e:
-        raise ConfigError(f"hard_ask_patterns: {e}") from None
-    return patterns
-
-
 MERGE_PLACEHOLDERS = ("target", "project", "iid", "sha")
 
 
@@ -716,8 +780,8 @@ def _session_metadata(section):
 
 
 def _chat_workspace(value) -> str:
-    if value not in ("none", "read", "write"):
-        raise ConfigError('[chat] chat_workspace must be "none", "read" or "write"')
+    if value not in ("none", "read", "write", "lane"):
+        raise ConfigError('[chat] chat_workspace must be "none", "read", "write" or "lane"')
     return value
 
 
@@ -728,6 +792,51 @@ def _gitlab_username(value, agent: str) -> str | None:
     if not isinstance(value, str):
         raise ConfigError(f"agent {agent}: gitlab_username must be a string")
     return value.strip()
+
+
+SERVICE_NAMES = ("chat", "editor", "gmail")
+
+
+def _service_processes(raw: dict) -> tuple:
+    """Top-level ``service_processes``: which side services run as processes of their own. It sits above
+    ``[runner]`` because it chooses how the whole runner is laid out, not how the task loop behaves; written
+    inside ``[runner]`` it would be silently ignored, so it is refused there."""
+    if "service_processes" in (raw.get("runner") or {}):
+        raise ConfigError("service_processes is a top-level key: put it above [runner]")
+    value = raw.get("service_processes", [])
+    if (not isinstance(value, list) or any(v not in SERVICE_NAMES for v in value)
+            or len(set(value)) != len(value)):
+        raise ConfigError(f"service_processes must be a list of distinct names from {list(SERVICE_NAMES)}")
+    return tuple(value)
+
+
+def check_service_processes(cfg: "RunnerConfig") -> None:
+    """A service listed as a process must be one that is on and that can run apart from the task loop."""
+    names = cfg.service_processes
+    if "chat" in names:
+        if not cfg.chat_enabled:
+            raise ConfigError('service_processes: "chat" needs [chat] enabled = true')
+        if cfg.chat_workspace == "write":
+            # a write chat leases slots of the card worktree pools; the lock that serialises the pool's git
+            # operations and slot rows (workspace.base_lock) is per process, so a chat process would race the
+            # task loop for the same slots
+            raise ConfigError('service_processes: "chat" with [chat] chat_workspace = "write" is not supported: '
+                              'worktree slot leases are serialised only inside one process. Use "none" or "read", '
+                              'or leave chat out of service_processes')
+    if "gmail" in names and not (cfg.gmail_watch_v1 and cfg.gmail_watch_reader):
+        raise ConfigError('service_processes: "gmail" needs [runner] gmail_watch_v1 = true and gmail_watch_reader')
+    if "editor" in names:
+        if not cfg.extension_enabled or not (cfg.tgpeek_editor is not None or cfg.tgpeek_editor_control_secret_file):
+            raise ConfigError('service_processes: "editor" needs [extension] enabled = true and [tgpeek_editor] '
+                              'or [tgpeek_editor_control]')
+        if editor_port(cfg) > 65535:
+            raise ConfigError("service_processes: the editor process listens on [extension] port + 1, which is out of range")
+
+
+def editor_port(cfg: "RunnerConfig") -> int:
+    """Where the editor-job routes and the operator editor control listen. As a process the editor cannot share
+    the runner's extension listener (Mesh delivers /mesh/events there), so it takes the next port."""
+    return cfg.extension_port + 1 if "editor" in cfg.service_processes else cfg.extension_port
 
 
 def load(path: str | Path) -> RunnerConfig:
@@ -742,15 +851,13 @@ def load(path: str | Path) -> RunnerConfig:
                 or any(not Path(native_pin[k]).is_absolute() for k in ("policy", "revocations"))):
             raise ConfigError("invalid [native_result_adoption] policy pin")
     r = raw.get("runner") or {}
+    _warn_retired(r)
     import math
     floor = float(r.get("min_free_gb", 0.0))
     if not math.isfinite(floor) or floor < 0:
         raise ConfigError("min_free_gb must be finite and nonnegative")
     if r.get("archive_require_mount") and not r.get("archive_root"):
         raise ConfigError("archive_require_mount needs archive_root")
-    dead_hours = float(r.get("dead_slot_hours", 24.0))
-    if not math.isfinite(dead_hours) or dead_hours < 0:
-        raise ConfigError("dead_slot_hours must be finite and nonnegative")
     if not r.get("mesh_url"):
         raise ConfigError("[runner] mesh_url is required")
     ops_registry = r.get("ops_review_wait_registry")
@@ -764,6 +871,9 @@ def load(path: str | Path) -> RunnerConfig:
     if (not isinstance(recipients, list) or any(not isinstance(v, str) or not re.fullmatch(
             r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", v) for v in recipients)):
         raise ConfigError("decision_request_metadata_only_recipients must be a list of canonical agent UUIDs")
+    cardless = r.get("cardless_question_lanes", [])
+    if not isinstance(cardless, list) or any(not isinstance(v, str) or not v.strip() for v in cardless):
+        raise ConfigError('cardless_question_lanes must be a list of lane names (or ["*"])')
     comment_wake = r.get("comment_wake", "all")
     if comment_wake not in ("all", "addressed"):
         raise ConfigError('comment_wake must be "all" or "addressed"')
@@ -775,7 +885,7 @@ def load(path: str | Path) -> RunnerConfig:
     ext = raw.get("extension") or {}
     ext_token = None
     if ext.get("token_file") or ext.get("token_env"):
-        if r.get("basic_auth_file") or r.get("basic_auth_env"):
+        if r.get("basic_auth_file"):
             raise ConfigError("[extension] token replaces basic auth: set only one of them")
         from .extension_service import ExtensionToken
         ext_token = ExtensionToken(_path(ext.get("token_file")), str(ext.get("token_env") or ""))
@@ -874,91 +984,37 @@ def load(path: str | Path) -> RunnerConfig:
     names = [a.name for a in agents]
     if len(set(names)) != len(names):
         raise ConfigError("agent names must be unique")
-    return RunnerConfig(
+    cfg = RunnerConfig(
         mesh_url=r["mesh_url"],
         state_dir=_path(r.get("state_dir") or _default_state_dir()),
         agents=agents,
         poll_seconds=int(r.get("poll_seconds", 20)),
-        wake_poll_seconds=int(r.get("wake_poll_seconds", 120)),
-        wake_budget_seconds=max(_positive(r.get("wake_budget_seconds", 45), "[runner] wake_budget_seconds"), 1.0),
-        heartbeat_seconds=int(r.get("heartbeat_seconds", 300)),
-        checkout_ttl_minutes=int(r.get("checkout_ttl_minutes", 120)),
-        max_no_outcome=int(r.get("max_no_outcome", 1)),
-        no_outcome_route_after=max(int(r.get("no_outcome_route_after", 3)), 1),
         daily_start_cap=int(r.get("daily_start_cap", 0)),
         comment_wake=comment_wake,
         comment_wake_always_from=[v.strip() for v in always_from],
-        decision_wake=_decision_wake(r.get("decision_wake", "any"), "[runner]"),
-        decision_reuse_hours=_idle_hours(r.get("decision_reuse_hours", 24.0), "decision_reuse_hours"),
-        decision_live_task_card_wait=r.get("decision_live_task_card_wait", True) is not False,
-        decision_identical_no_reopen=r.get("decision_identical_no_reopen", True) is not False,
-        decision_default_proceeds=r.get("decision_default_proceeds", True) is not False,
         max_compactions=int(r.get("max_compactions", 0)),
-        max_failures=int(r.get("max_failures", 3)),
-        provider_outage_giveup_minutes=int(r.get("provider_outage_giveup_minutes", 360)),
-        provider_outage_backoff_seconds=int(r.get("provider_outage_backoff_seconds", 120)),
-        provider_outage_backoff_cap_seconds=int(r.get("provider_outage_backoff_cap_seconds", 7200)),
-        provider_outage_lanes=int(r.get("provider_outage_lanes", 3)),
-        max_startup_failures=int(r.get("max_startup_failures", 2)),
-        failed_cooldown_hours=float(r.get("failed_cooldown_hours", 0.5)),
-        max_turns=int(r.get("max_turns", 30)),
-        turn_cap_progress_min=max(1, int(r.get("turn_cap_progress_min", 3))),
-        max_turn_minutes=int(r.get("max_turn_minutes", 180)),
-        straggler_grace_minutes=int(r.get("straggler_grace_minutes", 30)),
         turn_first_output_minutes=_idle_hours(r.get("turn_first_output_minutes", 0.0), "turn_first_output_minutes"),
         turn_idle_minutes=_idle_hours(r.get("turn_idle_minutes", 0.0), "turn_idle_minutes"),
-        turn_external_wait_minutes=_idle_hours(r.get("turn_external_wait_minutes", 0.0),
-                                               "turn_external_wait_minutes"),
-        wait_first_recheck_hours=float(r.get("wait_first_recheck_hours", 2.0)),
         min_free_gb=float(r.get("min_free_gb", 0.0)),
         archive_root=_path(r.get("archive_root")),
         archive_require_mount=_path(r.get("archive_require_mount")),
-        dead_slot_hours=dead_hours,
         workspace_wait_release_minutes=float(r.get("workspace_wait_release_minutes", 0.0)),
-        workspace_readiness_v1=r.get("workspace_readiness_v1") is True,
-        ignored_cleanup=r.get("ignored_cleanup", False) is True,
-        ignored_cleanup_idle_hours=_idle_hours(r.get("ignored_cleanup_idle_hours", 24.0)),
-        ignored_cleanup_interval_minutes=float(r.get("ignored_cleanup_interval_minutes", 30.0)),
-        checkpoint_gc_grace_hours=_idle_hours(r.get("checkpoint_gc_grace_hours", 6.0), "checkpoint_gc_grace_hours"),
-        checkpoint_budget_gb=_idle_hours(r.get("checkpoint_budget_gb", 4.0), "checkpoint_budget_gb"),
-        checkpoint_exclude_names=_exclude_names(r.get("checkpoint_exclude_names")),
         ops_review_wait_registry=_path(ops_registry),
         ops_review_wait_notifier_id=ops_notifier or "",
-        receipt_wait_v1=r.get("receipt_wait_v1") is True,
         gmail_watch_v1=r.get("gmail_watch_v1") is True,
         gmail_watch_reader=_argv(r.get("gmail_watch_reader"), "gmail_watch_reader"),
-        gmail_watch_interval_seconds=max(30.0, _idle_hours(r.get("gmail_watch_interval_seconds", 120.0), "gmail_watch_interval_seconds")),
-        gmail_watch_timeout_seconds=_idle_hours(r.get("gmail_watch_timeout_seconds", 60.0), "gmail_watch_timeout_seconds"),
-        recovery_supersede_authors=tuple(str(x) for x in (r.get("recovery_supersede_authors") or [])),
-        max_wait_hours=float(r.get("max_wait_hours", 6.0)),
         time_wait_ignore_names=[str(n) for n in (r.get("time_wait_ignore_names") or [])],
-        abort_backoff_minutes=int(r.get("abort_backoff_minutes", 15)),
-        metrics_file=_path(r.get("metrics_file")),
-        mesh_effects=bool(r.get("mesh_effects", True)),
         decision_request_metadata_only_recipients=list(recipients),
-        completion_comment=bool(r.get("completion_comment", True)),
-        session_reports=bool(r.get("session_reports", True)),
-        review_starts_per_tick=int(r.get("review_starts_per_tick", 1)),
+        cardless_question_lanes=[v.strip() for v in cardless],
         review_own_hold_hours=float(r.get("review_own_hold_hours", 1.0)),
-        review_gate_hold_minutes=float(r.get("review_gate_hold_minutes", 30.0)),
-        review_unstartable_retry_minutes=float(r.get("review_unstartable_retry_minutes", 60.0)),
-        review_refeed_hours=float(r.get("review_refeed_hours", 4.0)),
-        review_gate_hold_pattern=_pattern(r.get("review_gate_hold_pattern", r"qa_(refused|no_selection)"), "[runner]"),
-        review_verdict_pattern=_pattern(r.get("review_verdict_pattern", DEFAULT_VERDICT_PATTERN), "[runner]"),
-        review_own_verdict_pattern=_pattern(r.get("review_own_verdict_pattern", DEFAULT_OWN_VERDICT_PATTERN),
-                                            "[runner]"),
-        review_label_prefix=str(r.get("review_label_prefix", "verified-by:")),
-        loop_streak_limit=_loop_streak_limit(r.get("loop_streak_limit", 6)),
         daily_next_budget=int(r.get("daily_next_budget", 6)),
         project_leads={str(k): str(v) for k, v in (raw.get("project_leads") or {}).items()},
         daily_wait_budget=int(r.get("daily_wait_budget", 8)),
         daily_step_budget=int(r.get("daily_step_budget", 24)),
         memory_hold_free_pct=float(r.get("memory_hold_free_pct", 0)),
         tmux_binary=str(r.get("tmux_binary", "tmux")),
-        launch_mode=_launch_mode(r.get("launch_mode", "interactive"), "[runner]"),
         interactive_idle_minutes=float(r.get("interactive_idle_minutes", 60.0)),
         interactive_max_sessions=int(r.get("interactive_max_sessions", 20)),
-        background_wait_minutes=_idle_hours(r.get("background_wait_minutes", 45.0), "background_wait_minutes"),
         mesh_basic_auth=_basic_auth(r),
         catalog=_catalog(raw.get("catalog"), _path(r.get("state_dir") or _default_state_dir())),
         git_index_admission=_git_index_admission(raw.get("git_index_admission")),
@@ -975,12 +1031,7 @@ def load(path: str | Path) -> RunnerConfig:
         tgpeek_editor=tgpeek_editor,
         tgpeek_editor_control_secret_file=control_secret_file,
         config_path=str(Path(path).resolve()),
-        unanswerable_ask_to_lead=r.get("unanswerable_ask_to_lead", True) is not False,
         login_ask_check=tuple(_string_list(r.get("login_ask_check"), "login_ask_check", ())),
-        hard_ask_patterns=_ask_patterns(r.get("hard_ask_patterns")),
-        hard_ask_labels=_string_list(r.get("hard_ask_labels"), "hard_ask_labels", asks.DEFAULT_HARD_LABELS),
-        unanswerable_users=tuple(s.casefold() for s in _string_list(r.get("unanswerable_users"),
-                                                                    "unanswerable_users", ())),
         merge_command=_merge_command(r.get("merge_command")),
         merge_command_cwd=_path(r.get("merge_command_cwd")),
         native_result_adoption=native_pin,
@@ -989,10 +1040,7 @@ def load(path: str | Path) -> RunnerConfig:
         native_result_dir=_path(r.get("native_result_dir")),
         native_result_channels_dir=_path(r.get("native_result_channels_dir")),
         reviewer_select_command=_reviewer_select_command(r.get("reviewer_select_command")),
-        merge_timeout_minutes=_positive(r.get("merge_timeout_minutes", 15.0), "merge_timeout_minutes"),
         merge_rerun_minutes=_positive(r.get("merge_rerun_minutes", 5.0), "merge_rerun_minutes"),
-        merge_max_runs=_positive(r.get("merge_max_runs", 30), "merge_max_runs", integer=True),
-        merge_queue_hours=_positive(r.get("merge_queue_hours", 24.0), "merge_queue_hours"),
         memory_release_free_pct=float(r.get("memory_release_free_pct", 0)),
         memory_hold_swap_mb=float(r.get("memory_hold_swap_mb", 0)),
         memory_release_swap_mb=float(r.get("memory_release_swap_mb", 0)),
@@ -1019,4 +1067,7 @@ def load(path: str | Path) -> RunnerConfig:
         if (raw.get("github") or {}).get("token_file") or (raw.get("github") or {}).get("token_env") else "",
         github_api_url=str((raw.get("github") or {}).get("api_url") or "https://api.github.com"),
         source=Path(path).resolve(),
+        service_processes=_service_processes(raw),
     )
+    check_service_processes(cfg)
+    return cfg

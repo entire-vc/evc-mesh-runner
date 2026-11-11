@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import re
 import shutil
@@ -24,6 +25,7 @@ from .chat_delivery import window_key
 from .chat_protocol import ChatClient, ChatError
 from .interactive import Tmux, agent_dir, forget, read_meta, session_name
 
+log = logging.getLogger("mesh_runner")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 HISTORY_CHARS = 6000
 
@@ -105,6 +107,10 @@ class _Refuse(urllib.request.HTTPRedirectHandler):
 _NO_REDIRECT = urllib.request.build_opener(_Refuse)
 
 
+class TooLarge(ValueError):
+    """The file is bigger than the turn's ``max_attachment_mb``: a fresh link would not make it smaller."""
+
+
 def _download(url: str, dest: Path, limit: int) -> None:
     if urllib.parse.urlparse(url).scheme != "https":
         raise ValueError("attachment link must be https")
@@ -114,13 +120,33 @@ def _download(url: str, dest: Path, limit: int) -> None:
             while chunk := resp.read(65536):
                 size += len(chunk)
                 if size > limit:
-                    raise ValueError("attachment over the size limit")
+                    raise TooLarge("attachment over the size limit")
                 out.write(chunk)
+
+
+def why_not_fetched(e: BaseException) -> str:
+    """A fixed class of a failed attachment fetch for the log: never the link (it is a credential) and never
+    a server message. ``ChatError`` is the refresh call, ``HTTPError`` the storage answer."""
+    if isinstance(e, ChatError):
+        return f"refresh {e.status} {str(e.error_code)[:40]}"
+    if isinstance(e, urllib.error.HTTPError):
+        return f"storage http {e.code}"
+    if isinstance(e, urllib.error.URLError):
+        return "storage unreachable"
+    if isinstance(e, LookupError):
+        return "no download_url"
+    if isinstance(e, ValueError):
+        return "over the size limit" if isinstance(e, TooLarge) else "link not https"
+    return type(e).__name__
 
 
 def fetch_attachments(client: ChatClient, turn: dict, state_dir: Path,
                       download: Callable[[str, Path, int], None] = _download) -> list[tuple[dict, Path | None]]:
-    """(attachment, local path) pairs; a file that could not be fetched has path None."""
+    """(attachment, local path) pairs; a file that could not be fetched has path None.
+
+    A turn whose attachment came without a link (Mesh could not presign it) or whose link failed (expired,
+    refused, unreachable) asks Mesh for a fresh link once. A failure is logged with its class: it reaches the
+    model only as "could not be downloaded", and without the log line nobody can tell why."""
     files = (turn.get("message") or {}).get("attachments") or []
     if not files:
         return []
@@ -132,15 +158,22 @@ def fetch_attachments(client: ChatClient, turn: dict, state_dir: Path,
         name = SAFE_NAME.sub("_", os.path.basename(str(a.get("file_name") or f"file{i}")))[:80] or f"file{i}"
         dest = directory / f"{i}-{name}"
         path: Path | None = dest
+        first = ""
         try:
             try:
-                download(a["download_url"], dest, limit)
-            except OSError:                                  # link expired: ask for a fresh one once
+                url = a.get("download_url")
+                if not url:
+                    raise LookupError("no download_url")
+                download(str(url), dest, limit)
+            except (OSError, LookupError) as e:              # none, expired or refused: ask for a fresh one once
+                first = why_not_fetched(e)
                 url = client.download_url(turn["turn_id"], a["attachment_id"])["download_url"]
                 download(url, dest, limit)
-        except (ChatError, OSError, ValueError, KeyError):
+        except (ChatError, OSError, ValueError, LookupError) as e:
             dest.unlink(missing_ok=True)
             path = None
+            log.warning("chat %s: attachment %d of turn %s not fetched: %s%s", window_key(str(turn["thread_id"])), i,
+                        str(turn.get("turn_id") or "")[:8], why_not_fetched(e), f" (first try: {first})" if first else "")
         out.append((a, path))
     return out
 

@@ -205,5 +205,8 @@ class ConfigKeys(unittest.TestCase):
     def test_default_progress_min(self):
         self.assertEqual(self.load().turn_cap_progress_min, 3)
 
-    def test_progress_min_is_read(self):
-        self.assertEqual(self.load("turn_cap_progress_min = 5\n").turn_cap_progress_min, 5)
+    def test_progress_min_is_fixed(self):
+        # no longer a [runner] option: a file that sets it keeps 3
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            self.assertEqual(self.load("turn_cap_progress_min = 5\n").turn_cap_progress_min, 3)
+        self.assertIn("turn_cap_progress_min is no longer an option", "\n".join(logs.output))

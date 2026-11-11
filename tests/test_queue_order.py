@@ -7,6 +7,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
 
+from fakes import FUTURE_AT, FakeMesh, task as mesh_task
+from test_runner import Bench
+
 from mesh_runner import queue_order
 from mesh_runner.effects import DECISION_REQUEST_LABEL
 from mesh_runner.runner import AgentRunner
@@ -31,7 +34,10 @@ open({str(self.log)!r}, "a").write(raw + "\\n")
 req = json.loads(raw)
 ids = [c["id"] for c in req["candidates"]]
 mode = {mode!r}
-if mode == "reverse": print(json.dumps({{"version": 1, "order": ids[::-1], "mode": "x"}}))
+if mode == "reverse": print(json.dumps({{"version": 1, "order": ids[::-1], "mode": "x", "fair_ids": ids[-1:]}}))
+elif mode == "reply_then_exit":
+    print(json.dumps({{"version": 1, "order": ids[::-1], "fair_ids": ids[-1:]}}), flush=True)
+    sys.exit(3)
 elif mode == "exit": sys.exit(3)
 elif mode == "flood":
     while True: sys.stdout.write("x" * 65536); sys.stdout.flush()
@@ -169,6 +175,40 @@ class QueueOrderTest(unittest.TestCase):
                     '{"version":1,"order":["x",1]}', '{"version":1}'):
             with self.assertRaises(ValueError):
                 queue_order.parse_reply(bad, ids)
+
+
+class QueueOrderDispatchTest(Bench):
+    def test_persists_actual_hold_and_fairness_at_ordinary_start(self):
+        oldest = mesh_task(1, "low", start_after=FUTURE_AT)
+        ready = mesh_task(2, "high")
+        helper = Helper(self.root, "reverse")
+        self.agent.queue_order_command = helper.argv
+        mesh = FakeMesh([oldest, ready], max_concurrent=1)
+        r = self.runner(mesh)
+        r.refresh_me()
+
+        self.assertEqual(r.start_new(1), 0)
+        (a,) = r.store.by_state(self.agent.name, ("running",))
+        self.assertEqual(a.task_id, ready["id"])
+        self.assertEqual(a.queue_order, {"fairness": False, "passed_over": [oldest["id"]]})
+        self.assertEqual([c["id"] for c in json.loads(helper.calls()[0])["candidates"]],
+                         [ready["id"], oldest["id"]])
+        self.assertEqual(r.store.events_on_task(oldest["id"], "created"), 0)
+
+    def test_fallback_ignores_reply_from_failed_helper_even_on_cache_hit(self):
+        oldest = mesh_task(1, "low")
+        ready = mesh_task(2, "high")
+        helper = Helper(self.root, "reply_then_exit")
+        self.agent.queue_order_command = helper.argv
+        r = self.runner(FakeMesh([oldest, ready], max_concurrent=1))
+        r.refresh_me()
+
+        self.assertEqual(len(r.candidates()), 2)  # primes failure cache without dispatch
+        self.assertEqual(r.start_new(1), 0)
+        (a,) = r.store.by_state(self.agent.name, ("running",))
+        self.assertEqual(a.task_id, ready["id"])
+        self.assertEqual(a.queue_order, {"fairness": None, "passed_over": []})
+        self.assertEqual(len(helper.calls()), 1)
 
 
 class ConfigTest(unittest.TestCase):

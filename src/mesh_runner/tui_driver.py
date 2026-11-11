@@ -56,6 +56,10 @@ LIMIT_RE = re.compile(r"(usage limit|hit your (usage )?limit|limit reached|limit
                       r"rate limit(ed)?\b|api error:? ?\d{3}|overloaded_error)", re.I)
 AUTH_RE = re.compile(r"(not logged in|run /login|please log in|oauth token (has )?expired|invalid api key|"
                      r"authentication_error|please run codex login)", re.I)
+# How much of a usage window is LEFT, which Codex keeps on screen once a window runs low
+# ("⚠ weekly limit: 25% left · resets at 14:10 on 15 Nov · /status"). It names a limit and a reset, so LIMIT_RE
+# matches it, but the turn goes on: it is a warning, not a limit. "0% left" is the limit itself and still counts.
+LIMIT_LEFT_RE = re.compile(r"\b(?:[1-9]\d?|100)\s?% left\b", re.I)
 # a running turn: the interrupt hint, a running tool, or an active spinner ("✽ Forging… (1m 2s · …)";
 # a finished one reads "✻ Sautéed for 24s")
 BUSY_RE = re.compile(r"(esc to interrupt|esc to cancel|working \(|ctrl\+b to run in background|…\s*\(\d+[ms])", re.I)
@@ -1220,7 +1224,7 @@ class Driver:
     @staticmethod
     def banner(text: str) -> str:
         for line in reversed([x.strip() for x in text.splitlines() if x.strip()][-6:]):
-            if LIMIT_RE.search(line) or AUTH_RE.search(line):
+            if AUTH_RE.search(line) or (LIMIT_RE.search(line) and not LIMIT_LEFT_RE.search(line)):
                 return line[:300]
         return ""
 

@@ -307,8 +307,8 @@ class Peers(CapBench):
 
     def test_a_paused_busy_or_capped_peer_is_skipped(self):
         def paused_file(r):
-            (self.cfg.state_dir / "pause").mkdir(parents=True, exist_ok=True)
-            (self.cfg.state_dir / "pause" / "peer").write_text("")
+            from mesh_runner import op_pause
+            op_pause.take(self.cfg.state_dir, "peer", "maintenance")
 
         def busy(r):
             a = r.store.create("peer", "other-task", "claude")

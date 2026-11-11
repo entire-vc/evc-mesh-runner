@@ -19,7 +19,7 @@ the workspace is restored from the checkpoint like any other released wait.
 
 The same opt-in threshold applies to a stopped `ready` attempt while it still
 owns Git leases. A maintenance pass observes it at most once per
-`wake_poll_seconds`, independently of admission: operator/quota pause, memory,
+two minutes, independently of admission: operator/quota pause, memory,
 full concurrency, authentication, checkout and standing review holds do not
 prevent lease return. Its hold clock starts at the first ready maintenance
 observation or refused admission, is bound to the exact attempt and survives
@@ -135,7 +135,7 @@ reason is logged as a warning and repeats at debug level. A snapshot whose base 
 base clone, and one whose rewrite saved nothing, are never retried. The entry is dropped with its
 snapshot.
 
-`runner.checkpoint_budget_gb` (default 4) is the budget for all snapshots together. The gc pass
+4 GB is the budget for all snapshots together. The gc pass
 measures them, publishes `mesh_runner_checkpoint_bytes` and `status.json` `checkpoints.bytes`, and
 logs an overrun; the monitoring alert `MeshRunnerCheckpointsOverBudget` fires above 6 GiB. Nothing is
 evicted to meet the budget: a snapshot is the only copy of a waiting card's uncommitted work.
@@ -150,7 +150,7 @@ budget:
 
 - every checkpoint of an attempt that ended (any state other than `starting`,
   `running`, `unknown`, `waiting`, `ready`) more than
-  `runner.checkpoint_gc_grace_hours` ago (default 6), with its journal row;
+  6 hours ago, with its journal row;
 - a checkpoint directory no journal row names (a replaced generation) whose
   modification time is older than the grace period;
 - `.pending-` capture directories while no capture runs in the process;

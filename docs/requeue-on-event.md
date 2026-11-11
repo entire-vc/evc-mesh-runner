@@ -6,7 +6,7 @@ starts again when something new reaches it, or on another agent that is free.
 ## Caps
 
 START CAP (`daily_start_cap` starts of one task by one agent per UTC day), TURN CAP
-(`daily_next_budget`, `daily_wait_budget`, `daily_step_budget`), LOOP (`loop_streak_limit`
+(`daily_next_budget`, `daily_wait_budget`, `daily_step_budget`), LOOP (6
 consecutive turns without progress; see the README) and COMPACTION CAP
 (`max_compactions`) no longer hand the task to the lead or keep it until tomorrow:
 
@@ -31,7 +31,7 @@ consecutive turns without progress; see the README) and COMPACTION CAP
    cannot be read counts as unchanged. Because the day's counters still stand, a task that is
    capped again after its new start waits for the next change.
 4. **Peers.** If another agent of the same pool is configured, not paused (`paused = true` or
-   `<state_dir>/pause/<Agent>`), serves the task's project and policy, has a free slot, has not hit
+   a token under `<state_dir>/pause.d/<Agent>/`, see `docs/operator-pause.md`), serves the task's project and policy, has a free slot, has not hit
    the cap on this task itself and is not itself waiting for input on it, the task is assigned to it
    at once ("fresh look"). A task a cap moved to an agent is not moved on again the same UTC day.
    *Pool* is, in order: the same non-empty `pool` name in the agent block; or, when neither agent
@@ -40,7 +40,7 @@ consecutive turns without progress; see the README) and COMPACTION CAP
 5. `RUNNER GAVE UP` (harness errors, turn limit) is mechanics, not work, and still goes to the lead.
    Turns without a readable outcome use the same wait: the second in a row puts the task back in todo
    with the same lane (`🔁 NO OUTCOME`, no peer reassignment) until its inputs change; the
-   `no_outcome_route_after`-th in a row (default 3, reset by any readable outcome) goes to the lead.
+   third in a row (reset by any readable outcome) goes to the lead.
 
 When the requeue cannot be done safely (the inputs are unreadable, or Mesh refuses the move to
 `todo`) the cap takes the older path: the task goes to the lead, or stays with the agent until the
@@ -49,7 +49,7 @@ next UTC day when nobody can take it.
 ### What counts toward `daily_start_cap`
 
 Only restarts with nothing new behind them are counted: a crash or no-outcome
-restart, a failed-turn retry, a `failed_cooldown_hours` retry, a turn-cap restart of a progressing
+restart, a failed-turn retry, a failed-cooldown retry (after half an hour), a turn-cap restart of a progressing
 attempt, the next-UTC-day restart of a capped task whose agent has no lead. A start that a real event woke is not counted, so a card that
 progresses, each start woken by something that happened, is never parked by the cap. The runner looks
 for such an event when it starts a session (a few reads of the task, none of them GitLab) and records
@@ -65,12 +65,12 @@ it on the attempt as an `informed_start` event. Since the agent's previous sessi
 When the cap would have applied, the log says `start cap not applied: <event> since the last session`.
 A read that fails is not news.
 
-## Questions to agents (`unanswerable_ask_to_lead`, default on)
+## Questions to agents (always on)
 
 `WAIT decision:@agent` files a decision request, a task labelled `decision-request` assigned to the
 addressee. The addressee's queue puts such requests ahead of ordinary tasks, whatever their priority.
 If the addressee cannot answer (not resolvable by this runner, not run by it, paused by config or by
-the pause file, the asker itself, or a user listed in `unanswerable_users` or flagged `is_test`,
+the pause file, the asker itself, or a user flagged `is_test`,
 `is_service`, `is_bot`, `test_user` on its roster row), the request goes to the project lead
 (agent `lead`, that lead's lead, then `[project_leads]`) with a comment naming whom and why. The
 asking task waits for a comment as before. Without any lead the older behaviour stands.
@@ -79,7 +79,7 @@ asking task waits for a comment as before. Without any lead the older behaviour 
 
 Where the runner turns `WAIT decision:@person` into a `❓ Blocking` ask it first classifies the
 question (`asks.py`). **Hard** questions stay a human gate: a keyword in the question or a task label
-from `hard_ask_patterns` / `hard_ask_labels` (money, secrets and access, irreversible or production
+from the built-in keyword and label lists (money, secrets and access, irreversible or production
 data actions, external publishing, legal, and actions only the person can take: logins, clicks, a physical device; English and Russian); no question text or unreadable labels
 count as hard. **Soft** ones are put to the project lead as a decision request without raising a
 gate, with the comment "Decided by lead, owner may override by commenting here". A comment by the

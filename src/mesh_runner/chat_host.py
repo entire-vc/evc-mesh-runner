@@ -25,6 +25,7 @@ from pathlib import Path
 from . import interactive
 from .chat_announce import build_snapshot
 from .chat_delivery import DriverDelivery, window_key
+from .chat_lane import lane_of
 from .chat_machine import build_prompt, chat_dir, delete_chat, fetch_attachments, stop_window
 from .chat_pool import ChatPool
 from .chat_protocol import ChatClient, ChatError
@@ -88,19 +89,22 @@ def routed(ar, clock=time.monotonic, ttl: float = ENV_TTL) -> tuple[dict, str, o
     than ``ttl`` seconds is served as it is while one background refresh replaces it, so a lane moved to
     another account is picked up within ``ttl`` plus one refresh. The router runs outside every lock. The
     three values come from one entry and a chat builds its command line from them on a private adapter
-    (``pinned``), never from the shared adapter that card turns re-route."""
-    lock = _agent_lock(ar)
+    (``pinned``), never from the shared adapter that card turns re-route. The entry is keyed on the lane
+    object itself (``ChatLane.owner``), so every ChatLane over one lane shares it."""
+    lane = lane_of(ar)
+    owner = lane.owner
+    lock = _agent_lock(owner)
     with lock:
         with _env_lock:
-            hit = _env_cache.get(id(ar))
-        if hit is None or hit[4] is not ar:                          # the agent's first call: nothing to serve, wait for the router
-            return _store(ar, clock, ar._read_env())
+            hit = _env_cache.get(id(owner))
+        if hit is None or hit[4] is not owner:                       # the agent's first call: nothing to serve, wait for the router
+            return _store(lane, clock, lane.read_env())
         with _env_lock:
-            refresh = clock() - hit[0] >= ttl and id(ar) not in _refreshing
+            refresh = clock() - hit[0] >= ttl and id(owner) not in _refreshing
             if refresh:
-                _refreshing.add(id(ar))
+                _refreshing.add(id(owner))
     if refresh:
-        threading.Thread(target=_refresh, args=(ar, clock, lock), name="chat-env-refresh", daemon=True).start()
+        threading.Thread(target=_refresh, args=(lane, clock, lock), name="chat-env-refresh", daemon=True).start()
     return dict(hit[1]), hit[2], hit[3]
 
 
@@ -129,25 +133,25 @@ _refreshing: set[int] = set()
 _agent_locks: dict[int, threading.RLock] = {}
 
 
-def _store(ar, clock, raw: dict) -> tuple[dict, str, object]:
+def _store(lane, clock, raw: dict) -> tuple[dict, str, object]:
     from .runner import session_env
-    env, harness, profile = ar._route_env(raw)           # pure: derived from the read env alone
+    env, harness, profile = lane.route_env(raw)          # pure: derived from the read env alone
     env = session_env(env)                                # what a session gets: the allowlisted runner env + the lane's
     with _env_lock:
-        _env_cache[id(ar)] = (clock(), dict(env), harness, profile, ar)
+        _env_cache[id(lane.owner)] = (clock(), dict(env), harness, profile, lane.owner)
     return dict(env), harness, profile
 
 
-def _refresh(ar, clock, lock) -> None:
+def _refresh(lane, clock, lock) -> None:
     try:
-        raw = ar._read_env()                     # the slow part, no lock held
+        raw = lane.read_env()                    # the slow part, no lock held
         with lock:
-            _store(ar, clock, raw)
+            _store(lane, clock, raw)
     except Exception as e:                       # the stale entry stays; the next call tries again
         log.warning("chat env refresh: %s", type(e).__name__)
     finally:
         with _env_lock:
-            _refreshing.discard(id(ar))
+            _refreshing.discard(id(lane.owner))
 
 
 def routed_env(ar, clock=time.monotonic, ttl: float = ENV_TTL) -> dict:
@@ -174,30 +178,75 @@ def with_chat_mcp(adapter, argv: list[str], cfg, token_file: str) -> list[str]:
 
 def lease_slot(ar, thread: str) -> Path:
     """The chat's worktree slot: the one it already holds, else a new lease from the agent's pool."""
+    lane = lane_of(ar)
     key = window_key(thread)
-    held = ar.pool.leased_path(key)
+    held = lane.pool.leased_path(key)
     if held is not None:
         return held
-    repos = list(getattr(ar.agent, "repos", None) or [])
+    repos = list(getattr(lane.agent, "repos", None) or [])
     if not repos:
         raise ChatRefused("chat_workspace_no_repo", "chat_workspace=write: the agent has no repository configured")
     try:
-        return ar.pool.lease(key, repos[0].name)
+        return lane.pool.lease(key, repos[0].name)
     except WorkspaceError as e:
         raise ChatRefused("chat_workspace_busy", f"no worktree slot for a chat: {e}"[:200]) from e
 
 
 def return_slot(ar, thread: str) -> None:
     """Give the chat's slot back; an unsafe one (uncommitted work) stays held for the operator, never wiped."""
-    pool = getattr(ar, "pool", None)
+    pool = lane_of(ar).pool
     if pool is None:
         return
     for path, reason in pool.release(window_key(thread)):
         log.warning("chat %s: worktree %s kept: %s", window_key(thread), path, reason)
 
 
+def attachment_dirs(ar, thread: str, harness: str, slot: Path | None) -> list[Path]:
+    """Directories the chat session is started with besides its cwd: the chat's attachment directory, so a
+    Claude session may read the files a message brings (they are saved outside its cwd, under the state
+    directory; without the directory in its scope Read asks for a permission nobody in a chat window answers).
+    The directory is stable per chat, so a session started for one message also reads the next one's files.
+    Codex reads the whole disk in both of its sandboxes and a write chat's slot is its whole boundary, so
+    neither gets one."""
+    if slot is not None or harness != "claude":
+        return []
+    files = chat_dir(lane_of(ar).cfg.state_dir, thread) / "files"
+    files.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return [files]
+
+
+def session_for(adapter, ar, thread: str, env: dict) -> tuple[str, bool]:
+    """``(session id, resume)`` of the session keyed by ``thread`` (its window ``window_key(thread)``): the one
+    the window's metadata recorded, resumed when this machine still has its transcript; otherwise a new one,
+    with the id stable per thread when the harness takes an id up front."""
+    key = window_key(thread)
+    meta = read_meta(adapter.dir, key)
+    warm_id = str(meta.get("session_id") or "")
+    sid = warm_id or (session_id_for(thread) if adapter.session_id_known_upfront else "")
+    resume = bool(warm_id)
+    if resume:
+        profile_dir = lane_of(ar).agent.profile_dir
+        try:
+            note = adapter.prepare_resume(sid, profile_dir, env)
+            known = adapter.session_known(sid, profile_dir, env)
+        except OSError as e:
+            note, known = f"could not carry the session over: {e}", True
+        if note:
+            log.info("chat %s: %s", key, note[:200])
+        if not known:
+            # the transcript is gone from this machine (deleted by hand, a lost account): --resume
+            # would fail the turn, so a new session starts and is fed the chat's past from Mesh
+            log.info("chat %s: session %s has no transcript on this machine; new session with history",
+                     key, sid[:8])
+            resume = False
+            sid = str(uuid.uuid4()) if adapter.session_id_known_upfront else ""
+    return sid, resume
+
+
 def make_plan(ar, client: ChatClient, chat_workspace: str = "none"):
-    """``plan(turn)`` for ``DriverDelivery``, bound to one AgentRunner ``ar``."""
+    """``plan(turn)`` for ``DriverDelivery``, bound to one lane ``ar`` (a ChatLane or an AgentRunner)."""
+    ar = lane_of(ar)
+
     def plan(turn: dict):
         env, harness, profile = routed(ar)                 # account/profile routing, may raise
         adapter = pinned(ar.adapter_for(harness), profile)
@@ -205,37 +254,22 @@ def make_plan(ar, client: ChatClient, chat_workspace: str = "none"):
             raise ChatRefused("headless_forbidden", "chats run in interactive sessions only")
         thread = turn["thread_id"]
         key = window_key(thread)
-        meta = read_meta(adapter.dir, key)
-        warm_id = str(meta.get("session_id") or "")
-        sid = warm_id or (session_id_for(thread) if adapter.session_id_known_upfront else "")
-        resume = bool(warm_id)
-        if resume:
-            try:
-                note = adapter.prepare_resume(sid, ar.agent.profile_dir, env)
-                known = adapter.session_known(sid, ar.agent.profile_dir, env)
-            except OSError as e:
-                note, known = f"could not carry the session over: {e}", True
-            if note:
-                log.info("chat %s: %s", key, note[:200])
-            if not known:
-                # the transcript is gone from this machine (deleted by hand, a lost account): --resume
-                # would fail the turn, so a new session starts and is fed the chat's past from Mesh
-                log.info("chat %s: session %s has no transcript on this machine; new session with history",
-                         key, sid[:8])
-                resume = False
-                sid = str(uuid.uuid4()) if adapter.session_id_known_upfront else ""
+        sid, resume = session_for(adapter, ar, thread, env)
         had_slot = chat_workspace == "write" and ar.pool.leased_path(key) is not None
         slot = lease_slot(ar, thread) if chat_workspace == "write" else None
         # a write chat runs IN its slot, so its write tools reach the slot and nothing else of the agent's
         # (the profile directory stays out of reach; the card sessions' profile-cwd + add-dir model is not used)
         cwd = slot or ar.agent.profile_dir
-        argv = (adapter.resume_argv if resume else adapter.start_argv)(sid, cwd, [])
+        argv = (adapter.resume_argv if resume else adapter.start_argv)(sid, cwd, attachment_dirs(ar, thread, harness, slot))
         i = argv.index("--")
         # a chat answers a person: short polling and settle (the card defaults are 1 s / 1.5 s)
         argv = argv[:i] + ["--key", key, "--poll", CHAT_POLL, "--settle", CHAT_SETTLE] + argv[i:]
-        # none/read: no repository, no writes; write: writes only in the slot. Both enforced by the harness
+        # none/read: no repository, no writes; write: writes only in the slot. Both enforced by the harness.
+        # lane: no repository and nothing denied here: the chat runs with the tools the lane's own arguments
+        # allow, as its card turns do (the operator's choice: who may chat with the agent may use its tools)
         try:
-            argv = adapter.with_read_only(argv) if slot is None else adapter.with_slot_confined(argv)
+            if chat_workspace != "lane":
+                argv = adapter.with_read_only(argv) if slot is None else adapter.with_slot_confined(argv)
         except NotImplementedError as e:
             if slot is not None:
                 if not had_slot:                            # leased just now; a held one may have a live window
@@ -272,7 +306,7 @@ class ChatHost:
         self.runner, self.client = runner, client
         self.by_id = agent_ids                              # Mesh agent id -> runner agent name
         self.tmux = interactive.Tmux(runner.cfg.tmux_binary)
-        self.runners = {ar.agent.name: ar for ar in runner.agents}
+        self.runners = {ar.agent.name: lane_of(ar) for ar in runner.agents}    # name -> ChatLane
         # one pool per runner: hosts of several agents share the host cap (each host has its own claim key)
         self.pool = pool or ChatPool(max_per_agent=max_per_agent, max_host=host_cap, idle_minutes=idle_minutes,
                                      host_used=self._card_sessions)
@@ -297,9 +331,9 @@ class ChatHost:
             return 0
 
     def _delivery(self, agent_id: str):
-        ar = self.runners[self._name(agent_id)]
+        ar = lane_of(self.runners[self._name(agent_id)])
         # the harness here is only a fallback: the plan returns the one its environment was routed with
-        return DriverDelivery(ar._routed_harness or ar.agent.harness, make_plan(ar, self.client, self.workspace),
+        return DriverDelivery(ar.routed_harness, make_plan(ar, self.client, self.workspace),
                               self.runner.cfg.state_dir / "chat" / "logs")
 
     def _return_if_gone(self, name: str, thread: str) -> None:
@@ -352,7 +386,7 @@ class ChatHost:
         if swept and getattr(self, "workspace", "none") == "write":
             for ar in self.runners.values():
                 try:
-                    for slot in ar.pool.rows():
+                    for slot in (ar.pool.rows() if ar.pool is not None else ()):
                         if slot["state"] == "leased" and str(slot["attempt"]).startswith(CHAT_PREFIX):
                             for path, reason in ar.pool.release(slot["attempt"]):
                                 log.warning("chat orphan %s: worktree %s kept: %s", slot["attempt"], path, reason)
@@ -364,7 +398,7 @@ class ChatHost:
         eligible = []
         for agent_id, name in self.by_id.items():
             try:
-                reason, _ = self.runners[name]._gate("transport", "", "chat")
+                reason = lane_of(self.runners[name]).transport_hold()
             except Exception:                        # a broken admission hook must not claim a turn
                 continue
             if not reason:

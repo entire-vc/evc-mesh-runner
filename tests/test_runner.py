@@ -1197,16 +1197,16 @@ class ReviewFindings(Bench):
 
 
 class Operations(Bench):
-    def test_pause_file_stops_starts_and_resumes(self):
+    def test_pause_token_stops_starts_and_resumes(self):
+        from mesh_runner import op_pause
         t1, t2 = task(1), task(2)
         mesh = FakeMesh([t1, t2], max_concurrent=2)
-        (self.cfg.state_dir / "pause").mkdir(parents=True, exist_ok=True)
-        (self.cfg.state_dir / "pause" / "builder").touch()
+        op_pause.take(self.cfg.state_dir, "builder", "maintenance")
         r = self.runner(mesh)
         r.tick()
         self.assertEqual(self.states(r), {})
         self.assertTrue(r.status()["paused"])
-        (self.cfg.state_dir / "pause" / "builder").unlink()
+        op_pause.release(self.cfg.state_dir, "builder", "maintenance")
         write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
         r.tick()
         self.assertEqual(len(self.states(r)), 2)
@@ -4341,6 +4341,56 @@ class WaitWorkspaceCheckpoint(Bench):
             note['observed_status'] = 'done'
             r.store.mark('builder', task(79)['id'], 'ownership_loss', json.dumps(note))
         r, first, later, ret, launches = self._return_roundtrip(79, holder='', mutate=terminal)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'ownership_return'))
+
+    def test_a_returning_card_takes_its_previous_slot_and_keeps_the_session(self):
+        """The previous attempt held slot-2 (slot-1 was busy then). When the card comes back, slot-1 is free
+        and is the first the pool would hand out: the start asks for the old slot first, so the paths match
+        and the session continues instead of a fresh start by path_changed."""
+        t = task(83)
+        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        r = self.runner(FakeMesh([t]))
+        first_slot = r.pool.lease('another-attempt', 'app')                # occupies the first slot
+        r.tick()
+        self.settle_all(r)
+        first = [x for x in r.store.by_state('builder', ('waiting',)) if x.task_id == t['id']][0]
+        self.assertNotEqual(first.workspaces, [str(first_slot)])
+        r.mesh.tasks[t['id']]['assignee_id'] = ''                          # status-only roundtrip
+        r.tick()
+        self.assertEqual(r.store.get(first.id).state, 'completed')
+        r.pool.release('another-attempt')                                  # the lower slot is free now
+        r.mesh.tasks[t['id']]['assignee_id'] = AGENT_ID
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        r.tick()
+        self.settle_all(r)
+        later = [x for x in r.store.by_state('builder', ('waiting', 'running', 'starting', 'ready', 'completed'))
+                 if x.task_id == t['id'] and x.id != first.id][0]
+        self.assertEqual(later.workspaces, first.workspaces)
+        self.assertEqual(later.session_id, first.session_id)
+        ret = [json.loads(d) for _, k, d in r.store.events(later.id) if k == 'ownership_return']
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('resume', 'ownership_return_same_lane'))
+
+    def test_a_reopened_decision_request_continues_in_the_addressees_session(self):
+        """A decision request is closed when answered and reopened by its asker with the next question:
+        the addressee keeps its session instead of a cold start per question."""
+        def answered_request(r):
+            note = json.loads(r.store.mark('builder', task(81)['id'], 'ownership_loss')[0])
+            note['observed_status'] = 'done'
+            r.store.mark('builder', task(81)['id'], 'ownership_loss', json.dumps(note))
+            r.mesh.tasks[task(81)['id']]['labels'] = ['decision-request']
+        r, first, later, ret, launches = self._return_roundtrip(81, holder='', mutate=answered_request)
+        self.assertEqual(later.session_id, first.session_id)
+        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason']),
+                         ('resume', 'decision_request_reopened', ''))
+        self.assertEqual((launches[0]['intent'], launches[0]['restart_reason']), ('resume', ''))
+
+    def test_a_cancelled_decision_request_starts_fresh_when_reopened(self):
+        def withdrawn_request(r):
+            note = json.loads(r.store.mark('builder', task(82)['id'], 'ownership_loss')[0])
+            note['observed_status'] = 'cancelled'
+            r.store.mark('builder', task(82)['id'], 'ownership_loss', json.dumps(note))
+            r.mesh.tasks[task(82)['id']]['labels'] = ['decision-request']
+        r, first, later, ret, launches = self._return_roundtrip(82, holder='', mutate=withdrawn_request)
         self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'ownership_return'))
 
     def test_wait_never_releases_live_writer_group(self):

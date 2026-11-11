@@ -64,19 +64,17 @@ correction and clears that specific wait. This parser alone does not migrate old
 The fields enforce an evidence contract; they do not prove the external source is truthful.
 
 Or moves the task to its review/done status. No outcome → the runner asks once
-in the same session (`max_no_outcome`). A second turn in a row without a readable
+in the same session (once). A second turn in a row without a readable
 outcome puts the task back in todo with the same lane until new input arrives (a comment,
 a change to a linked merge request or pipeline, a closed dependency: the same inputs that
 restart a capped task; no timer). The
-`no_outcome_route_after`-th turn in a row without a readable outcome on the task (default 3,
-any lane; a readable outcome resets the count) hands it to the lead. A task that was handed up
+third turn in a row without a readable outcome on the task (any lane; a readable outcome resets the count) hands it to the lead. A task that was handed up
 for this reason is only ever kept by the lead that receives it, never handed further up.
 
 
 Observable waits are polled without starting the agent while their target is healthy
 and unchanged; time waits wake at their deadline. Age re-checks apply to unreadable
-or unavailable targets and human gates, using `wait_first_recheck_hours` (2), then
-`max_wait_hours` (6), without counting against the daily wait budget. A `❓ Blocking`
+or unavailable targets and human gates, first after 2 hours, then every 6 hours, without counting against the daily wait budget. A `❓ Blocking`
 ask to a person retains its separate one-day re-check. A pipeline or MR wait with no
 GitLab/GitHub observer is not re-checked by age: it stays integration-blocked until the
 observer is restored. A `card:` wait whose card is itself waiting on this agent is woken as a cycle.
@@ -154,7 +152,7 @@ being parked, and counts against the daily wait budget like any idle wait:
 `pipeline:... until=success` on a pipeline that is already `manual`, `failed` or
 `canceled`, and `mr:... until=merged` or `until=change` on the task's own open merge
 request whose head pipeline is `success` or `manual` and which has no label starting
-with `review_label_prefix` (`verified-by:`; `''` turns this check off). The merge
+with `verified-by:`. The merge
 request is the task's own when it is linked to the task, names the task id in its
 title, description or source branch, or was authored by the agent's GitLab user:
 `gitlab_username` in the agent's block (default: the agent name lower-cased; `''`
@@ -223,7 +221,7 @@ the merge request, never by the command's text:
 - The command's last output line is `⏳ WAIT pipeline:<project>#<id> ...` (queued): the agent stays
   asleep. The command is run again when that pipeline or the MR's head pipeline reaches a final
   status, and in any case every `merge_rerun_minutes`; once the wait has been
-  queued for `merge_queue_hours` the agent is woken with the run history.
+  queued for 24 hours the agent is woken with the run history.
 - MR head differs from `after=`, MR closed, a non-zero exit, a refusal, a timeout, or any other
   output: the agent is woken with the tail (last 40 lines) of the command's output.
 
@@ -231,10 +229,9 @@ the merge request, never by the command's text:
 |---|---|---|
 | `merge_command` | unset (feature off) | argv template, e.g. `["tools/merge", "{iid}", "{project}", "--expected-sha", "{sha}"]` |
 | `merge_command_cwd` | runner cwd | working directory of the command |
-| `merge_timeout_minutes` | `15` | one run; the process group is killed after it |
 | `merge_rerun_minutes` | `5` | fallback re-run interval while queued |
-| `merge_max_runs` | `30` | deprecated, ignored (polling a queue is not a try; see `merge_queue_hours`) |
-| `merge_queue_hours` | `24` | a wait that stays queued this long wakes the agent |
+
+One run of the command is killed (with its process group) after 15 minutes.
 
 This is an explicit opt-in contract, not a migration of existing stored waits. Legacy
 `WAIT pipeline:` / `WAIT mr:` declarations retain their current completion semantics;
@@ -289,8 +286,8 @@ its own reason. Measured on one fleet over a week, such a wake ended in an uncha
 re-declared wait in about a quarter of the cases.
 
 A decision wait whose addressee has a request card still wakes on every comment the addressee
-writes on the waiting card, progress notes included. `[runner] decision_wake = "answer"` (or the
-same key on one `[[agents]]` block, which wins) narrows that to an answer: a comment on the
+writes on the waiting card, progress notes included. `decision_wake = "answer"` on one
+`[[agents]]` block narrows that to an answer for that lane: a comment on the
 request card from its addressee or a person, or the request card closed; or, on the waiting card,
 a person's comment, an @-mention of the waiting agent, a comment that opens with `Answer`,
 `Decision`, `Ответ` or `Решение` (or contains `Answer:`/`Decision:` at a line start), one that
@@ -309,7 +306,7 @@ reassignment retains it. Ownership is checked again before reuse or supersession
 Failed closes and terminal sources are reconciled at most once per five minutes
 per retained question, with at most ten questions checked per pass.
 
-Within `[runner] decision_reuse_hours` (default 24, `0` = off) of filing a request, a new
+Within 24 hours of filing a request, a new
 question from the same source to the same agent does not file another card: the question is
 added as a comment on that request, which is reopened (assignee kept) if it was closed, and the
 wait is bound to it. A different source or addressee files a new request as before. When the
@@ -318,25 +315,25 @@ addressee has already commented after it was asked, the wait is sent back at dec
 the start of that answer: the same question gets the same answer, so the agent waits on the
 event that changes it or asks something else. People are never asked here.
 
-Three kinds of decision wait to an agent file no request at all, each behind its own `[runner]`
-switch (all default on, `false` restores filing the request):
+Three kinds of decision wait to an agent file no request at all (always so; the former `[runner]`
+switches for them are retired, see [Retired options](#retired-options)):
 
-- `decision_live_task_card_wait`: the question names exactly one other task (`#<8hex>` or its
+- Live task: the question names exactly one other task (`#<8hex>` or its
   uuid) that the addressee holds and is working on (todo, in progress or review), such as "pass
   the handback from #x when ready". The addressee could only answer "not ready yet", so the wait
   becomes a card wait on that task (its `blocks` edge included): it wakes when the task closes or
   ships, or when the addressee comments on it. Nothing is posted to the addressee. A task held by
   someone else, a closed or backlog task, or several named tasks file the request as before.
-- `decision_identical_no_reopen`: the same question again (case, whitespace, trailing punctuation
+- Identical question: the same question again (case, whitespace, trailing punctuation
   and trailing references to the asking task ignored) from the same asker and source to the same
   agent is attached to the request that already carries it, open or closed within
-  `decision_reuse_hours`: no new card, no comment, no reopen, since each of those starts a new
+  24 hours: no new card, no comment, no reopen, since each of those starts a new
   session for the addressee. Only a changed question is asked on that request (and reopens it) as
   above. A closed request attached this way hands the question back to the asker after the
-  re-check interval (`wait_first_recheck_hours`) unless a comment answers it first.
-- `decision_default_proceeds`: the question states the asker's own proposed default (`default:`,
+  first re-check interval (2 hours) unless a comment answers it first.
+- Asker's default: the question states the asker's own proposed default (`default:`,
   `proposed:`, `if no objection`, `дефолт:`, `по умолчанию:`, `предлагаю`, `рекомендую`) and no
-  hard rule (`hard_ask_patterns`, `hard_ask_labels`) matches it. The runner posts the question on
+  hard rule (the built-in keyword and label lists in `asks.py`) matches it. The runner posts the question on
   the asking task, @-mentioning the addressee, which may object there, and the asker continues
   with its default at once (counted like a `↻ NEXT`). Hard questions and questions to people are
   asked as before.
@@ -374,27 +371,14 @@ search-before-retry, not exactly-once.
 mesh_url = "https://mesh.example.com"
 state_dir = "~/.local/state/mesh-runner"
 
-# launch_mode = "interactive"             # turns go into live interactive sessions in tmux (default);
-#                                         # "headless" runs claude -p / codex exec per turn
 # interactive_idle_minutes = 60           # a warm interactive session idle this long is closed
 # interactive_max_sessions = 20           # live interactive sessions on this host, all agents
-# background_wait_minutes = 45            # an interactive turn's prompt waits this long while the session's
-#                                         # background agents run (0 = paste at once); see docs/architecture.md
 # turn_first_output_minutes = 0           # end a turn whose harness has not replied this long (0 = off)
 # turn_idle_minutes = 0                   # end a turn with no progress this long (0 = off)
-# turn_external_wait_minutes = 0          # same, while the harness runs a tool / background task (0 = off)
 # basic_auth_file = "~/.config/mesh-runner/mesh-basic-auth"   # "user:pass", a Mesh behind HTTP basic auth
 # review_own_hold_hours = 1               # own work in review waits this long for someone else
-# wait_first_recheck_hours = 2            # first fallback re-check; healthy observable waits stay asleep
-# max_wait_hours = 6
 # comment_wake = "all"                    # "addressed": agents' unaddressed comments do not end a pipeline/MR/merge/card/time/decision wait
 # comment_wake_always_from = []           # author names that always wake, with comment_wake = "addressed"
-# decision_wake = "any"                   # "answer": a decision wait with a request card wakes on an answer only, not on the addressee's progress notes
-# decision_reuse_hours = 24               # a new question from the same source to the same agent reuses its request card (0 = file a new one)
-# decision_live_task_card_wait = true     # a question about the addressee's own live task waits on that task, no request
-# decision_identical_no_reopen = true     # the same question again is attached to its request: no comment, no reopen
-# decision_default_proceeds = true        # a non-hard question carrying the asker's default proceeds; the addressee may object
-# review_unstartable_retry_minutes = 15   # a review no reviewer could start is tried again
 
 [chat]                                    # optional: Agent Chat (interactive sessions only, never headless)
 # enabled = false
@@ -403,8 +387,11 @@ state_dir = "~/.local/state/mesh-runner"
 # max_chat_sessions = 3                   # live chat sessions per agent
 # host_cap = 6                            # live sessions on this host, chats and cards together
 # session_idle_minutes = 10               # an idle chat session is stopped; the next message resumes it
-# chat_workspace = "none"                 # "none" | "read" | "write"; none/read: no repository checkout (read-only tools);
-                                          # write: a slot of the card worktree pool (first repo) for the life of the session
+# chat_workspace = "none"                 # "none" | "read" | "write" | "lane"; none/read: no repository checkout (read-only tools);
+                                          # write: a slot of the card worktree pool (first repo) for the life of the session;
+                                          # lane: no checkout, the tools the lane's own arguments allow (commands and
+                                          # writes included where its card turns have them): everyone who may chat
+                                          # with the agent can then make it use them
 # mcp_command = ["/usr/local/bin/evc-mesh-mcp", "--transport", "stdio"]   # Mesh MCP of a chat, run with the
 #                                         # thread's token (MESH_CHAT_TOKEN_FILE), never the agent key; it
 #                                         # replaces the profile's `evc-mesh` server in the session
@@ -433,6 +420,65 @@ mesh-runner once --config runner.toml     # one pass, prints what it did
 mesh-runner run  --config runner.toml     # service loop
 mesh-runner status --config runner.toml   # local view of attempts
 ```
+
+### `[runner]` options
+
+The `[runner]` table has 40 options; every other key in it is either one of the two native-result
+adoption paths or a retired option. All are optional except `mesh_url`.
+
+| group | keys |
+|---|---|
+| Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers` |
+| Daily budgets and caps | `daily_start_cap`, `daily_next_budget`, `daily_wait_budget`, `daily_step_budget`, `max_compactions` |
+| Interactive sessions | `tmux_binary`, `interactive_idle_minutes`, `interactive_max_sessions`, `turn_first_output_minutes`, `turn_idle_minutes` ([turn watchdog](docs/turn-watchdog.md)) |
+| Waits and wakes | `comment_wake`, `comment_wake_always_from`, `time_wait_ignore_names`, `workspace_wait_release_minutes`, `ops_review_wait_registry`, `ops_review_wait_notifier_id` ([ops review](docs/ops-review-wait.md)), `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
+| Questions and reviews | `login_ask_check`, `decision_request_metadata_only_recipients` ([metadata producer](docs/decision-metadata-producer.md)), `cardless_question_lanes` (answer desk, below), `review_own_hold_hours`, `reviewer_select_command` ([reviewer merge](docs/reviewer-merge.md)) |
+| Merge waits | `merge_command`, `merge_command_cwd`, `merge_rerun_minutes` |
+| Host gates | `min_free_gb`, `archive_root`, `archive_require_mount`, `memory_hold_free_pct`, `memory_release_free_pct`, `memory_hold_swap_mb`, `memory_release_swap_mb`, `load_hold_per_cpu`, `load_release_per_cpu` |
+
+`cardless_question_lanes` (list of lane names, `["*"]` = every lane of this runner, default `[]` = off):
+a question one lane asks a listed lane of the same runner with `ask_agent` gets no `[decision]` request
+card. The addressee's answer desk (`src/mesh_runner/answer_desk.py`) reads its open requests
+(`GET /agents/me/decision-requests`, at most every 30 s) and runs one turn in the addressee's profile, in a
+session keyed by the asking card, that answers with `answer_decision` on the asking card; a request still
+open after that turn gets one reminder turn. The asker files the request card as before when the desk
+fails the request, when 20 minutes pass, when the addressee is paused or no longer listed, when Mesh has
+no such list (404: the desk is off for 10 minutes) or when the asking card is not in the addressee's
+workspace. `status.json` shows an `answer_desk` block per listed lane; `events.jsonl` has
+`answer_started`, `answer_done` and `answer_failed`.
+
+`native_result_dir` and `native_result_channels_dir` are also read from `[runner]`, but they are
+not ordinary options: the native-result adoption protocol checks them in the file itself
+([native-result config](docs/native-result-config.md)).
+
+### Retired options
+
+These `[runner]` keys are no longer options; no deployed config set them to anything but their
+default. The loader does not read them and their value is fixed at that default. A file that still
+sets one loads, and the runner logs one warning per key (`[runner] <key> is no longer an option and
+is ignored (...)`). The list, with each fixed value, is `RETIRED_RUNNER_OPTIONS` in
+`src/mesh_runner/config.py`. The per-agent `launch_mode`, `decision_wake`, `review_verdict_pattern`
+and `review_own_verdict_pattern` in `[[agents]]` are not affected.
+
+`abort_backoff_minutes`, `background_wait_minutes`, `basic_auth_env` (use `basic_auth_file`),
+`checkout_ttl_minutes`, `checkpoint_budget_gb`, `checkpoint_exclude_names`, `checkpoint_gc_grace_hours`,
+`completion_comment`, `dead_slot_hours`, `decision_default_proceeds`, `decision_identical_no_reopen`,
+`decision_live_task_card_wait`, `decision_reuse_hours`, `decision_wake`, `failed_cooldown_hours`,
+`gmail_watch_interval_seconds`, `gmail_watch_timeout_seconds`, `hard_ask_labels`, `hard_ask_patterns`,
+`heartbeat_seconds`, `ignored_cleanup`, `ignored_cleanup_idle_hours`, `ignored_cleanup_interval_minutes`,
+`launch_mode`, `loop_streak_limit`, `max_failures`, `max_no_outcome`, `max_startup_failures`,
+`max_turn_minutes`, `max_turns`, `max_wait_hours`, `merge_max_runs`, `merge_queue_hours`,
+`merge_timeout_minutes`, `mesh_effects`, `metrics_file`, `no_outcome_route_after`,
+`provider_outage_backoff_cap_seconds`, `provider_outage_backoff_seconds`, `provider_outage_giveup_minutes`,
+`provider_outage_lanes`, `receipt_wait_v1`, `recovery_supersede_authors`, `review_gate_hold_minutes`,
+`review_gate_hold_pattern`, `review_label_prefix`, `review_own_verdict_pattern`, `review_refeed_hours`,
+`review_starts_per_tick`, `review_unstartable_retry_minutes`, `review_verdict_pattern`, `session_reports`,
+`straggler_grace_minutes`, `turn_cap_progress_min`, `turn_external_wait_minutes`, `unanswerable_ask_to_lead`,
+`unanswerable_users`, `wait_first_recheck_hours`, `wake_budget_seconds`, `wake_poll_seconds`,
+`workspace_readiness_v1`.
+
+With their fixed values, the features behind `receipt_wait_v1`, `workspace_readiness_v1`,
+`ignored_cleanup` and `metrics_file` stay off, and `launch_mode` can only be changed per agent.
 
 Set the agent's **Max concurrent tasks** in Mesh to choose how many sessions run
 at once. Cost of parallel sessions is the operator's choice.
@@ -534,7 +580,7 @@ Optional hooks per agent:
   environment, in their own process group.
   QA infrastructure refusals (`qa_artifact_unresolved:*`, `qa_fail_closed:*`, and
   exactly `qa_no_selection:sibling_evidence_unknown`) use the durable, bounded
-  `review_unstartable_retry_minutes` retry even without a card change: pool or
+  retry (every 60 minutes) even without a card change: pool or
   controller evidence can recover externally. Every retry still runs admission
   control. Reviewer identity and independent-reviewer absence refusals keep their
   existing hold until an observable card change; they are not infrastructure failures.
@@ -603,11 +649,11 @@ acceptor or its lead, or wait. An attempt that ended because the task left the a
 while it was parked is not the agent's work. A fed review card is not fed again for a
 day without a new comment.
 
-A verdict is a line matched by `review_verdict_pattern` in anyone's comment and by the
-stricter `review_own_verdict_pattern` in the author's own (it may run the reviewer
+A verdict is a line matched by the verdict pattern in anyone's comment and by the
+stricter own-verdict pattern in the author's own (it may run the reviewer
 itself and post the verdict; its requests and plans must not count). Both are regexes
-with a `verdict` group and an optional `sha` group, set in `[runner]` or per agent
-(`""` = off). The defaults read `Verify: SHIP @1a2b3c4` and `Verdict: DO-NOT-SHIP on
+with a `verdict` group and an optional `sha` group; an agent block may replace them with
+`review_verdict_pattern` / `review_own_verdict_pattern` (`""` = off). The defaults read `Verify: SHIP @1a2b3c4` and `Verdict: DO-NOT-SHIP on
 1a2b3c4d`; the verdict word is case-sensitive, and a line naming both verdicts
 (`reply SHIP or DO-NOT-SHIP`) is a request, not a verdict. A verdict naming a commit
 counts only on the head of a linked merge request when GitLab is configured.
@@ -632,7 +678,7 @@ task is held for is logged once (`<agent>: #<task> held: <reason>`).
 
 ### Loops are caught by repetition, not by a count
 
-`loop_streak_limit` (6, `0` = off) is the loop guard. The runner keeps, per task and agent, a streak
+A streak limit of 6 is the loop guard. The runner keeps, per task and agent, a streak
 of consecutive turns that made no progress (a store mark, so it survives attempts and restarts). At
 the limit the task is stopped like any other cap (back to the queue until new input; the lead chain
 only when that cannot be done) under the
@@ -677,7 +723,7 @@ Not seen by the streak: an agent that writes a genuinely different comment (40+ 
 new gist) on every turn, and work that leaves no trace in the worktree, a comment or the card
 status (a task without a worktree has only the last two). The per-day counters
 `daily_next_budget` (6), `daily_wait_budget` (8) and `daily_step_budget` (24) remain in the code and
-the config as a backstop and a rollback; they count turns whether or not the task progresses, so a
+the config as a backstop; they count turns whether or not the task progresses, so a
 fleet that relies on the streak sets them high.
 
 ### Caps without a clock, questions without a wait
@@ -692,18 +738,18 @@ never on a timer. Details: `docs/requeue-on-event.md`.
   agent block; without it, another agent with the same repos and the same `lead`) takes it at once
   for a fresh start. `RUNNER GAVE UP` still goes to the lead. A capped task of an agent without a
   lead also restarts on the next UTC day.
-- A work attempt that reaches `max_turns` but kept
-  making progress (at least `turn_cap_progress_min`, default 3, of its last 10 declared outcomes are
+- A work attempt that reaches the turn cap (30 turns) but kept
+  making progress (at least 3 of its last 10 declared outcomes are
   `step` or `next`) ends as `turn cap: continued in a fresh session` and the same agent starts the
   task again in a new session instead of `RUNNER GAVE UP` to the lead. The restart counts as a start,
   so `daily_start_cap` (required, > 0) bounds the loop; with no recent progress, a spent start cap or
   `daily_start_cap = 0` the task goes to the lead. The cap is applied
   when the attempt resumes, after the capped turn's own outcome is recorded (a `WAIT` waits first). Both paths log `turn cap: ...` and record
   a `turn_cap` attempt event.
-- `unanswerable_ask_to_lead = true`: a `WAIT decision:@x` whose addressee cannot answer (not run by
-  this runner, paused, itself, or a user listed in `unanswerable_users`) is put to the project lead.
+- A `WAIT decision:@x` whose addressee cannot answer (not run by
+  this runner, paused, or itself) is put to the project lead.
 - A `WAIT decision:@person` that no hard rule matches
-  (`hard_ask_patterns`, `hard_ask_labels`: money, secrets and access, irreversible actions, publishing, legal, actions only the person can take)
+  (the built-in keyword and label lists in `asks.py`: money, secrets and access, irreversible actions, publishing, legal, actions only the person can take)
   is put to the project lead instead of raising a human gate; the person can still override by
   commenting on the card.
 
@@ -823,6 +869,50 @@ send/exec remain pending with their diagnostic reason; this command cannot resol
 Archive completed request/receipt pairs only when the bounded spool is full; a retry uses a new
 request ID and fresh snapshot, never a renewed deadline for the old request.
 
+## Service processes
+
+Agent Chat, the tgpeek editor-job routes and the Gmail observer can run as processes of their own,
+so they keep working while the task loop is busy, restarting or crashed, and cannot slow a lane's
+tick down. One top-level key, above `[runner]`, chooses them:
+
+```toml
+service_processes = ["chat", "editor", "gmail"]   # default [] = every service in the runner process
+
+[runner]
+...
+```
+
+`mesh-runner run` then starts nothing of a listed service in its own process. Its supervisor runs
+`mesh-runner service <name> --config <the same runner.toml>` in a process session of its own,
+starts it again with a backoff (1 s doubling to 5 min, back to 1 s after a run of a minute) when it
+exits, and stops the ones it started when the runner stops (SIGTERM, SIGKILL after 15 s).
+`status.json` gains `services`: per service `mode`, `state` (`running`, `watched`, `waiting`,
+`stopped`), `pid`, `started_at`, `restarts`, `last_exit` (`code`, `signal`, `at`) and
+`next_start_in`. Removing a name from the list (and restarting the runner) is the rollback.
+
+A service runs once per state directory: `<state_dir>/services/<name>.lock` is held for the life of
+the process and `<name>.pid` names it; a second copy exits with code 3. A runner that finds a
+service already running (its previous run was killed, or the operator runs the service under a
+launchd job of its own) watches that process instead of starting another and leaves it running
+when it stops. The service's output goes to `<state_dir>/services/<name>.log`.
+
+| Service | As a process | What the operator sets |
+|---|---|---|
+| `gmail` | reads mail on its own schedule (every `poll_seconds`) and writes the `gmail_*` rows and the outbox; the lanes only wake on the wake rows | `gmail_watch_v1 = true` and `gmail_watch_reader`, as before |
+| `editor` | the editor-job routes and `/operator/editor/*` on a listener of their own at `[extension] host`, port **`[extension] port + 1`**; `/mesh/install` and `/mesh/events` stay on the runner's listener | `[extension] enabled = true` and `[tgpeek_editor]` / `[tgpeek_editor_control]`, as before; the product client's bridge URL must point at port + 1. `mesh-runner editor-control` follows by itself |
+| `chat` | the claim loops and turn workers, over the chat agents' routing, adapters and start gate | `[chat] enabled = true`; `chat_workspace` `"none"` or `"read"`: a `"write"` chat leases card worktree slots, whose lock holds only inside one process, so the config refuses it as a process |
+
+A chat process that starts (after a crash, or a runner stop) stops the chat windows a previous
+chat process left, as a runner restart did: a session resumes on its next message, a turn that was
+running is not finished. A runner restart alone no longer touches chats when the chat process is
+not started by that runner.
+
+**A dedicated instance** runs one service without a task loop: a config with the agents the
+service needs, the service listed in `service_processes`, and a launchd job running
+`mesh-runner service <name> --config <that config>` (`KeepAlive`, its own log). The entry point
+needs no supervising parent. On a dedicated chat instance set `announce_controllers = false`: the
+chat process then announces its own agents.
+
 ## Runtime catalog
 
 With `[catalog] enabled = true` the runner is the catalog controller of the listed workspaces: it
@@ -891,8 +981,7 @@ configuration. With `[extension] enabled = true` it listens on `host:port` (`run
 ## Telemetry
 
 Nothing is sent to the publisher or to any third party. The runner writes local state only:
-`runner.sqlite`, `status.json`, the event and turn logs under `state_dir`, and, if `metrics_file` is
-set, a Prometheus textfile for the operator's own collector.
+`runner.sqlite`, `status.json`, and the event and turn logs under `state_dir`.
 
 ## License
 
@@ -905,8 +994,7 @@ not leased again, and a WAIT restores into a fresh lease, so such a slot only ke
 pool smaller. About once an hour per slot (at most three per maintenance pass) the runner
 frees a held slot when its attempt is finished (`completed`, `failed`, `aborted`) and its
 task can no longer resume there: the task is done, cancelled or deleted, or is no longer
-assigned to the agent, or the slot has been held longer than `[runner] dead_slot_hours`
-(default `24`; `0` turns the age rule off) with no newer attempt of the agent on the task.
+assigned to the agent, or the slot has been held longer than 24 hours with no newer attempt of the agent on the task.
 A task still assigned to the agent with an open (running, waiting, ready) attempt is never
 touched.
 
@@ -1070,8 +1158,12 @@ it. This command never edits Mesh or clears other holds.
 ## Optional start order (`queue_order_command`)
 
 Per agent, absent = off (no subprocess). The command gets `{"version":1,"agent","candidates":[{id,priority,created_at,version,workspace_id,project_id}]}`
-on stdin (runner order; never title, body or labels) and prints `{"version":1,"order":[ids]}`. Only `order` is used, and only as an
+on stdin (runner order; never title, body or labels) and prints `{"version":1,"order":[ids]}`. The runner accepts `order` as an
 exact permutation of the input; exit != 0, timeout (`queue_order_timeout_seconds`, default 3, process group killed), non-JSON,
 another version or a bad permutation fall back to the runner's order (logged on the edge). Results are cached for
 `queue_order_cache_seconds` (default 60) per agent + ids + priority/version. It reorders the ordinary class only: decision
 requests stay first, cap-waiting cards last, reviews untouched; every admission rule still runs per card before its start.
+An accepted reply can include `fair_ids`, a list of distinct IDs from `order` selected for fairness.
+For ordinary attempts the runner writes `queue_order` in its local attempt database with that
+task's fairness flag and the IDs it tried and passed over earlier in the same dispatch. A null
+flag means there was no accepted fairness assignment, including on fallback.

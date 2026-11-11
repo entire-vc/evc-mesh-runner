@@ -247,6 +247,11 @@ class MeshClient:
                 return out
             page += 1
 
+    def decision_requests(self, state: str = "open", limit: int = 100) -> list[dict]:
+        """Decision requests (``ask_agent``) addressed to this agent in the workspace its key opened,
+        oldest first. A Mesh without the route answers 404 (raised as MeshError)."""
+        return _items(self.request("GET", "/agents/me/decision-requests", query={"state": state, "limit": limit}))
+
     # -- tasks -------------------------------------------------------------------
     def task(self, task_id: str) -> dict:
         return self.request("GET", f"/tasks/{task_id}")

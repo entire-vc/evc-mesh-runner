@@ -138,8 +138,11 @@ class ExtensionService:
     def __init__(self, state_dir: Path, wake: Callable[[str, dict], object], workspace_id: str,
                  expected_secret: str = "", trust_first_install: bool = False,
                  extension_id: str = "agent-runner", allow_rekey: bool = False, tolerance: float = TOLERANCE_SECONDS,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, mesh_routes: bool = True):
         self.store = SecretStore(state_dir)
+        # False on the editor process's own listener: /mesh/install and /mesh/events belong to the runner's
+        # listener (an install there would rewrite the signing secret the runner verifies events with)
+        self.mesh_routes = mesh_routes
         self.wake, self.extension_id, self.workspace_id = wake, extension_id, workspace_id
         self.allow_rekey, self.tolerance, self.clock = allow_rekey, tolerance, clock
         self.expected_secret, self.trust_first_install = expected_secret, trust_first_install
@@ -296,7 +299,8 @@ class ExtensionService:
             def do_POST(self):
                 if self._operator("POST") or self._editor("POST"):
                     return
-                handler = {"/mesh/install": svc.install, "/mesh/events": svc.events}.get(self.path)
+                handler = ({"/mesh/install": svc.install, "/mesh/events": svc.events}.get(self.path)
+                           if svc.mesh_routes else None)
                 if handler is None:
                     return self._send(404, {"error": "not found"})
                 try:

@@ -7,6 +7,11 @@ state directory, but none of them is a step in the life of a task: nothing in `A
 the task loop does not wait for them. `Runner.run_forever` starts each through the function here.
 
 Each function takes the `Runner` and the stop event; every one is off unless its own config enables it.
+
+Chat, the editor-job routes and the Gmail observer can instead run as processes of their own
+(top-level `service_processes`, see `service_process.py`): then the runner does not start them here,
+its supervisor starts `mesh-runner service <name>`, and that process calls the same `serve_chat` /
+`attach_editor` below.
 """
 from __future__ import annotations
 
@@ -36,22 +41,34 @@ def start_announce(runner, stop: threading.Event) -> None:
 
 
 def start_chat(runner, stop: threading.Event) -> None:
-    """Agent Chat for the configured agents, in a thread of its own (off unless `[chat] enabled`)."""
+    """Agent Chat for the configured agents, in threads of the runner (off unless `[chat] enabled`; with chat
+    in `service_processes` the chat process serves it instead)."""
     cfg = runner.cfg
-    if not cfg.chat_enabled:
+    if not cfg.chat_enabled or "chat" in getattr(cfg, "service_processes", ()):
         return
+    serve_chat(runner, stop)
+
+
+def serve_chat(runner, stop: threading.Event) -> bool:
+    """Start the chat claim loops over ``runner.agents`` (the runner's live lanes, or the lanes a chat process
+    built with ``chat_lanes``). False when no configured agent resolved, so nothing was started."""
+    cfg = runner.cfg
     from .chat_host import ChatHost, claim_key
     from .chat_protocol import load_runner_id, registered_client
     ids = {}
     for ar in runner.agents:
         if ar.agent.name in cfg.chat_agents:
             try:
-                ids[str(ar.mesh.me()["id"])] = ar.agent.name
+                me = ar.mesh.me()
+                ids[str(me["id"])] = ar.agent.name
             except (MeshError, KeyError, TypeError) as e:
                 log.warning("chat: %s has no Mesh identity yet: %s", ar.agent.name, type(e).__name__)
+                continue
+            if not getattr(ar, "me", None):
+                ar.me = me                      # a lane nothing ticks learns who it is here (gate hooks name it)
     if not ids:
         log.warning("chat enabled but no configured agent resolved")
-        return
+        return False
     runner_id = load_runner_id(cfg.state_dir)
     from .chat_announce import Announcer, announce_loop
     announcer = getattr(runner, "_announcer", None) if cfg.announce_controllers else None
@@ -84,6 +101,7 @@ def start_chat(runner, stop: threading.Event) -> None:
     for name, host in hosts:
         threading.Thread(target=host.loop, args=(stop,), name=f"chat-{name}", daemon=True).start()
     log.info("chat serving %s", ", ".join(sorted(ids.values())))
+    return True
 
 
 def start_meta_receiver(runner, stop: threading.Event) -> None:
@@ -162,6 +180,34 @@ def native_config_receiver(runner, policy):
         raise native_result_config.Refused("receiver_not_current")
 
 
+def attach_editor(service, cfg) -> None:
+    """The tgpeek editor-job routes (`[tgpeek_editor]`) and their signed operator lifecycle
+    (`[tgpeek_editor_control]`) on an extension listener: the runner's, or the editor process's own."""
+    from .host_admission import HostAdmission
+    from .interactive import Tmux, state_root
+
+    def admission():
+        # one host cap with the card and chat windows: the same lock and count the tui driver uses (a flock and
+        # tmux, so it holds across processes)
+        return HostAdmission(state_root(cfg.state_dir), cfg.interactive_max_sessions, Tmux(cfg.tmux_binary))
+    bridge = None
+    if cfg.tgpeek_editor is not None:
+        from .editor_job import build_bridge
+        bridge = service.editor = build_bridge(cfg.tgpeek_editor, admission=admission())
+        log.info("tgpeek editor-job routes on (executor %s)", "configured" if cfg.tgpeek_editor.argv else "unprovisioned")
+    if cfg.tgpeek_editor_control_secret_file and cfg.config_path:
+        import tomllib
+        from .editor_control import EditorController
+        path = cfg.config_path
+
+        def section() -> dict:
+            return tomllib.loads(Path(path).read_text()).get("tgpeek_editor") or {}
+        service.controller = EditorController(service, cfg.state_dir, cfg.tgpeek_editor_control_secret_file, section,
+                                              admission=admission, source=path)
+        service.controller.adopt(bridge, cfg.tgpeek_editor)
+        log.info("operator editor lifecycle on (loopback, signed)")
+
+
 def start_extension(runner, stop: threading.Event):
     """The Mesh extension endpoint and the extension token's runner-rotation (`[extension]`)."""
     cfg = runner.cfg
@@ -172,28 +218,8 @@ def start_extension(runner, stop: threading.Event):
                                    expected_secret=cfg.extension_secret,
                                    trust_first_install=cfg.extension_trust_first_install, allow_rekey=cfg.extension_allow_rekey,
                                    tolerance=cfg.extension_tolerance_seconds)
-        from .host_admission import HostAdmission
-        from .interactive import Tmux, state_root
-
-        def admission():
-            # one host cap with the card and chat windows: the same lock and count the tui driver uses
-            return HostAdmission(state_root(cfg.state_dir), cfg.interactive_max_sessions, Tmux(cfg.tmux_binary))
-        bridge = None
-        if cfg.tgpeek_editor is not None:
-            from .editor_job import build_bridge
-            bridge = service.editor = build_bridge(cfg.tgpeek_editor, admission=admission())
-            log.info("tgpeek editor-job routes on (executor %s)", "configured" if cfg.tgpeek_editor.argv else "unprovisioned")
-        if cfg.tgpeek_editor_control_secret_file and cfg.config_path:
-            import tomllib
-            from .editor_control import EditorController
-            path = cfg.config_path
-
-            def section() -> dict:
-                return tomllib.loads(Path(path).read_text()).get("tgpeek_editor") or {}
-            service.controller = EditorController(service, cfg.state_dir, cfg.tgpeek_editor_control_secret_file, section,
-                                                  admission=admission, source=path)
-            service.controller.adopt(bridge, cfg.tgpeek_editor)
-            log.info("operator editor lifecycle on (loopback, signed)")
+        if "editor" not in getattr(cfg, "service_processes", ()):
+            attach_editor(service, cfg)
         if cfg.native_result_adoption:
             service.native_config = native_result_config.Adoption(runner)
         service.serve(cfg.extension_host, cfg.extension_port)

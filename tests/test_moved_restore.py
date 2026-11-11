@@ -40,7 +40,8 @@ class MovedRestore(Bench):
         old = list(a.workspaces)
         r._suspend_waiting(a)
         self.assertEqual(r.pool.leased_to(a.id), [])
-        self.assertEqual([str(r.pool.lease(intruder, 'app'))], old)
+        # the intruder names the slot: a pool that may still grow would otherwise leave it alone
+        self.assertEqual([str(r.pool.lease(intruder, 'app', preferred_path=old[0]))], old)
         r.store.update(a, state='ready', wake_text=f'#{a.task8} dependency met')     # the fixture replies by id
         return old
 

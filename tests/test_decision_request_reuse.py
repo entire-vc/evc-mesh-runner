@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fakes import FakeMesh, task, write_replies
-from mesh_runner.config import ConfigError, load
+from mesh_runner.config import load
 from mesh_runner.mesh import MeshError
 from mesh_runner.store import iso, now
 from test_runner import Bench
@@ -313,15 +313,13 @@ class ReuseConfig(unittest.TestCase):
             os.environ.setdefault('K', 'k')
             return load(p)
 
-    def test_default_value_and_off(self):
+    def test_default_value_and_a_retired_key_is_ignored(self):
+        # decision_reuse_hours is no longer a [runner] option: it stays 24 whatever a file says
         self.assertEqual(self.read().decision_reuse_hours, 24.0)
-        self.assertEqual(self.read('decision_reuse_hours = 0').decision_reuse_hours, 0.0)
-        self.assertEqual(self.read('decision_reuse_hours = 6.5').decision_reuse_hours, 6.5)
-
-    def test_bad_values_are_refused(self):
-        for bad in ('-1', '"24"', 'true', 'nan'):
-            with self.subTest(bad), self.assertRaises(ConfigError):
-                self.read(f'decision_reuse_hours = {bad}')
+        for value in ('0', '6.5', '-1', '"24"', 'true', 'nan'):
+            with self.subTest(value), self.assertLogs('mesh_runner', 'WARNING') as logs:
+                self.assertEqual(self.read(f'decision_reuse_hours = {value}').decision_reuse_hours, 24.0)
+            self.assertIn('decision_reuse_hours is no longer an option', '\n'.join(logs.output))
 
 
 if __name__ == '__main__':

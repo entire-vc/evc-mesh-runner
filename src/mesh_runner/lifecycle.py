@@ -1,8 +1,10 @@
 """The attempt lifecycle as one table.
 
-An attempt is one execution of one task by one agent (see ``store``). Its state changes in many places
-of the runner; this module is the single statement of which changes exist. ``Store.update`` asks it on
-every state write:
+An attempt is one execution of one task by one agent (see ``store``). The runner decides when its state
+changes in many places, but it writes every change through one object, ``AttemptStateMachine`` (one method
+per target state: ``to_running``, ``to_waiting``, ``to_ready`` ...); no other code passes ``state=`` to the
+store. This module is also the single statement of which changes exist. ``Store.update`` asks it on every
+state write:
 
     starting --> running --> waiting --> ready --> running ...
         |           |           |          |
@@ -83,3 +85,66 @@ def check(before: str, after: str) -> str:
     if before in ENDED:
         return REFUSED
     return UNLISTED
+
+
+class AttemptStateMachine:
+    """The one writer of an attempt's ``state``: every other module moves an attempt through these methods
+    (``tests/test_state_writes.py`` enforces it). Each method is a pass-through to the store and decides nothing:
+
+    * without ``marks`` it is ``store.update(a, state=..., **changes)``;
+    * with ``marks`` (a dict, possibly empty) it is ``store.update_with_marks(a, marks, state=..., **changes)``,
+      the transaction that commits the state together with its observation receipts.
+
+    ``changes`` carries the store's own keywords unchanged (``expect=``, and with ``marks`` also ``expect_wait=``
+    and ``validate=``) next to the columns written with the state. The return value is the store's, as is the
+    ``check`` of the change against ``TRANSITIONS``. The attempt is created in ``starting`` by ``Store.create``.
+    """
+
+    def __init__(self, store) -> None:
+        self.store = store
+
+    def to(self, a, state: str, marks: dict[str, str] | None = None, **changes) -> bool:
+        """Move ``a`` to ``state`` (for a caller that holds the target state in a variable, e.g. an end)."""
+        if marks is None:
+            return self.store.update(a, state=state, **changes)
+        return self.store.update_with_marks(a, marks, state=state, **changes)
+
+    def to_starting(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """Reserve or re-reserve the start: the prompt intent is recorded before the spawn, or the native binary
+        could not be executed after the launch was registered and the start is held again."""
+        return self.to(a, STARTING, marks, **changes)
+
+    def to_running(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """A turn begins (spawn or resume), or a turn whose delivery was unknown is shown to have begun."""
+        return self.to(a, RUNNING, marks, **changes)
+
+    def to_waiting(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """Park on an event: the turn ended in a wait, a ready attempt is parked again without a turn, or a native
+        delivery is held for repair. The slot is freed; session and workspaces are kept."""
+        return self.to(a, WAITING, marks, **changes)
+
+    def to_ready(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """Needs a slot to (re)run: the wake condition is met, the turn asked to continue, a turn is sent back
+        with guidance, or a start or resume is held locally and retried later."""
+        return self.to(a, READY, marks, **changes)
+
+    def to_unknown(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """The outcome of a spawn or a delivery cannot be established, or a registration is unresolvable:
+        the attempt keeps occupying its slot until it is reconciled or resolved by the owner."""
+        return self.to(a, UNKNOWN, marks, **changes)
+
+    def to_completed(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """End: the task left the agent's working statuses."""
+        return self.to(a, COMPLETED, marks, **changes)
+
+    def to_failed(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """End: gave up (no outcome, repeated crashes); the workspace is kept for a human."""
+        return self.to(a, FAILED, marks, **changes)
+
+    def to_aborted(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """End: the attempt never started (checkout refused, no workspace, preflight refused) or was withdrawn."""
+        return self.to(a, ABORTED, marks, **changes)
+
+    def to_aborted_notified(self, a, marks: dict[str, str] | None = None, **changes) -> bool:
+        """The bookkeeping mark after an abort: its notice was posted on the task."""
+        return self.to(a, ABORTED_NOTIFIED, marks, **changes)
