@@ -37,8 +37,10 @@ import urllib.error
 import uuid
 from pathlib import Path
 
+from . import answer_desk
 from . import chat_diag
 from . import op_pause
+from . import op_resolve
 from . import asks
 from . import card_wait_reconcile
 from . import next_action
@@ -70,6 +72,7 @@ from . import native_result_wait, native_result_resume, native_result_rebind, na
 from . import ops_review_wait
 from . import receipt_wait
 from . import gmail_watch
+from . import lifecycle
 from . import lifecycle_wait
 from . import services
 from . import recovery_wait
@@ -561,14 +564,27 @@ class AgentRunner:
         self._hold_logged: dict[str, str] = {}              # task -> the hold reason last logged
         self._repo_hold_checked: dict[str, tuple[str, float, str]] = {}   # task -> (updated_at, mono, verdict)
         self.preamble = prompts.load_preamble(agent.preamble_file) if agent.preamble_file else ""
+        # names whose old pause marker could not become a token at start (op_pause.migrate_legacy); the Runner
+        # shares one set with every lane. A lone AgentRunner migrated nothing and reads no marker.
+        self.legacy_pause: set[str] = set()
+
+    @property
+    def life(self) -> lifecycle.AttemptStateMachine:
+        """The attempt state machine over the current ``store``: every state write goes through it. Built on
+        each access, so it always writes to the store this runner holds now (a lane may be handed the
+        runner's shared store after construction)."""
+        return lifecycle.AttemptStateMachine(self.store)
 
     # ------------------------------------------------------------------ helpers
     def paused(self) -> bool:
-        """Operator pause: config ``paused``, a file <state_dir>/pause/<agent>, or any operation
-        token under <state_dir>/pause.d (see op_pause). Paused agents start and resume nothing;
-        waits are still tracked."""
-        return (self.agent.paused or (self.cfg.state_dir / "pause" / self.agent.name).exists()
-                or op_pause.any_token(self.cfg.state_dir, self.agent.name))
+        """Operator pause: config ``paused`` or any operation token under <state_dir>/pause.d (see
+        op_pause; the old marker <state_dir>/pause/<agent> became the token ``legacy-pause-file`` at start
+        and is read only where that failed). Paused agents start and resume nothing; waits are still tracked."""
+        return self._name_paused(self.agent)
+
+    def _name_paused(self, agent: AgentConfig) -> bool:
+        return (agent.paused or op_pause.any_token(self.cfg.state_dir, agent.name)
+                or op_pause.legacy_paused(self.cfg.state_dir, agent.name, self.legacy_pause))
 
     def emit(self, kind: str, a: Attempt | None = None, **detail) -> None:
         """One JSON line per lifecycle event, for metrics and audits."""
@@ -928,6 +944,24 @@ class AgentRunner:
         self.store.mark(self.agent.name, a.task_id, self.OWNERSHIP_LOSS, json.dumps(note))
         self.store.event(a.id, self.OWNERSHIP_LOSS, json.dumps({k: v for k, v in note.items() if k != "session_id"}))
 
+    def _previous_workspaces(self, a: Attempt) -> dict[str, str]:
+        """repo name -> the working copy this lane's previous attempt on the card held, from the ownership-loss
+        note. A card that comes back (a review returned, a decision request reopened, a status roundtrip) can
+        continue its session only on the same paths (``_ownership_return_verdict``); its old slots are usually
+        free by then, but the pool hands out the first free slot. Asking for the old ones first keeps the
+        paths, and with them the session. Only a preference among this pool's free slots: a slot that is
+        leased, held or gone is not taken, and the start then is a fresh one as before."""
+        raw = self.store.mark(self.agent.name, a.task_id, self.OWNERSHIP_LOSS)
+        try:
+            note = json.loads(raw[0]) if raw and raw[0] else {}
+        except ValueError:
+            return {}
+        if not isinstance(note, dict) or not note.get("attempt") or note.get("attempt") == a.id:
+            return {}
+        repos = {r.name for r in self.agent.repos}
+        return {Path(p).parent.name: p for p in note.get("workspaces") or []
+                if isinstance(p, str) and Path(p).parent.name in repos}
+
     def _ownership_return_verdict(self, a: Attempt, task: dict) -> tuple[str, str, dict]:
         """(session to keep or "", reason, loss note) for the first turn of an attempt admitted after
         this lane's previous attempt on the card ended by ownership/status loss. No record: a real
@@ -940,7 +974,10 @@ class AgentRunner:
         author answering it in the session that wrote the change needs the reviewer's words, not a cold
         re-read of the whole card. What the other holder did is new to the session and the start prompt
         says so. A card that went to done or cancelled starts fresh: that work was closed, a reopening
-        is new work. Every refusal carries its own reason."""
+        is new work. The one exception is a decision request answered (done) and reopened by its asker
+        with the next question (``decision_request_reopened``): it is the same conversation, and the
+        addressee who answers a series of questions on one card needs what it already read, not a cold
+        start per question. Every refusal carries its own reason."""
         raw = self.store.mark(self.agent.name, a.task_id, self.OWNERSHIP_LOSS)
         try:
             note = json.loads(raw[0]) if raw and raw[0] else {}
@@ -958,10 +995,14 @@ class AgentRunner:
         # attempt still carries the lane's native harness until the spawn applies the route
         if note.get("harness") != self._routed_harness or note.get("cwd") != str(self.agent.profile_dir):
             return "", "cwd_or_harness_changed", note
-        if note.get("observed_status") in ("done", "cancelled"):
+        reopened_request = (note.get("observed_status") == "done"
+                            and DECISION_REQUEST_LABEL in ((task or {}).get("labels") or []))
+        if note.get("observed_status") in ("done", "cancelled") and not reopened_request:
             return "", "ownership_return", note                # a terminal card in between
         if sorted(a.workspaces) != sorted(note.get("workspaces") or []):
             return "", "path_changed", note
+        if reopened_request:
+            return sid, "decision_request_reopened", note
         if note.get("observed_assignee") not in ("", self.agent_id):
             return sid, "ownership_return_other_owner", note
         return sid, "ownership_return_same_lane", note
@@ -1169,7 +1210,7 @@ class AgentRunner:
             kept = [("?", f"release failed: {e}")]
         if kept:
             note = (note + "; " if note else "") + "worktrees: " + ", ".join(f"{p} ({r})" for p, r in kept)
-        self.store.update(a, state=state, note=note[:1000])
+        self.life.to(a, state, note=note[:1000])
         self.procs.pop(a.id, None)
         self.emit(state, a, note=note[:300])
         if report and state == "completed" and a.turns and self.cfg.completion_comment:
@@ -1312,8 +1353,8 @@ class AgentRunner:
         note = "launch readiness " + observation.state + ": " + observation.reason
         # An unchanged local hold writes no repeated state/event on normal admission.
         if not previous or previous[0] != value or a.state != "ready" or a.note != note:
-            if not self.store.update_with_marks(a, {key: value}, expect=expect,
-                                               state="ready", pid=0, stamp="", note=note):
+            if not self.life.to_ready(a, marks={key: value}, expect=expect,
+                                     pid=0, stamp="", note=note):
                 return False
             self.store.event(a.id, "launch_readiness_held", observation.state + ":" + observation.reason)
         self._release_gate(a, "launch-readiness-held")
@@ -1431,7 +1472,7 @@ class AgentRunner:
             if reason := self.pool.disk_hold():
                 self._release_gate(a, "disk-held")
                 self._release_checkout(a)
-                self.store.update(a, state="ready", pid=0, stamp="", note=reason)
+                self.life.to_ready(a, pid=0, stamp="", note=reason)
                 self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
                 return False
             try:
@@ -1485,8 +1526,8 @@ class AgentRunner:
         interactive.write_delivery(interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id,
                                    {"version": 1, "token": intent["token"], "sha256": intent["sha256"],
                                     "phase": "reserved"})
-        if not self.store.update(a, expect=expect, state="starting",
-                                 wait={**pending_wait, "interactive_prompt_intent": intent}):
+        if not self.life.to_starting(a, expect=expect,
+                                     wait={**pending_wait, "interactive_prompt_intent": intent}):
             return False
         expect = ("starting",)
 
@@ -1494,7 +1535,7 @@ class AgentRunner:
             self.procs[a.id] = proc
             spawn_wait = dict(a.wait or {})
             try:
-                ok = self.store.update_with_marks(a, {}, expect=expect, state="running", wait=spawn_wait,
+                ok = self.life.to_running(a, marks={}, expect=expect, wait=spawn_wait,
                                        pid=proc.pid, stamp=proc_stamp(proc.pid),
                                        log_path=str(log_path), session_id=sid, turns=a.turns + 1,
                                        turn_started_at=anchor,
@@ -1580,8 +1621,8 @@ class AgentRunner:
             return self._deny_launch(a, intent, pending_wait, exc.reason, before_spawn if reserved else None)
         except LaunchExecError as exc:
             self.procs.pop(a.id, None)
-            self.store.update(a, expect=a.state, state="starting", wait=pending_wait,
-                              pid=0, stamp="", leader_done_at="", **intent["prior"])
+            self.life.to_starting(a, expect=a.state, wait=pending_wait,
+                                  pid=0, stamp="", leader_done_at="", **intent["prior"])
             expect = ("starting",)
             # Re-observe after failure so a late permission loss is held until repair.
             if not isinstance(adapter, interactive.InteractiveAdapter):
@@ -1613,9 +1654,9 @@ class AgentRunner:
         if undo is not None:
             undo()
         self._launch_obs.pop(a.task_id, None)           # the next attempt recaptures its candidate
-        self.store.update(a, expect=a.state, state="ready", wait=pending_wait, pid=0, stamp="",
-                          leader_done_at="", note="launch observation refused native exec: " + reason,
-                          **intent["prior"])
+        self.life.to_ready(a, expect=a.state, wait=pending_wait, pid=0, stamp="",
+                           leader_done_at="", note="launch observation refused native exec: " + reason,
+                           **intent["prior"])
         self.store.event(a.id, "launch_probe_denied", reason)
         self._release_gate(a, "launch-probe-denied")
         self._release_checkout(a)
@@ -1627,7 +1668,7 @@ class AgentRunner:
         """Preserve work, release writer authority and leave a diagnostic local hold."""
         self._release_gate(a, "auth-held")
         self._release_checkout(a)
-        self.store.update(a, state="ready", pid=0, stamp="", note=f"authentication held for profile {profile}")
+        self.life.to_ready(a, pid=0, stamp="", note=f"authentication held for profile {profile}")
         self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
 
     def _disk_hold_attempt(self, a: Attempt) -> None:
@@ -1704,7 +1745,7 @@ class AgentRunner:
                 log.warning("%s: provider outage on %d+ lanes; starts paused %d s", name, lanes, delay)
             if held is None or until > held:        # a later lane's shorter backoff never shortens the pause
                 self.store.mark(OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY, iso(until))
-        self.store.update(a, state="ready", pid=0, stamp="", note="provider outage, retrying")
+        self.life.to_ready(a, pid=0, stamp="", note="provider outage, retrying")
         self._resume_hold[a.id] = time.monotonic() + delay
         log.info("%s: #%s provider outage (%d in a row); retry in %d s", name, a.task8, n, delay)
 
@@ -2061,7 +2102,7 @@ class AgentRunner:
             # attempt, so an error text that merely looks like this cannot loop
             self.store.mark(self.agent.name, a.task_id, "session_restart", a.id)
             self.store.event(a.id, "session_restart", "resume_unsupported" if unsupported else "session_missing")
-            self.store.update(a, state="ready", session_id="", wake_text="")
+            self.life.to_ready(a, session_id="", wake_text="")
             return
         if (not result.finished and not result.is_error and not result.final_text
                 and not result.session_id and stderr.strip()):          # the stream never began
@@ -2084,7 +2125,7 @@ class AgentRunner:
                 # checks the existing catalog policy, including allowed reserves.
                 self.store.mark(self.agent.name, a.task_id, "quota_admission_required", a.id)
                 switched = self._switch_on_limit(a)
-                self.store.update(a, state="ready", pid=0, stamp="",
+                self.life.to_ready(a, pid=0, stamp="",
                     wake_text=prompts.wake_prompt(task,
                         "the provider limit was hit; account routing selected another account"
                         if switched else "the provider limit was hit; fresh account capacity admission is required"))
@@ -2103,8 +2144,8 @@ class AgentRunner:
             elif failures > self.cfg.max_failures:
                 self._give_up(a, task, f"stopped after {failures} failed turns: {public_error}")
             else:
-                self.store.update(a, state="ready", no_outcome=failures,
-                                  wake_text=prompts.wake_prompt(task, f"the previous turn failed: {public_error}"))
+                self.life.to_ready(a, no_outcome=failures,
+                                   wake_text=prompts.wake_prompt(task, f"the previous turn failed: {public_error}"))
             return
         if result.compactions and self._over_compaction_cap(a, task, result.compactions):
             return
@@ -2174,8 +2215,8 @@ class AgentRunner:
                 # Invalid registration is not a supported wait or a retry timer.
                 # Preserve the declaration and explicit owner/grounds for repair.
                 blocked = {"owner": self.agent_id, "reason": str(exc)[:512]}
-                if not self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait,
-                    state="unknown", pid=0, stamp="", note="native WAIT registration refused",
+                if not self.life.to_unknown(a, marks={}, expect=a.state, expect_wait=a.wait,
+                    pid=0, stamp="", note="native WAIT registration refused",
                     wait={"kind": "native", "target": outcome.target,
                           "native_delivery_failed": blocked}):
                     return
@@ -2237,7 +2278,7 @@ class AgentRunner:
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, missing))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, missing))
             log.info("%s: #%s wait on %s sent back: the pipeline does not exist on its host",
                      self.agent.name, a.task8, outcome.target)
             return
@@ -2249,7 +2290,7 @@ class AgentRunner:
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, jobs_problem))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, jobs_problem))
             log.info("%s: #%s wait on jobs of %s sent back", self.agent.name, a.task8, outcome.target)
             return
         dead, dead_again = self._canceled_pipeline_wait(a, outcome)
@@ -2261,7 +2302,7 @@ class AgentRunner:
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, dead))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, dead))
             log.info("%s: #%s wait on %s sent back: the pipeline is in a terminal canceled state",
                      self.agent.name, a.task8, outcome.target)
             return
@@ -2277,7 +2318,7 @@ class AgentRunner:
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, stale))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, stale))
             log.info("%s: #%s CI wait with a stale baseline sent back", self.agent.name, a.task8)
             return
         unattended = "" if dead_again else self._unattended_ci_wait(a, outcome)
@@ -2290,7 +2331,7 @@ class AgentRunner:
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, unattended))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, unattended))
             log.info("%s: #%s %s wait on %s sent back: it cannot complete on its own",
                      self.agent.name, a.task8, outcome.kind, outcome.target)
             return
@@ -2303,7 +2344,7 @@ class AgentRunner:
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, idle_card))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, idle_card))
             log.info("%s: #%s card wait on #%s sent back: it waits on a timer or a person",
                      self.agent.name, a.task8, outcome.target)
             return
@@ -2316,7 +2357,7 @@ class AgentRunner:
             self.store.outcome(a, "wait")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, repeat))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, repeat))
             log.info("%s: #%s decision wait to @%s sent back: the same question was already answered",
                      self.agent.name, a.task8, outcome.handle)
             return
@@ -2330,7 +2371,7 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "cap_observation", "")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0, wake_text=prompts.wake_prompt(task, proceed))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, proceed))
             return
         if not mesh_ask:
             outcome = self._live_task_card_wait(a, task, outcome)
@@ -2374,9 +2415,9 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "cap_observation", "")
             if self._over_budget(a, task):
                 return
-            self.store.update(a, state="ready", no_outcome=0,
-                              wake_text=prompts.wake_prompt(task, "you asked to continue (↻ NEXT)")
-                              + ("\n" + outcome.extra["hint"] if outcome.extra.get("hint") else ""))
+            self.life.to_ready(a, no_outcome=0,
+                               wake_text=prompts.wake_prompt(task, "you asked to continue (↻ NEXT)")
+                               + ("\n" + outcome.extra["hint"] if outcome.extra.get("hint") else ""))
             return
         wait = {"kind": outcome.kind, "target": outcome.target, "handle": outcome.handle,
                 "line": outcome.line[:400],
@@ -2500,7 +2541,7 @@ class AgentRunner:
             if (self.store.get(a.id) or a).state in ("failed", "completed", "aborted"):
                 return
             if told:
-                self.store.update(a, state="ready", no_outcome=0, wake_text=told)
+                self.life.to_ready(a, no_outcome=0, wake_text=told)
                 log.info("%s: #%s ask to @%s not raised by Mesh; told the agent", self.agent.name, a.task8,
                          outcome.handle)
                 return
@@ -2524,9 +2565,9 @@ class AgentRunner:
                 marks[queue_wait.delivered_key(self.agent_id, req["contract"])] = "delivered"
                 marks[queue_wait.FLOOR_KEY] = queue_wait.raised_floor(
                     self.store, self.agent.name, a.task_id, req["contract"])
-            self.store.update_with_marks(a, marks, expect=a.state, state="waiting", wait=wait, no_outcome=0)
+            self.life.to_waiting(a, marks=marks, expect=a.state, wait=wait, no_outcome=0)
         else:
-            self.store.update(a, state="waiting", wait=wait, no_outcome=0)
+            self.life.to_waiting(a, wait=wait, no_outcome=0)
         self.emit("wait", a, wait=wait["kind"], target=wait.get("target") or wait.get("handle") or wait.get("until"))
         log.info("%s: #%s waits: %s %s", self.agent.name, a.task8, wait["kind"],
                  wait.get("target") or wait.get("handle") or wait.get("until"))
@@ -2593,7 +2634,7 @@ class AgentRunner:
             self._give_up_no_outcome(a, task, f"the session ended without a readable outcome {misses} turns in a row" + last)
             return
         if a.no_outcome < self.cfg.max_no_outcome:
-            self.store.update(a, state="ready", no_outcome=a.no_outcome + 1, wake_text=prompt)
+            self.life.to_ready(a, no_outcome=a.no_outcome + 1, wake_text=prompt)
             return
         why = f"{misses} turns in a row ended without a readable outcome" + last
         if outcome and outcome.note == TIME_WAIT_GUIDANCE:
@@ -3366,12 +3407,11 @@ class AgentRunner:
 
     def _unavailable(self, name: str) -> str:
         """Why the named agent cannot take or answer anything now ('' = it can): it is not run by
-        this runner, or it is paused (config ``paused`` or the pause file)."""
+        this runner, or it is paused (config ``paused`` or a pause token)."""
         ours = next((ag for ag in self.cfg.agents if ag.name.casefold() == name.casefold()), None)
         if ours is None:
             return "it is not run by this runner"
-        if (ours.paused or (self.cfg.state_dir / "pause" / ours.name).exists()
-                or op_pause.any_token(self.cfg.state_dir, ours.name)):
+        if self._name_paused(ours):
             return "it is paused"
         return ""
 
@@ -3457,7 +3497,7 @@ class AgentRunner:
             except sqlite3.IntegrityError:
                 row = None
             if row is not None:
-                self.store.update(row, state="completed", note=note)
+                self.life.to_completed(row, note=note)
                 self.emit("completed", row, note=note)
         self.emit("cap", a, cap=kind, requeued=True, reassigned_to=moved_to, **({} if a else {"task": tid}))
         if moved_to:
@@ -4172,8 +4212,8 @@ class AgentRunner:
                 prior = intent["prior"]
                 retry = {**intent, "retryable": True}
                 wait = {**a.wait, "interactive_prompt_intent": retry}
-                if self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait,
-                         state="ready", wait=wait, pid=0, stamp="", leader_done_at="",
+                if self.life.to_ready(a, marks={}, expect=a.state, expect_wait=a.wait,
+                         wait=wait, pid=0, stamp="", leader_done_at="",
                          note="native send never began; exact pending prompt will use normal admission", **prior):
                     self.store.event(a.id, "prompt_unsent_reconciled", intent["token"])
                     self.emit("prompt_unsent_reconciled", a)
@@ -4196,12 +4236,12 @@ class AgentRunner:
                         marks[queue_wait.FLOOR_KEY] = delivery["floor"]
             wait.pop("interactive_prompt_intent")
             wait.pop("unsent_scope_recovery", None)
-            return self.store.update_with_marks(a, marks, expect=a.state, expect_wait=a.wait,
-                       state="running", wait=wait, wake_text="", note="",
+            return self.life.to_running(a, marks=marks, expect=a.state, expect_wait=a.wait,
+                       wait=wait, wake_text="", note="",
                        source_read_at=intent["source_read_at"])
         if a.state != "unknown" or intent.get("resolution") != resolution:
             wait = {**a.wait, "interactive_prompt_intent": {**intent, "resolution": resolution}}
-            if self.store.update_with_marks(a, {}, expect=a.state, expect_wait=a.wait, state="unknown", wait=wait,
+            if self.life.to_unknown(a, marks={}, expect=a.state, expect_wait=a.wait, wait=wait,
                                  note="mandatory delivery pending: " + resolution + "; native evidence or owner resolution required"):
                 self.store.event(a.id, "prompt_delivery_unknown", resolution)
                 stderr_path = Path(intent["log_path"]).with_suffix(".stderr")
@@ -4244,9 +4284,9 @@ class AgentRunner:
             return (current is not None and current.workspaces == a.workspaces
                     and delivery_recovery.legacy_writer_stopped(
                         directory, a.id, intent, self.agent.name, self._tmux))
-        return self.store.update_with_marks(a, {archive: json.dumps(intent),
+        return self.life.to_ready(a, marks={archive: json.dumps(intent),
             archive + ":journal": json.dumps(journal)}, expect="unknown",
-            expect_wait=a.wait, validate=still_owned, state="ready", wait=wait,
+            expect_wait=a.wait, validate=still_owned, wait=wait,
             note="unsent request retained after verified checkpoint path restore; fresh admission required")
 
     def _restored_unsent_ready(self, a: Attempt) -> bool:
@@ -4377,6 +4417,30 @@ class AgentRunner:
     def _retire_terminal_intent(self, a: Attempt) -> bool:
         return self._retire_proven_unsent_intent(a) or self._retire_proven_delivered_intent(a)
 
+    def _operator_resolution(self, a: Attempt) -> None:
+        """End an ``unknown`` attempt on the operator's token (see op_resolve). The delivery stays
+        unproven: the intent is archived in a mark, never consumed or replayed, and the card starts in a
+        new attempt. A live process group is left alone: its own end settles the delivery."""
+        reason = op_resolve.read(self.cfg.state_dir, a.id)
+        if reason is None or a.state != "unknown":
+            return
+        if a.pid and not self._turn_over(a):
+            return
+        intent = a.wait.get("interactive_prompt_intent")
+        wait = {k: v for k, v in a.wait.items() if k != "interactive_prompt_intent"}
+        archive = "operator_resolved_intent:" + a.id
+        record = json.dumps({"intent": intent, "reason": reason, "at": iso()})
+        if not self.store.update_with_marks(a, {archive: record}, expect="unknown", expect_wait=a.wait, wait=wait):
+            return                           # the attempt moved under us: the token is read again next pass
+        a = self.store.get(a.id)
+        self._close_window(a)
+        self.store.event(a.id, "operator_resolution", reason)
+        self._finish(a, "completed", "operator resolution: " + reason)
+        self._comment(a.task_id, "OPERATOR RESOLUTION: the attempt whose prompt delivery could not be proven is "
+                      f"ended ({reason}). Its pending prompt was not replayed; the card starts in a new attempt.")
+        op_resolve.consume(self.cfg.state_dir, a.id)
+        log.info("%s: #%s operator resolution: unknown attempt ended (%s)", self.agent.name, a.task8, reason[:120])
+
     def settle_terminal_intents(self) -> None:
         """Retire proven-unsent or proven-delivered intents left on ended attempts, at most once a minute."""
         if time.monotonic() < getattr(self, "_terminal_intent_next", 0):
@@ -4389,6 +4453,9 @@ class AgentRunner:
         self.settle_terminal_intents()
         for a in self.store.by_state(self.agent.name, ACTIVE):
             if (a.wait or {}).get("interactive_prompt_intent"):
+                if a.state == "unknown" and op_resolve.read(self.cfg.state_dir, a.id) is not None:
+                    self._guard(a, "operator-resolution", self._operator_resolution)
+                    continue
                 self._guard(a, "prompt-delivery", lambda x:
                     self._reconcile_interactive_prompt(x) and self._turn_over(x) and self.settle(x))
                 continue
@@ -5177,10 +5244,10 @@ class AgentRunner:
                 return current == row
             except (ValueError, OSError, MeshError):
                 return False
-        if self.store.update_with_marks(a,
-                {ops_review_wait.delivered_key(identity): evidence["comment_id"], "met_wake": a.id},
+        if self.life.to_ready(a,
+                marks={ops_review_wait.delivered_key(identity): evidence["comment_id"], "met_wake": a.id},
                 expect="waiting", expect_wait=a.wait, validate=still,
-                state="ready", wake_text=prompts.wake_prompt(task, ops_review_wait.event_text(evidence))):
+                wake_text=prompts.wake_prompt(task, ops_review_wait.event_text(evidence))):
             self.emit("wake", a, event="ops-review eligibility receipt delivered")
 
     def _receipt_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
@@ -5230,9 +5297,9 @@ class AgentRunner:
         still = lambda: (receipt_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None  # noqa: E731
                          and receipt_wait.registration(self.store, a.agent, a.task_id)["state"] == "armed")
         event = receipt_wait.event_text(evidence)
-        if self.store.update_with_marks(a, {receipt_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
-                                        expect="waiting", expect_wait=a.wait, validate=still,
-                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+        if self.life.to_ready(a, marks={receipt_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                              expect="waiting", expect_wait=a.wait, validate=still,
+                              wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="receipt delivered")
 
     def _gmail_reader(self):
@@ -5258,39 +5325,20 @@ class AgentRunner:
 
     def _scan_gmail(self) -> None:
         """Advance this lane's active registrations on their own schedule (never an agent turn) and
-        deliver pending comments. An observer fault must not stop the lane."""
-        if not self.cfg.gmail_watch_v1:
+        deliver pending comments. An observer fault must not stop the lane. With gmail in
+        ``service_processes`` this is the gmail process's work: the lane spawns no reader (a read may
+        take ``gmail_watch_timeout_seconds``) and only wakes on the rows that process writes."""
+        if not self.cfg.gmail_watch_v1 or "gmail" in getattr(self.cfg, "service_processes", ()):
             return
         reader = self._gmail_reader()
         if reader is None:
             return
-        now_ms = int(time.time() * 1000)
-        try:
-            regs = gmail_watch.registrations_of(self.store, self.agent_id)
-        except Exception as e:                  # noqa: BLE001
-            log.warning("%s: gmail scan failed: %s", self.agent.name, type(e).__name__)
-            return
         busy = getattr(self, "_gmail_inflight", None)
         if busy is None:
             busy = self._gmail_inflight = set()   # one read per registration at a time; empty after a restart
-        for r in regs:
-            if r["state"] != "active" or r["next_check_at"] > now_ms or r["id"] in busy:
-                continue
-            busy.add(r["id"])
-            try:
-                t = gmail_watch.tick(self.store, reader, r["id"], now_ms, self.cfg.gmail_watch_interval_seconds)
-                if t.alert:
-                    log.error("%s: gmail observation %s unavailable (%s) after %d consecutive failures; baseline kept, "
-                              "no wake, no turn", self.agent.name, r["id"], t.alert, gmail_watch.ALERT_AFTER)
-                    self.emit("gmail_alert", None, registration=r["id"], error_class=t.alert)
-            except Exception as e:             # noqa: BLE001
-                log.warning("%s: gmail tick failed: %s", self.agent.name, type(e).__name__)
-            finally:
-                busy.discard(r["id"])
-        try:
-            gmail_watch.deliver_comments(self.store, self.mesh, self.agent_id)
-        except Exception as e:                  # noqa: BLE001
-            log.warning("%s: gmail comment delivery failed: %s", self.agent.name, type(e).__name__)
+        gmail_watch.scan(self.store, reader, self.mesh, self.agent_id, self.cfg.gmail_watch_interval_seconds, busy,
+                         lambda reg, cls: self.emit("gmail_alert", None, registration=reg, error_class=cls),
+                         self.agent.name)
 
     def _wake_gmail(self, a: Attempt, task: dict) -> None:
         """Wake on the pending wake row of the exact registration this wait declared. The ready
@@ -5312,9 +5360,9 @@ class AgentRunner:
                 return False
             gmail_watch.ack(self.store.db, key)
             return True
-        if self.store.update_with_marks(a, {"gmail_delivered": key, "met_wake": a.id}, expect="waiting",
-                                        expect_wait=a.wait, validate=ack_if_pending, state="ready",
-                                        wake_text=prompts.wake_prompt(task, event)):
+        if self.life.to_ready(a, marks={"gmail_delivered": key, "met_wake": a.id}, expect="waiting",
+                              expect_wait=a.wait, validate=ack_if_pending,
+                              wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="gmail delivered")
 
     def _recovery_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
@@ -5382,9 +5430,9 @@ class AgentRunner:
                     and cur["owner_id"] == self.agent_id
                     and recovery_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None)
         event = recovery_wait.event_text(evidence)
-        if self.store.update_with_marks(a, {recovery_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
-                                        expect="waiting", expect_wait=a.wait, validate=still,
-                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+        if self.life.to_ready(a, marks={recovery_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                              expect="waiting", expect_wait=a.wait, validate=still,
+                              wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="recovery delivered")
 
     def _wake_superseded(self, a: Attempt, task: dict, reg_id: str, sup: dict) -> None:
@@ -5392,10 +5440,9 @@ class AgentRunner:
         (same one-shot delivered mark as a real recovery); the gate itself is not satisfied."""
         def still() -> bool:
             return recovery_wait.superseded(self.store, a.agent, a.task_id, reg_id) is not None
-        if self.store.update_with_marks(a, {recovery_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
-                                        expect="waiting", expect_wait=a.wait, validate=still,
-                                        state="ready",
-                                        wake_text=prompts.wake_prompt(task, recovery_wait.supersede_text(sup))):
+        if self.life.to_ready(a, marks={recovery_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                              expect="waiting", expect_wait=a.wait, validate=still,
+                              wake_text=prompts.wake_prompt(task, recovery_wait.supersede_text(sup))):
             self.emit("wake", a, event="recovery gate superseded")
 
     def _stall_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
@@ -5471,9 +5518,9 @@ class AgentRunner:
                     and cur["owner_id"] == self.agent_id
                     and stall_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None)
         event = stall_wait.event_text(evidence)
-        if self.store.update_with_marks(a, {stall_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
-                                        expect="waiting", expect_wait=a.wait, validate=still,
-                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+        if self.life.to_ready(a, marks={stall_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                              expect="waiting", expect_wait=a.wait, validate=still,
+                              wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="stall delivered")
 
     def _lifecycle_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
@@ -5525,9 +5572,9 @@ class AgentRunner:
                     and cur["owner_id"] == self.agent_id
                     and lifecycle_wait.pending(self.store, a.agent, a.task_id, reg_id) is not None)
         event = lifecycle_wait.event_text(evidence)
-        if self.store.update_with_marks(a, {lifecycle_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
-                                        expect="waiting", expect_wait=a.wait, validate=still,
-                                        state="ready", wake_text=prompts.wake_prompt(task, event)):
+        if self.life.to_ready(a, marks={lifecycle_wait.DELIVERED_KEY: reg_id, "met_wake": a.id},
+                              expect="waiting", expect_wait=a.wait, validate=still,
+                              wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="lifecycle delivered")
 
     def _wake_queue(self, a: Attempt, task: dict) -> None:
@@ -5567,11 +5614,11 @@ class AgentRunner:
                     return
             pending["state"], pending["clock_watermark"] = "cancelled", current_time
             event = "The owner withdrew this queue request by removing fleet-starvation-wake; continue the task under its current instructions. Queue recovery was not asserted."
-            if self.store.update_with_marks(a, {
+            if self.life.to_ready(a, marks={
                     queue_wait.key(req): json.dumps(pending),
                     queue_wait.consumed_key(self.agent_id, req["contract"]): "withdrawn"},
                     expect="waiting", expect_wait=a.wait,
-                    state="ready", wake_text=prompts.wake_prompt(task, event)):
+                    wake_text=prompts.wake_prompt(task, event)):
                 self.emit("wake", a, event="queue request explicitly withdrawn")
             return
         # Receipt reads are local and cheap. Source polling also detects new
@@ -5622,7 +5669,7 @@ class AgentRunner:
             return checked >= finished and queue_wait.available(
                 receipt, req, checked, queue_wait.published_manifest(self.store))
         residual = queue_wait.residual_mark(self.agent_id, req, receipt)
-        if self.store.update_with_marks(a, {queue_wait.key(req): json.dumps(pending), "met_wake": a.id,
+        if self.life.to_ready(a, marks={queue_wait.key(req): json.dumps(pending), "met_wake": a.id,
                     **residual,
                     queue_wait.consumed_key(self.agent_id, req["contract"]): "fulfilled",
                 queue_wait.delivered_key(self.agent_id, req["contract"]): "fulfilled",
@@ -5630,7 +5677,7 @@ class AgentRunner:
                     self.store, a.agent, a.task_id, req["contract"])},
                 expect="waiting", expect_wait=a.wait,
                 validate=still_fresh,
-                state="ready", wake_text=prompts.wake_prompt(task, event)):
+                wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event=event)
 
     def _first_move(self, a: Attempt, task: dict, req: dict, pending: dict, current_time: float) -> None:
@@ -5655,9 +5702,9 @@ class AgentRunner:
                                             "value": "delivered",
                                             "floor": queue_wait.raised_floor(
                                                 self.store, a.agent, a.task_id, req["contract"])})
-        if self.store.update_with_marks(a, {queue_wait.key(req): json.dumps(pending)},
+        if self.life.to_ready(a, marks={queue_wait.key(req): json.dumps(pending)},
                 expect="waiting", expect_wait=a.wait, wait=wait,
-                state="ready", wake_text=prompts.wake_prompt(task, event)):
+                wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="queue refill first move")
 
     def _reconcile_card_wait(self, a: Attempt, task: dict, comments: list[dict]) -> bool:
@@ -5748,9 +5795,9 @@ class AgentRunner:
         removed_mark = {}
         if wait.get("target"):
             removed_mark[f"{EDGE_REMOVED_MARK}:{wait['target']}"] = edge_id
-        if self.store.update_with_marks(a, {key: edge_id, **removed_mark}, expect="waiting", expect_wait=expected,
+        if self.life.to_ready(a, marks={key: edge_id, **removed_mark}, expect="waiting", expect_wait=expected,
                 validate=still_removed,
-                state="ready", wait=wait, wake_text=prompts.wake_prompt(task, event)):
+                wait=wait, wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="card edge removed")
         return True
 
@@ -5787,8 +5834,8 @@ class AgentRunner:
                 return bool(again) and again["id"] == edge["id"] and again["condition"] == edge["condition"]
             except MeshError:
                 return False
-        if self.store.update_with_marks(a, {key: edge["id"]}, expect="waiting", expect_wait=expected,
-                validate=still_satisfied, state="ready", wait=wait, wake_text=prompts.wake_prompt(task, event)):
+        if self.life.to_ready(a, marks={key: edge["id"]}, expect="waiting", expect_wait=expected,
+                validate=still_satisfied, wait=wait, wake_text=prompts.wake_prompt(task, event)):
             self.emit("wake", a, event="card edge condition satisfied", condition=edge["condition"])
         return True
 
@@ -5819,8 +5866,8 @@ class AgentRunner:
         event = (f"the next-action projection of this card has a new generation ({generation}): continue the "
                  "prep stage once; the open typed edges stay open and the final acceptance gates are not released")
         mark = json.dumps({"generation": generation, "attempt": a.id})
-        if self.store.update_with_marks(a, {next_action.MARK: mark}, expect="waiting", expect_wait=expected,
-                state="ready", wait=copy.deepcopy(expected), wake_text=prompts.wake_prompt(task, event)):
+        if self.life.to_ready(a, marks={next_action.MARK: mark}, expect="waiting", expect_wait=expected,
+                wait=copy.deepcopy(expected), wake_text=prompts.wake_prompt(task, event)):
             self.store.event(a.id, "next_action_prep", generation)
             self.emit("wake", a, event="next-action prep generation", generation=generation)
         return True
@@ -5968,8 +6015,8 @@ class AgentRunner:
                     wait["native_packet"] = packet
                     # READY, pending prompt and duplicate-suppression mark are one
                     # normal Store CAS. Source/outbox cursor remains UNACKNOWLEDGED.
-                    if self.store.update_with_marks(a, {key: packet["event"]},
-                            expect="waiting", expect_wait=expected, state="ready", wait=wait,
+                    if self.life.to_ready(a, marks={key: packet["event"]},
+                            expect="waiting", expect_wait=expected, wait=wait,
                             wake_text=prompts.wake_prompt(task, native_result_wait.wake_text(packet))):
                         self.emit("wake", a, event="native:" + packet["event"])
                     return
@@ -5996,7 +6043,7 @@ class AgentRunner:
             + "Repair/rebind the native delivery before rearming its wait.")
         self._release_gate(a, "native-integration-held")
         self._release_checkout(a)
-        self.store.update(a, state="waiting", pid=0, stamp="", wake_text="")
+        self.life.to_waiting(a, pid=0, stamp="", wake_text="")
 
     def _settle_native(self, a: Attempt, task: dict) -> bool:
         with native_result_config.paths(self.cfg) as native:
@@ -6071,9 +6118,9 @@ class AgentRunner:
                             and current.task_id == request["task"]
                             and current.session_id == request["session"]
                             and not current.checkout and not current.pid)
-            if not self.store.update_with_marks(a, {key: json.dumps(audit, sort_keys=True)},
+            if not self.life.to_waiting(a, marks={key: json.dumps(audit, sort_keys=True)},
                     expect=a.state, expect_wait=expected, validate=same_receiver,
-                    state="waiting", wait=wait, wake_text="", note="explicit native rebind"):
+                    wait=wait, wake_text="", note="explicit native rebind"):
                 return "rejected_cas"
             self.emit("native_rebind", a, request_id=request["request_id"],
                       registration=request["registration"], old_registration=request["old_registration"])
@@ -6091,8 +6138,8 @@ class AgentRunner:
         for key in ("kind", "until", "external_time", "line", "note"):
             wait.pop(key, None)
         wait["quota_wait_rejected"] = True
-        if self.store.update_with_marks(a, {}, expect=a.state, expect_wait=expected,
-                state="ready", wait=wait,
+        if self.life.to_ready(a, marks={}, expect=a.state, expect_wait=expected,
+                wait=wait,
                 wake_text=prompts.wake_prompt(task, QUOTA_TIME_WAIT_GUIDANCE)):
             self.store.event(a.id, "quota_time_wait_rejected")
 
@@ -6230,10 +6277,10 @@ class AgentRunner:
                         return False
                     self.store.mark(self.agent.name, a.task_id, key, card_delivery["value"])
                 return True
-            if self.store.update_with_marks(a, marks, expect="waiting", expect_wait=expected_wait,
-                                            validate=claim if cycle_sig or card_delivery else None,
-                                            state="ready", wait=wait,
-                                            wake_text=prompts.wake_prompt(task, event)):
+            if self.life.to_ready(a, marks=marks, expect="waiting", expect_wait=expected_wait,
+                                  validate=claim if cycle_sig or card_delivery else None,
+                                  wait=wait,
+                                  wake_text=prompts.wake_prompt(task, event)):
                 self.emit("wake", a, event=event[:200])
                 log.info("%s: #%s woke: %s", self.agent.name, a.task8, event[:120])
         else:
@@ -7027,8 +7074,8 @@ class AgentRunner:
                 if (retry.get("workspaces") != list(a.workspaces)
                         or (retry.get("harness") != a.harness and not handoff)
                         or (retry.get("harness") != routed and not handoff)):
-                    self.store.update(a, expect="ready", state="unknown",
-                                      note="unsent prompt scope changed; owner resolution required")
+                    self.life.to_unknown(a, expect="ready",
+                                         note="unsent prompt scope changed; owner resolution required")
                     self.store.event(a.id, "prompt_retry_scope_changed", "workspaces-or-harness")
                     self.emit("prompt_retry_scope_changed", a, action="owner-resolution")
                     return
@@ -8789,9 +8836,12 @@ class AgentRunner:
             self._queue_order = queue_order.QueueOrder(
                 self.agent.name, argv, self.agent.queue_order_timeout_seconds,
                 self.agent.queue_order_cache_seconds)
-        chosen = iter(self._queue_order.apply(ordinary))
+        chosen = self._queue_order.apply(ordinary)
+        fair_ids = self._queue_order.applied_fair_ids
+        observed = iter(dict(t, _queue_order_fairness=None if fair_ids is None else t["id"] in fair_ids)
+                        for t in chosen)
         # decision requests stay first, CAP_WAIT last: only the ordinary slots are refilled
-        return [next(chosen) if rank(t) == 1 else t for t in ranked]
+        return [next(observed) if rank(t) == 1 else t for t in ranked]
 
     def host_hold(self) -> bool:
         """The host is short of memory or overloaded. Both gates are asked, so each logs its own edge."""
@@ -8814,6 +8864,7 @@ class AgentRunner:
             self._break_review_streaks()
             return room
         reviews = 0
+        passed_over: list[str] = []
         for task in self.candidates():
             if room <= 0 or time.monotonic() < self._starts_paused_until or self.paused():
                 self._break_review_streaks()
@@ -8826,6 +8877,10 @@ class AgentRunner:
                 continue
             self._start_held = False
             self._gate_asked = False
+            ordered = "_queue_order_fairness" in task
+            if ordered:
+                task["_queue_order"] = {"fairness": task.pop("_queue_order_fairness"),
+                                        "passed_over": passed_over.copy()}
             try:
                 started = self._start_one(task)
                 if review and (started or self._gate_asked):
@@ -8837,6 +8892,8 @@ class AgentRunner:
                     room -= 1
                 elif self._start_held:
                     break                          # the gate holds (pool full, …): do not ask per task
+                elif ordered:
+                    passed_over.append(task["id"])
             except Exception as e:
                 if review and self._gate_asked:
                     reviews += 1                   # it reached the gate: the slot is spent
@@ -8868,6 +8925,7 @@ class AgentRunner:
     def _start_one(self, task: dict) -> bool:
         backoff = time.monotonic() + self.cfg.abort_backoff_minutes * 60
         mode = task.get("_mode", "work")
+        queue_trace = task.pop("_queue_order", None)
         from . import cap_rearm
         if self.hold_reason(task, mode):
             return False
@@ -8913,7 +8971,9 @@ class AgentRunner:
             return False
         self._clear_hold_log(task["id"][:8], "start")
         try:
-            a = self.store.create(self.agent.name, task["id"], self.agent.harness, task.get("title", ""), mode=mode, cap_rearm=rearm["id"] if rearm else None)
+            a = self.store.create(self.agent.name, task["id"], self.agent.harness, task.get("title", ""),
+                                  mode=mode, cap_rearm=rearm["id"] if rearm else None,
+                                  queue_order=queue_trace)
         except sqlite3.IntegrityError:
             self._turn_end(task["id"], mode, None, gate, "not-started")
             return False
@@ -8958,7 +9018,7 @@ class AgentRunner:
             if not metadata_only(task, mode) and self._repo_preflight_refused(a, task, backoff):
                 return False                   # before any Mesh checkout, lease or model turn
             if not self._acquire(a):
-                self.store.update(a, state="aborted", note="checkout refused")
+                self.life.to_aborted(a, note="checkout refused")
                 self._task_backoff[task["id"]] = backoff
                 return False
             # The pool fetches with the agent's own identity. Reject a known auth
@@ -8991,7 +9051,9 @@ class AgentRunner:
                             json.dumps({"attempt": a.id, "scope":
                                         "metadata-only" if no_workspace else "workspace"}))
             had_workspaces = bool(self.pool.leased_to(a.id))
-            paths = [] if no_workspace else [str(self.pool.lease(a.id, r.name)) for r in self.agent.repos]
+            previous = {} if no_workspace else self._previous_workspaces(a)
+            paths = [] if no_workspace else [str(self.pool.lease(a.id, r.name, preferred_path=previous.get(r.name)))
+                                             for r in self.agent.repos]
         except MeshError:
             self._finish(a, "aborted", "task unreadable after checkout; no turn started")
             self._task_backoff[a.task_id] = backoff
@@ -9010,7 +9072,7 @@ class AgentRunner:
                 self._comment(task["id"], f"cannot start: {e}. An operator must clean or free worktrees "
                                           "(`mesh-runner slots`).")
                 self.store.event(a.id, "notified", "pool full")
-                self.store.update(a, state="aborted-notified")
+                self.life.to_aborted_notified(a)
             return False
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:   # env command refused/missing/hung
             self._finish(a, "aborted", str(e)[:300])
@@ -9055,6 +9117,10 @@ class AgentRunner:
                            "your own earlier session. What that agent wrote and did is new to you: read the "
                            "card's comments since your last turn, and check your worktree (`git status`, "
                            "`git log`, the merge request head) before continuing, in case the branch moved.\n")
+            elif why == "decision_request_reopened":
+                prompt += ("\n\n[runner] This decision request was answered and closed, and its asker opened it "
+                           "again with the next question; this is your own earlier session on it. The question to "
+                           "answer now is in the request's newest comments: answer that one, on the asking card.\n")
             else:
                 prompt += ("\n\n[runner] The card returned to this lane after a status roundtrip; this is your "
                            "own earlier session. Re-read the card's latest comments before continuing.\n")
@@ -9115,7 +9181,7 @@ class AgentRunner:
         if resume:
             self._resume_hold[a.id] = backoff     # the attempt stays ready; no checkout, no model turn
             return True
-        self.store.update(a, state="aborted", note=f"repository preflight: {verdict.reason}")
+        self.life.to_aborted(a, note=f"repository preflight: {verdict.reason}")
         self._task_backoff[a.task_id] = backoff
         return True
 
@@ -9547,6 +9613,12 @@ class Runner:
                     fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     raise AlreadyRunning(f"another runner owns {cfg.state_dir}") from None
+        if lock:
+            # the owner of the state directory turns old pause markers into tokens, once, before any tick
+            legacy_pause = op_pause.migrate_legacy(cfg.state_dir, [a.name for a in cfg.agents])
+        else:
+            # a read-mostly tool beside the service moves nothing: it reads any marker still there
+            legacy_pause = {op_pause.EVERY}
         self.store = Store(cfg.state_dir / "runner.sqlite")
         github = GitHub(cfg.github_token, cfg.github_api_url, cfg.github_orgs) if (cfg.github_orgs or cfg.github_token) else None
         gitlab = GitLab(cfg.gitlab_url, cfg.gitlab_token, github) if (cfg.gitlab_url or github) else None
@@ -9568,6 +9640,7 @@ class Runner:
         self._task_owner = TaskOwners()        # task id -> agent name, learnt from each agent's polls
         for ar in self.agents:
             ar.owners = self._task_owner
+            ar.legacy_pause = legacy_pause
 
     def wake(self, names=()) -> None:
         """Make the loops of these agents poll now, not at poll_seconds; nobody else wakes."""
@@ -9651,6 +9724,8 @@ class Runner:
             tmp = self.cfg.state_dir / "status.json.tmp"
             from .pool_ops import summary
             pool = summary(self.store, self.cfg.pool_root)
+            if getattr(self, "answer_desk", None) is not None:
+                self.answer_desk.annotate(out)
             status = {"at": iso(), "unix": stamp, "agents": out, "pool": pool,
                       "outcome_sources": self.outcome_sources()}
             try:                # bound to this snapshot; a failure never carries a (stale) digest
@@ -9659,6 +9734,9 @@ class Runner:
                 log.warning("config receipt: %s", type(e).__name__)
                 status["receipt"] = {"schema": config_receipt.SCHEMA, "pid": os.getpid(),
                                      "status_unix": stamp, "error": type(e).__name__}
+            supervisor = getattr(self, "supervisor", None)
+            if supervisor is not None and supervisor.services:     # absent while no service runs as a process
+                status["services"] = supervisor.snapshot()
             if getattr(self, "checkpoint_bytes", None) is not None:
                 status["checkpoints"] = {"bytes": self.checkpoint_bytes,
                                          "budget_bytes": int(self.cfg.checkpoint_budget_gb * 1024 ** 3)}
@@ -9872,8 +9950,14 @@ class Runner:
             t.start()
         self._start_announce(stop)
         self._start_chat(stop)
+        self.answer_desk = answer_desk.build(self.cfg, self.agents)    # None unless cardless_question_lanes
+        if self.answer_desk is not None:
+            self.answer_desk.start(stop)
         self._start_meta_receiver(stop)
         service = self._start_extension(stop)
+        from .service_process import Supervisor
+        self.supervisor = Supervisor(self.cfg)       # services listed in service_processes; none = nothing runs
+        self.supervisor.start()
         try:
             while not stop.is_set():
                 self._prune_ignored_if_due()
@@ -9883,9 +9967,11 @@ class Runner:
             # let every agent finish its tick: a thread cut between spawn and the
             # store update would leave a session the next start does not know about
             stop.set()
+            self.supervisor.terminate()               # the services drain while the lanes finish their ticks
             if service:
                 service.shutdown()
             deadline = time.monotonic() + STOP_GRACE_SECONDS
             for t in threads:
                 t.join(timeout=max(0.1, deadline - time.monotonic()))
+            self.supervisor.wait()
             self.write_status(self.snapshot())

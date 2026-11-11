@@ -12,6 +12,12 @@
 Attempt states: `starting → running → waiting ⇄ ready → running … → completed | failed | aborted`.
 `starting` and `running` occupy the cap; `waiting` and `ready` do not.
 
+The allowed changes are one table, `lifecycle.TRANSITIONS`, which the store checks on every state write.
+Every write goes through one object, `lifecycle.AttemptStateMachine` (`AgentRunner.life`), with one method
+per target state (`to_running`, `to_waiting`, `to_ready`, …); it decides nothing and passes the write to
+`Store.update` / `Store.update_with_marks`. `tests/test_state_writes.py` fails when any other module passes
+`state=` to the store.
+
 One open attempt per (agent, task) is enforced by a unique index; the Mesh checkout is
 the cross-controller fence while a turn runs.
 
@@ -31,15 +37,15 @@ the cross-controller fence while a turn runs.
    - `↻ NEXT` → `ready`;
    - nothing → ask once in the same session, then `failed` (not retried until someone
      else writes on the task or the cooldown passes).
-4. **Wake.** Waiting attempts are checked every `wake_poll_seconds`: the condition itself
+4. **Wake.** Waiting attempts are checked every two minutes: the condition itself
    (pipeline/MR state via GitLab, the other task closed, time, gate lifted) or any new
    comment from someone other than the agent. Woken attempts become `ready` and are
    resumed in the **same session** with a short message saying what changed.
 
 ## Launch modes
 
-`[runner] launch_mode` decides how a turn runs; an agent may override it with its own
-`launch_mode` (e.g. to try a mode on one agent, or to roll one back).
+Turns run in `interactive` mode unless an agent sets its own `launch_mode` (e.g. to try a mode
+on one agent, or to roll one back); `[runner] launch_mode` is a retired option (README "Retired options").
 
 - **`interactive`** (default): the harness runs as its interactive program in a tmux
   window, one window per attempt in a session `mr-<agent>`. The turn's process is a small
@@ -58,7 +64,7 @@ the cross-controller fence while a turn runs.
   has a free prompt box, but a prompt pasted then only gets a "still waiting" turn; when
   an agent finishes, Claude Code resumes the main thread by itself. The driver therefore
   holds the prompt until no background agent is listed and the session is idle with a
-  settled transcript, at most `background_wait_minutes` (default 45, 0 = no hold), then
+  settled transcript, at most 45 minutes, then
   pastes it anyway. The hold reports as an external wait: the first-output limit
   (`turn_first_output_minutes`) is not judged during it and counts from its end.
 - **`headless`**: `claude -p --output-format stream-json`, `codex exec --json`; one
@@ -74,7 +80,7 @@ restarted runner re-attaches by pid and log path: while the process group lives,
 stays occupied; once it is gone, the turn is settled from its event file. An attempt whose
 process never started is aborted and its task given back. A turn cut off without a result
 counts as a turn without an outcome (asked once in the same session, then back in todo with the same lane until new input
-arrives; handed to the lead from the `no_outcome_route_after`-th turn in a row without a readable outcome).
+arrives; handed to the lead from the third turn in a row without a readable outcome).
 
 ## Worktree pool
 

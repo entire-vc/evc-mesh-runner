@@ -2,6 +2,7 @@
 
     mesh-runner run    --config runner.toml     # service loop
     mesh-runner once   --config runner.toml     # one tick, print status
+    mesh-runner service chat|editor|gmail --config runner.toml   # one side service as its own process (service_processes)
     mesh-runner status --config runner.toml     # attempts from the local registry, no Mesh calls
     mesh-runner plan   --config runner.toml     # dry run: what would start, and why not
     mesh-runner slots  --config runner.toml     # worktree pool, with reasons for held slots
@@ -184,7 +185,8 @@ def _editor_control(argv: list[str]) -> int:
     body = json.dumps(req).encode()
     path, ts = ec.PREFIX + args.action, str(int(time.time()))
     host = "127.0.0.1" if cfg.extension_host in ("", "0.0.0.0", "::") else cfg.extension_host
-    http_req = urllib.request.Request(f"http://{host}:{cfg.extension_port}{path}", data=body, method="POST", headers={
+    # the editor process listens on its own port (config.editor_port); in the runner it is the extension port
+    http_req = urllib.request.Request(f"http://{host}:{config_mod.editor_port(cfg)}{path}", data=body, method="POST", headers={
         "X-Mesh-Timestamp": ts, "X-Operator-Signature": ec.sign_request(secret, ts, path, body), "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(http_req, timeout=60) as resp:
@@ -425,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
         return command(args_in[1:])
     if args_in and args_in[0] == "reviewer-merge":
         return _reviewer_merge(args_in[1:])
+    if args_in and args_in[0] == "service":
+        from .service_process import command
+        return command(args_in[1:])
     if args_in and args_in[0] == "session-receiver":
         from .session_receiver import command
         return command(args_in[1:])

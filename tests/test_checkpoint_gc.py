@@ -187,17 +187,16 @@ class CheckpointGC(unittest.TestCase):
         self.assertFalse(cp.exists())
         self.assertGreater(runner.checkpoint_gc_freed_bytes, 0)
 
-    def test_grace_is_read_and_validated(self):
+    def test_grace_is_fixed_and_the_cli_flag_validated(self):
         from unittest.mock import patch
         from mesh_runner import cli
-        from mesh_runner.config import RunnerConfig, load
-        cfg = self.root / 'r.toml'
-        cfg.write_text('[runner]\nmesh_url = "x"\nstate_dir = "%s"\ncheckpoint_gc_grace_hours = 2\n' % self.root)
-        loaded = load(cfg)
-        self.assertEqual(loaded.checkpoint_gc_grace_hours, 2.0)
-        for bad in ('-1', 'nan', '"6"', 'true'):
-            with self.assertRaisesRegex(ConfigError, 'checkpoint_gc_grace_hours'):
-                load(self._toml('checkpoint_gc_grace_hours = %s' % bad))
+        from mesh_runner.config import load
+        # checkpoint_gc_grace_hours is no longer a [runner] option: a file that sets it keeps 6 hours
+        self.assertEqual(load(self._toml('')).checkpoint_gc_grace_hours, 6.0)
+        for value in ('2', '-1', 'nan', '"6"', 'true'):
+            with self.subTest(value=value), self.assertLogs('mesh_runner', 'WARNING') as logs:
+                self.assertEqual(load(self._toml('checkpoint_gc_grace_hours = %s' % value)).checkpoint_gc_grace_hours, 6.0)
+            self.assertIn('checkpoint_gc_grace_hours is no longer an option', '\n'.join(logs.output))
         with self.assertRaises(SystemExit):
             with patch('sys.stderr'):
                 cli.main(['pool', '--config', 'x.toml', '--prune-checkpoints', '--checkpoint-grace-hours', '-1'])

@@ -338,13 +338,15 @@ class Switches(unittest.TestCase):
             os.environ.setdefault("K", "k")
             return load(p)
 
-    def test_on_by_default_and_each_can_be_switched_off(self):
+    def test_on_by_default_and_a_file_cannot_switch_them_off(self):
+        # no longer [runner] options (always on); the off paths are exercised by setting the field above
         names = ("decision_live_task_card_wait", "decision_identical_no_reopen", "decision_default_proceeds")
         cfg = self.read()
         self.assertEqual([getattr(cfg, n) for n in names], [True, True, True])
         for name in names:
-            with self.subTest(name):
-                self.assertFalse(getattr(self.read(f"{name} = false"), name))
+            with self.subTest(name), self.assertLogs("mesh_runner", "WARNING") as logs:
+                self.assertTrue(getattr(self.read(f"{name} = false"), name))
+            self.assertIn(f"{name} is no longer an option", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

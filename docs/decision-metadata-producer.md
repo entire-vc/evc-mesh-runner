@@ -15,7 +15,7 @@ For a scoped coordinator canary, replace the empty array with only the intended
 recipient's freshly verified canonical agent UUID. Entries must be lowercase canonical UUID strings;
 malformed configuration is rejected. Scope matches the identity resolved from
 `WAIT decision:@handle`, not prose, source labels or a source lane name.
-The existing `mesh_effects = false` parent switch still disables decision creation.
+Decision creation is part of the runner's Mesh effects, which are always on (`mesh_effects` is a retired option).
 
 Only a new POST receives `runner:metadata-only`, alongside `decision-request`,
 `pin-assignee`, and `owner-locked`. No source, existing, legacy referenced or

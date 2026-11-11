@@ -214,16 +214,22 @@ class Config(unittest.TestCase):
     def test_defaults_and_values(self):
         c = self.read()
         self.assertEqual((c.decision_wake, c.agents[0].decision_wake), ("any", ""))
-        c = self.read('decision_wake = "answer"', 'decision_wake = "any"')
-        self.assertEqual((c.decision_wake, c.agents[0].decision_wake), ("answer", "any"))
+        c = self.read("", 'decision_wake = "answer"')
+        self.assertEqual((c.decision_wake, c.agents[0].decision_wake), ("any", "answer"))
+        # [runner] decision_wake is no longer an option: the runner value stays "any"; the lane's applies
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            c = self.read('decision_wake = "answer"', 'decision_wake = "any"')
+        self.assertEqual((c.decision_wake, c.agents[0].decision_wake), ("any", "any"))
+        self.assertIn("decision_wake is no longer an option", "\n".join(logs.output))
 
     def test_bad_values_are_refused(self):
-        for runner_extra, agent_extra in (('decision_wake = "mentions"', ""), ('decision_wake = true', ""),
-                                          ('decision_wake = ""', ""), ("", 'decision_wake = "all"'),
-                                          ("", "decision_wake = false"), ("", "decision_wake = 0"),
-                                          ("", "decision_wake = []")):
-            with self.subTest((runner_extra, agent_extra)), self.assertRaises(ConfigError):
-                self.read(runner_extra, agent_extra)
+        for agent_extra in ('decision_wake = "all"', "decision_wake = false", "decision_wake = 0",
+                            "decision_wake = []", 'decision_wake = "mentions"', "decision_wake = true"):
+            with self.subTest(agent_extra), self.assertRaises(ConfigError):
+                self.read("", agent_extra)
+        for runner_extra in ('decision_wake = "mentions"', 'decision_wake = true', 'decision_wake = ""'):
+            with self.subTest(runner_extra), self.assertLogs("mesh_runner", "WARNING"):
+                self.assertEqual(self.read(runner_extra).decision_wake, "any")
 
 
 if __name__ == "__main__":

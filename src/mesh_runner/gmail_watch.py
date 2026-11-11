@@ -466,6 +466,41 @@ def tick(store, reader, reg_id: str, now_ms: int, interval_s: float = 120.0, jit
     return out
 
 
+def scan(store, reader, mesh, resume_agent: str, interval_s: float, busy: set, on_alert, label: str = "") -> None:
+    """One pass over the active registrations one lane resumes: each due one is read once (``tick``), then the
+    pending comments are delivered. The same pass runs inside the lane's tick (gmail in the runner process) or
+    in ``mesh-runner service gmail`` (gmail as a process); the lane then only reads the wake rows this writes.
+    ``busy`` holds the registrations being read, so one is never read twice at a time; ``on_alert(reg_id,
+    error_class)`` hears a registration that has failed ALERT_AFTER times in a row. Nothing here raises."""
+    import logging
+    import time
+    log = logging.getLogger("mesh_runner")
+    now_ms = int(time.time() * 1000)
+    try:
+        regs = registrations_of(store, resume_agent)
+    except Exception as e:                  # noqa: BLE001
+        log.warning("%s: gmail scan failed: %s", label, type(e).__name__)
+        return
+    for r in regs:
+        if r["state"] != "active" or r["next_check_at"] > now_ms or r["id"] in busy:
+            continue
+        busy.add(r["id"])
+        try:
+            t = tick(store, reader, r["id"], now_ms, interval_s)
+            if t.alert:
+                log.error("%s: gmail observation %s unavailable (%s) after %d consecutive failures; baseline kept, "
+                          "no wake, no turn", label, r["id"], t.alert, ALERT_AFTER)
+                on_alert(r["id"], t.alert)
+        except Exception as e:             # noqa: BLE001
+            log.warning("%s: gmail tick failed: %s", label, type(e).__name__)
+        finally:
+            busy.discard(r["id"])
+    try:
+        deliver_comments(store, mesh, resume_agent)
+    except Exception as e:                  # noqa: BLE001
+        log.warning("%s: gmail comment delivery failed: %s", label, type(e).__name__)
+
+
 class _Lost(Exception):
     """The CAS was lost; nothing is written."""
 

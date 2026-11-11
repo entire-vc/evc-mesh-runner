@@ -2,7 +2,7 @@
 once the later same-cwd rollouts are proven to belong to other attempts.
 
 Real SQLite rows, real journals, stderr and rollouts on disk. The runner object is the real method bound to a
-minimal host (state dir, agent name, store, tmux handle, emitter): no internal mocks."""
+minimal host (state dir, agent name, store and its state machine, tmux handle, emitter): no internal mocks."""
 import hashlib
 import json
 import os
@@ -12,7 +12,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from mesh_runner import interactive
+from mesh_runner import interactive, lifecycle
 from mesh_runner.runner import AgentRunner
 from mesh_runner.store import Store
 
@@ -39,7 +39,8 @@ class RecoverOtherSessions(unittest.TestCase):
         self.events = []
         self.host = types.SimpleNamespace(
             cfg=types.SimpleNamespace(state_dir=self.state), agent=types.SimpleNamespace(name="howard"),
-            store=self.store, _tmux=object(), _turn_over=lambda a: True,
+            store=self.store, life=lifecycle.AttemptStateMachine(self.store), _tmux=object(),
+            _turn_over=lambda a: True,
             emit=lambda kind, a: self.events.append(kind))
         self.row = self.legacy_row()
 

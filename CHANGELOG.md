@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.2.21 — 2026-11-11
+
+- Add chat_workspace = "lane" so chat turns use the lane's configured tools without acquiring a worktree. Thread-scoped Mesh credentials remain enforced; the default is "none".
+
+## 0.2.20 — 2026-11-11
+
+- Keep suspended slots aside while a pool can grow. Answer desks use the lane's configured tools; metadata-only recipients remain confined.
+
+## 0.2.19 — 2026-11-11
+
+- Recreate a returning card's pruned preferred slot at its previous path while the pool can grow.
+
+## 0.2.18 — 2026-11-11
+
+- Add optional cardless_question_lanes and an answer desk for same-workspace decision requests, with request-card fallback.
+
+## 0.2.17 — 2026-11-11
+
+- Keep a recently departed open card's preferred slots aside while a pool can grow.
+
+## 0.2.16 — 2026-11-11
+
+- Retire 61 default-only runner configuration keys with explicit warnings for ignored values. Document the remaining options.
+
+## 0.2.15 — 2026-11-11
+
+- Reserve preferred slots only for recently departed open cards.
+
+## 0.2.14 — 2026-11-11
+
+- Prefer free slots that are not named by recent ownership-loss notes.
+
+## 0.2.13 — 2026-11-11
+
+- Prefer a returning card's previous working-copy paths when restoring its session.
+
+## 0.2.12 — 2026-11-11
+
+- Route attempt-state writes through AttemptStateMachine while retaining transition validation.
+
+## 0.2.11 — 2026-11-11
+
+- Treat positive remaining-usage notices as warnings instead of terminal limit banners.
+
+## 0.2.10 — 2026-11-11
+
+- Recover refused interactive turns only from exact bound prompt and typed-error evidence.
+
+## 0.2.9 — 2026-11-11
+
+- Resume a reopened decision request in the addressee's kept session when its harness, profile and working copies still match.
+
+## 0.2.8 — 2026-11-11
+
+- Support separate supervised chat, editor and Gmail processes; improve chat attachment refresh, token-based pause migration and shared chat identity creation.
+
+## 0.2.7 — 2026-11-11
+
+- Add guarded operator resolution for unknown attempts when prompt-delivery evidence cannot be recovered, without replaying the pending prompt.
+
 ## Unreleased
 
 ## 0.2.6 — 2026-11-11

@@ -4,8 +4,9 @@
 "candidates": [{id, priority, created_at, version, workspace_id, project_id}]}`` in the runner's
 own order, and answers ``{"version": 1, "order": [ids], ...}``. Only ``order`` is used, and only
 when it is an exact permutation of the input ids. Anything else (exit != 0, timeout, garbage,
-another version, a missing/extra/repeated id) means the runner's own order. Titles, bodies and
-labels never leave the runner. It never raises.
+another version, a missing/extra/repeated id) means the runner's own order. A valid optional
+``fair_ids`` list identifies fairness positions in the accepted order. Titles, bodies and labels
+never leave the runner. It never raises.
 """
 from __future__ import annotations
 
@@ -89,6 +90,10 @@ def run_helper(argv: list[str], body: bytes, timeout: float) -> str:
 
 def parse_reply(text: str, ids: list[str]) -> list[str]:
     """The ``order`` of a v1 reply; ValueError when it is not an exact permutation of ``ids``."""
+    return _parse_reply(text, ids)[0]
+
+
+def _parse_reply(text: str, ids: list[str]) -> tuple[list[str], frozenset[str] | None]:
     try:
         reply = json.loads(text)
     except ValueError:
@@ -100,19 +105,26 @@ def parse_reply(text: str, ids: list[str]) -> list[str]:
         raise ValueError("order is not a list of ids")
     if len(order) != len(ids) or sorted(order) != sorted(ids):
         raise ValueError("order is not a permutation of the input")
-    return order
+    fair = reply.get("fair_ids")
+    if isinstance(fair, list) and all(isinstance(i, str) for i in fair):
+        fair_ids = frozenset(fair)
+        if len(fair_ids) == len(fair) and fair_ids.issubset(ids):
+            return order, fair_ids
+    return order, None
 
 
 class QueueOrder:
     def __init__(self, agent: str, argv: list[str], timeout: float = 3.0, cache_seconds: float = 60.0):
         self.agent, self.argv = agent, list(argv)
         self.timeout, self.cache_seconds = timeout, cache_seconds
-        self._cache: tuple | None = None          # (key, monotonic time, order)
+        self._cache: tuple | None = None          # (key, monotonic time, order, fairness ids)
+        self.applied_fair_ids: frozenset[str] | None = None
         self._failing = False
         self._last_first = ""
 
     def apply(self, tasks: list[dict]) -> list[dict]:
         """``tasks`` in the runner's own order -> the external order, or ``tasks`` itself."""
+        self.applied_fair_ids = None
         try:
             return self._apply(tasks)
         except Exception as e:                    # never out of candidates()
@@ -125,20 +137,19 @@ class QueueOrder:
             return tasks
         key = (self.agent, tuple(ids), tuple((t.get("priority"), t.get("version")) for t in tasks))
         now = time.monotonic()
-        order = None
         if self._cache and self._cache[0] == key and now - self._cache[1] < self.cache_seconds:
-            order = self._cache[2]
+            order, fair_ids = self._cache[2:]
         else:
             body = json.dumps({"version": VERSION, "agent": self.agent,
                                "candidates": [{f: t.get(f) for f in FIELDS} for t in tasks]},
                               separators=(",", ":"), ensure_ascii=False).encode()
             try:
-                order = parse_reply(run_helper(self.argv, body, self.timeout), ids)
+                order, fair_ids = _parse_reply(run_helper(self.argv, body, self.timeout), ids)
             except (RuntimeError, ValueError) as e:
                 self._fail(str(e))
-                self._cache = (key, now, None)    # a failing helper is not asked again every tick
+                self._cache = (key, now, None, None)  # don't ask a failing helper every tick
                 return tasks
-            self._cache = (key, now, order)
+            self._cache = (key, now, order, fair_ids)
             if self._failing:
                 self._failing = False
                 log.info("queue order: %s helper recovered", self.agent)
@@ -153,6 +164,7 @@ class QueueOrder:
                 log.info("queue order: %s first #%s (own #%s)", self.agent, order[0][:8], ids[0][:8])
         else:
             self._last_first = ""
+        self.applied_fair_ids = fair_ids
         return result
 
     def _fail(self, reason: str) -> None:

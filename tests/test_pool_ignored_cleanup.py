@@ -205,9 +205,13 @@ class IgnoredCleanup(unittest.TestCase):
     def test_cleanup_is_off_by_default(self):
         from mesh_runner.config import RunnerConfig as Config
         self.assertFalse(Config.__dataclass_fields__['ignored_cleanup'].default)
-        import inspect
+        # no longer a [runner] option: the loader never reads it, so a file cannot turn cleanup on
         from mesh_runner import config
-        self.assertIn('"ignored_cleanup", False) is True', inspect.getsource(config))
+        self.assertIn('ignored_cleanup', config.RETIRED_RUNNER_OPTIONS)
+        cfg = self.root / 'on.toml'
+        cfg.write_text('[runner]\nmesh_url = "x"\nstate_dir = "%s"\nignored_cleanup = true\n' % self.root)
+        with self.assertLogs('mesh_runner', 'WARNING'):
+            self.assertFalse(config.load(cfg).ignored_cleanup)
 
     def test_slow_pools_share_one_deadline_and_never_block_the_loop(self):
         from mesh_runner.runner import Runner
@@ -443,7 +447,7 @@ class IgnoredCleanup(unittest.TestCase):
 
     def test_negative_idle_threshold_is_rejected_everywhere_and_prunes_nothing(self):
         from mesh_runner import cli
-        from mesh_runner.config import ConfigError, load
+        from mesh_runner.config import ConfigError, _idle_hours, load
         slot = self.slot('a')                                # released just now: must never qualify
         for bad in (-1, -0.001, float('nan'), float('inf')):
             with self.assertRaises(ValueError):
@@ -452,14 +456,16 @@ class IgnoredCleanup(unittest.TestCase):
         with self.assertRaises(SystemExit):                  # argparse rejects the CLI override
             with patch('sys.stderr'):
                 cli.main(['pool', '--config', 'x.toml', '--prune-ignored', '--ignored-idle-hours', '-1'])
-        for bad in ('-1', '-0.5', 'nan', 'inf', '"soon"'):
+        for bad in (-1, -0.001, float('nan'), float('inf')):
+            with self.assertRaises(ConfigError):
+                _idle_hours(bad)
+        # ignored_cleanup_idle_hours is no longer a [runner] option: a file keeps the fixed 24 hours
+        for value in ('-1', '-0.5', 'nan', 'inf', '"soon"', '0'):
             cfg = self.root / 'bad.toml'
             cfg.write_text('[runner]\nmesh_url = "x"\nstate_dir = "%s"\nignored_cleanup_idle_hours = %s\n'
-                           % (self.root, bad))
-            with self.assertRaises(ConfigError):
-                load(cfg)
-        cfg.write_text('[runner]\nmesh_url = "x"\nstate_dir = "%s"\nignored_cleanup_idle_hours = 0\n' % self.root)
-        self.assertEqual(load(cfg).ignored_cleanup_idle_hours, 0.0)
+                           % (self.root, value))
+            with self.subTest(value=value), self.assertLogs('mesh_runner', 'WARNING'):
+                self.assertEqual(load(cfg).ignored_cleanup_idle_hours, 24.0)
 
     def test_non_numeric_idle_threshold_is_rejected(self):
         from mesh_runner.config import ConfigError, _idle_hours, load
@@ -470,12 +476,12 @@ class IgnoredCleanup(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 _idle_hours(bad)
         self.assertTrue((slot / 'node_modules' / 'blob').exists())
-        for raw in ('"1"', 'true'):
+        for raw in ('"1"', 'true'):                         # retired key: ignored, not refused
             cfg = self.root / 'bad2.toml'
             cfg.write_text('[runner]\nmesh_url = "x"\nstate_dir = "%s"\nignored_cleanup_idle_hours = %s\n'
                            % (self.root, raw))
-            with self.assertRaises(ConfigError):
-                load(cfg)
+            with self.subTest(raw=raw), self.assertLogs('mesh_runner', 'WARNING'):
+                self.assertEqual(load(cfg).ignored_cleanup_idle_hours, 24.0)
         self.assertEqual(_idle_hours(2), 2.0)
 
     def test_symlinked_pool_root_is_refused(self):

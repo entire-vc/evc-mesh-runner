@@ -146,6 +146,7 @@ class RunnerPause(Bench):
         t1 = task(1)
         (self.cfg.state_dir / "pause").mkdir(parents=True, exist_ok=True)
         (self.cfg.state_dir / "pause" / "builder").touch()
+        op_pause.migrate_legacy(self.cfg.state_dir, ["builder"])       # what the runner does at start
         op_pause.take(self.cfg.state_dir, "builder", "op-1")
         r = self._start(FakeMesh([t1], max_concurrent=1))
         self.assertTrue(r.paused())

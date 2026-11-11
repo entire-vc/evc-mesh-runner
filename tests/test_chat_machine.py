@@ -111,6 +111,61 @@ class Machine(unittest.TestCase):
         text = build_prompt(turn, files)
         self.assertIn("could not be downloaded", text)
 
+    def test_attachment_without_a_link_asks_for_a_fresh_one(self):
+        # Mesh omits download_url when it cannot presign; the refresh used to be tried only on OSError,
+        # so such a file went to the model as "could not be downloaded" without a second try
+        asked = []
+
+        class Client:
+            def download_url(self, turn_id, attachment_id):
+                asked.append((turn_id, attachment_id))
+                return {"download_url": "https://s3.test/fresh"}
+        turn = {"turn_id": "t", "thread_id": "th", "settings": {}, "message": {"body": "see", "attachments": [
+            {"attachment_id": "a1", "file_name": "doc.pdf"}]}}
+        got = []
+        files = fetch_attachments(Client(), turn, self.state, lambda url, dest, limit: (got.append(url), dest.write_text("x")))
+        self.assertEqual(asked, [("t", "a1")])
+        self.assertEqual(got, ["https://s3.test/fresh"])
+        self.assertEqual(files[0][1].read_text(), "x")
+        self.assertIn(str(files[0][1]), build_prompt(turn, files))
+
+    def test_a_failed_attachment_is_logged_by_class_never_by_link(self):
+        import urllib.error
+        from mesh_runner.chat_protocol import ChatError
+
+        class Client:
+            def download_url(self, turn_id, attachment_id):
+                raise ChatError(404, "not_found", "no route")
+
+        def refused(url, dest, limit):
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        turn = {"turn_id": "turn-123456789", "thread_id": "th", "settings": {}, "message": {"attachments": [
+            {"attachment_id": "a1", "file_name": "p.png", "download_url": "https://s3.test/x?X-Amz-Signature=SECRET"}]}}
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            files = fetch_attachments(Client(), turn, self.state, refused)
+        self.assertIsNone(files[0][1])
+        line = "\n".join(logs.output)
+        self.assertIn("refresh 404 not_found (first try: storage http 403)", line)
+        self.assertNotIn("SECRET", line)
+        self.assertNotIn("s3.test", line)
+
+    def test_an_oversized_attachment_is_not_fetched_again(self):
+        asked = []
+
+        class Client:
+            def download_url(self, *a):
+                asked.append(a)
+                return {"download_url": "https://s3.test/again"}
+
+        from mesh_runner.chat_machine import TooLarge
+
+        def big(url, dest, limit):
+            raise TooLarge("attachment over the size limit")
+        turn = {"turn_id": "t", "thread_id": "th", "settings": {}, "message": {"attachments": [
+            {"attachment_id": "a1", "file_name": "big.bin", "download_url": "https://s3.test/big"}]}}
+        self.assertIsNone(fetch_attachments(Client(), turn, self.state, big)[0][1])
+        self.assertEqual(asked, [])
+
     def test_prompt_with_history_keeps_order_and_budget(self):
         hist = [{"role": "user", "body": "q1"}, {"role": "agent", "body": "a1"}]
         text = build_prompt({"message": {"body": "q2"}, "requested_by": {"display_name": "Ann"}}, [], hist)

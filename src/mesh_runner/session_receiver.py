@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import meta_delivery as md
+from . import cmux_transport as ct
 from . import iterm_transport as it
 from . import qa_assignment as qa
 from .interactive import Tmux
@@ -46,10 +47,14 @@ LABEL = "vc.entire.mesh-session-receiver"
 SECTION = "session_receiver"
 KEYS = ("enabled", "mesh_url", "ledger_root", "harness", "claude_config_dir", "runner_credential_file", "tmux_binary",
         "tmux_session", "tmux_window", "tmux_window_id", "tmux_server_pid", "producer_pid", "producer_started",
-        "transport", "iterm_session_id", "iterm_tty")
-TRANSPORTS = ("tmux", "iterm")                           # "tmux" is the default and the only one an old config can mean
+        "transport", "iterm_session_id", "iterm_tty", "cmux_workspace_id", "cmux_surface_id", "cmux_tty",
+        "cmux_binary", "cmux_socket")
+TRANSPORTS = ("tmux", "iterm", "cmux")                   # "tmux" is the default and the only one an old config can mean
 TMUX_KEYS = ("tmux_session", "tmux_window", "tmux_window_id", "tmux_server_pid")
 ITERM_KEYS = ("iterm_session_id", "iterm_tty")
+CMUX_KEYS = ("cmux_workspace_id", "cmux_surface_id", "cmux_tty")
+CMUX_CLIENT_KEYS = ("cmux_binary", "cmux_socket")        # how to reach cmux; not part of the binding
+TRANSPORT_KEYS = {"tmux": TMUX_KEYS, "iterm": ITERM_KEYS, "cmux": CMUX_KEYS}
 EXIT_REFUSED, EXIT_BUSY, EXIT_REVOKE_FAILED = 3, 4, 5
 PIN_FILE, LOCK_FILE = "ledger-identity.json", "consumer.lock"
 ADMISSION_FILE, REVOKED_FILE = "admission.json", "admission-revoked.json"   # this receiver's own server-side admission
@@ -287,10 +292,12 @@ class ReceiverConfig:
     claude_config_dir: str
     runner_credential_file: Path
     tmux_binary: str
-    pin: "ProducerPin | it.ITermPin"
+    pin: "ProducerPin | it.ITermPin | ct.CmuxPin"
     enabled: bool
     transport: str = "tmux"
     qa: "qa.QASettings | None" = None                      # [host_local_qa_assignment_v1]; None = OFF (default)
+    cmux_binary: str = ""                                  # transport cmux: the bundled CLI ("" = ct.DEFAULT_CLI)
+    cmux_socket: str = ""                                  # transport cmux: explicit socket path ("" = the CLI's default)
 
     @property
     def transport_sha(self) -> str | None:
@@ -300,6 +307,13 @@ class ReceiverConfig:
 def transport_digest(cfg: "ReceiverConfig") -> str | None:
     """None for tmux (the released ledger format). For iTerm: the whole terminal<->producer<->host<->runner binding, so a
     different terminal session, tty, producer, host or runner can never reuse this ledger or admission record."""
+    if cfg.transport == "cmux":
+        f, pin = cfg.settings.identity.fields, cfg.pin
+        return hashlib.sha256(json.dumps({"transport": "cmux", "workspace_id": pin.workspace_id.lower(),
+                                          "surface_id": pin.surface_id.lower(), "tty": pin.tty,
+                                          "producer_pid": pin.producer_pid, "producer_started": pin.producer_started,
+                                          "host_id": f["host_id"], "runner_id": f["runner_id"],
+                                          "session_id": f["session_id"]}, sort_keys=True).encode()).hexdigest()
     if cfg.transport != "iterm":
         return None
     f, pin = cfg.settings.identity.fields, cfg.pin
@@ -345,7 +359,10 @@ def load_config(path: str | Path, require_enabled: bool = True, allow_expired_qa
         transport = sec.get("transport", "tmux")
         if transport not in TRANSPORTS:
             raise Refusal("config_bad_transport")
-        mine, other = (ITERM_KEYS, TMUX_KEYS) if transport == "iterm" else (TMUX_KEYS, ITERM_KEYS)
+        mine = TRANSPORT_KEYS[transport]
+        other = [k for t, keys in TRANSPORT_KEYS.items() if t != transport for k in keys]
+        if transport != "cmux":
+            other += list(CMUX_CLIENT_KEYS)
         if any(sec.get(k) for k in other):
             raise Refusal("config_transport_mixed", ", ".join(k for k in other if sec.get(k)))
         missing = [k for k in ("mesh_url", "ledger_root", "harness", "runner_credential_file", *mine,
@@ -357,7 +374,12 @@ def load_config(path: str | Path, require_enabled: bool = True, allow_expired_qa
         if not " ".join(str(sec["producer_started"]).split()):
             raise Refusal("config_incomplete", "producer_started")
         started = " ".join(str(sec["producer_started"]).split())
-        if transport == "iterm":
+        if transport == "cmux":
+            pin = ct.CmuxPin(str(sec["cmux_workspace_id"]), str(sec["cmux_surface_id"]), str(sec["cmux_tty"]),
+                             int(sec["producer_pid"]), started)
+            if ct.valid_pin(pin):
+                raise Refusal("config_invalid", ct.valid_pin(pin))
+        elif transport == "iterm":
             pin = it.ITermPin(str(sec["iterm_session_id"]), str(sec["iterm_tty"]), int(sec["producer_pid"]), started)
             if it.valid_pin(pin):
                 raise Refusal("config_invalid", it.valid_pin(pin))
@@ -377,7 +399,8 @@ def load_config(path: str | Path, require_enabled: bool = True, allow_expired_qa
         raise Refusal(e.code, e.detail) from None
     return ReceiverConfig(settings, str(sec["mesh_url"]), Path(str(sec["ledger_root"])).expanduser(), sec["harness"],
                           str(sec.get("claude_config_dir") or ""), Path(str(sec["runner_credential_file"])).expanduser(),
-                          str(sec.get("tmux_binary") or "tmux"), pin, enabled, transport, qa_settings)
+                          str(sec.get("tmux_binary") or "tmux"), pin, enabled, transport, qa_settings,
+                          str(sec.get("cmux_binary") or ""), str(sec.get("cmux_socket") or ""))
 
 
 def read_runner_token(path: Path, runner_id: str) -> str:
@@ -410,12 +433,22 @@ def _known(cfg: ReceiverConfig):
 
 
 def build_session(cfg: ReceiverConfig, tmux: Tmux | None = None, known=None, started=process_started, info=None):
-    """The transport of the config. ``tmux`` carries the ``ITermAPI`` for transport iterm (the one transport client)."""
+    """The transport of the config. ``tmux`` carries the ``ITermAPI``/``CmuxAPI`` for transport iterm/cmux (the one
+    transport client)."""
+    if cfg.transport == "cmux":
+        return ct.CmuxSession(tmux or transport_client(cfg), cfg.pin, cfg.settings.identity.fields["session_id"],
+                              known or _known(cfg), info or it.process_info)
     if cfg.transport == "iterm":
         return it.ITermSession(tmux or it.ITermAPI(), cfg.pin, cfg.settings.identity.fields["session_id"],
                                known or _known(cfg), info or it.process_info)
     return PinnedSession(tmux or Tmux(cfg.tmux_binary), cfg.pin, cfg.ledger_root / "tmp",
                          cfg.settings.identity.fields["session_id"], known or _known(cfg), started)
+
+
+def transport_client(cfg: ReceiverConfig):
+    if cfg.transport == "cmux":
+        return ct.CmuxAPI(cfg.cmux_binary, cfg.cmux_socket)
+    return it.ITermAPI() if cfg.transport == "iterm" else Tmux(cfg.tmux_binary)
 
 
 def preflight(cfg: ReceiverConfig, tmux: Tmux | None = None, known=None, started=None, info=None,
@@ -425,13 +458,14 @@ def preflight(cfg: ReceiverConfig, tmux: Tmux | None = None, known=None, started
     started = started or process_started
     ident = cfg.settings.identity
     iterm = cfg.transport == "iterm"
-    tmux = tmux or (it.ITermAPI() if iterm else Tmux(cfg.tmux_binary))
+    tmux = tmux or transport_client(cfg)
 
     def add(name, reason):
         out.append((name, reason or "ok"))
-    if iterm:
+    if iterm or cfg.transport == "cmux":
         add("host_binding", "" if it.host_matches(ident.fields["hostname"], local_host) else "host_mismatch")
-        add("terminal_binding", it.check_iterm(tmux, cfg.pin, info or it.process_info))
+        check = it.check_iterm if iterm else ct.check_cmux
+        add("terminal_binding", check(tmux, cfg.pin, info or it.process_info))
     else:
         add("producer_pin", check_producer(tmux, cfg.pin, started))
     try:
@@ -455,7 +489,7 @@ def run(cfg: ReceiverConfig, stop: threading.Event, tmux: Tmux | None = None, kn
         opener=None, adopt_existing_ledger: bool = False, info=None, local_host: str | None = None, qa_opener=None, argv_of=None) -> int:
     """Gate, then serve. Every gate is checked BEFORE registration, so a refused start leaves no admission side effect."""
     ident = cfg.settings.identity
-    tmux = tmux or (it.ITermAPI() if cfg.transport == "iterm" else Tmux(cfg.tmux_binary))
+    tmux = tmux or transport_client(cfg)
     lock = ConsumerLock(cfg.ledger_root)
     if not lock.acquire("session-receiver"):
         log.error("session receiver: another consumer owns %s", cfg.ledger_root)

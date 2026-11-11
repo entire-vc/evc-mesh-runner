@@ -3,6 +3,9 @@
 One native, bounded event wait: the source card sleeps until the **first new provider-accepted,
 correlated Telegram text receipt** appears in journals an operator registered. Off by default.
 
+`receipt_wait_v1` is a retired `[runner]` option fixed at `false` (README "Retired options"): a
+config file can no longer turn this wait on, and a file that still sets the key loads with a warning.
+
 ## Declaration
 
 ```
@@ -59,5 +62,5 @@ task UUID is the delivered ask; it need not equal the source card. A provider me
 
 ## Rollback
 
-`disarm`, then set `receipt_wait_v1 = false` (or route to the previous catalog). Receipts, baseline
+`disarm` (or route to the previous catalog). Receipts, baseline
 and dedup marks stay in the store; nothing is written to the journals.

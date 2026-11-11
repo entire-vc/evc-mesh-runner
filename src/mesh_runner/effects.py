@@ -42,7 +42,7 @@ import re
 import time
 import uuid
 
-from . import card_wait_reconcile, outcome
+from . import answer_desk, card_wait_reconcile, outcome
 from .mesh import MeshClient, MeshError
 from .blocking_path import BlockingPath, Budget
 
@@ -364,6 +364,7 @@ class Effects:
         self._blocking_path = BlockingPath(mesh, store, lane)
         self._decision_metadata_recipients = frozenset(decision_metadata_recipients)
         self.agent_id = ""                    # set by the runner once it knows who it is
+        self.desk = None                      # answer_desk.AnswerDesk: questions its lanes answer without a card
         self._published: dict[str, tuple[dict, dt.datetime]] = {}
         self._failed_put: dict[str, dt.datetime] = {}
         self._agents: dict[str, dict] = {}
@@ -606,6 +607,8 @@ class Effects:
         if kind == "decision" and wait.get("handle"):
             if wait.get("decision_request_id") and not self._typed_question(a, wait):
                 return                      # the question could not be read: adopt() retries
+            if answer_desk.defer(self.desk, self, a, task, wait, me):
+                return                      # the addressee's answer desk takes it; adopt() files the card if not
             # ``ask_agent`` records the question on Mesh, but its comment wakes nobody and no queue
             # shows the addressee an open request: the request card is still what starts the addressee
             self._file_decision(a, task, wait, me)
@@ -649,6 +652,8 @@ class Effects:
         or mesh_effects=false): its addressee was never asked and nothing is scheduled.
         True when it did so."""
         if not self.enabled or (wait.get("fx") and not self._typed_ask_unfiled(wait)):
+            return False
+        if answer_desk.waiting(self.desk, self, a, wait):
             return False
         self.on_wait(a, task, wait, me)
         return True

@@ -69,6 +69,20 @@ class Driver(unittest.TestCase):
             list(d.run({"turn_id": "turn-12345678"}, lambda: False))
         self.assertNotIn("SECRET-SCREEN", cm.output[0])
 
+    def test_expired_login_has_a_safe_actionable_reason(self):
+        for message, expected in [
+            ("Login expired · Please run /login", "authentication_failed: Login expired; run /login"),
+            ("Login expired · Please run /login SECRET-SCREEN", "kind=unclassified"),
+        ]:
+            with self.subTest(message=message):
+                failed = {"type": "result", "is_error": True, "result": message}
+                d = self.delivery("import sys\nsys.stdin.read()\nprint(%r)" % json.dumps(failed))
+                with self.assertLogs("mesh_runner.chat_delivery", level="WARNING") as cm:
+                    events = list(d.run({"turn_id": "turn-12345678"}, lambda: False))
+                self.assertEqual(events[-1]["code"], "harness_error")
+                self.assertIn(expected, cm.output[0])
+                self.assertNotIn("SECRET-SCREEN", cm.output[0])
+
     def test_failed_turn_log_names_the_driver_error_kind(self):
         failed = {"type": "turn.failed", "error": {"message": "interactive session exited at start: SECRET-SCREEN"}}
         d = self.delivery("import sys\nsys.stdin.read()\nprint(%r)" % json.dumps(failed))

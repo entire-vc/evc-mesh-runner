@@ -509,15 +509,13 @@ class DeadSlotConfig(unittest.TestCase):
             p.write_text(f'[runner]\nmesh_url = "http://mesh"\n{extra}\n')
             return config_mod.load(p)
 
-    def test_default_and_override(self):
+    def test_default_and_a_retired_key_is_ignored(self):
+        # dead_slot_hours is no longer a [runner] option: the age rule stays at 24 hours whatever a file says
         self.assertEqual(self.load("").dead_slot_hours, 24.0)
-        self.assertEqual(self.load("dead_slot_hours = 6").dead_slot_hours, 6.0)
-        self.assertEqual(self.load("dead_slot_hours = 0").dead_slot_hours, 0.0)
-
-    def test_negative_or_nonfinite_is_refused(self):
-        for bad in ("-1", "nan", "inf"):
-            with self.assertRaises(config_mod.ConfigError):
-                self.load(f"dead_slot_hours = {bad}")
+        for value in ("6", "0", "-1", "nan", "inf"):
+            with self.subTest(value=value), self.assertLogs("mesh_runner", "WARNING") as logs:
+                self.assertEqual(self.load(f"dead_slot_hours = {value}").dead_slot_hours, 24.0)
+            self.assertIn("dead_slot_hours is no longer an option", "\n".join(logs.output))
 
 
 if __name__ == "__main__":

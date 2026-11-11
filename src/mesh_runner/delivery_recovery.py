@@ -440,6 +440,10 @@ def recover_codex(d: Driver, journal: dict, native: list[dict], base: int, sid: 
     # delivery, and a rollout task end alone does not identify its user prompt.
     notes = [e for e in native[base:] if e.get('type') == 'agent-turn-complete'
              and e.get('thread-id') == sid]
+    if not any(e.get('type') == 'agent-turn-complete' for e in native[base:]):
+        failed = recover_codex_failed_turn(d, journal, native, sid, intent)
+        if failed is not None:
+            return failed
     ours = [e for e in notes if e.get('turn-id') and isinstance(e.get('input-messages'), list)
             and e['input-messages'] and isinstance(e['input-messages'][-1], str)
             and _exact(e['input-messages'][-1]) == _exact(intent['prompt'])]
@@ -479,5 +483,101 @@ def recover_codex(d: Driver, journal: dict, native: list[dict], base: int, sid: 
     d.emit_codex({'event': end, 'totals': journal.get('totals') or {}})
     d.emit({'type': 'mesh_runner.prompt_ack', 'token': intent['token'], 'sha256': intent['sha256'],
             'recovered_from': 'codex.session-turn-notify-rollout'})
+    persist_result(d, intent)
+    return 'completed'
+
+
+def _codex_user_text(line: bytes) -> str | None:
+    """Extract a text-only user message. Invalid user content rejects the whole proof."""
+    if b'"response_item"' not in line or b'"user"' not in line:
+        return None
+    rec = json.loads(line)
+    item = rec.get('payload') if isinstance(rec, dict) and rec.get('type') == 'response_item' else None
+    if not isinstance(item, dict) or item.get('type') != 'message' or item.get('role') != 'user':
+        return None
+    content = item.get('content')
+    if not isinstance(content, list) or not content or not all(
+            isinstance(part, dict) and set(part) == {'type', 'text'}
+            and part['type'] in ('input_text', 'text') and isinstance(part['text'], str)
+            for part in content):
+        raise ValueError('user message is not exclusively typed text')
+    return ''.join(part['text'] for part in content)
+
+
+def _typed_codex_error(error) -> bool:
+    """Codex's typed task error: exactly ``message`` and ``codex_error_info``, both non-empty strings.
+    Any other shape (a bare string, a dict missing a field or carrying others) is not a typed refusal."""
+    return (isinstance(error, dict) and set(error) == {'message', 'codex_error_info'}
+            and all(isinstance(error[k], str) and error[k].strip() for k in error))
+
+
+def recover_codex_failed_turn(d: Driver, journal: dict, native: list[dict], sid: str, intent: dict) -> str | None:
+    """Codex calls its notify only for a task that finished with a message. A turn the provider refused
+    (2026-11-10: HTTP 400 for every turn of an outdated CLI) ends within a second with a typed
+    ``task_complete.error`` and no notify, so the live driver may never see it busy and the send stays
+    unproven. The bound rollout is then the native acceptance record: after the journal's verified cursor
+    exactly one task, holding exactly one user message equal to this prompt, ended with a typed error and
+    no model output. Anything else (no such record, a second task or prompt, model output, an abort, an
+    unreadable line) returns None and the caller keeps the notify rule."""
+    cursor, rollout = journal.get('rollout_cursor'), journal.get('rollout')
+    if type(cursor) is not int or cursor < 0 or not rollout:
+        return None
+    try:
+        raw = Path(rollout).read_bytes()
+    except OSError:
+        return None                      # a gone or unreadable rollout proves nothing
+    if len(raw) < cursor or hashlib.sha256(raw[:cursor]).hexdigest() != journal.get('rollout_prefix'):
+        return None
+    starts, users, ends = [], [], []
+    try:
+        for index, line in enumerate(raw[cursor:].splitlines()):
+            if not line.strip():
+                continue
+            if d.codex_turn_aborted(line) is not None or d.codex_reply(line):
+                return None
+            started = d.codex_task_start(line)
+            if started is not None:
+                starts.append((index, started))
+                continue
+            text = _codex_user_text(line)
+            if text is not None:
+                users.append((index, text))
+                continue
+            if b'"task_complete"' in line:
+                payload = json.loads(line).get('payload') or {}
+                ends.append((index, payload, d.codex_task_end(line)))
+    except (ValueError, AttributeError):
+        return None
+    if len(starts) != 1 or len(users) != 1 or len(ends) != 1:
+        return None
+    (s_at, turn), (u_at, text), (e_at, payload, end) = starts[0], users[0], ends[0]
+    if (not turn or not s_at < u_at < e_at or _exact(text) != _exact(intent['prompt'])
+            or end is None or not end['error'] or end['message'] or not _typed_codex_error(payload.get('error'))
+            or payload.get('turn_id') != turn
+            or (journal.get('turn_id') and journal['turn_id'] != turn)):
+        return None
+    d.meta = dict(journal.get('meta') or {})
+    d.prompt, d.turn_id = intent['prompt'], turn
+    d.rollout, d.scan_from = rollout, cursor
+    if d.rollout_thread() != sid:
+        return None
+    if d.window_state() == 'alive':
+        if d.busy():
+            return 'native-running-or-incomplete'
+        time.sleep(d.t['settle'])
+        try:
+            changed = d.busy() or Path(rollout).read_bytes() != raw
+        except OSError:
+            return 'native-evidence-changing'
+        if changed:
+            return 'native-evidence-changing'
+    if d.read_events() != native:
+        return 'native-evidence-changing'
+    why = 'no model output; ' + end['error']
+    d.emit_codex({'event': {'type': 'agent-turn-complete', 'thread-id': sid, 'turn-id': turn,
+                            'last-assistant-message': '', 'no-reply': why},
+                  'totals': journal.get('totals') or {}})
+    d.emit({'type': 'mesh_runner.prompt_ack', 'token': intent['token'], 'sha256': intent['sha256'],
+            'recovered_from': 'codex.session-rollout-failed-turn'})
     persist_result(d, intent)
     return 'completed'

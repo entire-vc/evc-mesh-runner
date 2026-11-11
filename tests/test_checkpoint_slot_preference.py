@@ -63,10 +63,10 @@ class RestoreSlotPreference(unittest.TestCase):
         # the suspended attempt's slot is the FIRST free one by path: new work still takes the later one
         pool = WorkspacePool(self.store, self.root / 'pool',
                              [RepoSpec('app', self.base, max_slots=3)], owner='agent')
+        self.pool.restore('attempt')                          # ``source`` is busy again
         early = pool.lease('early', 'app')
         self.assertEqual(early, self.first)
-        pool.lease('busy', 'app')                             # takes ``source``: the only free slot
-        third = pool.lease('third', 'app')                    # a new slot
+        third = pool.lease('third', 'app')                    # a new slot: the pool is at its maximum now
         (early / 'README').write_text('early work')
         pool.suspend('early', {'session_id': 'early-session'}, writer_stopped=True)
         pool.release('third')
@@ -75,6 +75,124 @@ class RestoreSlotPreference(unittest.TestCase):
         paths, _ = pool.restore('early')
         self.assertEqual(paths, [str(early)])
         self.assertEqual((early / 'README').read_text(), 'early work')
+
+    def test_new_work_leaves_the_slot_of_a_card_that_may_come_back(self):
+        """A card left the lane and its attempt ended: the ownership-loss note names its slot. Other work
+        takes the plain free slot first, so the card finds its paths (and its session) when it returns."""
+        import json
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=3)], owner='agent')
+        self.pool.restore('attempt')                          # the suspended attempt is back on ``source``
+        left = pool.lease('left', 'app')                      # the earliest free slot: ``first``
+        self.assertEqual(left, self.first)
+        third = pool.lease('third', 'app')                    # a new slot
+        pool.release('left'); pool.release('third')
+        self.store.mark('agent', 'task-left', 'ownership_loss', json.dumps({"attempt": "left", "observed_status": "review", "workspaces": [str(left)]}))
+        self.assertEqual(sorted(r['path'] for r in pool._rows('app', 'free')), sorted([str(left), str(third)]))
+        self.assertEqual(pool.lease('newcomer', 'app'), third)
+        # the returning card asks for its slot and gets it
+        self.assertEqual(pool.lease('left-again', 'app', preferred_path=str(left)), left)
+
+    def test_a_pool_that_may_grow_makes_a_new_slot_instead_of_taking_one_kept_aside(self):
+        """Below the maximum the slot of a card that may come back is not taken at all: the newcomer gets a
+        new slot, and the returning card still finds its own."""
+        import json
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=4)], owner='agent')
+        self.pool.restore('attempt')                          # ``source`` is busy again
+        left = pool.lease('left', 'app')                      # ``first``
+        pool.release('left')
+        self.store.mark('agent', 'task-left', 'ownership_loss', json.dumps({"attempt": "left", "observed_status": "review", "workspaces": [str(left)]}))
+        self.assertEqual([r['path'] for r in pool._rows('app', 'free')], [str(left)])
+        new = pool.lease('newcomer', 'app')
+        self.assertNotIn(new, (left, self.source))
+        self.assertEqual(len(pool._rows('app')), 3)
+        self.assertEqual(pool.lease('left-again', 'app', preferred_path=str(left)), left)
+
+    def test_a_pool_that_may_grow_leaves_a_suspended_attempts_slot_too(self):
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=3)], owner='agent')
+        self.assertEqual(pool.lease('one', 'app'), self.first)       # the plain free slot
+        new = pool.lease('two', 'app')                               # not ``source``: a new slot
+        self.assertNotIn(new, (self.first, self.source))
+        self.assert_restore(self.source, pool)
+
+    def test_a_caller_that_names_a_suspended_attempts_slot_gets_it(self):
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=3)], owner='agent')
+        self.assertEqual(pool.lease('named', 'app', preferred_path=str(self.source)), self.source)
+
+    def test_at_the_maximum_a_kept_aside_slot_is_taken_as_before(self):
+        import json
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=2)], owner='agent')
+        self.pool.restore('attempt')
+        left = pool.lease('left', 'app')
+        pool.release('left')
+        self.store.mark('agent', 'task-left', 'ownership_loss', json.dumps({"attempt": "left", "observed_status": "review", "workspaces": [str(left)]}))
+        self.assertEqual(pool.lease('newcomer', 'app'), left)
+
+    def _prune(self, pool, path):
+        """What a slot pruner does to a free slot: the worktree and its inventory row go away."""
+        import subprocess
+        subprocess.run(['git', '-C', str(self.base), 'worktree', 'remove', '--force', str(path)], check=True)
+        self.store.db.execute("DELETE FROM slots WHERE path=? AND state='free'", (str(path),))
+        self.assertFalse(Path(path).exists())
+
+    def test_a_returning_card_gets_its_pruned_slot_back_at_the_same_path(self):
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=3)], owner='agent')
+        self.pool.restore('attempt')                          # ``source`` (slot-2) is busy again
+        third = pool.lease('left', 'app', preferred_path=None)
+        self.assertEqual(third, self.first)                   # slot-1
+        extra = pool.lease('other', 'app')                    # slot-3
+        pool.release('other')
+        self._prune(pool, extra)
+        # the card that held slot-3 comes back: slot-1 is busy, slot-3 is gone; it is made again in place
+        back = pool.lease('other-again', 'app', preferred_path=str(extra))
+        self.assertEqual(back, extra)
+        self.assertTrue((back / '.git').exists())
+        self.assertEqual(pool.leased_to('other-again'), [str(extra)])
+
+    def test_a_pruned_slot_is_remade_even_when_another_slot_is_free(self):
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=3)], owner='agent')
+        self.pool.restore('attempt')
+        extra = pool.lease('other', 'app')                    # slot-1 (free in setUp)
+        newer = pool.lease('newer', 'app')                    # slot-3
+        pool.release('other'); pool.release('newer')
+        self._prune(pool, newer)
+        self.assertEqual(pool.lease('newer-again', 'app', preferred_path=str(newer)), newer)
+        self.assertEqual([r['path'] for r in pool._rows('app', 'free')], [str(extra)])
+
+    def test_a_gone_path_outside_the_pool_or_at_the_maximum_is_ignored(self):
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=2)], owner='agent')
+        self.pool.restore('attempt')                          # slot-2 busy; the pool is at its maximum
+        self.assertEqual(pool.lease('a', 'app', preferred_path=str(self.first.parent / 'slot-9')), self.first)
+        pool.release('a')
+        roomy = WorkspacePool(self.store, self.root / 'pool',
+                              [RepoSpec('app', self.base, max_slots=4)], owner='agent')
+        for bad in (str(self.root / 'elsewhere' / 'slot-3'), str(self.first.parent / 'not-a-slot'),
+                    str(self.first.parent / 'slot-0')):
+            self.assertEqual(roomy.lease('b', 'app', preferred_path=bad), self.first)
+            roomy.release('b')
+
+    def test_a_spent_or_foreign_note_keeps_no_slot_aside(self):
+        import json
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=3)], owner='agent')
+        self.pool.restore('attempt')
+        left = pool.lease('left', 'app')
+        third = pool.lease('third', 'app')
+        pool.release('left'); pool.release('third')
+        self.store.mark('agent', 'task-left', 'ownership_loss', '')                       # spent by a return
+        self.store.mark('other-agent', 'task-x', 'ownership_loss', json.dumps({"workspaces": [str(left)]}))
+        self.store.mark('agent', 'task-bad', 'ownership_loss', 'not json')
+        self.store.mark('agent', 'task-done', 'ownership_loss',                     # closed when it left
+                        json.dumps({"observed_status": "done", "workspaces": [str(left)]}))
+        self.assertEqual(pool._returning_sources(), set())
+        self.assertEqual(pool.lease('newcomer', 'app'), left)
 
     def test_the_only_free_slot_is_still_taken_when_a_suspended_attempt_left_it(self):
         self.assertEqual(self.pool.lease('one', 'app'), self.first)
