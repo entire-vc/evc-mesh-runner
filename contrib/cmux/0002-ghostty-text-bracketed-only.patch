@@ -1,0 +1,96 @@
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 64e947c..21b5e6a 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1635,6 +1635,11 @@ GHOSTTY_API bool ghostty_surface_key_consume_if_menu_action(
+     const char*,
+     uintptr_t);
+ GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
++// cmux fork: paste only as a bracketed paste (DECSET 2004 active, no ESC in
++// the text); returns false and writes nothing otherwise.
++GHOSTTY_API bool ghostty_surface_text_bracketed_only(ghostty_surface_t, const char*, uintptr_t);
++// cmux fork: true when bracketed paste (DECSET 2004) is enabled right now.
++GHOSTTY_API bool ghostty_surface_bracketed_paste_active(ghostty_surface_t);
+ // cmux fork: delete when upstream separates committed typed text from paste
+ // delivery for libghostty embedders.
+ GHOSTTY_API void ghostty_surface_text_input(ghostty_surface_t, const char*, uintptr_t);
+diff --git a/src/Surface.zig b/src/Surface.zig
+index f44321c..1be08a5 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -5234,6 +5234,45 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
+     try self.completeClipboardPaste(text, true);
+ }
+ 
++/// cmux fork (`surface.exact_input` probe): whether a paste right now would
++/// be framed (DECSET 2004 active). Read-only.
++pub fn bracketedPasteActive(self: *Surface) bool {
++    self.renderer_state.mutex.lockUncancelable(global.io());
++    defer self.renderer_state.mutex.unlock(global.io());
++    return input.paste.Options.fromTerminal(&self.io.terminal).bracketed;
++}
++
++/// cmux fork (`surface.exact_input`): paste `data` ONLY as a bracketed paste.
++/// Returns false and writes nothing when the terminal has not enabled
++/// bracketed paste (DECSET 2004), when the data carries any ESC (it could
++/// close the fence early), or when the child already exited. Unlike
++/// textCallback it never sends an unframed paste, so interior newlines can
++/// never submit a line on their own.
++pub fn bracketedPasteOnlyCallback(self: *Surface, data: []const u8) !bool {
++    if (data.len == 0) return false;
++    if (std.mem.indexOfScalar(u8, data, 0x1B) != null) return false;
++    if (self.child_exited) return false;
++
++    const encode_opts: input.paste.Options = encode_opts: {
++        self.renderer_state.mutex.lockUncancelable(global.io());
++        defer self.renderer_state.mutex.unlock(global.io());
++        const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
++        if (!opts.bracketed) return false;
++        self.scrollToBottom() catch |err| {
++            log.warn("error scrolling to bottom err={}", .{err});
++        };
++        break :encode_opts opts;
++    };
++
++    // Fence, payload and closing fence cross the IO mailbox as one message
++    // (same as completeClipboardPaste).
++    self.queueIo(.{ .write_alloc = .{
++        .alloc = self.alloc,
++        .data = try input.paste.encodeAlloc(self.alloc, data, encode_opts),
++    } }, .unlocked);
++    return true;
++}
++
+ /// Sends committed text input to the terminal without keyboard protocol
+ /// encoding. cmux fork: unlike textCallback, this is not treated like a paste.
+ /// Delete when upstream provides committed typed-text input for embedders.
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 6451ac6..a11e567 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -4921,6 +4921,25 @@ pub const CAPI = struct {
+         surface.textCallback(ptr[0..len]);
+     }
+ 
++    /// cmux fork: true when the terminal has bracketed paste (DECSET 2004)
++    /// enabled right now. Read-only.
++    export fn ghostty_surface_bracketed_paste_active(surface: *Surface) bool {
++        return surface.core_surface.bracketedPasteActive();
++    }
++
++    /// cmux fork: bracketed-paste-only text (see
++    /// Surface.bracketedPasteOnlyCallback). false = nothing was written.
++    export fn ghostty_surface_text_bracketed_only(
++        surface: *Surface,
++        ptr: [*]const u8,
++        len: usize,
++    ) bool {
++        return surface.core_surface.bracketedPasteOnlyCallback(ptr[0..len]) catch |err| {
++            log.err("error in bracketed-only paste err={}", .{err});
++            return false;
++        };
++    }
++
+     /// Send committed text input to the terminal. This is treated like
+     /// typed text, not a paste. Newlines are normalized to carriage
+     /// returns and bracketed paste mode is not used.
