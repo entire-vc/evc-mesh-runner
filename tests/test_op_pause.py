@@ -9,7 +9,7 @@ from pathlib import Path
 
 from mesh_runner import op_pause
 from test_runner import Bench
-from fakes import FakeMesh, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, task, write_replies, FUTURE_AT, wait_time
 
 SRC = str(Path(__file__).resolve().parent.parent / "src")
 
@@ -171,7 +171,7 @@ class RunnerPause(Bench):
         r = self._start(FakeMesh([t1], max_concurrent=1))
         self.assertEqual(self.states(r), {})
         op_pause.release(self.cfg.state_dir, "builder", "a")
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="soak window")})
         r.tick()
         self.assertFalse(r.paused())
         self.assertEqual(len(self.states(r)), 1)

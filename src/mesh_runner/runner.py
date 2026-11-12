@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import socket
 import sqlite3
@@ -40,6 +41,8 @@ from pathlib import Path
 from . import answer_desk
 from . import chat_diag
 from . import op_pause
+from . import operator_alert
+from . import harness_hold
 from . import op_resolve
 from . import asks
 from . import card_wait_reconcile
@@ -69,6 +72,7 @@ from .adapters.claude import ClaudeAdapter
 from .adapters.codex import CodexAdapter
 from . import queue_wait
 from . import queue_order
+from . import wait_roots
 from . import native_result_wait, native_result_resume, native_result_rebind, native_result_config
 from . import receipt_wait
 from . import gmail_watch
@@ -263,6 +267,7 @@ CHAT_CHECK_SECONDS = 60
 GATE_HOLD = 75                      # start gate exit code: hold starts of this agent (EX_TEMPFAIL)
 GATE_HOLD_TASK = 76                 # start gate exit code: hold this task only; try the agent's next
 GATE_HOLD_SECONDS = 120
+OWN_PROFILE_DAYS = 3       # a lane's status lists auth holds of the logins it launched this recently
 # An ``unknown`` attempt whose turn process group is gone and whose native evidence stayed unchanged this long is
 # ended by the runner the way an operator token ends it: nothing new can prove the delivery any more.
 UNKNOWN_QUIET_MINUTES = 15
@@ -614,6 +619,10 @@ class AgentRunner:
         self._gitlab_unreadable: dict[tuple[str, str], float] = {}   # (kind, target) -> skip until (4xx)
         self._hold_logged: dict[str, str] = {}              # task -> the hold reason last logged
         self._repo_hold_checked: dict[str, tuple[str, float, str]] = {}   # task -> (updated_at, mono, verdict)
+        # backoffs set by an access refusal (no_membership, undeclared, missing clone): a new Mesh
+        # revision drops exactly these, so a grant starts the card on the next tick, not after 15 min
+        self._access_backoff: dict[str, float] = {}       # task -> the _task_backoff deadline it set
+        self._access_resume_hold: dict[str, float] = {}   # attempt -> the _resume_hold deadline it set
         self.preamble = prompts.load_preamble(agent.preamble_file) if agent.preamble_file else ""
         # names whose old pause marker could not become a token at start (op_pause.migrate_legacy); the Runner
         # shares one set with every lane. A lone AgentRunner migrated nothing and reads no marker.
@@ -1470,6 +1479,8 @@ class AgentRunner:
         if blocked:
             self._authentication_failed(a, blocked, current_route=True)
             return False
+        if self._harness_held(a, routed):
+            return False
         # Recheck under the Runner's existing single state-directory owner, after
         # workspace/auth checks and before changing session or durable outbox.
         if handoff_guard is not None and not handoff_guard():
@@ -1577,7 +1588,8 @@ class AgentRunner:
             # Record the actual launch environment, not the lane's later route. A turn
             # can finish after another task has changed the lane's active profile.
             self.store.mark(self.agent.name, a.task_id, "auth_launch",
-                            json.dumps({"attempt": a.id, "turn": a.turns + 1, "profile": profile}))
+                            json.dumps({"attempt": a.id, "turn": a.turns + 1, "profile": profile,
+                                        "account": auth.account_label(routed, env, self.agent.profile_dir)}))
         self.store.mark(self.agent.name, a.task_id, "turn_work", self._work_digest(a))
         native_grant = None
         if (a.wait or {}).get("native_packet"):
@@ -1775,6 +1787,7 @@ class AgentRunner:
         if not isinstance(launch, dict):
             launch = {}
         profile = launch.get("profile", "")
+        account = launch.get("account") if isinstance(launch.get("account"), str) else ""
         if (launch.get("attempt") != a.id or launch.get("turn") != a.turns
                 or not isinstance(profile, str) or not auth.PROFILE.fullmatch(profile)):
             # Upgraded while an older runner's process was already running: no
@@ -1782,7 +1795,7 @@ class AgentRunner:
             # never quarantine a guessed/current account in its place.
             profile = hashlib.sha256(f"unrecorded:{a.id}".encode()).hexdigest()[:32]
             self.store.mark(self.agent.name, a.task_id, "auth_unknown", json.dumps({"attempt": a.id, "profile": profile}))
-        auth.hold(self.store, profile, verification=verification)
+        auth.hold(self.store, profile, verification=verification, account=account)
         self.store.event(a.id, "auth_failed", str(a.turns))
         if verification:
             self.store.event(a.id, "verification_required", str(a.turns))
@@ -1840,9 +1853,71 @@ class AgentRunner:
         if self._switch_on_auth(a, profile, current_route):
             self._resume_hold.pop(a.id, None)  # next turn re-runs every admission/checkpoint gate
             self.store.update(a, note="authentication held; routed to another profile")
+            self._signal_auth_hold(a, profile, routed=True)
             return
-        log.warning("%s: #%s authentication held; profile %s; repair authentication then use clear-auth-hold",
-                    self.agent.name, a.task8, profile)
+        if not self._signal_auth_hold(a, profile, routed=False):
+            log.info("%s: #%s authentication held; profile %s (operator already told)",
+                     self.agent.name, a.task8, profile)
+
+    def _signal_auth_hold(self, a: Attempt, profile: str, routed: bool) -> bool:
+        """One operator signal per hold generation and per repeat interval, naming the account:
+        a hold met on every admission tick is otherwise only a log line while the lane silently
+        spends its fallback account."""
+        got = self.store.mark(auth.OWNER, auth.PREFIX + profile, auth.KEY)
+        since = got[0] if got and got[0] else ""
+        if not since:
+            return False
+        name = auth.account(self.store, profile) or f"profile {profile}"
+        text = (f"[mesh-runner] Login expired: {name}. Lane {self.agent.name} "
+                + ("moved to its fallback account and spends it until the login is repaired. "
+                   if routed else "is held and does not start work. ")
+                + f"Held since {since}. Repair the login, then: mesh-runner clear-auth-hold "
+                  f"--config {shlex.quote(self.cfg.config_path or '<runner.toml>')} --profile {profile}")
+        return operator_alert.signal(self.store, "auth:" + profile, since, text, self.emit,
+                                     incident="auth_hold", lane=self.agent.name,
+                                     account=auth.account(self.store, profile), profile=profile,
+                                     routed=routed)
+
+    def _harness_binary(self, harness: str) -> str:
+        adapter = self.adapter_for(harness)
+        return str(getattr(getattr(adapter, "base", adapter), "binary", "") or "")
+
+    def _harness_held(self, a: Attempt, harness: str) -> bool:
+        """A launch of a CLI version the provider refuses is not made: same pattern as an
+        authentication hold, the attempt keeps its counters and stays ready."""
+        held = harness_hold.active(self.store, harness, self._harness_binary(harness))
+        if not held:
+            return False
+        self._release_gate(a, "harness-upgrade-held")
+        self._release_checkout(a)
+        self.life.to_ready(a, pid=0, stamp="", note=f"{harness} CLI upgrade required; lane held")
+        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        self._signal_harness_hold(harness, held)
+        return True
+
+    def _harness_upgrade_required(self, a: Attempt, task: dict, text: str) -> None:
+        """The provider refused this CLI version: a fault of the host's binary, not a turn.
+        Not a turn without an outcome and not a failed turn: the card's counters stay, the
+        turn budget ignores it, the lane is held until the binary changes."""
+        self.store.event(a.id, "auth_only_turn", str(a.turns))       # the turn budget ignores it
+        self.store.event(a.id, "harness_upgrade_required", str(a.turns))
+        held, _ = harness_hold.hold(self.store, a.harness, self._harness_binary(a.harness),
+                                    harness_hold.reason(text))
+        self.life.to_ready(a, pid=0, stamp="", note=f"{a.harness} CLI upgrade required; lane held")
+        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        log.warning("%s: #%s %s CLI refused by the provider as outdated; lane held",
+                    self.agent.name, a.task8, a.harness)
+        self._signal_harness_hold(a.harness, held)
+
+    def _signal_harness_hold(self, harness: str, held: dict) -> bool:
+        binary = (held.get("binary") or {}).get("path") or self._harness_binary(harness)
+        text = (f"[mesh-runner] The provider refuses the installed {harness} CLI as outdated "
+                f"({binary}): every lane on it is held, cards keep their place. "
+                f"Upgrade the CLI; the hold lifts by itself when the binary changes. "
+                f"Provider said: {str(held.get('reason') or '')[:200]}")
+        return operator_alert.signal(self.store, "upgrade:" + harness, str(held.get("since") or ""), text,
+                                     self.emit, incident="harness_upgrade", harness=harness,
+                                     reason=str(held.get("reason") or "")[:300])
 
     @property
     def merge_enabled(self) -> bool:
@@ -2170,8 +2245,9 @@ class AgentRunner:
             return
         stream_never_began = (not result.finished and not result.is_error and not result.final_text
                               and not result.session_id and bool(stderr.strip()))
-        outage_turn = (result.is_error or stream_never_began) and bool(PROVIDER_OUTAGE_HINT.search(
+        outage_turn = ((result.is_error or stream_never_began) and bool(PROVIDER_OUTAGE_HINT.search(
             f"{result.error_details or result.error} {result.final_text} {stderr[-500:]}"))
+            or result.upgrade_required)
         if (a.turns - self.store.auth_turns(a.id) >= self.cfg.max_turns and not outage_turn
                 and not self._cap_at_resume(a)):
             self._give_up(a, task, f"stopped after {a.turns} turns on this task")
@@ -2202,6 +2278,9 @@ class AgentRunner:
             result.is_error, result.error = True, stderr.strip()[-300:]
         if not result.is_error and (self.store.mark(self.agent.name, a.task_id, "outage_since") or ("",))[0]:
             self.store.mark(self.agent.name, a.task_id, "outage_since", "")   # the provider answered: the outage is over
+        if result.is_error and result.upgrade_required:
+            self._harness_upgrade_required(a, task, result.error_details or result.error)
+            return
         if result.is_error:
             text = f"{result.error_details or result.error} {result.final_text} {stderr[-500:]}"
             public_error = public_harness_error(text)
@@ -2271,6 +2350,11 @@ class AgentRunner:
                 and (label := self._park_label(task))):
             # park:* is the turn's outcome in work and review; NEXT must not bypass the label
             self._park(a, task, label, "turn end")
+            return
+        if (outcome is None or outcome.kind == "unparsed") and result.upgrade_required:
+            # the turn ended on the provider's refusal of this CLI version: no outcome was
+            # possible, so this is a held lane, not a miss of the card
+            self._harness_upgrade_required(a, task, result.error_details or result.error)
             return
         if outcome is None or outcome.kind == "unparsed":
             self._no_outcome(a, task, outcome)
@@ -9038,14 +9122,14 @@ class AgentRunner:
 
     def candidates(self) -> list[dict]:
         held = {a.task_id for a in self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))}
-        out = []
+        reviews = []
         feed = self._feed(("review", "in_progress", "todo") if self.agent.feed_review else ("in_progress", "todo"))
         if self.agent.feed_review:
-            out += [dict(t, _mode="review") for t in order(feed["review"]) if t.get("id") not in held]
+            reviews = [dict(t, _mode="review") for t in self._roots_first(order(feed["review"])) if t.get("id") not in held]
         work = []
         for cat in ("in_progress", "todo"):
             work += [t for t in feed[cat] if t.get("id") not in held]
-        out += [dict(t, _mode="work") for t in self._work_order(work)]
+        out = self._roots_before_reviews(reviews, [dict(t, _mode="work") for t in self._work_order(work)])
         for task in out:
             if task.get("human_gate") and task.get("_mode") == "work":
                 did = self._gate_decision_for(task)
@@ -9068,6 +9152,10 @@ class AgentRunner:
                 return 2
             return 0 if DECISION_REQUEST_LABEL in (t.get("labels") or []) else 1
         ranked = sorted(ordered, key=rank)           # stable: priority order kept within a rank
+        ordinary = self._roots_first([t for t in ranked if rank(t) == 1])
+        if ordinary:
+            refill = iter(ordinary)
+            ranked = [next(refill) if rank(t) == 1 else t for t in ranked]
         argv = getattr(self.agent, "queue_order_command", None)
         if not argv:
             return ranked                            # off: no subprocess, the order above byte for byte
@@ -9078,12 +9166,52 @@ class AgentRunner:
             self._queue_order = queue_order.QueueOrder(
                 self.agent.name, argv, self.agent.queue_order_timeout_seconds,
                 self.agent.queue_order_cache_seconds)
-        chosen = self._queue_order.apply(ordinary)
+        # The helper orders equal-weight work; it cannot undo the wait-root priority.
+        chosen = self._roots_first(self._queue_order.apply(ordinary))
         fair_ids = self._queue_order.applied_fair_ids
         observed = iter(dict(t, _queue_order_fairness=None if fair_ids is None else t["id"] in fair_ids)
                         for t in chosen)
         # decision requests stay first, CAP_WAIT last: only the ordinary slots are refilled
         return [next(observed) if rank(t) == 1 else t for t in ranked]
+
+    def _root_weight(self, t: dict) -> int:
+        radar = getattr(self, "roots", None)
+        if radar is None or t.get("human_gate"):
+            return 0
+        return radar.weight(t.get("id") or "")
+
+    def _roots_before_reviews(self, reviews: list[dict], work: list[dict]) -> list[dict]:
+        """Reviews, then work (``_work_order``). A ready wait root of this lane goes in front of
+        all of them, the heaviest first (a review first within equal weight): it holds more
+        waiting cards than anything else the lane would start. Without a root the order is
+        unchanged; a card waiting for new input after a cap and a gated card never move."""
+        both = reviews + work
+        roots = [t for t in both if self._root_weight(t) > 0]
+        if not roots:
+            return both                                  # no radar or no root: nothing read, nothing moved
+        waiting = set(self.store.marked(self.agent.name, CAP_WAIT))
+        roots = [t for t in roots if t.get("id") not in waiting]
+        if not roots:
+            return both
+        roots.sort(key=lambda t: -self._root_weight(t))      # stable within equal weights
+        moved = {id(t) for t in roots}
+        return roots + [t for t in both if id(t) not in moved]
+
+    def _roots_first(self, tasks: list[dict]) -> list[dict]:
+        """Wait roots of this lane first, the card with the most waiting cards behind it first
+        (``wait_roots``); the rest keep their order. A card with a human gate is never moved."""
+        radar = getattr(self, "roots", None)
+        if radar is None or len(tasks) < 2:
+            return tasks
+        weight = {t.get("id"): (0 if t.get("human_gate") else radar.weight(t.get("id") or "")) for t in tasks}
+        if not any(weight.values()):
+            return tasks
+        out = sorted(tasks, key=lambda t: -weight[t.get("id")])      # stable within equal weights
+        first = out[0].get("id") or ""
+        if first != (tasks[0].get("id") or "") and first != getattr(self, "_roots_logged", ""):
+            self._roots_logged = first
+            log.info("%s: wait root #%s first (%d waiting behind it)", self.agent.name, first[:8], weight[first])
+        return out
 
     def host_hold(self) -> bool:
         """The host is short of memory or overloaded. Both gates are asked, so each logs its own edge."""
@@ -9428,9 +9556,13 @@ class AgentRunner:
             self.store.event(a.id, "repo_preflight_refused", json.dumps(verdict.as_dict()))
         if resume:
             self._resume_hold[a.id] = backoff     # the attempt stays ready; no checkout, no model turn
+            if verdict.needs_access:
+                self._access_resume_hold[a.id] = backoff
             return True
         self.life.to_aborted(a, note=f"repository preflight: {verdict.reason}")
         self._task_backoff[a.task_id] = backoff
+        if verdict.needs_access:
+            self._access_backoff[a.task_id] = backoff
         return True
 
     def _repo_access_contact(self) -> str:
@@ -9710,6 +9842,16 @@ class AgentRunner:
         and restore keep working; only new starts and turns see the narrower list."""
         if hasattr(self, "_repo_hold_checked"):
             self._repo_hold_checked.clear()       # a new revision re-reads every held card at once
+        # and lifts the failed-start backoff an access refusal set: the grant is the input that refusal
+        # waited for. A deadline replaced since (another failure) is that failure's and stays.
+        for held, mine in ((getattr(self, "_task_backoff", None), getattr(self, "_access_backoff", None)),
+                           (getattr(self, "_resume_hold", None), getattr(self, "_access_resume_hold", None))):
+            if not mine:
+                continue
+            for key, until in mine.items():
+                if held is not None and held.get(key) == until:
+                    held.pop(key, None)
+            mine.clear()
         if not self.access.mesh:
             return
         lane = self.lane_repos
@@ -9840,13 +9982,35 @@ class AgentRunner:
                 "load_hold": self.loadgate.describe() if self.loadgate.check() else "",
                 "would_start": min(eligible, max(0, self.cap() - active)), "tasks": rows}
 
+    def _own_profiles(self) -> set[str]:
+        """The logins this lane uses now: those it launched in the last OWN_PROFILE_DAYS and
+        the one any of its attempts is held on. A hold of a login no lane launches any more
+        (a retired personal login) is shown nowhere: not on live lanes and not in the runner-wide
+        status.json list. It stays stored and comes back the moment a lane launches that login."""
+        cutoff = iso(now() - dt.timedelta(days=OWN_PROFILE_DAYS))
+        own = set()
+        for (value,) in self.store.db.execute(
+                "SELECT value FROM marks WHERE agent=? AND key='auth_launch' AND at>=?", (self.agent.name, cutoff)):
+            try:
+                profile = json.loads(value).get("profile") if value else ""
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(profile, str) and auth.PROFILE.fullmatch(profile):
+                own.add(profile)
+        for a in self.store.by_state(self.agent.name, ("ready",)):
+            note = a.note or ""
+            if note.startswith("authentication held for profile "):
+                own.add(note.removeprefix("authentication held for profile ").strip())
+        return own
+
     def status(self) -> dict:
         rows = self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))
         out = {"agent": self.agent.name, "cap": self.cap(), "paused": self.paused(),
                "pause_tokens": op_pause.tokens(self.cfg.state_dir, self.agent.name),
                "repository_access": {**self.access.describe(),
                                      "lane_repos": sorted(r.name for r in self.lane_repos)},
-               "auth_holds": auth.status(self.store),
+               "auth_holds": auth.status(self.store, profiles=self._own_profiles()),
+               "harness_holds": harness_hold.status(self.store),
                "attempts": [{"task": a.task8, "task_id": a.task_id, "state": a.state, "title": a.title[:60],
                              "session": a.session_id, "wait": a.wait.get("kind", ""), "harness": a.harness,
                              "turns": a.turns, "since": a.updated_at,
@@ -9951,9 +10115,11 @@ class Runner:
         self._latest_lock = threading.Lock()
         self._wake_gen: dict[str, int] = {}    # per agent, bumped by a Mesh event addressed to it
         self._task_owner = TaskOwners()        # task id -> agent name, learnt from each agent's polls
+        self.roots = wait_roots.RootRadar(cfg)  # read by every lane, refreshed off the main loop
         for ar in self.agents:
             ar.owners = self._task_owner
             ar.legacy_pause = legacy_pause
+            ar.roots = self.roots
 
     def wake(self, names=()) -> None:
         """Make the loops of these agents poll now, not at poll_seconds; nobody else wakes."""
@@ -10041,6 +10207,15 @@ class Runner:
                 self.answer_desk.annotate(out)
             status = {"at": iso(), "unix": stamp, "agents": out, "pool": pool,
                       "outcome_sources": self.outcome_sources()}
+            try:                # runner-wide, once: holds of the logins some lane uses now
+                in_use = set()
+                for ar in getattr(self, "agents", ()):
+                    in_use |= ar._own_profiles()
+                status["auth_holds"] = auth.status(self.store, self.cfg.config_path or "<runner.toml>",
+                                                   profiles=in_use)
+                status["harness_holds"] = harness_hold.status(self.store)
+            except (sqlite3.Error, AttributeError):
+                pass
             try:                # bound to this snapshot; a failure never carries a (stale) digest
                 status["receipt"] = config_receipt.build(self.cfg, stamp)
             except Exception as e:
@@ -10050,6 +10225,9 @@ class Runner:
             supervisor = getattr(self, "supervisor", None)
             if supervisor is not None and supervisor.services:     # absent while no service runs as a process
                 status["services"] = supervisor.snapshot()
+            roots = getattr(self, "roots", None)
+            if roots is not None and roots.radar is not None:
+                status["roots"] = roots.status()
             if getattr(self, "checkpoint_bytes", None) is not None:
                 status["checkpoints"] = {"bytes": self.checkpoint_bytes,
                                          "budget_bytes": int(self.cfg.checkpoint_budget_gb * 1024 ** 3)}
@@ -10274,6 +10452,7 @@ class Runner:
         try:
             while not stop.is_set():
                 self._prune_ignored_if_due()
+                self.roots.refresh_if_due()
                 self.write_status(self.snapshot())
                 stop.wait(self.cfg.poll_seconds)
         finally:

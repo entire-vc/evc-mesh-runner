@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 from ..auth import is_codex_auth_error
+from ..harness_hold import is_upgrade_required
 from .base import Adapter, TurnResult, read_events
 
 ROLLOUT_SCAN = 1 << 20          # how much of the rollout's end is searched for the latest turn_context
@@ -187,6 +188,12 @@ class CodexAdapter(Adapter):
                 r.finished = True
                 r.usage = ev.get("usage") or {}
                 r.is_error, r.error, r.auth_failed, r.auth_only = False, "", False, False   # a transient error earlier in the turn did not end it
+                r.upgrade_required = False
+                # the interactive driver's record of a turn that ended without a reply; a typed
+                # provider refusal of this CLI version is a lane fault, not an empty turn
+                no_reply = str(ev.get("no_reply") or "")
+                if is_upgrade_required(no_reply):
+                    r.upgrade_required, r.error_details = True, no_reply[-2000:]
             elif t in ("turn.failed", "error"):
                 r.finished = True
                 r.is_error = True
@@ -194,5 +201,6 @@ class CodexAdapter(Adapter):
                 r.error = (err.get("message") if isinstance(err, dict) else str(err)) or ev.get("message", "") or t
                 # typed provider refusal only; never assistant prose or a quoted report
                 r.auth_failed = is_codex_auth_error(str(r.error))
+                r.upgrade_required = is_upgrade_required(str(r.error))
                 r.auth_only = r.auth_failed and not worked
         return r

@@ -13,7 +13,7 @@ from mesh_runner.store import Store, iso
 from mesh_runner.selection import parse_time
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import Runner
-from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT, write_replies, calls
+from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT, write_replies, calls, wait_time
 from test_runner import Bench
 
 NOW = 1792500000
@@ -912,7 +912,7 @@ class FirstMove(QueueWait):
                 return real_iso(at)
             return real_iso(*args)
 
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="approved external window", event_ref="published-window")})
         r.store.update(a, state='ready')                  # the wake: a waiting attempt is spawned from ready
         with mock.patch('mesh_runner.runner.iso', side_effect=clock), \
                 mock.patch('mesh_runner.runner.now', side_effect=lambda: at or dt.datetime.now(dt.timezone.utc)):
@@ -943,8 +943,8 @@ class FirstMove(QueueWait):
         # the first turn was spawned BEFORE the request (NOW-600), so the new source is owed one refill
         r, a = self.spawn_then_settle(spawn_clock=NOW - 1200)
         t = a.task_id
-        write_replies(self.replies, {t[:8]: f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window',
-                                     t[:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window'})
+        write_replies(self.replies, {t[:8]: wait_time(why="approved external window", event_ref="published-window"),
+                                     t[:8] + ':resume': wait_time(why="approved external window", event_ref="published-window")})
         first = calls(self.calls)
         self.assertEqual([c['resume'] for c in first], [False])
         sid = first[0]['sid']

@@ -1,7 +1,10 @@
 # Release package contract
 
-The catalog artifact of a release is the source archive of the release commit
-(`git archive`), not a Python wheel: `pyproject.toml` packages only `src/`, so a wheel or
+The catalog artifact of a release is the source archive of the release commit, the head of
+`release/<version>` (`git archive <release-sha>`), never of the merge of the release into `main`,
+which also carries what reached `main` after the cut-off. The archive fills `SOURCE_COMMIT` in
+(`export-subst` in `.gitattributes`) with the commit and its parents; `ops/install.py` refuses a
+merge commit and `--status` shows the sha. It is not a Python wheel: `pyproject.toml` packages only `src/`, so a wheel or
 `pip install` omits `scripts/` and `docs/`. The runner is installed from the unpacked archive
 (`PYTHONPATH=<release>/src`, see README "Updating the runner").
 

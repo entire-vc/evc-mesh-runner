@@ -16,7 +16,7 @@ from mesh_runner.store import Store
 from mesh_runner.workspace import WorkspaceError
 from mesh_runner.runner import AgentRunner
 from mesh_runner.tui_driver import Driver
-from fakes import HarnessGate, FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import HarnessGate, FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time
 from test_runner import Bench
 
 EXPIRED = "Failed to authenticate: OAuth session expired and could not be refreshed"
@@ -218,7 +218,7 @@ class AuthLoop(Bench):
         self.assertEqual(r.store.get(a.id).turns, 1)
         self.assertFalse(r._quarantine)
         self.assertFalse(mesh.checkouts)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         self.agent.inline_env["CLAUDE_CONFIG_DIR"] = str(self.root / "auth-b")
         r._resume_hold.clear()
         r.tick()
@@ -235,7 +235,7 @@ class AuthLoop(Bench):
         progress.write_text("keep work")
         self.assertTrue(auth.clear(r.store, profile))
         self.assertFalse(auth.clear(r.store, profile))
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r._resume_hold.clear()
         r.tick()
         self.settle_all(r)
@@ -276,7 +276,7 @@ class AuthLoop(Bench):
         self.assertEqual([row["phase"] for row in r.pool._checkpoint_rows(a.id)], ["released"])
         self.assertEqual(r.store.get(a.id).session_id, original_session)
         auth.clear(r.store, profile)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r._resume_hold.clear()
         r.tick()
         self.settle_all(r)
@@ -312,7 +312,7 @@ class AuthLoop(Bench):
         r2 = AgentRunner(self.cfg, other, Store(self.root / "state" / "r.sqlite"), mesh=mesh2,
                         adapter=self.adapter)
         sibling = HarnessGate(self.root / "sibling")
-        write_replies(other_replies, {t2["id"][:8]: sibling.reply(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window")})
+        write_replies(other_replies, {t2["id"][:8]: sibling.reply(wait_time(why="soak window"))})
         r2.tick()
         a2 = r2.store.by_state("other", ("running",))[0]
         with sibling.hold(r2.procs[a2.id]):
@@ -347,7 +347,7 @@ class AuthLoop(Bench):
         self.assertEqual((r.store.get(a.id).state, len(calls(self.calls))), ("ready", 1))
         self.assertTrue(auth.clear(r.store, unknown_profile))
         r._resume_hold.clear()
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r.tick()
         self.settle_all(r)
         self.assertEqual((r.store.get(a.id).state, r.store.get(a.id).turns), ("waiting", 2))
@@ -579,7 +579,7 @@ class AuthRouting(Bench):
         self.assertTrue(route.exists())
         self.assertFalse(mesh.checkouts)
         self.assertTrue(auth.held(r.store, profile))
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r.tick()
         self.settle_all(r)
         kept = r.store.get(a.id)
@@ -704,8 +704,8 @@ class AuthRouting(Bench):
         self.assertFalse(mesh.checkouts)
         self.assertFalse(any(row["attempt"] == held.id for row in r.pool.rows()))
         self.assertEqual(mesh.tasks[second["id"]], before_task)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 first",
-                                     second["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 second"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="first"),
+                                     second["id"][:8]: wait_time(why="second")})
         self.assertTrue(auth.clear(r.store, profile))
         r._resume_hold.clear()
         r.tick()
@@ -726,7 +726,7 @@ class AuthRouting(Bench):
         self.route_to_codex(r)
         self.agent.on_limit_command = self.agent.on_auth_command
         self.assertTrue(r._switch_on_limit(a))
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r._resume_hold.clear()
         r.tick()
         self.settle_all(r)
@@ -776,7 +776,7 @@ class AuthRouting(Bench):
         r.alt_adapters = {"claude": self.adapter}
         r.store.mark(self.agent.name, t["id"], "model", "opus")
         r.store.mark(self.agent.name, t["id"], "effort", "low")
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r._resume_hold.clear()
         r.tick()
         self.settle_all(r)

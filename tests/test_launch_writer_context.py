@@ -4,7 +4,7 @@ import json
 
 from pathlib import Path
 
-from fakes import FAKE_AGENT, FakeMesh, task, write_replies
+from fakes import FAKE_AGENT, FakeMesh, task, write_replies, next_turn
 from test_runner import Bench
 
 KEYS = ("MESH_RUNNER_TASK", "MESH_RUNNER_LANE",
@@ -29,7 +29,7 @@ class LaunchWriterContext(Bench):
     def launch(self, change=None, resume=False):
         t = task(1)
         mesh = FakeMesh([t])
-        write_replies(self.replies, {"00000001": "↻ NEXT"})
+        write_replies(self.replies, {"00000001": next_turn()})
         r = self.runner(mesh)
         a = r.store.create(self.agent.name, t["id"], "claude")
         self.assertTrue(r._acquire(a))

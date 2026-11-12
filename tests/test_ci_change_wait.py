@@ -6,7 +6,7 @@ from unittest import mock
 from mesh_runner.outcome import parse_line
 from mesh_runner.store import Store, iso
 from mesh_runner.wake import check, ci_change_event, ci_delivery_key
-from fakes import FakeGitLab, FakeMesh, task, write_replies, calls
+from fakes import FakeGitLab, FakeMesh, task, write_replies, calls, wait_pipeline
 from test_runner import Bench
 
 NOW = dt.datetime.now(dt.timezone.utc)
@@ -358,7 +358,7 @@ class TypedCI(Bench):
         sha='a'*40
         gl.mr_rows['g/app!56']={'sha':sha,'state':'opened',
             'head_pipeline':{'id':14845,'sha':sha,'status':'failed'}}
-        write_replies(self.replies,{t['id'][:8]:'⏳ WAIT pipeline:g/app#14845',
+        write_replies(self.replies,{t['id'][:8]:wait_pipeline("g/app", 14845),
             t['id'][:8]+':resume':f'⏳ WAIT mr:g/app!56 until=change after={sha}:14845:failed'})
         r=self.runner(FakeMesh([t]),gl)
         r.tick()

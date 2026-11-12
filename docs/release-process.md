@@ -60,10 +60,14 @@ merged by GitLab together with it.
 Each step is its own card with a named owner (or a fail-closed CI job), in this order; a step
 starts only after the previous one is verified:
 
-1. **Install** the merge commit once: `git archive <merge-sha>`, unpack, `python3 ops/install.py
-   --source <dir>` on the fleet host (README, "Updating the runner"); the receipt is
-   `ops/install.py --status` showing the new version running.
-2. **Catalog**: publish that same archive as the version in the extension catalog
+1. **Install** the release commit once: the head of `release/<version>`, which is the second parent
+   of the release merge (`git rev-parse <release-merge>^2`). Not the merge itself: `main` moves on
+   after the cut-off, so the merge also carries merge requests the version's `CHANGELOG.md` section
+   does not name. `git archive <release-sha>`, unpack,
+   `python3 ops/install.py --source <dir>` on the fleet host (README, "Updating the runner");
+   `install.py` refuses a tree exported from a merge commit. The receipt is `ops/install.py --status`
+   showing the new version running and `commit.sha` equal to the release commit.
+2. **Catalog**: publish that same archive (of the release commit) as the version in the extension catalog
    (`docs/release-package.md`), so hosts that follow the catalog see it.
 3. **Proto** runner: upgrade from the published catalog version by its reviewed upgrade procedure.
 4. **Partner host**: the same, last.

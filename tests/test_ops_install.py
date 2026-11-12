@@ -53,6 +53,46 @@ class Install(unittest.TestCase):
         with self.assertRaises(install.Failed):
             install.tree_digest(self.root)
 
+    def test_source_commit_is_read_from_the_exported_tree(self):
+        self.assertIsNone(install.source_commit(self.source)["sha"])                     # a release from before it
+        (self.source / "SOURCE_COMMIT").write_text("$Format:%H %P$\n")                   # a copy of a checkout
+        self.assertIn("git archive", install.source_commit(self.source)["why"])
+        sha, parent = "a" * 40, "b" * 40
+        (self.source / "SOURCE_COMMIT").write_text(f"{sha} {parent}\n")
+        self.assertEqual(install.source_commit(self.source), {"sha": sha, "parents": [parent]})
+        install.refuse_merge_commit(self.source)                                         # the release commit passes
+        target = install.stage(self.source, self.catalog, "9.9.9")
+        self.assertEqual(install.source_commit(target)["sha"], sha)                       # the catalog keeps it
+
+    def test_a_reused_catalog_entry_keeps_the_commit_it_was_exported_from(self):
+        install.stage(self.source, self.catalog, "9.9.9")                                 # staged before SOURCE_COMMIT
+        target = self.catalog / "9.9.9"
+        first, other = "a" * 40, "f" * 40
+        (self.source / "SOURCE_COMMIT").write_text(f"{first} {'b' * 40}\n")
+        install.stage(self.source, self.catalog, "9.9.9")                                 # the missing file is filled in
+        self.assertEqual(install.source_commit(target)["sha"], first)
+        install.stage(self.source, self.catalog, "9.9.9")                                 # same commit: reused
+        (self.source / "SOURCE_COMMIT").write_text(f"{other} {'b' * 40}\n")
+        with self.assertRaisesRegex(install.Failed, "exported from commit " + first):    # same code, other commit
+            install.stage(self.source, self.catalog, "9.9.9")
+        (self.source / "SOURCE_COMMIT").write_text("$Format:%H %P$\n")
+        with self.assertRaises(install.Failed):                                           # a checkout copy
+            install.stage(self.source, self.catalog, "9.9.9")
+        self.assertEqual(install.source_commit(target)["sha"], first)
+
+    def test_a_tree_exported_from_a_merge_commit_is_refused(self):
+        merge, main, release = "c" * 40, "d" * 40, "e" * 40
+        (self.source / "SOURCE_COMMIT").write_text(f"{merge} {main} {release}\n")
+        with self.assertRaisesRegex(install.Failed, "merge commit " + merge):
+            install.refuse_merge_commit(self.source)
+        out = install.main(["--source", str(self.source), "--catalog", str(self.catalog)])
+        self.assertEqual(out, 2)
+        self.assertFalse(self.catalog.exists())                                          # nothing staged
+
+    def test_the_repository_marks_source_commit_for_git_archive(self):
+        self.assertEqual((ROOT / "SOURCE_COMMIT").read_text().strip(), "$Format:%H %P$")
+        self.assertIn("SOURCE_COMMIT export-subst", (ROOT / ".gitattributes").read_text().splitlines())
+
     def test_version_comes_from_the_tree(self):
         self.assertRegex(install.source_version(self.source), r"^\d+\.\d+\.\d+")
 

@@ -1,7 +1,7 @@
 """An umbrella task (open children) waiting on a card keeps no worktree lease."""
 import unittest
 
-from fakes import FakeMesh, task, write_replies
+from fakes import FakeMesh, task, write_replies, wait_time
 from test_runner import Bench
 
 
@@ -12,7 +12,7 @@ class UmbrellaWait(Bench):
         if with_child:
             tasks.append(task(82, cat="in_progress", parent_task_id=parent["id"]))
         self.agent.workspace_wait_release_minutes = release_minutes
-        write_replies(self.replies, {parent["id"][:8]: "⏳ WAIT 2h: the child"})
+        write_replies(self.replies, {parent["id"][:8]: wait_time(why="the child")})
         r = self.runner(FakeMesh(tasks))
         r.refresh_me()
         a = r.store.create("builder", parent["id"], "claude")

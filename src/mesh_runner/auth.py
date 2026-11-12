@@ -75,11 +75,39 @@ def profile_id(env: dict[str, str], cwd: Path) -> str:
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
 
 
-def hold(store: Store, profile: str, verification: bool = False) -> None:
+def account_label(harness: str, env: dict[str, str], cwd: Path | None = None) -> str:
+    """The human name of the login a spawn uses: the account directory's name
+    (``~/.claude-accounts/team-a`` -> ``team-a``), never a credential.
+    The default directory is named as such, so a personal login is recognisable."""
+    home = Path(env.get("HOME") or Path.home())
+    if harness == "codex":
+        raw, default, var = env.get("CODEX_HOME"), home / ".codex", "CODEX_HOME"
+    else:
+        raw, default, var = env.get("CLAUDE_CONFIG_DIR"), home / ".claude", "CLAUDE_CONFIG_DIR"
+    if harness != "codex" and env.get("ANTHROPIC_API_KEY"):
+        # Provider URLs may contain credentials in userinfo, paths, or queries.
+        # This label is persisted and sent to the operator, so omit the URL entirely.
+        return "claude API key"
+    directory = Path(raw) if raw else default
+    if not directory.is_absolute():
+        directory = (cwd or Path.cwd()) / directory
+    if os.path.realpath(directory) == os.path.realpath(default):
+        return f"{harness} default login ~/{default.name} (no {var})"
+    return f"{harness} {directory.name}"
+
+
+def account(store: Store, profile: str) -> str:
+    got = store.mark(OWNER, PREFIX + profile, "auth_account")
+    return got[0] if got and got[0] else ""
+
+
+def hold(store: Store, profile: str, verification: bool = False, account: str = "") -> None:
     generation = iso()
     store.db.execute("SAVEPOINT auth_hold")
     try:
         store.mark(OWNER, PREFIX + profile, KEY, generation)
+        if account:
+            store.mark(OWNER, PREFIX + profile, "auth_account", account)
         store.mark(OWNER, PREFIX + profile, "auth_hold_scope", generation + ":" + uuid.uuid4().hex +
                    (":verification_required" if verification else ":authentication"))
         store.db.execute("RELEASE auth_hold")
@@ -105,9 +133,12 @@ def clear(store: Store, profile: str) -> bool:
     return cleared
 
 
-def status(store: Store, config_path: str = "<runner.toml>") -> list[dict]:
-    return [{"profile": task.removeprefix(PREFIX), "reason": "authentication failed; repair auth then clear explicitly",
+def status(store: Store, config_path: str = "<runner.toml>", profiles=None) -> list[dict]:
+    """Every live hold, or only those of ``profiles`` (a lane's own logins)."""
+    return [{"profile": task.removeprefix(PREFIX), "account": account(store, task.removeprefix(PREFIX)),
+             "reason": "authentication failed; repair auth then clear explicitly",
              "since": at, "clear_command": shlex.join(["mesh-runner", "clear-auth-hold", "--config", config_path,
                                                         "--profile", task.removeprefix(PREFIX)])}
             for task, at in sorted(store.marked(OWNER, KEY).items())
-            if task.startswith(PREFIX) and PROFILE.fullmatch(task.removeprefix(PREFIX))]
+            if task.startswith(PREFIX) and PROFILE.fullmatch(task.removeprefix(PREFIX))
+            and (profiles is None or task.removeprefix(PREFIX) in profiles)]

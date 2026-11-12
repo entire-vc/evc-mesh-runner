@@ -5,7 +5,7 @@ never twice for the same run of misses."""
 import datetime as dt
 from unittest import mock
 
-from fakes import AGENT_ID, FakeGitLab, FakeMesh, calls, task, write_replies
+from fakes import AGENT_ID, FakeGitLab, FakeMesh, calls, task, write_replies, wait_pipeline
 from test_requeue_on_cap import CapBench
 from test_runner import Bench
 
@@ -183,7 +183,7 @@ class CiWaitWithoutBaseline(Bench):
         gl = FakeGitLab()
         gl.pipelines["g/app#7"] = "running"
         gl.pipeline_rows["g/app#7"] = {"sha": SHA, "id": 7, "status": "running"}
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT pipeline:g/app#7 until=success"})
+        write_replies(self.replies, {t["id"][:8]: wait_pipeline("g/app", 7, until="green")})
         r = self.runner(mesh, gl)
         r.tick()
         a = self.finish_turn(r)

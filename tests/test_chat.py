@@ -1,5 +1,4 @@
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -8,11 +7,11 @@ from pathlib import Path
 
 from mesh_runner import chat as chat_mod
 from mesh_runner.chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
+from tmux_support import TMUX, needs_tmux
 
-TMUX = shutil.which("tmux")
 
 
-@unittest.skipUnless(TMUX, "tmux not installed")
+@needs_tmux
 class Chat(unittest.TestCase):
     """Runs on a private tmux server (-L): never touches the host's sessions."""
 

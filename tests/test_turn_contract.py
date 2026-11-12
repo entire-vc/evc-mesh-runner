@@ -4,7 +4,7 @@ import re
 import unittest
 
 from mesh_runner import prompt as prompts
-from mesh_runner.outcome import CONTRACT, MERGE_WAIT_GUIDANCE, contract, parse_line
+from mesh_runner.outcome import CONTRACT, MERGE_MARKER_GUIDANCE, MERGE_WAIT_GUIDANCE, contract, parse_line
 
 from fakes import task
 
@@ -57,7 +57,8 @@ class TurnContract(unittest.TestCase):
                      "after_status=opened", "required_jobs=", "provider=github", "event_ref=", "source=", "why="):
             self.assertIn(form, text)
         self.assertNotIn("on=merge", CONTRACT)              # only where the merge gate runs
-        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, ""), CONTRACT)
+        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, "").replace(MERGE_MARKER_GUIDANCE, ""),
+                         CONTRACT)
 
     def test_the_command_comes_first_and_the_marker_is_the_fallback(self):
         first_command = CONTRACT.index("wait_for on=card")
@@ -75,6 +76,23 @@ class TurnContract(unittest.TestCase):
             out = parse_line("⏳ WAIT ops-review:" + ref, None)
             self.assertEqual(out.kind, "unparsed")
             self.assertIn("finish_task to=review", out.note)
+
+    def test_a_marker_is_offered_only_after_a_refused_command(self):
+        # lanes wrote the marker in place of a command they never called ("habit"); the contract
+        # must not present it as an equal path: no marker beside a command, the fallback names the refusal
+        for merge in (False, True):
+            text = contract(merge)
+            fallback = text.index("Only if the Mesh command is unavailable or fails")
+            self.assertNotIn("Marker:", text)
+            self.assertNotIn("WAIT merge:", text[:fallback])
+            tail = " ".join(text[fallback:].split())
+            self.assertIn("a marker line never replaces a call", tail)
+            self.assertIn("quoting the command and its error", tail)
+        t = task(1)
+        for text in (prompts.no_outcome_prompt(t), prompts.no_outcome_prompt(t, "⏳ WAIT 2h", "relative", merge=True)):
+            head = " ".join(text[:text.index("End every turn")].split())
+            self.assertIn("call it, do not write it as a line", head)
+            self.assertIn("read only after Mesh refused that command", head)
 
     def test_the_marker_grammar_is_unchanged(self):
         self.assertEqual(parse_line("↻ NEXT: the docs", None).kind, "next")

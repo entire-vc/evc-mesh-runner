@@ -37,6 +37,7 @@ class TurnResult:
     auth_failed: bool = False       # an adapter-verified terminal authentication banner
     auth_only: bool = False         # no assistant/tool work preceded that banner
     verification_required: bool = False  # the exact terminal provider envelope `verification_required`
+    upgrade_required: bool = False  # the provider refused this harness version (harness_hold)
 
 
 @dataclass

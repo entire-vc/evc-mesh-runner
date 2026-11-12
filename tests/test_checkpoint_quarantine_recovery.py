@@ -14,7 +14,7 @@ from mesh_runner.workspace_scope import RECEIPT_KEY
 from test_runner import Bench
 from test_workspace import make_repo
 from test_workspace_requests import WorkspaceRequests
-from fakes import write_replies, FUTURE_AT
+from fakes import write_replies, FUTURE_AT, wait_time
 
 
 class CheckpointQuarantineRecovery(Bench):
@@ -59,7 +59,7 @@ class CheckpointQuarantineRecovery(Bench):
         r, a, fifo = self.failed_resume()
         deadline = r._quarantine[(a.id, 'resume')]
         self.recover(r, a, fifo)
-        write_replies(self.replies, {a.task8: f'⏳ WAIT {FUTURE_AT}: external=fixture source=card:#abcdef12 work'})
+        write_replies(self.replies, {a.task8: wait_time(why="work", event_ref="fixture")})
         r.tick()
         self.assertEqual(r.store.get(a.id).state, 'running')
         self.assertEqual(len(self.events(r, a, 'checkpoint_quarantine_recheck')), 1)

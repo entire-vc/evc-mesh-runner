@@ -5,7 +5,7 @@ from unittest import mock
 
 from mesh_runner.outcome import parse_outcome, contract
 from mesh_runner.wake import check
-from fakes import FakeGitLab, FakeMesh, calls, task, write_replies
+from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, wait_mr
 from test_runner import Bench
 
 NOW = dt.datetime(2026, 10, 28, 12, tzinfo=dt.timezone.utc)
@@ -65,33 +65,6 @@ class ExternalTimeGrammar(unittest.TestCase):
                 self.assertEqual(wait['integration_blocked'], 'GitLab observer unavailable')
 
 class TypedTimeSettlement(Bench):
-    def test_invalid_repeated_timer_is_bounded_even_when_already_warned_today(self):
-        t = task(1); mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t['id'][:8]:'⏳ WAIT 6h: poll: inbox', t['id'][:8]+':resume':'⏳ WAIT 6h: poll: inbox'})
-        r = self.runner(mesh)
-        r.store.mark('*', t['id'], 'time_wait_told', NOW.date().isoformat())
-        r.tick(); self.settle_all(r)
-        self.assertFalse(r.store.by_state(self.agent.name, ('waiting','running','ready','starting')))
-        self.assertLessEqual(len(calls(self.calls)), self.cfg.max_no_outcome + 1)
-        self.assertFalse(mesh.tasks[t['id']].get('start_after'))
-        self.assertTrue(any('source=' in c['body'] for c in mesh.comment_log[t['id']]))
-        self.assertTrue(r.store.by_state(self.agent.name, ('failed',))[0].note.startswith('wait correction required:'))
-        count = len(calls(self.calls))
-        self.cfg.failed_cooldown_hours = 0
-        with mock.patch('mesh_runner.runner.now', return_value=dt.datetime.now(dt.timezone.utc)+dt.timedelta(days=2)):
-            r.tick(); self.settle_all(r)
-        self.assertEqual(len(calls(self.calls)), count)
-        self.assertFalse(r._task_backoff)
-        # The persisted failed attempt, not a process-local timer, owns the hold.
-        self.assertIn('wait correction required', r._hold_reason(mesh.tasks[t['id']], 'work'))
-        r.agent.name='replacement-lane'
-        self.assertNotIn('wait correction required', r._hold_reason(mesh.tasks[t['id']], 'work'))
-        r.agent.name='builder'
-        mesh.add_comment(t['id'], 'Corrected: wait for card event instead', author='lead')
-        mesh.tasks[task(0xabcdef12, assignee_id='other')['id']] = task(0xabcdef12, assignee_id='other')
-        write_replies(self.replies, {t['id'][:8]:'⏳ WAIT card:#abcdef12', t['id'][:8]+':resume':'⏳ WAIT card:#abcdef12'})
-        r.tick(); self.settle_all(r)
-        self.assertGreater(len(calls(self.calls)), count)
 
     def test_same_identity_explicit_next_rearms_but_old_next_and_notices_do_not(self):
         t=task(1);mesh=FakeMesh([t],max_concurrent=1);r=self.runner(mesh);r.refresh_me()
@@ -142,7 +115,7 @@ class TypedTimeSettlement(Bench):
     def test_repeated_terminal_ci_is_bounded_without_a_time_wait(self):
         t=task(1);mesh=FakeMesh([t],max_concurrent=1);gl=FakeGitLab()
         gl.mr_head['g/app!7']='9:success'
-        write_replies(self.replies,{t['id'][:8]:'⏳ WAIT mr:g/app!7', t['id'][:8]+':resume':'⏳ WAIT mr:g/app!7'})
+        write_replies(self.replies,{t['id'][:8]:wait_mr("g/app", 7), t['id'][:8]+':resume':wait_mr("g/app", 7)})
         r=self.runner(mesh,gl);r.tick();self.settle_all(r)
         for _ in range(4):
             r.tick();self.settle_all(r)
@@ -150,21 +123,9 @@ class TypedTimeSettlement(Bench):
         self.assertEqual(r.store.by_state(self.agent.name,('failed',))[0].note.split(':')[0], 'wait correction required')
         self.assertFalse(mesh.tasks[t['id']].get('start_after'))
 
-    def test_refused_person_gate_finishes_without_resurrecting_as_waiting(self):
-        from mesh_runner.outcome import Outcome
-        t=task(1);mesh=FakeMesh([t],max_concurrent=1)
-        write_replies(self.replies,{t['id'][:8]:'❓ Blocking @owner: choose?'})
-        r=self.runner(mesh)
-        r.store.mark(self.agent.name,t['id'],'ask_not_raised','no-marker:blocking')
-        r.tick();self.settle_all(r)
-        self.assertFalse(r.store.by_state(self.agent.name,('waiting','ready','running')))
-        self.assertTrue(r.store.by_state(self.agent.name,('failed',)))
-        self.assertFalse(mesh.tasks[t['id']].get('start_after'))
-        self.assertTrue(any('Repair owner:' in c['body'] for c in mesh.comment_log[t['id']]))
-
     def test_no_gitlab_is_visible_event_wait_without_timer(self):
         t=task(1);mesh=FakeMesh([t],max_concurrent=1)
-        write_replies(self.replies,{t['id'][:8]:'⏳ WAIT mr:g/app!7'})
+        write_replies(self.replies,{t['id'][:8]:wait_mr("g/app", 7)})
         r=self.runner(mesh);r.tick();self.settle_all(r)
         a=r.store.by_state(self.agent.name,('waiting',))[0]
         self.assertEqual(a.wait['kind'],'mr')

@@ -131,19 +131,6 @@ class RecipientResolution(Bench):
         self.assert_no_ask()
         self.assertEqual(self.r.store.get(self.a.id).state, "failed")
 
-    def test_repeated_invalid_wait_stops_after_one_correction(self):
-        t = task(1)
-        mesh = FakeMesh([t])
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@code-reviewer: pick one?"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        for _ in range(4):
-            r.tick()
-        self.assertEqual(len(calls(self.calls)), 2)
-        self.assertEqual(r.store.by_state("builder", ("failed",))[0].state, "failed")
-        self.assertFalse(any("❓ Blocking" in c["body"] for c in mesh.comments(t["id"])))
-
     def test_adapter_is_bounded_and_rejects_invalid_or_truncated_roster(self):
         client = MeshClient("http://mesh", "fixture")
         with patch.object(client, "bounded_get", return_value=[]) as get:

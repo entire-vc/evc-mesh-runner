@@ -4,6 +4,9 @@ import datetime as dt
 import unittest
 from unittest import mock
 
+from fakes import FakeGitLab, FakeMesh, calls, task, wait_mr, write_replies
+from test_runner import Bench
+
 from mesh_runner.outcome import parse_outcome
 from mesh_runner.wake import (GitHub, GitLab, ProviderUnavailable, ci_delivery_key, ci_observation,
                               split_provider, target_jobs_state)
@@ -172,6 +175,39 @@ class Namespace(unittest.TestCase):
     def test_split_provider(self):
         self.assertEqual(split_provider("github:o/r!1"), ("github", "o/r!1"))
         self.assertEqual(split_provider("o/r!1"), ("", "o/r!1"))
+
+
+class TypedGitHubPR(Bench):
+    """`wait_for on=mr provider=github until=merged ... after_status=opened`: the route Mesh names for a GitHub PR
+    merge (it answers 422 to on=merge provider=github, so no such merge wait reaches the runner). The runner
+    waits on the PR and wakes once it is merged."""
+
+    def turn(self, gl, command):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: command, t["id"][:8] + ":resume": wait_mr("o/r", 9, note="next")})
+        r = self.runner(mesh, gl)
+        r.tick()
+        self.settle_all(r)
+        return r, t
+
+    def test_it_waits_while_the_pr_is_open_and_wakes_when_it_is_merged(self):
+        gl = FakeGitLab()
+        gl.mr_rows["github:o/r!3"] = {"state": "opened", "sha": SHA}
+        r, t = self.turn(gl, wait_mr("o/r", 3, until="merged", provider="github", after_sha=SHA,
+                                     after_status="opened", note="PR showcase"))
+        a = r.store.by_state(self.agent.name, ("waiting",))[0]
+        self.assertEqual((a.wait["kind"], a.wait["target"]), ("mr", "github:o/r!3"))
+        self.assertEqual(a.wait["mr_state"], {"predicate": "merged", "sha": SHA, "state": "opened"})
+        r.tick()
+        self.settle_all(r)
+        self.assertEqual(len(calls(self.calls)), 1)            # still open: nothing woke it
+        gl.mr_rows["github:o/r!3"] = {"state": "merged", "merged_at": "2026-11-11T19:00:00Z", "sha": SHA}
+        r.tick()
+        self.settle_all(r)
+        c = calls(self.calls)
+        self.assertEqual([x["resume"] for x in c], [False, True])
+        self.assertIn("github:o/r!3", c[1]["prompt"])
 
 
 if __name__ == "__main__":

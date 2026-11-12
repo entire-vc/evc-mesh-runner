@@ -4,7 +4,7 @@ import time
 from dataclasses import replace
 from unittest.mock import patch
 
-from fakes import FakeMesh, task, write_replies
+from fakes import FakeMesh, task, write_replies, next_turn
 from test_runner import Bench
 from test_workspace import make_repo
 from mesh_runner.workspace import RepoSpec, WorkspaceError
@@ -25,7 +25,7 @@ class MetadataAlert(Bench):
     def test_explicit_diagnostics_start_behind_code_with_full_pool(self):
         normal, alert = task(1, priority="urgent"), diagnostic(2)
         runner, held = self.full_pool(FakeMesh([normal, alert], max_concurrent=1))
-        write_replies(self.replies, {alert["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {alert["id"][:8]: next_turn()})
         with patch.object(runner.adapter, "spawn", wraps=runner.adapter.spawn) as spawn:
             runner.tick()
         spawn.assert_called_once()
@@ -90,7 +90,7 @@ class MetadataAlert(Bench):
         t = diagnostic()
         mesh = FakeMesh([t], max_concurrent=1)
         runner, _ = self.full_pool(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         for kind in ("human", "auth", "quota", "disk"):
@@ -119,7 +119,7 @@ class MetadataAlert(Bench):
         t = diagnostic()
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         self.assertEqual(first.workspaces, [])
@@ -150,7 +150,7 @@ class MetadataAlert(Bench):
         t = diagnostic()
         mesh = FakeMesh([t], max_concurrent=1)
         runner, _ = self.full_pool(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         mesh.tasks[t["id"]]["labels"].remove("runner:alert-diagnostics")

@@ -1,5 +1,6 @@
 """Mesh repository_access read hot each tick, host inventory separate from permission."""
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -307,6 +308,59 @@ class Runner(Bench):
         r._task_backoff.clear()
         self.settle_all(r)
         self.assertEqual(len(self.starts()), 1)
+
+    def test_grant_lifts_the_refusal_backoff_on_the_next_tick(self):
+        # the failed-start backoff of an access refusal is NOT cleared by hand here: the grant itself
+        # must start the card on the next tick (live 0.2.26 held it 15 min after the grant)
+        self.grant = access(1)
+        t = task(1)
+        mesh, r = self.setup_run(t)
+        r.tick()
+        self.assertIn("no_membership", self.notes(mesh, t)[-1])
+        self.assertIn(t["id"], r._task_backoff)
+        r.tick()                                           # no new revision: the backoff holds
+        self.assertFalse(self.starts())
+        self.grant = access(2, "g/deploy")
+        self.settle_all(r)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertNotIn(t["id"], r._access_backoff)
+
+    def test_new_revision_keeps_a_backoff_another_failure_set(self):
+        self.grant = access(1)
+        t = task(1)
+        mesh, r = self.setup_run(t)
+        r.tick()
+        r._task_backoff[t["id"]] += 60                    # replaced by another failure's deadline
+        self.grant = access(2, "g/deploy")
+        r.tick()
+        self.assertFalse(self.starts())
+        self.assertIn(t["id"], r._task_backoff)
+
+    def test_new_revision_lifts_an_access_resume_hold_and_keeps_a_replaced_one(self):
+        # a resume refused for access sets _resume_hold through the real preflight; a new revision
+        # lifts it, while a hold another failure replaced since stays
+        self.grant = access(1)
+        t1, t2 = task(1), task(2)
+        mesh, r = self.setup_run(t1, t2)
+        r.refresh_me()
+        holds = {}
+        for t in (t1, t2):
+            a = r.store.create(self.agent.name, t["id"], "claude")
+            until = time.monotonic() + 900
+            self.assertTrue(r._repo_preflight_refused(a, t, until, resume=True))
+            self.assertEqual(r._resume_hold[a.id], until)
+            self.assertEqual(r._access_resume_hold[a.id], until)
+            holds[t["id"]] = a.id
+        kept = holds[t2["id"]]
+        r._resume_hold[kept] += 60                         # replaced by another failure's deadline
+        replaced = r._resume_hold[kept]
+        r.refresh_me()                                      # same revision: nothing lifted
+        self.assertIn(holds[t1["id"]], r._resume_hold)
+        self.grant = access(2, "g/deploy")
+        r.refresh_me()
+        self.assertNotIn(holds[t1["id"]], r._resume_hold)
+        self.assertEqual(r._resume_hold[kept], replaced)
+        self.assertEqual(r._access_resume_hold, {})
 
     def test_grant_with_unnormalized_identity_matches_the_card(self):
         self.grant = access(1, "/g/deploy.git/", host="GIT.EXAMPLE:443")

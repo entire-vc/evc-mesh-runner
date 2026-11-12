@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT, slow, wait_time
 from test_runner import Bench
 
 from mesh_runner import interactive, watchdog
@@ -113,8 +113,8 @@ class Watched(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         for k, v in limits.items():
             setattr(self.cfg, k, v)
-        write_replies(self.replies, {t["id"][:8]: f"SLEEP:60:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window",
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: slow(f"SLEEP:60:", wait_time(why="soak window")),
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         a = r.store.by_state("builder", ("running",))[0]

@@ -16,7 +16,7 @@ Names are spelled out instead of imported so this file runs against the old code
 """
 import json
 
-from fakes import FakeMesh, calls, task, write_replies
+from fakes import FakeMesh, calls, task, write_replies, wait_card
 from mesh_runner.config import AgentConfig
 from mesh_runner.runner import TASK_WIDE, AgentRunner
 from mesh_runner.store import Store
@@ -44,8 +44,8 @@ class MutualCardCycle(Bench):
     def start(self, other_wait):
         self.t, self.other = task(1), task(0xabcdef12, assignee_id="someone-else")
         self.mesh = FakeMesh([self.t, self.other], max_concurrent=1)
-        write_replies(self.replies, {self.t["id"][:8]: f"⏳ WAIT card:#{OTHER8}",
-                                     self.t["id"][:8] + ":resume": f"⏳ WAIT card:#{OTHER8}"})
+        write_replies(self.replies, {self.t["id"][:8]: wait_card(self.other["id"]),
+                                     self.t["id"][:8] + ":resume": wait_card(self.other["id"])})
         self.r = self.runner(self.mesh)
         self.r.tick()
         self.settle_all(self.r)

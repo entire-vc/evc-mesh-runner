@@ -5,6 +5,13 @@
     install.py --activate <version>                       switch to a version already in the catalog (rollback)
     install.py --status                                   what is installed and what is running
 
+The tree is exported from the release commit, the head of ``release/<version>``:
+``git archive <release-sha> | tar -x -C <dir>``. ``git archive`` fills ``SOURCE_COMMIT`` in (export-subst)
+with that commit and its parents; the file is copied into the catalog, and ``--status`` and the install
+report name the commit a release was exported from. A merge commit (the release merged into ``main``
+after main moved on) also carries the commits merged after the cut-off, which the version's CHANGELOG
+does not name: ``--source`` refuses it unless ``--allow-merge-commit``.
+
 Why this needs no drain: agent turns run in their own sessions (tmux, or a child in its own
 process session) and write their event stream to a file; the attempt registry is SQLite. A
 restarted Runner re-attaches to live turns and reconciles pending delivery rows from the journal
@@ -41,7 +48,9 @@ HOME = Path.home()
 CATALOG = HOME / ".mesh-runner-catalog" / "agent-runner"
 PLIST = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 CONFIG = HOME / ".mesh-runner" / "runner.toml"
-COPIED = ("src", "pyproject.toml", "mesh-extension.json", "CHANGELOG.md", "README.md", "LICENSE", "requirements.lock")
+SOURCE_COMMIT = "SOURCE_COMMIT"
+COPIED = ("src", "pyproject.toml", "mesh-extension.json", "CHANGELOG.md", "README.md", "LICENSE", "requirements.lock",
+          SOURCE_COMMIT)
 
 
 class Failed(RuntimeError):
@@ -65,12 +74,44 @@ def source_version(release: Path) -> str:
     raise Failed("no __version__ in src/mesh_runner/__init__.py")
 
 
+def source_commit(release: Path) -> dict:
+    """The commit ``release`` was exported from, read from ``SOURCE_COMMIT`` (``$Format:%H %P$`` filled in by
+    ``git archive <commit>``): ``{"sha", "parents"}``, or ``{"sha": None, "why"}`` when the tree does not say
+    (no file: a release from before it; the placeholder: a copy of a checkout, or ``git archive`` of a tree)."""
+    try:
+        words = (release / SOURCE_COMMIT).read_text().split()
+    except OSError:
+        return {"sha": None, "why": f"no {SOURCE_COMMIT} in the tree"}
+    if not words or not all(len(w) in (40, 64) and all(c in "0123456789abcdef" for c in w) for w in words):
+        return {"sha": None, "why": f"{SOURCE_COMMIT} is not filled in: export the tree with git archive <commit>"}
+    return {"sha": words[0], "parents": words[1:]}
+
+
+def refuse_merge_commit(source: Path) -> None:
+    commit = source_commit(source)
+    if len(commit.get("parents") or []) > 1:
+        raise Failed(f"{source} is exported from merge commit {commit['sha']} (parents {', '.join(commit['parents'])}): "
+                     "it also carries what reached main after the release cut-off. Export the release commit, the "
+                     "head of release/<version> (the second parent of the release merge), see docs/release-process.md; "
+                     "--allow-merge-commit installs it anyway")
+
+
 def stage(source: Path, catalog: Path, version: str) -> Path:
-    """Copy ``source`` to ``catalog/version``; an existing identical tree is reused."""
+    """Copy ``source`` to ``catalog/version``; an existing identical tree is reused.
+
+    Identical means the same Python sources and the same source commit: an entry staged before
+    ``SOURCE_COMMIT`` existed gets the source's file; an entry exported from another commit is refused,
+    so ``--status`` never names a commit the installed tree was not exported from."""
     target = catalog / version
     if target.exists():
         if tree_digest(target) != tree_digest(source):
             raise Failed(f"{target} already holds different content; choose another --version")
+        held, given = source_commit(target).get("sha"), source_commit(source).get("sha")
+        if held is None and (source / SOURCE_COMMIT).is_file():
+            shutil.copy2(source / SOURCE_COMMIT, target / SOURCE_COMMIT)
+        elif held != given:
+            raise Failed(f"{target} holds the same code exported from commit {held}, not {given or 'an unknown commit'}; "
+                         "export the commit that version was installed from, or choose another --version")
         return target
     catalog.mkdir(parents=True, exist_ok=True)
     partial = catalog / f".{version}.partial"
@@ -264,7 +305,8 @@ def switch(release: Path, args) -> dict:
         current = plistlib.load(stream)
     previous = running_release(current)
     state = Path(args.state)
-    report = {"previous": str(previous) if previous else "unknown", "target": str(release), "tree": tree_digest(release)}
+    report = {"previous": str(previous) if previous else "unknown", "target": str(release), "tree": tree_digest(release),
+              "commit": source_commit(release)}
     same = previous is not None and previous.resolve() == release.resolve()
     if same and not args.restart and not runs_another_tree(state, release):
         return {**report, "result": "already-active", "pid": job_pid(args.label)}
@@ -305,7 +347,9 @@ def status(args) -> dict:
     except (OSError, ValueError):
         receipt = {}
     catalog = Path(args.catalog)
-    return {"configured": str(configured) if configured else "unknown", "pid": job_pid(args.label),
+    return {"configured": str(configured) if configured else "unknown",
+            "commit": source_commit(configured) if configured else {"sha": None, "why": "no configured release"},
+            "pid": job_pid(args.label),
             "receipt": {k: receipt.get(k) for k in ("pid", "release", "source", "status_unix")},
             "receipt_age_seconds": round(time.time() - float(receipt.get("status_unix") or 0), 1),
             "catalog": sorted(p.name for p in catalog.iterdir() if p.is_dir() and not p.name.startswith("."))
@@ -319,6 +363,8 @@ def main(argv=None) -> int:
     what.add_argument("--activate", metavar="VERSION", help="switch to a version already in the catalog")
     what.add_argument("--status", action="store_true")
     ap.add_argument("--version", help="catalog name for --source (default: __version__ of the tree)")
+    ap.add_argument("--allow-merge-commit", action="store_true",
+                    help="install a tree exported from a merge commit (normally the release commit is installed)")
     ap.add_argument("--restart", action="store_true", help="restart even when the target is already active")
     ap.add_argument("--catalog", default=str(CATALOG))
     ap.add_argument("--plist", default=str(PLIST))
@@ -339,6 +385,8 @@ def main(argv=None) -> int:
             out = switch(release, args)
         else:
             source = args.source.resolve()
+            if not args.allow_merge_commit:
+                refuse_merge_commit(source)
             out = switch(stage(source, Path(args.catalog), args.version or source_version(source)), args)
     except Failed as exc:
         print(json.dumps({"result": "refused", "reason": str(exc)}, ensure_ascii=False, indent=1))

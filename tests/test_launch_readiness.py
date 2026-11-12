@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from fakes import FakeAdapter, FakeMesh, calls, task, write_replies
+from fakes import FakeAdapter, FakeMesh, calls, task, write_replies, next_turn
 from test_runner import Bench
 from test_workspace import make_repo
 from mesh_runner.workspace import RepoSpec, WorkspaceError
@@ -337,7 +337,7 @@ class AdmissionReadiness(Bench):
             seen.append(list(launch.argv))
             return spawn(launch, log_path)
         self.adapter.spawn = capture
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         restarted._resume_one(restarted.store.get(a.id))
         current = restarted.store.get(a.id)
         self.assertEqual((current.state, current.workspaces), ("running", []))
@@ -382,7 +382,7 @@ class AdmissionReadiness(Bench):
         runner.store.mark(self.agent.name, t["id"], "model", "stale-model")
         mesh.tasks[t["id"]]["labels"] = ["model:sonnet", "effort:high"]
         self.adapter.binary = sys.executable
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         restarted = self.runner(mesh)
         restarted._resume_one(restarted.store.get(a.id))
         self.finish_turn(restarted)
@@ -430,7 +430,7 @@ class AdmissionReadiness(Bench):
         self.assertEqual(routed.spawn_calls, 1)
         binary.unlink()
         binary.symlink_to(sys.executable)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         restarted._resume_one(restarted.store.get(a.id))
         self.finish_turn(restarted)
         self.assertEqual(routed.spawn_calls, 2)
@@ -531,7 +531,7 @@ class AdmissionReadiness(Bench):
         # An actual external repair is observed; ordinary same-attempt admission.
         binary.unlink()
         binary.symlink_to(sys.executable)
-        write_replies(self.replies, {"00000001": "↻ NEXT"})
+        write_replies(self.replies, {"00000001": next_turn()})
         restarted._resume_one(restarted.store.get(a.id))
         proc = restarted.procs[a.id]
         self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait(timeout=10)))
@@ -622,7 +622,7 @@ class AdmissionReadiness(Bench):
         self.assertFalse(r._start_one(t))
         a = r.store.by_state(self.agent.name, ("ready",))[0]
         self.adapter.binary = sys.executable
-        write_replies(self.replies, {"00000001": "↻ NEXT"})
+        write_replies(self.replies, {"00000001": next_turn()})
         r._resume_one(a)
         proc = r.procs[a.id]
         try:
@@ -668,7 +668,7 @@ class AdmissionReadiness(Bench):
         self.assertEqual(restarted.store.events(a.id), before)
         self.assertEqual(len(restarted.store.by_state(self.agent.name, ("ready",))), 1)
         binary.symlink_to(sys.executable)
-        write_replies(self.replies, {"00000001": "↻ NEXT"})
+        write_replies(self.replies, {"00000001": next_turn()})
         restarted._resume_one(restarted.store.get(a.id))
         proc = restarted.procs[a.id]
         self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait(timeout=10)))
@@ -706,7 +706,7 @@ class AdmissionReadiness(Bench):
         # must treat it as evidence, strip it from admitted workspaces and lease cleanly.
         r.store.update(a, workspaces=[str(held_path)])
         binary.symlink_to(sys.executable)
-        write_replies(self.replies, {"00000001": "↻ NEXT"})
+        write_replies(self.replies, {"00000001": next_turn()})
         r._resume_one(r.store.get(a.id))
         proc = r.procs[a.id]
         self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait(timeout=10)))
@@ -742,7 +742,7 @@ class AdmissionReadiness(Bench):
         self.assertEqual((held / "README").read_text(), "preserve held progress\n")
 
         r.pool.release(blocker.id)
-        write_replies(self.replies, {"00000001": "↻ NEXT"})
+        write_replies(self.replies, {"00000001": next_turn()})
         r._resume_one(r.store.get(a.id))
 
         current = r.store.get(a.id)
@@ -780,7 +780,7 @@ class AdmissionReadiness(Bench):
         self.assertEqual(r.procs, {})
         late_parent.unlink()
         hook.unlink()
-        write_replies(self.replies, {"00000001": "↻ NEXT"})
+        write_replies(self.replies, {"00000001": next_turn()})
 
         r._resume_one(r.store.get(a.id))
 

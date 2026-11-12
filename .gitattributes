@@ -1,0 +1,2 @@
+# `git archive <commit>` writes the commit and its parents into SOURCE_COMMIT (ops/install.py --status).
+SOURCE_COMMIT export-subst

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.30 — 2026-11-12
+
+- A new repository-access grant now starts a card that was refused for missing access on the next tick: the grant lifts exactly the backoff and resume holds the access refusal set, and a deadline set by another failure stays.
+- The runner is installed from the release commit. `git archive` writes the exported commit and its parents into `SOURCE_COMMIT`; `ops/install.py --source` refuses a tree exported from a merge commit (`--allow-merge-commit` overrides) and `--status` shows `commit.sha`. `docs/release-process.md` installs the head of `release/<version>`, not the release merge.
+- Turn guidance names the typed turn commands; a marker line is offered only as the fallback after a command was refused, quoted with the command and its error.
+- `wait_for on=manual` is read: the typed passive wait on a `wake:manual` card settles as the manual marker did, with the same label check.
+
+## 0.2.29 — 2026-11-12
+
+- Wait-root radar: every 3 minutes, off the main loop, open card waits are followed to the card that waits on no other card. Each root gets a kind, a holder, the number of waiting cards behind it and the age of the oldest wait. Only a ready root of this runner's own lanes is acted on: its lane starts it before other work, the heaviest first. Nothing is written. `status.json` shows `roots`; `mesh-runner roots --config <toml> [--json]` prints the full picture.
+- A provider refusal of an outdated harness version and an expired login are lane faults with one operator signal. The refusal holds the harness on the host, keeps the card's counters and turn budget, and signals once; the hold lifts when the CLI binary changes or lets one turn through every 6 hours. An authentication hold signals once per hold and every 6 hours while it lasts, naming the account. The signal is one `operator_alert` line in `events.jsonl` and one warning; `status.json` lists `auth_holds` for logins launched in the last 3 days and `harness_holds`.
+
 ## 0.2.28 — 2026-11-12
 
 - End a turn whose prompt delivery stays unproven without an operator: once its processes are gone and its native evidence stays unchanged for 15 minutes, the prompt is archived (never replayed) and the card starts in a new attempt. The transition emits one operator alert and the card says what happens next. No session window starts below the configured memory floor, read right before the window opens, and a driver claims its window under the host start lock so another driver cannot close it as idle.

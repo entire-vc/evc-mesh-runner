@@ -8,7 +8,6 @@ Everything runs on a private tmux server (-L), never the host's sessions.
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,8 +23,8 @@ from mesh_runner.adapters.codex import CodexAdapter
 from mesh_runner.config import ConfigError, load
 from mesh_runner.store import ACTIVE, OPEN, Store
 from mesh_runner.tui_driver import Driver
+from tmux_support import TMUX, needs_tmux
 
-TMUX = shutil.which("tmux")
 
 FAKE_HARNESS = r'''
 import json, os, subprocess, sys, termios, tty, time, uuid
@@ -263,7 +262,7 @@ class A:
         self.state, self.wait = state, wait or {}
 
 
-@unittest.skipUnless(TMUX, "tmux not installed")
+@needs_tmux
 class DriverTurns(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

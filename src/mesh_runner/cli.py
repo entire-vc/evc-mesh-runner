@@ -116,6 +116,25 @@ def _asks(argv: list[str]) -> int:
     return 0
 
 
+def _roots(argv: list[str]) -> int:
+    """`roots`: the wait-root radar, read-only (store opened read-only, card GETs only)."""
+    from . import wait_roots
+    p = argparse.ArgumentParser(prog="mesh-runner roots")
+    p.add_argument("--config", required=True)
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    args = p.parse_args(argv)
+    logging.basicConfig(level="WARNING", format="%(asctime)s %(levelname)s %(message)s")
+    cfg = config_mod.load(args.config)
+    reader = wait_roots.CardReader(wait_roots.clients_for(cfg))
+    radar = wait_roots.compute(cfg.state_dir / "runner.sqlite", reader, frozenset(a.name for a in cfg.agents))
+    if args.json:
+        json.dump(wait_roots.status(radar, limit=len(radar.roots)), sys.stdout, ensure_ascii=False, indent=2)
+        print()
+    else:
+        print(wait_roots.render(radar))
+    return 0
+
+
 def _reviewer_merge(argv: list[str]) -> int:
     """`reviewer-merge`: dry-run by default (reads only); --apply creates the one merge-only card."""
     from . import reviewer_merge
@@ -466,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
         return _lifecycle_wait(args_in[1:])
     if args_in and args_in[0] == "asks":
         return _asks(args_in[1:])
+    if args_in and args_in[0] == "roots":
+        return _roots(args_in[1:])
     if args_in and args_in[0] == "workspace-readiness":
         return _workspace_readiness(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
