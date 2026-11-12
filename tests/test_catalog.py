@@ -344,11 +344,15 @@ class CatalogConfigTest(unittest.TestCase):
             reporter_key_file = "{self.key}"
         """).catalog
 
-    def test_execution_observations_absent_or_false_is_accepted_and_true_is_refused(self):
-        self.assertTrue(self.observations_cfg().enabled)
-        self.assertTrue(self.observations_cfg("false").enabled)
-        with self.assertRaises(ConfigError):
-            self.observations_cfg("true")
+    def test_execution_observations_is_opt_in(self):
+        self.assertFalse(self.observations_cfg().execution_observations)
+        self.assertFalse(self.observations_cfg("false").execution_observations)
+        self.assertTrue(self.observations_cfg("true").execution_observations)
+
+    def test_execution_observations_needs_the_catalog_controller(self):
+        for head in ("[catalog]\nenabled = false", "[catalog]"):
+            with self.subTest(head=head), self.assertRaises(ConfigError):
+                self.cfg(head + "\nexecution_observations = true\n")
 
     def test_execution_observations_wrong_type_is_refused_not_enabled(self):
         for bad in ('"true"', '"false"', "1", "0", "[true]"):
