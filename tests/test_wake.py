@@ -560,7 +560,7 @@ class PersonAsk(unittest.TestCase):
 
     def wait(self, days):
         asked = (NOW - dt.timedelta(days=days)).isoformat()
-        return {"kind": "blocking", "handle": "alice", "since": asked, "started": asked, "rechecks": 3}
+        return {"kind": "blocking", "handle": "morgan", "since": asked, "started": asked, "rechecks": 3}
 
     def ask(self, wait, task, comments=()):
         mine = StatusCategories(Denied())

@@ -2,14 +2,14 @@
 
 One file per change: `changelog.d/<card>-<slug>.md`, where `<card>` is the 8-hex id of the card the
 merge request delivers and `<slug>` is lowercase words joined by hyphens
-(`1b80d5c5-task-writer-hold.md`); the slug may be left out (`1b80d5c5.md`). Two merge requests
+(`0123abcd-task-writer-hold.md`); the slug may be left out (`0123abcd.md`). Two merge requests
 never write the same file, so they never conflict here.
 
 The file holds the entry exactly as it will read in `CHANGELOG.md`: one or more list items, no
-headings.
+headings. The file name carries the card; the entry text does not repeat it.
 
 ```markdown
-- **What changed, in one sentence (#aaaaaaaa).** Why it matters, what an operator sees, the new
+- **What changed, in one sentence.** Why it matters, what an operator sees, the new
   option and its default, the doc to read.
 ```
 

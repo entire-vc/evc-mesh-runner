@@ -150,7 +150,7 @@ class Alerts(Bench):
         r = self.runner(mesh)
         r.refresh_me()
         a = r.store.create(self.agent.name, t["id"], "claude")
-        env = {"HOME": "/u/x", "CLAUDE_CONFIG_DIR": "/u/x/.claude-accounts/team-a"}
+        env = {"HOME": "/u/x", "CLAUDE_CONFIG_DIR": "/u/x/.claude-accounts/example-team"}
         profile = auth.profile_id(env, self.root)
         r.store.mark(self.agent.name, t["id"], "auth_launch", json.dumps(
             {"attempt": a.id, "turn": 1, "profile": profile, "account": auth.account_label("claude", env)}))
@@ -160,11 +160,11 @@ class Alerts(Bench):
             r._authentication_failed(r.store.get(a.id), profile)
         alerts = self.alerts(r)
         self.assertEqual(len(alerts), 1)
-        self.assertIn("claude team-a", alerts[0]["text"])
+        self.assertIn("claude example-team", alerts[0]["text"])
         self.assertEqual((alerts[0]["incident"], alerts[0]["account"], alerts[0]["lane"]),
-                         ("auth_hold", "claude team-a", self.agent.name))
+                         ("auth_hold", "claude example-team", self.agent.name))
         self.assertNotIn(profile + ".", alerts[0]["text"].split("--profile")[0])   # named, not hashed
-        self.assertEqual(auth.status(r.store)[0]["account"], "claude team-a")
+        self.assertEqual(auth.status(r.store)[0]["account"], "claude example-team")
 
     def test_auth_hold_repeats_after_the_interval(self):
         store = self.agent_store()
@@ -180,7 +180,7 @@ class Alerts(Bench):
     def test_account_labels(self):
         home = {"HOME": "/u/x"}
         self.assertEqual(auth.account_label("claude", home), "claude default login ~/.claude (no CLAUDE_CONFIG_DIR)")
-        self.assertEqual(auth.account_label("claude", {**home, "CLAUDE_CONFIG_DIR": "/a/team-b"}), "claude team-b")
+        self.assertEqual(auth.account_label("claude", {**home, "CLAUDE_CONFIG_DIR": "/a/ops-team"}), "claude ops-team")
         self.assertEqual(auth.account_label("codex", {**home, "CODEX_HOME": "/c/codex-2"}), "codex codex-2")
 
     def test_api_account_label_never_exposes_provider_url(self):

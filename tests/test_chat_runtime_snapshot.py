@@ -60,7 +60,7 @@ class Fixture(unittest.TestCase):
     def setUp(self):
         self.t = [1000.0]
         self.pool = ChatPool(max_per_agent=3, max_host=6, idle_minutes=10, clock=lambda: self.t[0])
-        self.tmux = FakeTmux({(SESSION, "card-0f1e2d3c"): True})        # a daemon (card) window of the agent
+        self.tmux = FakeTmux({(SESSION, "card-0000aaaa"): True})        # a daemon (card) window of the agent
         self.svc = ChatService(None, [AGENT_ID], self.pool, lambda a: None,
                                lambda a, th: stop_window(self.tmux, None, NAME, th), lambda a, th: True)
         self.mesh = FakeMesh()

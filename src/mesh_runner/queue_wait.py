@@ -157,24 +157,31 @@ def new_request(task_id, value):
     return request(dict(version=1, generation_id=str(uuid4()), task_id=task_id, contract=value))
 
 
-def eligible(task, owner):
+BUILTIN_HOLDS = ('no-runner', 'rescue-exhausted')
+
+
+def held(labels, hold_labels=()):
+    """A label that keeps the card from an automatic continuation."""
+    return any(x.startswith('park:') or x in BUILTIN_HOLDS or x in hold_labels for x in labels)
+
+
+def eligible(task, owner, hold_labels=()):
     labels = task.get('labels')
     return bool(task.get('assignee_id') == owner and task.get('human_gate') is False
                 and isinstance(labels, list) and all(isinstance(x, str) for x in labels)
                 and 'fleet-starvation-wake' in labels
-                and not any(x.startswith('park:') or x in ('no-runner', 'awaiting-pavel', 'rescue-exhausted')
-                            for x in labels)
+                and not held(labels, hold_labels)
                 and task.get('delegation_level') != 'supervised' and not task.get('completion_signal')
                 and task.get('checked_out_by') in (None, '', owner))
 
 
-def source(task, comments, owner, current_time):
+def source(task, comments, owner, current_time, hold_labels=()):
     """Strictly validate the newest machine demand, allowing audited supersession.
 
     Older malformed contracts do not poison a later generation. A typed source
     without an orderable machine stamp remains unknown; it cannot be proved old.
     """
-    if not eligible(task, owner):
+    if not eligible(task, owner, hold_labels):
         return None
     candidates = []
     try:

@@ -124,7 +124,7 @@ class GitIndexAdmission(Bench):
         text = r._git_index_notice(r.store.get(a.id))
         self.assertIn(rid, text)
         self.assertIn('scripts/macmini-disk-cleanup.sh', text)
-        self.assertIn('does NOT permit editing source in the shared bob checkout', text)
+        self.assertIn('does NOT permit editing source in the shared fleet checkout', text)
         self.assertEqual(self.index_state(), self.index_before)      # the consumer never touches a live index
 
     def test_cli_command_submits_only(self):

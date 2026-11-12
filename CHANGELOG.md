@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.34 — 2026-11-12
+
+- **A blocked pool returns by its reset time, and a long route hold is signalled.** A pool left at the threshold used to turn `unknown` as soon as its reading went stale (an expired collector token), so lanes stayed on their reserve with no end. Now a blocked pool with a known reset time stays blocked until that time whatever the readings do, and is reported `available` (source `reset_elapsed`) once it has passed, until a fresh reading says otherwise. The code fallback thresholds block and transfer at 99 % and readmit below 95 %. A lane held by one `route:` reason for 30 minutes raises one `operator_alert` (`route_hold:<lane>`). A resume re-reads the lane's route after the start gate, so a gate that restores the lane to its primary is followed by the launch.
+
+## 0.2.33 — 2026-11-12
+
+- **A sent-back Mesh wait resumes with a checkout.** `wait_for`, `ask_agent` and `ask_human` release the caller's Mesh checkout in the same step, but the runner kept the lease token on the attempt. When it then sent the wait back (a pipeline in a terminal canceled state, a stale baseline, any other bounce) and resumed the same session, `_resume_one` skipped the acquire because a token was present, so every turn command of the resumed session got 409 "the caller does not hold this card's checkout". The runner now drops the token as soon as it reads a typed outcome whose command released it (event `checkout_released_by_mesh`); the resume acquires a new lease for the same session.
+- **New `[runner]` option `hold_labels` (default `["awaiting-owner"]`) names the labels that keep a card from a starvation or queue wake.** It replaces a built-in deployment-specific label; set it to the label your team uses for a card that waits for a person. Tests, docs and comments use neutral lane names and fixture card ids.
+
+## 0.2.32 — 2026-11-12
+
+- **Behind a merge gate, an MR that is only behind its target is no longer the author's to sync.** With `merge_command` set, a `⏳ WAIT mr:… until=merged` on an MR whose only blocker is `need_rebase` is accepted instead of sent back, and the evaluator no longer wakes the waiter with an "action required" notice for it: the gate syncs that branch itself right before merging. Where the next step is still shown, it tells the author to leave the branch alone and arm `⏳ WAIT merge:` on the current head. A conflict, and every case without a gate, keep the old text (merge the target into the branch, new head, new review).
+
 ## 0.2.31 — 2026-11-12
 
 - Asks to write to, call or contact someone classify as hard in English too. A letter, an offer or a call was caught only in Russian; `call`, `letter`, `offer`, `proposal`, `outreach`, `reach out`, `write to`, `reply to`, `contact`, `dm` and their Russian counterparts now keep such an ask hard, so its stated default is never applied by the clock. Asking to write a test stays soft. The shared fixture `tests/fixtures/ask_class_cases.json` gains these cases.

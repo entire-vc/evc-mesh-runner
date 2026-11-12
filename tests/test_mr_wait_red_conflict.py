@@ -2,7 +2,7 @@
 conflict with its target) is sent back at declaration instead of parking for good."""
 import unittest
 
-from mesh_runner.wake import ci_delivery_key, mr_merge_blocker, typed_event
+from mesh_runner.wake import blocked_mr_next_step, ci_delivery_key, mr_merge_blocker, typed_event
 from fakes import FakeGitLab, FakeMesh, task, write_replies
 from test_runner import Bench
 
@@ -164,6 +164,45 @@ class MergeWaitOnBlockedMR(Bench):
         self.assertNotIn('WAIT merge:', a.wake_text)
 
 
+    # -- behind only, merge gate ------------------------
+
+    def test_behind_mr_behind_a_merge_gate_is_accepted(self):
+        # the gate syncs a branch that is only behind right before merging: the wait is not sent back
+        for linked in (True, False):
+            with self.subTest(linked=linked):
+                self.tearDown(), self.setUp()
+                self.cfg.merge_command = ('merge-gate', '{iid}', '{project}', '{sha}')
+                r, t, gl = self.flow(mr_row('success', detailed_merge_status='need_rebase'), linked=linked)
+                a = self.turn(r, t, merged_line())
+                self.assertEqual(a.state, 'waiting')
+                self.assertEqual(a.wait['target'], MR)
+                r.store.db.close()
+
+    def test_conflict_behind_a_merge_gate_is_still_sent_back(self):
+        self.cfg.merge_command = ('merge-gate', '{iid}', '{project}', '{sha}')
+        r, t, gl = self.flow(mr_row('success', has_conflicts=True, detailed_merge_status='need_rebase'))
+        a = self.turn(r, t, merged_line())
+        self.assert_sent_back(a, 'has a merge conflict', 'merge the target branch into the MR branch')
+
+    def test_behind_mr_next_step_behind_a_merge_gate_leaves_the_branch_alone(self):
+        text = blocked_mr_next_step(MR, 'need_rebase', True, SHA)
+        self.assertNotIn('merge the target branch', text)
+        self.assertNotIn('Do not wait for this MR to merge again', text)
+        self.assertIn('leave the branch as it is', text)
+        self.assertIn(f'`⏳ WAIT merge:{MR} after={SHA}`', text)     # the current head, not a new one
+        self.assertNotIn('new-head', text)
+        self.assertIn('<full-head-sha>', blocked_mr_next_step(MR, 'need_rebase', True))
+        # without a gate, or for a conflict, the author still makes the new head
+        for cause, gate in (('need_rebase', False), ('conflict', True), ('conflict', False)):
+            with self.subTest(cause=cause, gate=gate):
+                text = blocked_mr_next_step(MR, cause, gate, SHA)
+                self.assertIn('merge the target branch into the MR branch', text)
+                self.assertIn('Do not wait for this MR to merge again', text)
+        # a provider-qualified target has no merge: wait, so no gate either
+        self.assertIn('merge the target branch',
+                      blocked_mr_next_step('github:o/r!5', 'need_rebase', True, SHA))
+
+
 class ConflictOwnerNotice(unittest.TestCase):
     def wait(self):
         return {'kind': 'mr', 'target': MR, 'mr_state': {'predicate': 'merged', 'sha': SHA, 'state': 'opened'}}
@@ -188,6 +227,15 @@ class ConflictOwnerNotice(unittest.TestCase):
                             allow_action_required=True)
         self.assertIn('is behind its target branch', event)
         self.assertNotEqual(first['key'], second['key'])
+
+    def test_behind_mr_gives_no_notice_behind_a_merge_gate(self):
+        gl = FakeGitLab()
+        gl.mr_rows[MR] = mr_row('success', detailed_merge_status='need_rebase')
+        self.assertEqual(typed_event(gl, 'mr', MR, self.wait(), '', {}, allow_action_required=True,
+                                     merge_gate=True), '')
+        event = typed_event(gl, 'mr', MR, self.wait(), '', {}, allow_action_required=True, merge_gate=False)
+        self.assertIn('is behind its target branch', event)
+        self.assertIn('merge the target branch into the MR branch', event)
 
     def test_a_skipped_head_is_red_only_behind_a_merge_gate(self):
         # the merge gate merges on success alone; without it a project may let a skipped head merge

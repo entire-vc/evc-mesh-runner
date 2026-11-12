@@ -35,7 +35,7 @@ PENDING_KEY = "lifecycle_pending"
 DELIVERED_KEY = "lifecycle_delivered"
 UNRESOLVED_KEY = "lifecycle_unresolved"
 SEEN_PREFIX = "lifecycle_seen:"
-PROFILE = "khan"                        # this observer is the Khan lane contract
+PROFILE = "khan"                        # the one Codex profile this observer serves
 UNRESOLVED_MAX = 16                     # valid rows whose session artifacts have not appeared yet
 UNRESOLVED_TTL = 600                    # seconds after the row's own ts
 JOURNAL_NAME = "khan-lifecycle.jsonl"
@@ -190,7 +190,7 @@ def pending(store, agent: str, task_id: str, reg_id: str) -> dict | None:
 
 
 def _identity(manifest: Path) -> tuple[str, str, str, str | None]:
-    """(manifest sha256[:16], config_path, hook_key) read from the Khan manifest by named fields."""
+    """(manifest sha256[:16], config_path, hook_key) read from that profile's manifest by named fields."""
     st = os.lstat(manifest)
     if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
         raise ValueError("manifest is not a small regular file")

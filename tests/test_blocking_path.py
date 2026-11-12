@@ -124,7 +124,7 @@ class BlockingPathTests(unittest.TestCase):
             with self.subTest(gate=gate):
                 t = node(2)
                 t.update(human_gate=gate, human_gate_info={'owner_agent_id':'asker'},
-                         labels=['awaiting-pavel'], description='Blocking @person')
+                         labels=['awaiting-owner'], description='Blocking @person')
                 mesh = Reads([t])
                 result = self.resolver(mesh).resolve(self.a, Budget())
                 self.assertNotIn('human_gate=true', result)
@@ -282,7 +282,7 @@ class BlockingPathTests(unittest.TestCase):
         clock = [0.0]
         waits = []
         for n in (10, 12):
-            waits.append((node(n), node(n + 1, assignee_name='Bill')))
+            waits.append((node(n), node(n + 1, assignee_name='Director')))
         mesh = Reads([t for pair in waits for t in pair],
                      {m['id']: [edge(e)] for m, e in waits})
         attempts = []
@@ -303,7 +303,7 @@ class BlockingPathTests(unittest.TestCase):
         for att in attempts:
             reason = mesh.runtime[att.task_id]['reason']
             self.assertNotIn('UNKNOWN', reason)
-            self.assertIn('addressee=Bill', reason)
+            self.assertIn('addressee=Director', reason)
 
     def test_tick_cap_bounds_the_budget_of_a_card_started_near_the_deadline(self):
         mesh = Reads([self.b])
@@ -318,12 +318,12 @@ class BlockingPathTests(unittest.TestCase):
         self.assertLessEqual(seen[0], start + 2.0 + 0.5)   # tick cap, not the 8 s card budget
 
     def test_gated_end_of_chain_addressee_stays_unknown(self):
-        end = node(3, assignee_name='Bill')
+        end = node(3, assignee_name='Director')
         end.update(human_gate=True, human_gate_info={'owner_agent_id': 'asker'})
         mesh = Reads([self.b, end], {self.b['id']: [edge(end)]})
         reason = self.resolver(mesh).resolve(self.a, Budget())
         self.assertIn('addressee=unknown', reason)
-        self.assertNotIn('Bill', reason)
+        self.assertNotIn('Director', reason)
 
     def test_only_card_waits_get_diagnostics_no_normal_get_fallback(self):
         mesh = Reads([self.b])

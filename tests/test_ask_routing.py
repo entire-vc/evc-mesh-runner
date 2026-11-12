@@ -416,7 +416,7 @@ class GateClass(unittest.TestCase):
 
 
 class SharedFixture(unittest.TestCase):
-    """tests/fixtures/ask_class_cases.json is byte-identical to evc-mesh
+    """tests/fixtures/ask_class_cases.json is byte-identical to the Mesh server's
     internal/service/testdata/ask_class_cases.json, which the server's markerGateClass test
     runs: one question set, one verdict on both sides."""
 

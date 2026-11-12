@@ -24,7 +24,7 @@ def state(tmp_path):
     ledger = Ledger.initialize(tmp_path / "ledger")
     rid = ledger.register(binding, receiver)["registration"]
     event = {"binding": binding, "sequence": 1, "status": "unknown", "receipt_sha256": "b" * 64,
-             "owner": "Riker", "reason": "control: original native producer unavailable"}
+             "owner": "Steward", "reason": "control: original native producer unavailable"}
     return ledger, rid, attempt, task, owner, event
 
 

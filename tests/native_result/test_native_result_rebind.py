@@ -28,13 +28,13 @@ def repair(tmp_path):
     old_wait = {"kind": "native", "target": old_rid, "native_receiver": receiver,
                 "native_packet": pending, "native_grant": {"not": "reusable"},
                 "native_delivery_failed": {"owner": owner, "reason": "receiver died"}}
-    state = {"id": attempt, "task_id": task, "session_id": session, "agent": "Riker",
+    state = {"id": attempt, "task_id": task, "session_id": session, "agent": "Steward",
              "state": "waiting", "mode": "work", "pid": 0, "checkout": {}, "wait": old_wait}
     card = {"id": task, "assignee_id": owner, "assignee_type": "agent", "checked_out_by": None,
             "checkout_session_id": attempt, "checkout_generation": 2}
     target = dict(receiver, generation=2)
     rid = ledger.register(source, target)["registration"]
-    request = {"version": 1, "request_id": str(uuid4()), "agent": "Riker", "task": task,
+    request = {"version": 1, "request_id": str(uuid4()), "agent": "Steward", "task": task,
                "attempt": attempt, "session": session, "owner": owner,
                "generation": identity(old_wait), "old_registration": old_rid,
                "registration": rid, "binding": source, "authority_sha256": "c" * 64,
@@ -118,12 +118,12 @@ def test_next_stage_uses_new_registration_without_acknowledging_previous_stage(r
     {"reason": "x" * 513}, {"created": True}, {"expires": 2000}, {"expires": 1000}, {"extra": 1}])
 def test_malformed_or_unbounded_repair_request_refuses(repair, changes):
     with pytest.raises(Refused):
-        validate(dict(repair["request"], **changes), "Riker")
+        validate(dict(repair["request"], **changes), "Steward")
 
 
 def test_same_registration_is_not_a_repair(repair):
     with pytest.raises(Refused):
-        validate(dict(repair["request"], registration=repair["old_rid"]), "Riker")
+        validate(dict(repair["request"], registration=repair["old_rid"]), "Steward")
 
 
 def test_production_rebind_cannot_skip_enrolled_authenticated_channel(repair):

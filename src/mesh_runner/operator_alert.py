@@ -51,9 +51,10 @@ def claim(store: Store, key: str, since: str, now: dt.datetime | None = None,
 
 
 def signal(store: Store, key: str, since: str, text: str, emit=None,
-           now: dt.datetime | None = None, **fields) -> bool:
-    """Signal ``text`` once for this slot of the incident. True when this caller signalled."""
-    got = claim(store, key, since, now)
+           now: dt.datetime | None = None, repeat_hours: float = REPEAT_HOURS, **fields) -> bool:
+    """Signal ``text`` once for this slot of the incident. True when this caller signalled.
+    ``repeat_hours=math.inf`` signals an incident exactly once."""
+    got = claim(store, key, since, now, repeat_hours)
     if not got:
         return False
     log.warning("operator alert [%s]: %s", key, text)

@@ -46,7 +46,7 @@ class ReleasePackage(unittest.TestCase):
                 self.assertIsNone(PRIVATE.search(line), f"{rel}:{n}: {line[:80]}")
 
     def test_check_detects_a_private_line(self):                       # red control: the pattern fires
-        for bad in ("see #0123abcd", "~/ClaudeCowork/bob", "/Users/x/y"):
+        for bad in ("see #0123abcd", "~/ClaudeCowork/x", "/Users/x/y"):
             self.assertIsNotNone(PRIVATE.search(bad))
 
 

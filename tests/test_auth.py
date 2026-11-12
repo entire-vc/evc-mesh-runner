@@ -497,7 +497,7 @@ class ClearCommand(unittest.TestCase):
         # control records the preview must not touch: wake outbox, an unrelated profile hold, an open attempt
         store.mark(auth.OWNER, "c" * 32, auth_recovery.OUTBOX, json.dumps({"wake": "pending"}))
         auth.hold(store, "d" * 32)
-        store.create("Khan", "e" * 32, "claude")
+        store.create("Deployer", "e" * 32, "claude")
         return cfg, store, a
 
     def test_dry_run_previews_without_touching_hold_route_mark_or_other_state(self):

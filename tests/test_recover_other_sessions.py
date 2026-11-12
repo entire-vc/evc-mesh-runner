@@ -38,19 +38,19 @@ class RecoverOtherSessions(unittest.TestCase):
         self.addCleanup(self.store.db.close)
         self.events = []
         self.host = types.SimpleNamespace(
-            cfg=types.SimpleNamespace(state_dir=self.state), agent=types.SimpleNamespace(name="howard"),
+            cfg=types.SimpleNamespace(state_dir=self.state), agent=types.SimpleNamespace(name="planner"),
             store=self.store, life=lifecycle.AttemptStateMachine(self.store), _tmux=object(),
             _turn_over=lambda a: True,
             emit=lambda kind, a: self.events.append(kind))
         self.row = self.legacy_row()
 
     def legacy_row(self):
-        a = self.store.create("howard", str(uuid.uuid4()), "codex")
+        a = self.store.create("planner", str(uuid.uuid4()), "codex")
         log = self.root / f"{a.id}.codex.jsonl"
         log.write_text("")
         log.with_suffix(".stderr").write_text(LINE + "\n")
         token, sha = uuid.uuid4().hex, "sha"
-        interactive.write_delivery(interactive.agent_dir(self.state, "howard"), a.id, {
+        interactive.write_delivery(interactive.agent_dir(self.state, "planner"), a.id, {
             "token": token, "sha256": sha, "phase": "send-intent", "harness": "codex", "session_id": "",
             "cwd": str(self.cwd), "native_base": 0,
             "native_prefix": hashlib.sha256(json.dumps([], sort_keys=True).encode()).hexdigest()})
@@ -61,7 +61,7 @@ class RecoverOtherSessions(unittest.TestCase):
         return self.store.get(a.id)
 
     def bind(self, sid):
-        other = self.store.create("garfield", str(uuid.uuid4()), "codex")
+        other = self.store.create("foreman", str(uuid.uuid4()), "codex")
         self.store.update(other, state="done", session_id=sid)
 
     def rollout(self, sid, raw=None):

@@ -358,9 +358,10 @@ class FakeMesh:
             t["status_id"] = "s-rev" if rec["row"]["kind"] == "review" else "s-done"
         elif rec["row"]["kind"] == "handoff":
             t["assignee_id"], t["status_id"] = rec["to"], "s-todo"
-        if rec["row"]["kind"] in ("done", "review", "handoff"):
-            # finish_task and hand_off release the caller's checkout in the same step (Mesh MCP
-            # turn_outcomes.go): a runner that sees the card closed mid-turn finds no lease left.
+        if rec["row"]["kind"] in ("wait", "done", "review", "handoff"):
+            # wait_for / ask_agent / ask_human, finish_task and hand_off release the caller's checkout
+            # in the same step (Mesh MCP turn_outcomes.go); only continue_next keeps it. A runner that
+            # reads the outcome finds no lease left, whatever it does with the turn next.
             self.checkouts.pop(tid, None)
 
     def turn_outcomes(self, tid, limit=5):

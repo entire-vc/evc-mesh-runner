@@ -62,7 +62,7 @@ class TimeWaitReason(unittest.TestCase):
     def test_event_reasons_are_sent_back_with_the_wait_kind_to_use(self):
         for line in ("⏳ WAIT 2h: waiting for the reviewer verdict",
                      "⏳ WAIT 6h: ждём ответ Павла",
-                     "⏳ WAIT 2h: @bill should answer",
+                     "⏳ WAIT 2h: @director should answer",
                      "⏳ WAIT 2h: after #abcdef12 closes",
                      "⏳ WAIT 2026-10-20T06:00Z: decision from the lead",
                      "⏳ WAIT 1h — решение по карточке"):

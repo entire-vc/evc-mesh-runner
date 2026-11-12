@@ -29,7 +29,7 @@ class NextSupersedesTimeWait(unittest.TestCase):
         self.assertTrue(w["met"])
 
     def test_a_blocking_ask_to_a_person_is_not_superseded(self):
-        w = {**wait(), "kind": "blocking", "handle": "pavel"}
+        w = {**wait(), "kind": "blocking", "handle": "morgan"}
         event = check(None, None, None, {"human_gate": True}, w, "me", [own("↻ NEXT", 5)], NOW)
         self.assertEqual(event, "")
         self.assertFalse(w.get("met"))

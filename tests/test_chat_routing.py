@@ -6,8 +6,8 @@ from unittest import mock
 from fakes import FakeMesh, FakeProfileAdapter
 from test_runner import Bench
 
-ROUTE = [sys.executable, "-c", "print('MESH_RUNNER_HARNESS=codex'); print('MESH_RUNNER_PROFILE=riker'); "
-                              "print('CODEX_HOME=/acct/riker')"]
+ROUTE = [sys.executable, "-c", "print('MESH_RUNNER_HARNESS=codex'); print('MESH_RUNNER_PROFILE=steward'); "
+                              "print('CODEX_HOME=/acct/steward')"]
 
 
 class ChatRouting(Bench):
@@ -23,18 +23,18 @@ class ChatRouting(Bench):
         return r
 
     def test_codex_chat_on_a_claude_base_lane_is_created_with_its_routed_env(self):
-        r = self.chat_runner(["codex", "--profile", "riker"])
+        r = self.chat_runner(["codex", "--profile", "steward"])
         r.keep_chat()
         r.chat.start.assert_called_once()
         env, digest = r.chat.start.call_args.args
-        self.assertEqual(env["CODEX_HOME"], "/acct/riker")
+        self.assertEqual(env["CODEX_HOME"], "/acct/steward")
         self.assertNotIn("MESH_RUNNER_HARNESS", env)
         self.assertNotIn("MESH_RUNNER_PROFILE", env)
         self.assertTrue(digest)
         self.assertEqual(r._chat_hold, "")
 
     def test_chat_routing_leaves_the_card_routing_alone(self):
-        r = self.chat_runner(["codex", "--profile", "riker"])
+        r = self.chat_runner(["codex", "--profile", "steward"])
         r._routed_harness, r.pool.env = "claude", {"POOL": "1"}
         agent_env, adapter = dict(self.agent.env), r.adapter_for("codex")
         r.keep_chat()
@@ -52,7 +52,7 @@ class ChatRouting(Bench):
         r2.chat.start.assert_not_called()
 
     def test_a_live_session_is_not_restarted_while_busy(self):
-        r = self.chat_runner(["codex", "--profile", "riker"])
+        r = self.chat_runner(["codex", "--profile", "steward"])
         r.chat.state = mock.Mock(return_value="ours")
         r.chat.option = mock.Mock(return_value="stale-digest")
         r.chat.idle = mock.Mock(return_value=False)
@@ -69,7 +69,7 @@ class ChatRouting(Bench):
         self.assertEqual(r.chat.start.call_args.args[0]["CLAUDE_CONFIG_DIR"], "/acct/a")
 
     def test_baseline_codex_lane_without_a_command_binary_name_uses_the_base_harness(self):
-        r = self.chat_runner(["/opt/bin/riker-chat"], base="codex")
+        r = self.chat_runner(["/opt/bin/steward-chat"], base="codex")
         r.alt_adapters = {}
         r.keep_chat()
         r.chat.start.assert_called_once()

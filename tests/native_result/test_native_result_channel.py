@@ -37,7 +37,7 @@ def channel(tmp_path):
     command = [sys.executable, "-m", "mesh_runner.native_result_channel",
                "receive", "--channel", str(endpoint)]
     frame = {"binding": contract, "sequence": 1, "status": "result", "receipt_sha256": "b" * 64,
-             "owner": "Riker", "reason": ""}
+             "owner": "Steward", "reason": ""}
     return {"source": source, "journal": journal, "ledger": ledger, "target": target,
             "sender": sender, "endpoint": endpoint, "registrations": registrations,
             "command": command, "frame": frame}

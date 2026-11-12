@@ -82,8 +82,8 @@ class Mapping(unittest.TestCase):
                        "review window opens")
 
     def test_ask_agent_is_a_decision_wait_on_the_named_agent(self):
-        out = from_typed(*wait_row("asked Ops", kind="decision", decision_request_id=REQUEST), NOW)
-        self.same(out, "⏳ WAIT decision:@Ops: asked Ops")
+        out = from_typed(*wait_row("asked Steward", kind="decision", decision_request_id=REQUEST), NOW)
+        self.same(out, "⏳ WAIT decision:@Steward: asked Steward")
         self.assertEqual(out.typed["decision_request_id"], REQUEST)
 
     def test_what_the_marker_grammar_cannot_spell_is_kept(self):
@@ -161,11 +161,11 @@ class Mapping(unittest.TestCase):
         self.assertFalse(out.is_wait)
 
     def test_ask_human_is_the_blocking_line_mesh_posted(self):
-        out = from_typed(*wait_row("asked @alice", kind="human", addressee="alice",
+        out = from_typed(*wait_row("asked @morgan", kind="human", addressee="morgan",
                                    question="Ship 0.2.4 tonight\n or wait for the canary?",
                                    human_gate_ref=f"comment:{COMMENT}"), NOW)
-        self.same(out, "❓ Blocking @alice: Ship 0.2.4 tonight or wait for the canary?")
-        self.assertEqual((out.kind, out.handle), ("blocking", "alice"))
+        self.same(out, "❓ Blocking @morgan: Ship 0.2.4 tonight or wait for the canary?")
+        self.assertEqual((out.kind, out.handle), ("blocking", "morgan"))
         self.assertEqual(out.typed["human_gate_ref"], f"comment:{COMMENT}")
 
     def test_mr_baselines(self):
@@ -227,8 +227,8 @@ class Mapping(unittest.TestCase):
                 (dict(kind="registered", registration="receipt"), "registration_ref `missing`"),
                 (dict(kind="human", addressee="two words", question="q", human_gate_ref="comment:x"),
                  "addressee `two words`"),
-                (dict(kind="human", addressee="alice", question=" ", human_gate_ref="comment:x"), "no question"),
-                (dict(kind="human", addressee="alice", question="q"), "no human_gate_ref")):
+                (dict(kind="human", addressee="morgan", question=" ", human_gate_ref="comment:x"), "no question"),
+                (dict(kind="human", addressee="morgan", question="q"), "no human_gate_ref")):
             with self.subTest(wait=wait):
                 out = from_typed(*wait_row(**wait), NOW, merge=True)
                 self.assertEqual(out.kind, "unparsed", out)
@@ -243,7 +243,7 @@ class Mapping(unittest.TestCase):
                            (dict(kind="mr", project_path="g/p", mr_iid=3, until="closed"), "MR until `closed`"),
                            (dict(kind="pipeline", project_path="g/p", pipeline_id=4, until="merged"),
                             "pipeline until `merged`"),
-                           (dict(kind="decision", note="asked Ops"), "no decision_request_id")):
+                           (dict(kind="decision", note="asked Steward"), "no decision_request_id")):
             out = from_typed(*wait_row(**wait), NOW)
             self.assertEqual(out.kind, "unparsed", wait)
             self.assertIn(says, out.note)
@@ -425,13 +425,13 @@ class Settle(TypedTurn):
         for path in ("typed", "marker"):
             t = task(1)
             mesh = FakeMesh([t], max_concurrent=1)
-            line = "❓ Blocking @alice: ship tonight or wait for the canary?"
+            line = "❓ Blocking @morgan: ship tonight or wait for the canary?"
             r = self.run_turn(mesh, t, reply=("Asked through Mesh." if path == "typed" else f"Asking.\n{line}"))
             mesh.tasks[t["id"]]["human_gate"] = True             # armed with the question, in both paths
             if path == "typed":
-                self.typed(mesh, t, "wait", {"kind": "human", "addressee": "alice", "note": "asked @alice",
+                self.typed(mesh, t, "wait", {"kind": "human", "addressee": "morgan", "note": "asked @morgan",
                                              "question": "ship tonight or wait for the canary?",
-                                             "human_gate_ref": f"comment:{COMMENT}"}, note="asked @alice")
+                                             "human_gate_ref": f"comment:{COMMENT}"}, note="asked @morgan")
             posted = len(mesh.comment_log.get(t["id"], []))
             with mock.patch.object(r, "_route_ask", wraps=r._route_ask) as routed:
                 a = self.finish_turn(r)

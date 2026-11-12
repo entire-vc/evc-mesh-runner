@@ -33,7 +33,7 @@ class WhereYouStopped(Bench):
     def test_a_card_the_lane_never_worked_on_has_no_block(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        mesh.add_comment(t["id"], "Please build it.", author="alice")
+        mesh.add_comment(t["id"], "Please build it.", author="morgan")
         _, prompt = self.first_prompt(mesh, t)
         self.assertNotIn(BLOCK, prompt)
         self.assertIn("[runner] Task #00000001 — task 1\nMesh task id: ", prompt)
@@ -48,7 +48,7 @@ class WhereYouStopped(Bench):
         closing = "Implemented the parser; tests pass locally.\n" + "detail " * 700 + "\n⏳ WAIT card:#0000beef"
         mesh.add_comment(t["id"], closing, at=at)
         mesh.add_comment(t["id"], "[runner] ✅ completed in ~3m", at=at + dt.timedelta(minutes=1))
-        mesh.add_comment(t["id"], "Looks good, one more case.", author="alice", at=at + dt.timedelta(minutes=5))
+        mesh.add_comment(t["id"], "Looks good, one more case.", author="morgan", at=at + dt.timedelta(minutes=5))
         r = self.runner(mesh)
         self.earlier_attempt(r, t, "gave up: stopped after 30 turns on this task")
         r.store.db.close()

@@ -6,7 +6,7 @@ TID = "0123456789abcdef0123456789abcdef0123"
 TASK = {"id": TID, "title": "t", "priority": "high", "labels": []}
 
 
-def c(i, body, who="Garfield", at=None):
+def c(i, body, who="Foreman", at=None):
     return {"id": f"c{i:03d}", "author_name": who, "created_at": at or f"2026-11-04T10:{i % 60:02d}:00Z", "body": body}
 
 
@@ -28,7 +28,7 @@ class DeltaContext(unittest.TestCase):
 
     def test_ids_and_times_are_present(self):
         text = prompts.start_prompt(TASK, "Lane", ["/w"], [c(1, "hello")])
-        self.assertIn("c001 2026-11-04T10:01:00Z Garfield: hello", text)
+        self.assertIn("c001 2026-11-04T10:01:00Z Foreman: hello", text)
 
     def test_old_decision_outside_tail_is_pinned(self):
         comments = [c(0, "SHIP on HEAD abc; do not touch the parser")] + [c(i, "chatter") for i in range(1, 12)]
@@ -39,11 +39,11 @@ class DeltaContext(unittest.TestCase):
         self.assertIn("+5 older comments not shown", text)
 
     def test_long_blocking_comment_is_marked_truncated_and_keeps_its_end(self):
-        body = "analysis " * 400 + "\n❓ Blocking @pavel: ship?"
+        body = "analysis " * 400 + "\n❓ Blocking @morgan: ship?"
         text = prompts.new_comments_block([c(1, body)], size=1500)
         self.assertIn("TRUNCATED", text)
         self.assertIn("fetch it before relying on it", text)
-        self.assertIn("❓ Blocking @pavel: ship?", text)
+        self.assertIn("❓ Blocking @morgan: ship?", text)
         self.assertIn("c001", text)
 
     def test_short_comment_is_not_marked(self):

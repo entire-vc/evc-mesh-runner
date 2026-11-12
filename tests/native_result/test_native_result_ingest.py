@@ -27,7 +27,7 @@ def setup(tmp_path):
     receiver = {"task": str(uuid4()), "attempt": str(uuid4()), "session": str(uuid4()), "generation": 1}
     rid = ledger.register(contract, receiver)["registration"]
     frame = {"binding": contract, "sequence": 1, "status": "result", "receipt_sha256": "b" * 64,
-             "owner": "Riker", "reason": ""}
+             "owner": "Steward", "reason": ""}
     with source.open("a") as stream:
         stream.write(json.dumps({"type": "response_item", "payload": {"type": "message", "role": "assistant",
                      "content": [{"type": "output_text", "text": MARKER + json.dumps(frame)}]}}) + "\n")

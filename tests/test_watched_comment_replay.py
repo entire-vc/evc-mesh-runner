@@ -1,4 +1,4 @@
-"""Regression for repeated watched-card declarations in an installed release.
+"""Regression for an installed runner: a lead card's unchanged decision.
 
 The unchanged decision converts to a watched card after source-clock dedup.
 Use the real Runner, SQLite, harness subprocess and repeated declarations;

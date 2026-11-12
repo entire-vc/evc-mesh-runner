@@ -43,8 +43,8 @@ mesh-runner receipt-wait rebaseline --config C --agent <lane> --task <card-uuid>
 
 ## What counts
 
-`kind=text`, `event=accepted`, integer `schema_version=1`, producer `pavel-gate-alert` or
-`pavel-digest`, canonical full UUID `request_id`/`batch_id`, at least one canonical task UUID in
+`kind=text`, `event=accepted`, integer `schema_version=1`, producer `owner-gate-alert` or
+`owner-digest`, canonical full UUID `request_id`/`batch_id`, at least one canonical task UUID in
 `task_ids` or `asks[].task_id`, non-empty bounded `bot_identity`, numeric `chat_id`, positive
 integer `message_id` and `provider_ts` with `time_source=provider`, and `provider_ts >= installed_at`.
 Missing/enqueued/suppressed/failed/unknown/legacy/document/malformed rows never wake. The receipt's

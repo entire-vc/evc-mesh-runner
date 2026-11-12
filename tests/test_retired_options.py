@@ -24,7 +24,7 @@ RUNNER_OPTIONS = frozenset("""
 announce_controllers archive_require_mount archive_root basic_auth_file cardless_question_lanes comment_wake
 comment_wake_always_from daily_next_budget daily_start_cap daily_step_budget daily_wait_budget
 decision_request_metadata_only_recipients
-gmail_watch_reader gmail_watch_v1 interactive_idle_minutes interactive_max_sessions load_hold_per_cpu
+gmail_watch_reader gmail_watch_v1 hold_labels interactive_idle_minutes interactive_max_sessions load_hold_per_cpu
 load_release_per_cpu login_ask_check max_compactions memory_hold_free_pct memory_hold_swap_mb
 memory_release_free_pct memory_release_swap_mb merge_command merge_command_cwd merge_rerun_minutes mesh_url
 min_free_gb poll_seconds repo_access_contacts review_own_hold_hours
@@ -59,6 +59,7 @@ def _settable(tmp: str) -> dict:
                                                       [RECIPIENT]),
         "gmail_watch_reader": ('["reader", "--json"]', "gmail_watch_reader", ("reader", "--json")),
         "gmail_watch_v1": ("true", "gmail_watch_v1", True),
+        "hold_labels": ('["awaiting-lead"]', "hold_labels", ("awaiting-lead",)),
         "interactive_idle_minutes": ("61.5", "interactive_idle_minutes", 61.5),
         "interactive_max_sessions": ("21", "interactive_max_sessions", 21),
         "load_hold_per_cpu": ("5.5", "load_hold_per_cpu", 5.5),
@@ -200,7 +201,7 @@ class RunnerOptions(Base):
 
     def test_the_option_count_is_capped(self):
         self.assertLessEqual(len(RUNNER_OPTIONS), MAX_RUNNER_OPTIONS)
-        self.assertEqual(len(RUNNER_OPTIONS), 39)
+        self.assertEqual(len(RUNNER_OPTIONS), 40)
 
     def test_retired_and_settable_do_not_overlap(self):
         retired = set(config_mod.RETIRED_RUNNER_OPTIONS)

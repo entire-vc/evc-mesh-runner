@@ -73,8 +73,8 @@ class WaitConstraint(unittest.TestCase):
     def test_mr_wait_target_and_decision_actor(self):
         (c,) = wait_constraints(waiting("mr", "g/p!5"))
         self.assertEqual(c["wake"]["target"]["mr_iid"], 5)
-        (d,) = wait_constraints(waiting("decision", "q", handle="garfield"))
-        self.assertEqual(d["next_actor"], {"kind": "agent", "name": "garfield"})
+        (d,) = wait_constraints(waiting("decision", "q", handle="foreman"))
+        self.assertEqual(d["next_actor"], {"kind": "agent", "name": "foreman"})
         (u,) = wait_constraints(waiting("card", "abcdef12"))
         self.assertEqual(u["next_actor"], {"kind": "unknown"})   # a card owner is not proven
 

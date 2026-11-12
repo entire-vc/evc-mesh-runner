@@ -112,15 +112,15 @@ class CheckpointStorage(unittest.TestCase):
         secret = 'git checkout-index --all --force in /private/secret-path: fatal: unable to read 0123abcd'
         with patch.object(Checkpoints, '_overlay_delta', side_effect=WorkspaceError(secret)), \
                 self.assertLogs('mesh_runner', 'WARNING') as logs:
-            path = cp.create('injected', source, {'task': '0f1e2d3c-4b5a-4697-8877-665544332211',
-                                                  'attempt': 'a1b2c3d4-0000', 'repo': 'example-repo'})
+            path = cp.create('injected', source, {'task': '0000aaaa-0000-4000-8000-000000000001',
+                                                  'attempt': 'a1b2c3d4-0000', 'repo': 'steward-workspace'})
         data = cp.read(path)
         self.assertEqual((data['slim_failure_stage'], data['slim_failure_reason'], data['slim_failure_git']),
                          ('verify-overlay', 'git-object-unreadable', 'checkout-index'))
         self.assertIn(data['slim_failure_stage'], SLIM_STAGES)
         lines = [l for l in logs.output if 'checkpoint slim fallback' in l]
         self.assertEqual(len(lines), 1)
-        self.assertIn('agent=cp card=0f1e2d3c attempt=a1b2c3d4 repo=example-repo stage=verify-overlay '
+        self.assertIn('agent=cp card=0000aaaa attempt=a1b2c3d4 repo=steward-workspace stage=verify-overlay '
                       'reason=git-object-unreadable git=checkout-index exit=- outcome=full-form', lines[0])
         for leak in ('/private', 'secret', '0123abcd'):
             self.assertNotIn(leak, lines[0])

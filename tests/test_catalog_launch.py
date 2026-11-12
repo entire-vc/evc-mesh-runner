@@ -12,8 +12,8 @@ from mesh_runner.config import load
 from test_catalog import FakeMesh, NOW, WS, D1, desired as claude_desired
 
 REF = "a1" * 32
-POOL = "codex/example/unknown"
-ACCOUNT = {"provider": "openai", "credential_ref": "cred:codex-accounts/example", "harness": "codex",
+POOL = "codex/morgan/unknown"
+ACCOUNT = {"provider": "openai", "credential_ref": "cred:codex-accounts/morgan", "harness": "codex",
            "model": "codex-default", "model_developer": "openai", "model_family": "gpt",
            "capabilities": ["codex"], "enabled": True,
            "modes": {"subscription": {"pools": [POOL]}}, "pools": {POOL: {"window": "unknown"}}}
@@ -27,7 +27,7 @@ def manifest(*, account=ACCOUNT):
     return {"schema_version": 1, "workspace_id": WS, "profile_controller": RUNNER_NAME,
             "controllers": {RUNNER_NAME: {"capabilities": ["codex"]}},
             "defaults": {"evidence_max_age_seconds": 1800},
-            "accounts": {"codex/example": account, "codex/other": OTHER}}
+            "accounts": {"codex/morgan": account, "codex/other": OTHER}}
 
 
 def snap(status="available", primary=10, secondary=20, at=None, ref=REF, cleanup=True):
@@ -52,9 +52,9 @@ class Fixture(unittest.TestCase):
         path.chmod(0o600)
 
     def enroll(self, accounts=None):
-        self.private(self.bind, {"version": 1, "accounts": accounts if accounts is not None else {"codex/example": REF}})
+        self.private(self.bind, {"version": 1, "accounts": accounts if accounts is not None else {"codex/morgan": REF}})
 
-    def cached(self, snapshot, *, account=None, ref="codex/example", extra=None):
+    def cached(self, snapshot, *, account=None, ref="codex/morgan", extra=None):
         entry = {"binding": cl.binding_digest(self.m, ref, REF), "observation": snapshot, "fingerprint": "f" * 64}
         self.private(self.cache, {"version": 1, "accounts": {ref: entry, **(extra or {})}})
 
@@ -72,9 +72,10 @@ class ReaderTest(Fixture):
         self.assertEqual((st["state"], st["verified"], st["used_fraction"]), ("available", True, 0.2))
 
     def test_thresholds_are_the_native_ones(self):
-        self.enroll(); self.cached(snap(primary=10, secondary=91))
-        self.assertEqual(self.state()["state"], "threshold")
-        self.cached(snap(primary=10, secondary=96))
+        # the fallback is the owner's 99 % rule: 98 % still starts, 99 % leaves the pool
+        self.enroll(); self.cached(snap(primary=10, secondary=98))
+        self.assertEqual(self.state()["state"], "available")
+        self.cached(snap(primary=10, secondary=99))
         self.assertEqual(self.state()["state"], "transfer")
 
     def test_blocked_and_hundred_are_exhausted(self):
@@ -100,9 +101,9 @@ class ReaderTest(Fixture):
         self.assertEqual(self.state()["state"], "unknown")      # no number: native rules never call it available
 
     def test_hysteresis_applies(self):
-        self.enroll(); self.cached(snap(primary=92, secondary=1))
+        self.enroll(); self.cached(snap(primary=99, secondary=1))
         prior = {POOL: self.state()}
-        self.assertEqual(prior[POOL]["state"], "threshold")
+        self.assertEqual(prior[POOL]["state"], "transfer")
         self.cached(snap(primary=10, secondary=1))
         again = self.observer().observe({POOL}, NOW + 5, prior, self.m)[POOL]
         self.assertEqual(again["state"], "threshold")
@@ -147,7 +148,7 @@ class ReaderTest(Fixture):
         self.enroll({})
         # revoked: the account is no longer overridden, so only ordinary records count (none here)
         self.assertEqual(self.state()["state"], "unknown")
-        self.enroll({"codex/example": "c3" * 32})                   # different independent identity
+        self.enroll({"codex/morgan": "c3" * 32})                   # different independent identity
         self.assertEqual(self.state()["state"], "unknown")
 
     def test_ordinary_quota_cannot_make_an_enrolled_account_available(self):
@@ -155,7 +156,7 @@ class ReaderTest(Fixture):
         q = self.dir / "q.json"
         q.write_text(json.dumps({"schema": "quota-observations/v1", "records": [
             {"catalog_pool": POOL, "pool_id": POOL, "status": "available", "used_fraction": 0.01, "window": "5h",
-             "observed_at": iso(NOW - 10), "max_age": 1800, "source": "x", "account_ref": "codex/example"},
+             "observed_at": iso(NOW - 10), "max_age": 1800, "source": "x", "account_ref": "codex/morgan"},
             {"catalog_pool": "codex/other/unknown", "pool_id": "codex/other/unknown", "status": "available",
              "used_fraction": 0.3, "window": "5h", "observed_at": iso(NOW - 10), "max_age": 1800, "source": "x",
              "account_ref": "codex/other"}]}))
@@ -182,7 +183,7 @@ class ReaderTest(Fixture):
         self.assertEqual(self.state()["state"], "unknown")
 
     def test_other_cached_accounts_do_not_leak(self):
-        self.enroll({"codex/example": REF, "codex/other": "d4" * 32})
+        self.enroll({"codex/morgan": REF, "codex/other": "d4" * 32})
         self.cached(snap(), extra={"codex/other": {"binding": "0" * 64, "observation": snap(ref="d4" * 32)}})
         out = self.observer().observe({POOL, "codex/other/unknown"}, NOW, None, self.m)
         self.assertEqual((out[POOL]["state"], out["codex/other/unknown"]["state"]), ("available", "unknown"))
@@ -191,26 +192,26 @@ class ReaderTest(Fixture):
         self.enroll(); self.cached(snap())
         self.assertEqual(PoolObserver().observe({POOL}, NOW, None, self.m)[POOL]["state"], "unknown")
 
-    def test_digest_is_bob_algorithm(self):
+    def test_digest_is_the_fleet_algorithm(self):
         want = hashlib.sha256(json.dumps({"account": ACCOUNT, "provider_ref": REF}, sort_keys=True,
                                          separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-        self.assertEqual(cl.binding_digest(self.m, "codex/example", REF), want)
+        self.assertEqual(cl.binding_digest(self.m, "codex/morgan", REF), want)
 
 
 def codex_desired():
     d = claude_desired()
-    pools = {POOL: {"provider": "openai", "resource_ref": "openai.example.unknown", "aliases": []},
+    pools = {POOL: {"provider": "openai", "resource_ref": "openai.morgan.unknown", "aliases": []},
              "codex/other/unknown": {"provider": "openai", "resource_ref": "openai.other.unknown", "aliases": []}}
     d["controller"]["capabilities"] = ["codex"]
     d["catalog"] = {
-        "accounts": {"codex/example": {"provider": "openai", "credential_ref": "cred:codex-accounts/example",
+        "accounts": {"codex/morgan": {"provider": "openai", "credential_ref": "cred:codex-accounts/morgan",
                                      "quota_pools_by_mode": {"subscription": [POOL]}},
                      "codex/other": {"provider": "openai", "credential_ref": "cred:codex-accounts/other",
                                      "quota_pools_by_mode": {"subscription": ["codex/other/unknown"]}}},
         "pools": pools,
         "profiles": {f"{a}/subscription": {"controller_ref": RUNNER_NAME, "account_ref": a,
                                            "execution_mode": "subscription", "harness": "codex",
-                                           "capabilities": ["codex"]} for a in ("codex/example", "codex/other")},
+                                           "capabilities": ["codex"]} for a in ("codex/morgan", "codex/other")},
         "bindings": {}}
     return d
 

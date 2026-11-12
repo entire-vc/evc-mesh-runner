@@ -801,15 +801,28 @@ def mr_merge_blocker(row: dict | None) -> str:
     return ""
 
 
-def blocked_mr_next_step(target: str, cause: str, merge_gate: bool) -> str:
+def blocked_mr_next_step(target: str, cause: str, merge_gate: bool, sha: str = "") -> str:
     """The way out of a wait for the merge of MR ``target`` that will not merge as is: its head is
     red (``cause`` ``red``), it conflicts with its target (``conflict``) or it is behind a target
     that merges fast-forward or semi-linear only (``need_rebase``). The way out is a new head, made
     by merging the target into the branch, never by rewriting it (the merge gate's own rule), so the text never suggests another wait for the
-    merge of the current one: measured, agents re-armed that same wait and it parked for good."""
+    merge of the current one: measured, agents re-armed that same wait and it parked for good.
+
+    Exception: a branch only behind its target (``need_rebase``) behind a merge gate. The gate
+    syncs it itself, once, right before merging, so the author leaves
+    the branch alone and arms the merge wait on the current head ``sha``: every sync push of an
+    author costs a CI round and a new review."""
     if split_provider(target)[0]:
         merge_gate = False                       # `merge:` has no provider-qualified form
     project, _, iid = target.rpartition("!")
+    if cause == "need_rebase" and merge_gate:
+        head = sha if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha or "") else "<full-head-sha>"
+        return ("Next step: leave the branch as it is and do not sync it yourself (no catch-up merge, "
+                "no rebase, no push). The merge gate syncs a branch that is only behind, right before merging, "
+                f"and carries the review over. Obtain the review verdict on the current head {head}; once "
+                f"it is SHIP, end with `⏳ WAIT merge:{project}!{iid or '<iid>'} after={head}` (not mr:, "
+                "which never runs the gate). If the gate refuses the sync, its refusal wakes you with "
+                "the next step.")
     if cause == "red":
         fix = ("open the failed job, fix the cause and push (or retry it once if it is a proven flake), "
                "then obtain the review verdict on the new head")
@@ -1037,6 +1050,8 @@ def typed_event(gitlab, kind: str, target: str, wait: dict, delivered="", observ
                         "the next authorized step rather than wait for the merge. "
                         + blocked_mr_next_step(target, "red", merge_gate))
         cause = mr_merge_blocker(row)
+        if cause == "need_rebase" and merge_gate and not split_provider(target)[0]:
+            cause = ""                          # the merge gate syncs a branch that is only behind
         if (allow_action_required and cause and isinstance(sha, str)
                 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
                 and _owner_action_once(target, sha, 0, cause, delivered, observation) is not None):

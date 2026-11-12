@@ -20,7 +20,7 @@ class AdmissionFixture(Bench):
 
     def setUp(self):
         super().setUp()
-        self.extra = RepoSpec("bob", make_repo(self.root / "bob-src"), max_slots=2)
+        self.extra = RepoSpec("extra", make_repo(self.root / "extra-src"), max_slots=2)
         self.cfg.source = self.root / "runner.toml"
 
     def fresh(self, **agent_changes):
@@ -55,8 +55,8 @@ class RepoAdmission(AdmissionFixture):
         self.assertEqual(len(got.workspaces), 2)
         self.assertEqual((got.state, got.session_id), ('waiting', sid))
         self.assertEqual(sorted(r.pool.leased_to(a.id)), sorted(got.workspaces))
-        self.assertIn('bob', r.pool.repos)
-        self.assertIn('bob', self.agent_names(r))
+        self.assertIn('extra', r.pool.repos)
+        self.assertIn('extra', self.agent_names(r))
         self.assertIn(got.workspaces[1], r._admission_notice(got))
 
     def agent_names(self, r):
@@ -101,8 +101,8 @@ class RepoAdmission(AdmissionFixture):
         _, status = self.ask(r, a, **kw)
         self.assertEqual(status, want)
         self.assertEqual((r.store.get(a.id).workspaces, sorted(r.pool.leased_to(a.id))), snapshot)
-        self.assertNotIn('bob', r.pool.repos)
-        self.assertNotIn('bob', self.agent_names(r))
+        self.assertNotIn('extra', r.pool.repos)
+        self.assertNotIn('extra', self.agent_names(r))
 
     def test_unrelated_config_drift_rejected(self):
         self.reject('rejected_config', fresh=self.fresh(profile_dir=Path('/elsewhere')))
@@ -187,7 +187,7 @@ class RepoAdmission(AdmissionFixture):
         self.extra = replace(self.extra, max_slots=0)
         _, status = self.ask(r, a)
         self.assertEqual(status, 'rejected_pool_full')
-        self.assertNotIn('bob', r.pool.repos)
+        self.assertNotIn('extra', r.pool.repos)
 
 
 class RealConfigFixture(AdmissionFixture):
@@ -283,11 +283,11 @@ class ActiveJournalAdmission(RealConfigFixture):
         self.assertEqual((len(r.pool.leased_to(a.id)), self.rows(r, a)), (2, before))
         # expanded inventory survives resuspend/restore
         r.pool.suspend(a.id, meta, writer_stopped=True)
-        self.assertEqual(sorted(self.rows(r, a)), ['app', 'bob'])
+        self.assertEqual(sorted(self.rows(r, a)), ['app', 'extra'])
         self.assertEqual(r.pool.leased_to(a.id), [])
-        paths, _ = r.pool.restore(a.id, expected_repos={'app', 'bob'})
+        paths, _ = r.pool.restore(a.id, expected_repos={'app', 'extra'})
         self.assertEqual(len(paths), 2)
-        self.assertEqual(Path(paths[0] if 'bob' not in paths[0] else paths[1]).joinpath('README').read_text(), 'edit')
+        self.assertEqual(Path(paths[0] if 'extra' not in paths[0] else paths[1]).joinpath('README').read_text(), 'edit')
 
     def test_crash_after_lease_is_adopted_with_active_journal(self):
         r, a, _ = self.restored()
@@ -319,7 +319,7 @@ class ActiveJournalAdmission(RealConfigFixture):
         again = self.runner(r.mesh)
         again.refresh_me()
         again.pool.suspend(a.id, meta, writer_stopped=True)
-        paths, _ = again.pool.restore(a.id, expected_repos={'app', 'bob'})
+        paths, _ = again.pool.restore(a.id, expected_repos={'app', 'extra'})
         self.assertEqual(len(paths), 2)
 
     def refused_with(self, sql, *args):
@@ -327,7 +327,7 @@ class ActiveJournalAdmission(RealConfigFixture):
         r.store.db.execute(sql, (*args, r.pool.owner, a.id))
         self.assertEqual(self.ask(r, a)[1], 'rejected_checkpointed')
         self.assertEqual(len(r.pool.leased_to(a.id)), 1)
-        self.assertNotIn('bob', r.pool.repos)
+        self.assertNotIn('extra', r.pool.repos)
 
     def test_non_active_phases_refused(self):
         self.refused_with("UPDATE workspace_checkpoints SET phase='released' WHERE owner=? AND attempt=?")
@@ -345,7 +345,7 @@ class ActiveJournalAdmission(RealConfigFixture):
         self.refused_with("UPDATE workspace_checkpoints SET target='/elsewhere' WHERE owner=? AND attempt=?")
 
     def test_journal_naming_requested_repo_refused(self):
-        self.refused_with("UPDATE workspace_checkpoints SET repo='bob' WHERE owner=? AND attempt=?")
+        self.refused_with("UPDATE workspace_checkpoints SET repo='extra' WHERE owner=? AND attempt=?")
 
     def test_foreign_lease_with_active_journal_refused(self):
         r, a, _ = self.restored()

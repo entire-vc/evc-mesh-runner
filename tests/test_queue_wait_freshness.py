@@ -358,9 +358,22 @@ class QueueWait(Bench):
             r._wake_one(a)
         self.assertEqual(a.state,'ready')
 
+    def test_configured_hold_label_holds_and_replaces_the_default(self):
+        for holds, label, held in ((('hold-me',), 'hold-me', True), ((), 'awaiting-owner', False),
+                                   (('hold-me',), 'awaiting-owner', False)):
+            with self.subTest(holds=holds, label=label):
+                r,a,t=self.adopted()
+                r.cfg.hold_labels = holds
+                self.receipt(a)
+                t['labels'] = ['fleet-starvation-wake', label]
+                self.assertEqual(q.eligible(t, r.agent_id, r.cfg.hold_labels), not held)
+                self.assertEqual(q.held(t['labels'], r.cfg.hold_labels), held)
+                r.store.update(a,state='completed')
+
     def test_owner_human_checkout_and_park_holds_never_ack(self):
         for change in ({'human_gate':True},{'human_gate':None},{'checked_out_by':'foreign'},
-                       {'labels':['fleet-starvation-wake','park:manual']}):
+                       {'labels':['fleet-starvation-wake','park:manual']},
+                       {'labels':['fleet-starvation-wake','awaiting-owner']}):
             with self.subTest(change=change):
                 r,a,t=self.adopted()
                 self.receipt(a)
@@ -690,7 +703,7 @@ class QueueWait(Bench):
         for body in invalid:
             with self.subTest(body=body):
                 self.assertIsNone(q.source(t, [{'body': body}], AGENT_ID, NOW))
-        conflict = dict(newer, targets=[dict(VALUE['targets'][0], lane='Luke')])
+        conflict = dict(newer, targets=[dict(VALUE['targets'][0], lane='Crafter')])
         for values in ((newer, conflict), (newer, dict(newer, observed_at=float(newer['observed_at'])))):
             self.assertIsNone(q.source(t, [{'body': description(x)} for x in values], AGENT_ID, NOW))
         self.assertEqual(q.source(t, [{'body': description(newer)}, {'body': description(newer)}], AGENT_ID, NOW), newer)
@@ -1139,11 +1152,11 @@ class ExplicitQueueWait(Bench):
 A2 = str(UUID(int=23))
 P2 = str(UUID(int=24))
 TWO = dict(version=1, observed_at=NOW - 600,
-           targets=[dict(agent_id=A, project_id=P, lane='Bart'), dict(agent_id=A2, project_id=P2, lane='Luke')])
+           targets=[dict(agent_id=A, project_id=P, lane='Coder'), dict(agent_id=A2, project_id=P2, lane='Crafter')])
 
 
 class ResidualQueueWait(ExplicitQueueWait):
-    """ANY wake served for Bart must leave Luke observable: once, durable, fail closed."""
+    """ANY wake served for Coder must leave Crafter observable: once, durable, fail closed."""
 
     def setUp(self):
         super().setUp()
@@ -1168,7 +1181,7 @@ class ResidualQueueWait(ExplicitQueueWait):
                   self.cfg.state_dir / 'queue-wait-receipts.json')
         return r, a, t
 
-    def bart_served(self):
+    def coder_served(self):
         r, a, t = self.armed()
         self.with_recovered(a, [dict(agent_id=A, project_id=P)])
         r._wake_one(a)
@@ -1183,23 +1196,23 @@ class ResidualQueueWait(ExplicitQueueWait):
         r.settle(a)
         return r.store.get(a.id)
 
-    def test_bart_only_any_wake_leaves_luke_residual_and_rewait_is_accepted(self):
-        r, a, t = self.bart_served()
+    def test_coder_only_any_wake_leaves_crafter_residual_and_rewait_is_accepted(self):
+        r, a, t = self.coder_served()
         first = a.wait['queue_request']['contract']
         self.assertTrue(q.served(r.store, a, r.agent_id, first))
         res = q.residual(r.store, a, r.agent_id, first)
-        self.assertEqual([x['lane'] for x in res['targets']], ['Luke'])
+        self.assertEqual([x['lane'] for x in res['targets']], ['Crafter'])
         self.assertEqual(res['observed_at'], TWO['observed_at'])
         b = self.rewait(r, a, t)
         self.assertEqual((b.state, b.wait['kind']), ('waiting', 'queue'))
         self.assertEqual(b.wait['queue_request']['contract'], res)
 
-    def test_replay_and_restart_do_not_wake_residual_without_new_luke_proof(self):
-        r, a, t = self.bart_served()
+    def test_replay_and_restart_do_not_wake_residual_without_new_crafter_proof(self):
+        r, a, t = self.coder_served()
         b = self.rewait(r, a, t)
         self.mark_delivered(r, b)  # no extra first-move turn is owed either way
         q.publish(r.store, self.cfg.state_dir / 'queue-wait-requests.json', self.cfg.state_dir / 'queue-wait-receipts.json')
-        # the Bart proof (old generation) cannot wake the residual generation
+        # the Coder proof (old generation) cannot wake the residual generation
         r._wake_one(b)
         self.assertEqual(r.store.get(b.id).state, 'waiting')
         restarted = self.runner(r.mesh)
@@ -1208,12 +1221,12 @@ class ResidualQueueWait(ExplicitQueueWait):
         self.assertEqual(restarted.store.get(b.id).state, 'waiting')
 
     def test_residual_needs_no_second_first_move_turn(self):
-        r, a, t = self.bart_served()
+        r, a, t = self.coder_served()
         b = self.rewait(r, a, t)
         self.assertTrue(q.delivered(r.store, b, r.agent_id, b.wait['queue_request']['contract']))
 
-    def test_luke_start_wakes_once_and_then_nothing_remains(self):
-        r, a, t = self.bart_served()
+    def test_crafter_start_wakes_once_and_then_nothing_remains(self):
+        r, a, t = self.coder_served()
         b = self.rewait(r, a, t)
         q.publish(r.store, self.cfg.state_dir / 'queue-wait-requests.json', self.cfg.state_dir / 'queue-wait-receipts.json')
         self.with_recovered(b, [dict(agent_id=A2, project_id=P2)], r)
@@ -1241,7 +1254,7 @@ class ResidualQueueWait(ExplicitQueueWait):
         self.assertIsNone(q.residual(r.store, a, r.agent_id, a.wait['queue_request']['contract']))
 
     def test_newer_source_supersedes_residual_and_holds_fail_closed(self):
-        r, a, t = self.bart_served()
+        r, a, t = self.coder_served()
         newer = dict(TWO, observed_at=TWO['observed_at'] + 1)
         self.assertEqual(q.effective(r.store, a, r.agent_id, newer)['targets'], q.as_any(newer)['targets'])
         r.mesh.tasks[t['id']]['human_gate'] = True

@@ -9,9 +9,9 @@ from mesh_runner.runner import AgentRunner
 from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time, wait_card
 from test_runner import Bench
 
-TID = "c1a9f668-c831-4861-9ec7-f99d573c5819"
-EDGE = "066affeb-3b4d-4c86-b8c9-d68cff983d2a"
-BLK = "a8be3e11-ebb3-4c81-8f5d-d63ee51a0352"
+TID = "0000aaaa-0000-4000-8000-000000000001"
+EDGE = "0000bbbb-0000-4000-8000-000000000002"
+BLK = "0000cccc-0000-4000-8000-000000000003"
 
 PROJ = {"version": 1, "task_id": TID, "generation": "v1:aa", "next_action": "continue_prep",
         "stages": [{"stage": "prep", "ready": True}, {"stage": "final_acceptance", "ready": False}],

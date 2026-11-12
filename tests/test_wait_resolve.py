@@ -10,7 +10,7 @@ from mesh_runner.mesh import MeshError
 from fakes import FakeMesh, task
 from test_typed_outcome import COMMENT, TypedTurn
 
-HUMAN = {"kind": "human", "addressee": "alice", "question": "ship tonight?", "note": "asked @alice",
+HUMAN = {"kind": "human", "addressee": "morgan", "question": "ship tonight?", "note": "asked @morgan",
          "human_gate_ref": f"comment:{COMMENT}"}
 
 
@@ -73,7 +73,7 @@ class Resolve(TypedTurn):
     def test_a_marker_wait_has_no_mesh_wait_to_resolve(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        r = self.run_turn(mesh, t, reply="Parked.\n❓ Blocking @alice: ship tonight?")
+        r = self.run_turn(mesh, t, reply="Parked.\n❓ Blocking @morgan: ship tonight?")
         mesh.tasks[t["id"]]["human_gate"] = True
         a = self.finish_turn(r)
         self.assertNotIn("mesh_wait_id", a.wait)

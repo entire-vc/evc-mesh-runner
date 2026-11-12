@@ -1057,7 +1057,7 @@ class AdapterAndConfig(unittest.TestCase):
         self.assertEqual(argv[:3], ["claude", "--resume", "sid"])
         self.assertNotIn("-p", argv)
         self.assertNotIn("stream-json", argv)
-        x = CodexAdapter(profile="mario")
+        x = CodexAdapter(profile="webmaster")
         argv = x.interactive_argv("t-1", Path("/p"), [], resume=True)
         self.assertNotIn("exec", argv)
         self.assertEqual(argv[-2:], ["resume", "t-1"])

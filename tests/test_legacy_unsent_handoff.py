@@ -226,7 +226,7 @@ class LegacyHandoff(Bench):
 
 class NativeProcessBoundary(unittest.TestCase):
     def test_real_detached_session_process_is_detected_then_absent(self):
-        session = 'd236fe7b-c219-40a2-9ab2-8d27ef949737'
+        session = '0000dddd-0000-4000-8000-000000000004'
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)',
                                   '--session-id', session], start_new_session=True)
         run = subprocess.run
