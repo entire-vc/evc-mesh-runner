@@ -523,6 +523,9 @@ class RunnerConfig:
     # lanes whose questions from other lanes of this runner are answered without a request card
     # (answer_desk.py); ["*"] = every lane, [] = off
     cardless_question_lanes: list[str] = field(default_factory=list)
+    # labels that, like no-runner, rescue-exhausted and park:*, keep a card from an automatic
+    # continuation (starvation or queue wake): the deployment's human-hold label(s)
+    hold_labels: tuple = ("awaiting-owner",)
     session_reports: bool = True      # spend of every turn reported to Mesh (agents/me/sessions/report)
     completion_comment: bool = True    # time, turns and cost on the task when an attempt completes
     review_starts_per_tick: int = 1    # a backlog of old review tasks must not crowd out work
@@ -917,6 +920,9 @@ def load(path: str | Path) -> RunnerConfig:
     cardless = r.get("cardless_question_lanes", [])
     if not isinstance(cardless, list) or any(not isinstance(v, str) or not v.strip() for v in cardless):
         raise ConfigError('cardless_question_lanes must be a list of lane names (or ["*"])')
+    hold = r.get("hold_labels", ["awaiting-owner"])
+    if not isinstance(hold, list) or any(not isinstance(v, str) or not v.strip() or v != v.strip() for v in hold):
+        raise ConfigError("hold_labels must be a list of label names")
     comment_wake = r.get("comment_wake", "all")
     if comment_wake not in ("all", "addressed"):
         raise ConfigError('comment_wake must be "all" or "addressed"')
@@ -1040,6 +1046,7 @@ def load(path: str | Path) -> RunnerConfig:
         time_wait_ignore_names=[str(n) for n in (r.get("time_wait_ignore_names") or [])],
         decision_request_metadata_only_recipients=list(recipients),
         cardless_question_lanes=[v.strip() for v in cardless],
+        hold_labels=tuple(hold),
         review_own_hold_hours=float(r.get("review_own_hold_hours", 1.0)),
         daily_next_budget=int(r.get("daily_next_budget", 6)),
         project_leads={str(k): str(v) for k, v in (raw.get("project_leads") or {}).items()},

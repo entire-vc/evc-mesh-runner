@@ -89,7 +89,7 @@ Enter to confirm · Esc to cancel
             root = Path(directory)
             journal = {'version': 1, 'token': 'fixture-intent', 'sha256': 'f' * 64, 'phase': 'send-intent'}
             write_delivery(root, 'attempt', journal)
-            driver = td.Driver('claude', 'Riker', root, CapturedTmux(FRAME), 1, root, 'fixture-session',
+            driver = td.Driver('claude', 'Steward', root, CapturedTmux(FRAME), 1, root, 'fixture-session',
                                'resume', 'attempt', ['claude'], out=io.StringIO(),
                                env={'_MESH_RUNNER_PROMPT_INTENT': journal['token'], '_MESH_RUNNER_PROMPT_SHA256': journal['sha256']})
             with self.assertRaisesRegex(td.DriverError, 'cannot prove this prompt was unsent'):
@@ -104,7 +104,7 @@ Enter to confirm · Esc to cancel
             boundary = CapturedTmux(FRAME)
             def no_sleep(seconds):
                 self.fail('quota frame must not enter busy wait')
-            driver = td.Driver('claude', 'Riker', root, boundary, 1, root, 'fixture-session',
+            driver = td.Driver('claude', 'Steward', root, boundary, 1, root, 'fixture-session',
                                'resume', 'attempt', ['claude'], out=io.StringIO(),
                                env={'_MESH_RUNNER_PROMPT_INTENT': journal['token'], '_MESH_RUNNER_PROMPT_SHA256': journal['sha256']},
                                sleep=no_sleep)

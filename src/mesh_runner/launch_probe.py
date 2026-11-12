@@ -35,7 +35,7 @@ DEADLINE_SECONDS = 8.0          # one shared deadline: spawn + write + read + cl
 CLEANUP_SECONDS = 1.5           # reserved inside the deadline for the group kill
 
 STATUSES = ("available", "quota_blocked", "account_unknown")
-# Fixed ProbeReason enum: equals bob scripts/codex_account_probe.py ProbeReason (helper e54bad9).
+# Fixed ProbeReason enum: equals the fleet's scripts/codex_account_probe.py ProbeReason (helper e54bad9).
 REASONS = frozenset({
     "unspecified", "available", "quota_blocked", "invalid_request", "scope_invalid", "scope_changed",
     "spawn_failed", "transport_error", "timeout", "rpc_error", "malformed_response",

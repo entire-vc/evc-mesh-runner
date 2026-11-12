@@ -462,12 +462,12 @@ class HostWindows(unittest.TestCase):
         return h
 
     def test_other_runners_card_windows_do_not_fill_the_host_cap(self):
-        h = self.host([("mr-Khan", "card-1"), ("mr-Bill", "card-2"), ("mr-Bill", "chat-x"),
+        h = self.host([("mr-Deployer", "card-1"), ("mr-Director", "card-2"), ("mr-Director", "chat-x"),
                        ("mr-e2e-chat-claude", "card-3"), ("mr-e2e-chat-claude", "chat-y")])
         self.assertEqual(h._card_sessions(), 1)
 
     def test_orphan_sweep_leaves_other_runners_chats_alone(self):
-        h = self.host([("mr-Bill", "chat-x"), ("mr-e2e-chat-claude", "chat-y")])
+        h = self.host([("mr-Director", "chat-x"), ("mr-e2e-chat-claude", "chat-y")])
         h._stop_orphans()
         self.assertEqual(h.tmux.killed, [("mr-e2e-chat-claude", "chat-y")])
 

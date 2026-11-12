@@ -18,6 +18,11 @@ Pool states come from files other host jobs write, never from a live probe here:
 ``harness-limits.json`` (harness-limits/v1, a usage limit a lane's own session printed). No data is
 ``unknown``, never 0 %; a harness limit only ever makes a pool ``exhausted``.
 
+A blocked pool whose reset time is known keeps its state from ``pools.json`` while no fresh reading
+comes (source ``reset_pending``) and is ``available`` once that time has passed (source
+``reset_elapsed``) until a fresh reading says otherwise: a reading that goes stale neither frees a
+pool before its window renews nor keeps it blocked after.
+
 The reporter key is read from a file or an environment variable and is never logged.
 """
 from __future__ import annotations
@@ -49,7 +54,9 @@ EVIDENCE_MAX_AGE = 1800
 POOL_STATES = ("available", "exhausted", "threshold", "unknown", "auth_error", "network_error")
 BLOCKED = ("threshold", "transfer", "exhausted")
 R1_STATE = {"transfer": "threshold"}   # local states the server does not know -> nearest allowed
-FALLBACK_THRESHOLDS = {"new_launch_block": 0.90, "transfer": 0.95, "readmit_below": 0.80, "min_pause_sec": 600}
+# leave a pool only at 99 %, come back below 95 %; used only when
+# the thresholds file is missing (the deployment's thresholds.json carries the same values)
+FALLBACK_THRESHOLDS = {"new_launch_block": 0.99, "transfer": 0.99, "readmit_below": 0.95, "min_pause_sec": 600}
 THRESHOLD_REF = "thr-default-v1"
 MODES = ("subscription", "api")
 QUOTA_SCHEMA = "quota-observations/v1"
@@ -383,6 +390,31 @@ def map_state(reading, t, now, prior=None, max_age=EVIDENCE_MAX_AGE):
     return "available", None
 
 
+def reset_hold(prior, now):
+    """(state, blocked_since, reading) for a pool without a fresh reading, from its last entry in
+    ``pools.json``; None when that entry decides nothing (then the pool is unknown, as before).
+
+    A blocked pool with a known reset time stays blocked until that time; after it the window has
+    renewed and the pool is available, and stays so (``reset_elapsed``) until a fresh reading
+    replaces it. A blocked pool without a reset time stays unknown: nothing says when it renews."""
+    if not isinstance(prior, dict):
+        return None
+    state, since = prior.get("state"), prior.get("blocked_since")
+    reset = parse_iso(prior["reset_at"]) if isinstance(prior.get("reset_at"), str) else None
+    window = prior.get("window") if isinstance(prior.get("window"), str) else None
+    frac = prior.get("used_fraction") if _num(prior.get("used_fraction")) else None
+    if state in BLOCKED and _num(since) and reset is not None:
+        if now < reset:
+            return state, since, {"observed": now, "fraction": frac, "exhausted": state == "exhausted",
+                                  "source": "reset_pending", "reset_at": reset, "window": window}
+        return "available", None, {"observed": now, "fraction": None, "exhausted": False,
+                                   "source": "reset_elapsed", "reset_at": None, "window": window}
+    if state == "available" and prior.get("source") == "reset_elapsed":
+        return "available", None, {"observed": now, "fraction": None, "exhausted": False,
+                                   "source": "reset_elapsed", "reset_at": None, "window": window}
+    return None
+
+
 def effective(record: dict, now: float) -> dict:
     """A quota record as it may be used at ``now``: stale, undated or future-dated is unknown."""
     rec = {k: record.get(k) for k in QUOTA_FIELDS}
@@ -472,9 +504,36 @@ class PoolObserver:
             old = prior.get(ref) if isinstance(prior.get(ref), dict) else None
             try:
                 reading = pool_reading(records, ref, now)
-                state, since = map_state(reading, thresholds_for(self.cfg, ref), now, old, self.max_age)
-                if reading and reading.get("partial") and state == "available":
-                    state, since = "unknown", None
+                t = thresholds_for(self.cfg, ref)
+                state, since = map_state(reading, t, now, old, self.max_age)
+                if state == "unknown" and not reading:
+                    held = reset_hold(old, now)
+                    if held:
+                        state, since, reading = held
+                elif state != "unknown":
+                    blocks = map_state(reading, t, now, None, self.max_age)[0] != "available"
+                    partial = bool(reading.get("partial"))
+                    if partial and not blocks:
+                        # a fresh low window does not speak for a window without data: the pool keeps
+                        # its block until that window's reset, and is unknown only without one
+                        held = reset_hold(old, now)
+                        if held:
+                            state, since, reading = held
+                        elif state == "available":
+                            state, since = "unknown", None
+                    if state in BLOCKED and reading.get("source") != "reset_pending":
+                        held = reset_hold(old, now)
+                        pending = held[2] if held and held[2]["source"] == "reset_pending" else None
+                        if not blocks:
+                            # hysteresis holds the block (min_pause_sec or readmit_below): its reset is
+                            # the one of the window that blocked, never the reset of a low window
+                            reading = dict(reading, reset_at=pending and pending["reset_at"],
+                                           window=pending and pending["window"])
+                        elif partial and pending and (not _num(reading.get("reset_at"))
+                                                      or pending["reset_at"] > reading["reset_at"]):
+                            # a fresh window blocks too, but the window without data keeps its own
+                            # block until its later reset: the pool returns at the later of the two
+                            reading = dict(reading, reset_at=pending["reset_at"], window=pending["window"])
                 limit = limits.get(ref)
                 if limit:
                     # the provider's verdict on the account, re-confirmed by the clock each pass

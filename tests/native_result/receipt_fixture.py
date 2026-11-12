@@ -1,4 +1,4 @@
-"""Deterministic native-review-admission/v1 fixture shared with A1 and Kepler.
+"""Deterministic native-review-admission/v1 fixture shared with A1 and Stargazer.
 
 All IDs are fixed so another implementation can reproduce receipt_sha256 from
 the canonical form: JSON, sorted keys, separators (",", ":"), ensure_ascii,

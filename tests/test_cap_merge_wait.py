@@ -94,7 +94,7 @@ class CappedMergeWait(MergeCapBench):
         r, mesh, gl, t, rec = self.capped()
         r.gitlab = None
         self.assertFalse(self.woke(r, mesh, t, rec))
-        mesh.add_comment(t["id"], "please look", author="linus")  # other inputs still wake
+        mesh.add_comment(t["id"], "please look", author="assembler")  # other inputs still wake
         self.assertTrue(self.woke(r, mesh, t, rec))
 
 

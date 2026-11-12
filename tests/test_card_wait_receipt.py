@@ -41,7 +41,7 @@ class ReceiptEvent(unittest.TestCase):
             self.event(resolved_at="now", resolution="unknown")
 
     def test_typed_mapping_preserves_server_observer(self):
-        target = "2d54f716-0000-4000-8000-000000000001"
+        target = "0f1e2d3c-0000-4000-8000-000000000001"
         mapped = from_typed({"id": "outcome", "kind": "wait", "wait_id": "wait-1"},
                             dict(self.receipt, target_task_id=target, target_condition="deployed"),
                             datetime.now(timezone.utc))
@@ -99,7 +99,7 @@ class RunnerReceiptFlow(TypedTurn):
         r = self.run_turn(mesh, source)
         receipt = dict(id="w-1", task_id=source["id"], agent_id=AGENT_ID,
                        kind="card", server_observed=True,
-                       target_task_id="2d54f716-0000-4000-8000-000000000001",
+                       target_task_id="0f1e2d3c-0000-4000-8000-000000000001",
                        target_condition="deployed")
         receipt.update(resolved)
         self.typed(mesh, source, "wait", receipt)

@@ -201,7 +201,7 @@ class BareBaseInstalledRegression(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def pool(self, owner="Ada", identity=("Ada", "ada@example.com")):
+    def pool(self, owner="Maker", identity=("Maker", "maker@example.com")):
         return WorkspacePool(self.store, self.root / "pool" / owner, [RepoSpec("app", self.base, max_slots=3)],
                              identity=identity, owner=owner)
 
@@ -223,7 +223,7 @@ class BareBaseInstalledRegression(unittest.TestCase):
         first = pool.lease("a1", "app")
         self.assert_work_tree(first)
         self.assert_base_still_bare()
-        self.assertEqual(git(first, "config", "user.email"), "ada@example.com")
+        self.assertEqual(git(first, "config", "user.email"), "maker@example.com")
         second = pool.lease("a2", "app")                        # the next slot and a reused one keep working
         self.assert_work_tree(second)
         pool.release("a1")
@@ -241,7 +241,7 @@ class BareBaseInstalledRegression(unittest.TestCase):
         broken = subprocess.run(["git", "-C", str(slot), "status", "--porcelain"], capture_output=True, text=True)
         self.assertEqual(broken.returncode, 128, broken.stderr)
         self.assertIn("work tree", broken.stderr)
-        other = self.pool("Ben", ("Ben", "ben@example.com")).lease("b1", "app")   # any lease on that base
+        other = self.pool("Assembler", ("Assembler", "assembler@example.com")).lease("b1", "app")   # any lease on that base
         self.assert_work_tree(other)
         self.assert_work_tree(slot)                             # the slot that was broken works again, untouched
         self.assert_base_still_bare()

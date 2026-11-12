@@ -14,7 +14,7 @@ class TaskRoute(Bench):
         self.agent.env_command = HOME_ROUTE
         self.agent.task_route_harnesses = permitted
         r = self.runner(FakeMesh([]))
-        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "gandalf")}
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "maker")}
         r._task = lambda tid: {"id": tid, "labels": self.labels}
         return r
 
@@ -22,7 +22,7 @@ class TaskRoute(Bench):
         r = self.lane(["codex"])
         self.labels = ["runner-harness:codex"]
         r._fresh_env("t1")
-        self.assertEqual((r._routed_harness, r.adapter_for("codex").profile), ("codex", "gandalf"))
+        self.assertEqual((r._routed_harness, r.adapter_for("codex").profile), ("codex", "maker"))
         self.labels = []
         r._fresh_env("t2")
         self.assertEqual(r._routed_harness, "claude")
@@ -42,7 +42,7 @@ class TaskRoute(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.agent.task_route_harnesses = ["codex"]
         self.agent.env_command = HOME_ROUTE  # The global lane remains Claude.
-        self.agent.alt = {"codex": {"profile": "gandalf"}}
+        self.agent.alt = {"codex": {"profile": "maker"}}
         self.agent.inline_env.update(HOME=str(self.root))
         capacity = self.root / "account-capacity-ready"
         # External operator hook: real subprocesses supply fresh account admission.
@@ -59,7 +59,7 @@ class TaskRoute(Bench):
         })
         r = self.runner(mesh)
         # External provider CLI: native Codex protocol, real child process and ACK.
-        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "gandalf", native="codex")}
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "maker", native="codex")}
         r.tick()
         self.settle_all(r)
         a = r.store.by_state(self.agent.name, ("ready",))[0]
@@ -79,7 +79,7 @@ class TaskRoute(Bench):
         self.assertEqual((r._routed_harness, resumed.harness), ("codex", "codex"))
         self.assertEqual(resumed.session_id, a.session_id)
         self.assertFalse(r._quota_admission_required(resumed))
-        self.assertEqual(calls(self.calls)[-1]["profile"], "gandalf")
+        self.assertEqual(calls(self.calls)[-1]["profile"], "maker")
         self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
 
 

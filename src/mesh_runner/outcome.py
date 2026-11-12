@@ -785,7 +785,7 @@ resolves it. A known external scheduled event may still use wait_for on=time whi
 # (internal/mcp/turn_outcomes.go): their names, parameters and values are copied from there. The marker
 # lines stay as the fallback the parser still reads, until the outcome_source counter shows nobody uses them;
 # they are offered only after a refused command (a lane that writes them instead of calling is the "habit"
-# failure), never as an equal path.
+# cause seen in practice), never as an equal path.
 _CONTRACT_TEMPLATE = """\
 End every turn on this task by calling exactly ONE Mesh turn command (Mesh MCP tool, task_id = this card).
 It records the outcome, writes the comment and keeps or releases your checkout; a refusal writes nothing,

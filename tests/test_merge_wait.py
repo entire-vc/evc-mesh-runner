@@ -182,6 +182,20 @@ class Declaration(MergeBench):
         self.assertEqual(shown, {"kind": "waiting", "ref": f"mr:{TARGET}"})
         self.assertEqual([(c["class"], c["wake"]["predicate"]) for c in constraints], [("local_wait", "merge")])
 
+    def test_declaration_on_a_behind_mr_parks_and_runs_the_gate(self):
+        # an MR only behind its target is the gate's to sync, not a reason to send back
+        t = task(1)
+        gl = FakeGitLab()
+        gl.mr_rows[TARGET] = mr_row(head=(10, "success"), detailed_merge_status="need_rebase")
+        write_replies(self.replies, {t["id"][:8]: LINE})
+        r = self.runner(FakeMesh([t]), gl)
+        r.tick()
+        self.settle_all(r)
+        a = r.store.by_state(self.agent.name, ("waiting",))[0]
+        self.assertEqual((a.wait["kind"], a.wait["target"], a.wait["merge"]["sha"]), ("merge", TARGET, SHA))
+        r._merge_jobs[a.id]["thread"].join(15)
+        self.assertEqual(self.runs(), [f"56 {PROJECT} {SHA}"])
+
     def test_feature_off_never_parks_or_runs_anything(self):
         for command, gitlab in ((), FakeGitLab()), (self.cfg.merge_command, None):
             with self.subTest(command=bool(command), gitlab=bool(gitlab)):

@@ -14,16 +14,16 @@ class LegacyAdminCollision(unittest.TestCase):
         root = Path(self.tmp.name).resolve()
         self.base = make_repo(root)
         self.store = Store(root / "state.sqlite")
-        self.pool = WorkspacePool(self.store, root / "pool", [RepoSpec("app", self.base)], owner="Garfield")
-        physical_owner = root / "volume" / "Garfield"
+        self.pool = WorkspacePool(self.store, root / "pool", [RepoSpec("app", self.base)], owner="Foreman")
+        physical_owner = root / "volume" / "Foreman"
         physical_owner.mkdir(parents=True)
         self.pool.root.parent.mkdir(parents=True)
         self.pool.root.symlink_to(physical_owner, target_is_directory=True)
         self.recorded = self.pool.root / "app" / "slot-1"
         self.recorded.parent.mkdir(parents=True)
-        self.other = root / "Linus" / "app" / "slot-1"
+        self.other = root / "Assembler" / "app" / "slot-1"
         self.other.parent.mkdir(parents=True)
-        # Real Git creates slot-1 for Linus and appends 1 for the colliding Garfield basename.
+        # Real Git creates slot-1 for Assembler and appends 1 for the colliding Foreman basename.
         git(self.base, "worktree", "add", "--quiet", "--detach", str(self.other), "HEAD")
         git(self.base, "worktree", "add", "--quiet", "--detach", str(self.recorded), "HEAD")
         self.physical = self.recorded.resolve()
@@ -68,7 +68,7 @@ class LegacyAdminCollision(unittest.TestCase):
 
     def test_nonexact_or_non_numeric_suffix_refused(self):
         original = self.admin
-        for name in ("slot-21", "prefix-slot-11", "slot-11-extra", "slot-1x1", "Garfield-slot-11"):
+        for name in ("slot-21", "prefix-slot-11", "slot-11-extra", "slot-1x1", "Foreman-slot-11"):
             with self.subTest(name=name):
                 renamed = original.with_name(name)
                 original.rename(renamed)
@@ -85,7 +85,7 @@ class LegacyAdminCollision(unittest.TestCase):
         self.assertEqual(self.pool.issue("attempt-one", str(self.recorded)), str(self.physical))
 
     def test_physical_target_of_another_owner_refused(self):
-        # the alias leads to Linus's slot-1: same basename and legacy-shaped admin, but another owner's tree
+        # the alias leads to Assembler's slot-1: same basename and legacy-shaped admin, but another owner's tree
         self.pool.root.unlink()
         self.pool.root.symlink_to(self.other.parent.parent, target_is_directory=True)
         with self.assertRaisesRegex(WorkspaceError, "unsafe physical target|belongs to another worktree"):

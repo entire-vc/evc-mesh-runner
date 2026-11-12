@@ -14,7 +14,7 @@ from mesh_runner.mesh import MeshClient, MeshError
 from mesh_runner.store import Store
 
 NOW = dt.datetime(2026, 11, 11, 20, 0, tzinfo=dt.timezone.utc)
-OURS = frozenset({"builder", "Ops"})
+OURS = frozenset({"builder", "Steward"})
 
 
 def tid(n):
@@ -55,14 +55,14 @@ class GraphTest(unittest.TestCase):
             tid(12): [{"agent": "E", "state": "running", "wait": {}, "updated_at": ""}],
             tid(13): [waiting("A", tid(14))],                                 # 13 -> 14 (gated, ours)
         }
-        cards = {tid(3): card(3), tid(8): card(8, name="owner", atype="user"),
+        cards = {tid(3): card(3), tid(8): card(8, name="morgan", atype="user"),
                  tid(14): card(14, gate=True)}
         radar = wait_roots.build(open_, self.reader(cards), OURS, NOW)
         by = {r.task_id: r for r in radar.roots}
         self.assertEqual((by[tid(3)].kind, by[tid(3)].holder, by[tid(3)].behind), ("ready", "builder", 3))
         self.assertEqual(by[tid(3)].oldest, "2026-11-01T00:00:00Z")
         self.assertEqual((by[tid(6)].kind, by[tid(6)].holder), ("pipeline", "g/p#77"))
-        self.assertEqual((by[tid(8)].kind, by[tid(8)].holder), ("human", "@owner"))
+        self.assertEqual((by[tid(8)].kind, by[tid(8)].holder), ("human", "@morgan"))
         self.assertEqual(by[tid(10)].kind, "foreign")
         self.assertEqual((by[tid(12)].kind, by[tid(12)].holder), ("working", "E"))
         self.assertEqual(by[tid(14)].kind, "human")
@@ -272,7 +272,7 @@ class LaneOrderTest(Bench):
         mesh = FakeMesh([self.light], max_concurrent=2)
         r = self.runner(mesh)
         r.refresh_me()
-        cards = {person: card(200, name="owner", atype="user")}          # foreign: unreadable (404)
+        cards = {person: card(200, name="morgan", atype="user")}          # foreign: unreadable (404)
         store, before = self.radar(r, cards, [(tid(100), person), (tid(101), person), (tid(102), foreign)])
         kinds = {x.task_id: x.kind for x in r.roots.radar.roots}
         self.assertEqual(kinds, {person: "human", foreign: "foreign"})

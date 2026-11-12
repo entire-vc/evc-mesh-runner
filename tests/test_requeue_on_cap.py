@@ -695,7 +695,7 @@ class EventWokenStarts(CapBench):
         self.assert_event_start(r, t, "blocker #00000003 is done since the last session")
 
     def test_a_lifted_human_gate_since_the_last_session_is_not_capped(self):
-        t, mesh, r = self.capped({"kind": "blocking", "handle": "pavel"})
+        t, mesh, r = self.capped({"kind": "blocking", "handle": "morgan"})
         mesh.tasks[t["id"]]["human_gate"] = False
         self.assert_event_start(r, t, "the human gate was lifted since the last session")
 

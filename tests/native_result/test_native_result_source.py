@@ -26,7 +26,7 @@ def original(tmp_path):
     source.write_bytes(line({"type": "session_meta", "payload": {"id": contract["producer"]}}))
     registration = enroll(root, source, contract)
     frame = {"binding": contract, "sequence": 1, "status": "result",
-             "receipt_sha256": "b" * 64, "owner": "Riker", "reason": ""}
+             "receipt_sha256": "b" * 64, "owner": "Steward", "reason": ""}
     return root, source, registration, frame
 
 

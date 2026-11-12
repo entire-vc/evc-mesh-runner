@@ -27,7 +27,7 @@ def channel(tmp_path):
     ledger = Ledger.initialize(tmp_path / "mailbox")
     registration = ledger.register(source, target)["registration"]
     frame = {"binding": source, "sequence": 1, "status": "result",
-             "receipt_sha256": "b" * 64, "owner": "Riker", "reason": ""}
+             "receipt_sha256": "b" * 64, "owner": "Steward", "reason": ""}
     return ledger, registration, source, target, frame
 
 
@@ -116,7 +116,7 @@ def test_terminal_evidence_uses_same_durable_delivery(channel, status):
     eid = publish(ledger, frame)["event"]
     delivery = Ledger(ledger.root).delivery(rid, target)
     assert delivery["value"]["status"] == status
-    assert delivery["value"]["owner"] == "Riker"
+    assert delivery["value"]["owner"] == "Steward"
     assert delivery["value"]["reason"]
     assert ledger.ack(rid, eid, target)["cursor"] == 1
 

@@ -38,10 +38,10 @@ def main(argv):
     try:
         if not opts["router-home"] or not opts["state-dir"]:
             raise ValueError("router home or state dir not set")
-        bob = Path(os.path.expanduser(opts["router-home"]))
-        sys.path.insert(0, str(bob / "scripts"))
+        home = Path(os.path.expanduser(opts["router-home"]))
+        sys.path.insert(0, str(home / "scripts"))
         import review_router as rr
-        spec = importlib.util.spec_from_file_location("fleet_balancer_rr", str(bob / "scripts" / "fleet-balancer.py"))
+        spec = importlib.util.spec_from_file_location("fleet_balancer_rr", str(home / "scripts" / "fleet-balancer.py"))
         fb = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fb)
         base = Path(os.path.expanduser(opts["state-dir"]))

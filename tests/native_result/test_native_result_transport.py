@@ -41,7 +41,7 @@ def test_transport_control_source_to_receiver_consumption_ack_crash_and_retry(tm
     ledger = Ledger.initialize(tmp_path / "outbox")
     rid = ledger.register(contract, receiver)["registration"]
     frame = {"binding": contract, "sequence": 1, "status": "result", "receipt_sha256": "b" * 64,
-             "owner": "Riker", "reason": "TEST transport control; not actual023"}
+             "owner": "Steward", "reason": "TEST transport control; not actual023"}
     run('''import json,os,sys
 from mesh_runner.native_result_source import MARKER
 frame=json.loads(sys.argv[2])

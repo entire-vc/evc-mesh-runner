@@ -398,9 +398,9 @@ class CatalogToAdmission(ProbeWiring):
         from test_catalog import FakeMesh as CatalogMesh, NOW, WS
         d = Path(tempfile.mkdtemp(dir=self.root))
         bind, cache, m = d / 'b.json', d / 'c.json', tcl.manifest()
-        for path, doc in ((bind, {"version": 1, "accounts": {"codex/example": tcl.REF}}),
-                          (cache, {"version": 1, "accounts": {"codex/example": {
-                              "binding": tcl.cl.binding_digest(m, "codex/example", tcl.REF),
+        for path, doc in ((bind, {"version": 1, "accounts": {"codex/morgan": tcl.REF}}),
+                          (cache, {"version": 1, "accounts": {"codex/morgan": {
+                              "binding": tcl.cl.binding_digest(m, "codex/morgan", tcl.REF),
                               "observation": snapshot, "fingerprint": "f" * 64}}})):
             path.write_text(json.dumps(doc))
             path.chmod(0o600)

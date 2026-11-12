@@ -180,3 +180,66 @@ class StaleCapacityBackoff(Bench):
         g._pools_changed('ws-a');self.assertIsNone(r._agent_gate_hold)
 
 if __name__=='__main__':unittest.main()
+
+
+class RouteHoldAlert(Bench):
+    """A lane the runtime route holds with one reason for 30 min gets one operator alert."""
+    REASON = 'route: claude_binding_team_profile_missing'
+
+    def alerts(self, r):
+        import json
+        path = r.cfg.state_dir / "events.jsonl"
+        rows = [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+        return [e for e in rows if e["kind"] == "operator_alert"]
+
+    def at(self, minutes):
+        import datetime as dt
+        return dt.datetime(2026, 11, 12, 5, 28, tzinfo=dt.timezone.utc) + dt.timedelta(minutes=minutes)
+
+    def test_alert_fires_once_after_thirty_minutes_of_one_reason(self):
+        r = self.runner(FakeMesh([]))
+        fired = [r._note_route_hold(self.REASON, self.at(m)) for m in (0, 10, 29, 30, 31, 90, 200)]
+        self.assertEqual(fired, [False, False, False, True, False, False, False])
+        alerts = self.alerts(r)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["alert"], "route_hold:builder")
+        self.assertEqual(alerts[0]["reason"], self.REASON)
+        self.assertIn("Lane builder", alerts[0]["text"])
+
+    def test_exactly_one_alert_for_a_long_episode(self):
+        # regression: no repeat after 6 h or 12 h of the same hold
+        r = self.runner(FakeMesh([]))
+        fired = [r._note_route_hold(self.REASON, self.at(m)) for m in (0, 30, 31, 360, 361, 720, 1440)]
+        self.assertEqual(fired, [False, True, False, False, False, False, False])
+        self.assertEqual(len(self.alerts(r)), 1)
+
+    def test_changed_reason_or_passed_gate_starts_a_new_episode(self):
+        r = self.runner(FakeMesh([]))
+        r._note_route_hold(self.REASON, self.at(0))
+        r._note_route_hold('route: unavailable', self.at(20))          # another reason: a new episode
+        self.assertFalse(r._note_route_hold('route: unavailable', self.at(45)))
+        self.assertTrue(r._note_route_hold('route: unavailable', self.at(50)))
+        r._route_hold_seen = None
+        self.agent.start_gate_command = ['operator-gate']
+        with patch.object(r, '_run_hook', return_value=(75, self.REASON, '')):
+            r._gate('reserve', 'one', 'work')
+        self.assertEqual(r._route_hold_seen[0], self.REASON)
+        with patch.object(r, '_run_hook', return_value=(0, '', '')):
+            r._gate('admit', 'one', 'work')
+        self.assertIsNone(r._route_hold_seen)                            # a passed gate ends the episode
+
+    def test_a_non_route_hold_ends_the_episode(self):
+        # regression: route@0, capacity@20, the same route@31 is a new episode
+        r = self.runner(FakeMesh([]))
+        fired = [r._note_route_hold(reason, self.at(m)) for reason, m in
+                 ((self.REASON, 0), ('runtime capacity unavailable', 20), (self.REASON, 31), (self.REASON, 60),
+                  (self.REASON, 61), (self.REASON, 62))]
+        self.assertEqual(fired, [False, False, False, False, True, False])
+        self.assertIn("for 30 min", self.alerts(r)[0]["text"])
+
+    def test_non_route_holds_never_alert(self):
+        r = self.runner(FakeMesh([]))
+        for m in (0, 40, 400):
+            self.assertFalse(r._note_route_hold('runtime capacity unavailable', self.at(m)))
+            self.assertFalse(r._note_route_hold('card writer still active (holder=x)', self.at(m)))
+        self.assertEqual(self.alerts(r), [])

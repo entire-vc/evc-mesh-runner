@@ -262,7 +262,7 @@ def instructions(grant: dict) -> str:
             + ", issuer " + grant['issuer'] + ") is in force for this attempt until " + when + ". "
             "It authorizes exactly one metadata-only effect: " + OPERATION + " on " + ", ".join(grant['paths'])
             + " in " + grant['target_root'] + " for package " + grant['package_sha256'] + ". "
-            "It does NOT permit editing source in the shared bob checkout or in any checkout, and it does not "
+            "It does NOT permit editing source in the shared fleet checkout or in any checkout, and it does not "
             "replace your own preconditions (fresh pins/CAS, quiescence, the cron mutex, bounded rollback). "
             "The existing ban on editing shared checkouts and the isolation of your leased checkout are unchanged. "
             "Do not act on this notice after the stated time or once a later turn says it ended.\n")

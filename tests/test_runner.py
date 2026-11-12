@@ -2398,6 +2398,36 @@ class Hardening(Bench):
         self.assertEqual(second["profile"], "")                          # the claude-shaped fake
         self.assertEqual(r.store.get(a.id).harness, "claude")
 
+    def test_resume_follows_the_route_the_start_gate_set(self):
+        """The gate restored the lane to its primary between the pre-gate env read
+        and the spawn; the resume runs on the restored harness, it never moves to the old route."""
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        route = self.root / "route"
+        route.write_text("codex")
+        self.agent.env_command = [sys.executable, "-c",
+                                  f"import pathlib;print('MESH_RUNNER_HARNESS='+pathlib.Path({str(route)!r}).read_text())"]
+        self.agent.start_gate_command = [sys.executable, "-c",
+                                         f"import pathlib;pathlib.Path({str(route)!r}).write_text('codex')"]
+        self.agent.alt = {"codex": {"profile": "base"}}
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window"),
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
+        r = self.runner(mesh)
+        r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base", native="codex")}
+        r.tick()
+        self.settle_all(r)
+        a = r.store.by_state("builder", ("waiting",))[0]
+        self.assertEqual(a.harness, "codex")
+        route.write_text("claude")                       # the lane sat on its reserve while the card waited
+        r.store.update(a, state="ready", wake_text="go on")
+        r.tick()                                         # the reserve gate restores it to codex
+        self.settle_all(r)
+        second = calls(self.calls)[-1]
+        self.assertEqual(len(calls(self.calls)), 2)
+        self.assertIn("running on the codex harness", second["prompt"])
+        self.assertNotIn("harness_switch", [e[1] for e in r.store.events(a.id)])
+        self.assertEqual(r.store.get(a.id).harness, "codex")
+
     def test_env_failure_on_resume_keeps_the_session_and_logs_name_the_harness(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
@@ -4334,8 +4364,7 @@ class WaitWorkspaceCheckpoint(Bench):
 
     def test_routed_lane_status_roundtrip_keeps_its_routed_session(self):
         # A new attempt carries the native harness until the spawn applies the route: comparing the
-        # loss note with it read every return of an alt-routed lane as a harness change (live 0.1.43:
-        # 270 of 1347 surplus fresh starts, 02-07.11, Garfield/Riker/Calvin/Howard/Bill/Daedalus).
+        # loss note with it read every return of an alt-routed lane as a harness change.
         r, first, later, ret, launches = self._routed_roundtrip(84, back_to='codex')
         self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason']),
                          ('resume', 'ownership_return_same_lane', ''))

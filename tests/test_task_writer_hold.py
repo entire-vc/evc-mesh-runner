@@ -12,14 +12,14 @@ from mesh_runner import runner as rmod
 from mesh_runner.runner import gate_hold_reason, GATE_RELEASE_PENDING
 
 WRITER = ("capacity: runtime.capacity: server admit hold acquire_refused:task_writer_active "
-          "[holder=Ops state=consumed until release]")
+          "[holder=Steward state=consumed until release]")
 
 
 class WriterReason(unittest.TestCase):
     def test_writer_refusal_names_the_holder_not_capacity(self):
-        self.assertEqual(gate_hold_reason(WRITER), "card writer still active (holder=Ops, state=consumed)")
+        self.assertEqual(gate_hold_reason(WRITER), "card writer still active (holder=Steward, state=consumed)")
         self.assertEqual(gate_hold_reason(WRITER.split("capacity: ", 1)[1]),
-                         "card writer still active (holder=Ops, state=consumed)")
+                         "card writer still active (holder=Steward, state=consumed)")
         self.assertEqual(gate_hold_reason("runtime.capacity: server admit hold acquire_refused:task_writer_active"),
                          "card writer still active")
 
@@ -48,7 +48,7 @@ class WriterHold(Bench):
         r = self._gated(self.runner(FakeMesh([])))
         with patch.object(r, "_run_hook", return_value=(75, WRITER, "")):
             reason, _ = r._gate("admit", "one", "work")
-        self.assertEqual(reason, "card writer still active (holder=Ops, state=consumed)")
+        self.assertEqual(reason, "card writer still active (holder=Steward, state=consumed)")
         self.assertTrue(r._gate_task_only)
         self.assertIsNone(r._agent_gate_hold)      # the lane's other cards keep starting
         self.assertFalse(r._gate_failures)
@@ -66,32 +66,32 @@ class WriterHold(Bench):
         with patch.object(r, "_run_hook", side_effect=hook), self.assertLogs("mesh_runner", "INFO") as logs:
             r.tick()
         attempts = r.store.by_state("builder", ("aborted",))
-        self.assertEqual([a.note for a in attempts], ["held: card writer still active (holder=Ops, state=consumed)"])
+        self.assertEqual([a.note for a in attempts], ["held: card writer still active (holder=Steward, state=consumed)"])
         self.assertFalse(r._start_held)
-        self.assertTrue(any("holder=Ops" in line for line in logs.output))
+        self.assertTrue(any("holder=Steward" in line for line in logs.output))
         self.assertNotIn("runtime capacity unavailable", "\n".join(logs.output))
 
     def test_local_holder_holds_before_any_attempt_and_lifts_on_release(self):
         t = task(1)
         r = self._gated(self.runner(FakeMesh([t])))
-        other = r.store.create("Ops", t["id"], "claude", "task 1")
-        r.store.mark("Ops", t["id"], "gate", json.dumps({"RES_ID": "r0"}))
+        other = r.store.create("Steward", t["id"], "claude", "task 1")
+        r.store.mark("Steward", t["id"], "gate", json.dumps({"RES_ID": "r0"}))
         mesh = r.mesh
         with patch.object(r, "_run_hook") as hook, self.assertLogs("mesh_runner", "INFO") as logs:
             r.tick()
         hook.assert_not_called()                                   # no reserve, no checkout, no admit
         self.assertEqual(r.store.by_state("builder", rmod.ACTIVE + ("aborted", "completed", "ready")), [])
         self.assertEqual(mesh.checkouts, {})
-        self.assertTrue(any("card writer still active (holder=Ops, state=running, local)" in line
+        self.assertTrue(any("card writer still active (holder=Steward, state=running, local)" in line
                             for line in logs.output))
-        r.store.mark("Ops", t["id"], "gate", "")                 # the holder's turn released it
+        r.store.mark("Steward", t["id"], "gate", "")                 # the holder's turn released it
         self.assertEqual(r._local_writer(t["id"]), "")
         self.assertIsNotNone(other)
 
     def test_stale_gate_mark_without_a_live_turn_holds_nothing(self):
         t = task(1)
         r = self._gated(self.runner(FakeMesh([t])))
-        r.store.mark("Ops", t["id"], "gate", json.dumps({"RES_ID": "r0"}))
+        r.store.mark("Steward", t["id"], "gate", json.dumps({"RES_ID": "r0"}))
         self.assertEqual(r._local_writer(t["id"]), "")
 
     def test_unconfirmed_release_is_kept_and_retried_until_confirmed(self):

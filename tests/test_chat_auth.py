@@ -81,20 +81,20 @@ class ChatAuthTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, "chat-runner.json")).st_mode), 0o600)
 
     def test_each_agent_registers_its_own_runner_credential(self):
-        # Mesh binds the runner token to the key that registered it: Hugh's key with Garfield's token is a 403
+        # Mesh binds the runner token to the key that registered it: Inspector's key with Foreman's token is a 403
         n = []
 
         def register():
             n.append(1)
             return {"runner_id": "6f1c3a52-0000-4000-8000-00000000000%d" % len(n), "token": "tok-%d" % len(n)}
         with tempfile.TemporaryDirectory() as d:
-            a = load_runner_credential(d, register, "Garfield")
-            b = load_runner_credential(d, register, "Hugh")
+            a = load_runner_credential(d, register, "Foreman")
+            b = load_runner_credential(d, register, "Inspector")
             self.assertNotEqual(a, b)
-            self.assertEqual(load_runner_credential(d, register, "Hugh"), b)
+            self.assertEqual(load_runner_credential(d, register, "Inspector"), b)
             self.assertEqual(len(n), 2)
             self.assertNotEqual(load_runner_credential(d, register, "foo.bar"), load_runner_credential(d, register, "foobar"))
-            for f in ("chat-runner-Garfield.json", "chat-runner-Hugh.json"):
+            for f in ("chat-runner-Foreman.json", "chat-runner-Inspector.json"):
                 self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, f)).st_mode), 0o600)
 
     def test_registration_failure_falls_back_to_plain_client_without_the_token(self):
@@ -269,7 +269,7 @@ class ChatAuthTests(unittest.TestCase):
         from mesh_runner.adapters.codex import CodexAdapter
         from mesh_runner.chat_host import pinned
         from mesh_runner.interactive import InteractiveAdapter
-        shared = InteractiveAdapter(CodexAdapter("codex", [], "shared"), "Hugh", Path(tempfile.mkdtemp()))
+        shared = InteractiveAdapter(CodexAdapter("codex", [], "shared"), "Inspector", Path(tempfile.mkdtemp()))
         mine = pinned(shared, "entry")
 
         def argv(a):

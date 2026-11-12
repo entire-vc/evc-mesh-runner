@@ -16,7 +16,7 @@ SELECTION = {"lane": "Reviewer-Codex", "reason": "cross-family", "username": "re
 
 
 def source(**extra):
-    return task(1, cat="in_progress", assignee_name="Linus", **extra)
+    return task(1, cat="in_progress", assignee_name="Assembler", **extra)
 
 
 def mr(**over):
@@ -195,7 +195,7 @@ class Request(MergeBench):
         self.refused("mr-not-open", row=mr(state="merged"))
 
     def test_explicit_verify_label_is_not_bypassed(self):
-        self.refused("explicit-verify", src=source(labels=["verify:garfield"]))
+        self.refused("explicit-verify", src=source(labels=["verify:foreman"]))
 
     def test_human_gate(self):
         self.refused("human-gate", src=source(human_gate=True))
@@ -212,7 +212,7 @@ class Request(MergeBench):
                 self.refused("", sel=lambda *a, _b=bad, **k: _b)
 
     def test_author_is_never_the_reviewer(self):
-        self.refused("reviewer-is-author", sel=lambda *a, **k: {**SELECTION, "lane": "linus"})
+        self.refused("reviewer-is-author", sel=lambda *a, **k: {**SELECTION, "lane": "assembler"})
 
     def test_missing_selector_refuses(self):
         mesh, gl = world()
@@ -332,7 +332,7 @@ class Identity(MergeBench):
 
     def test_wrong_user_missing_token_and_unreadable(self):
         with self.assertRaisesRegex(rm.Refused, "identity-mismatch"):
-            rm.check_identity({"GITLAB_TOKEN": "t"}, self.REQ, "https://git.test", opener=self.opener("linus"))
+            rm.check_identity({"GITLAB_TOKEN": "t"}, self.REQ, "https://git.test", opener=self.opener("assembler"))
         with self.assertRaisesRegex(rm.Refused, "identity-missing"):
             rm.check_identity({}, self.REQ, "https://git.test", opener=self.opener("x"))
 
@@ -343,7 +343,7 @@ class Identity(MergeBench):
 
     def test_secret_never_in_the_refusal(self):
         try:
-            rm.check_identity({"GITLAB_TOKEN": "s3cr3t-token"}, self.REQ, "https://git.test", opener=self.opener("linus"))
+            rm.check_identity({"GITLAB_TOKEN": "s3cr3t-token"}, self.REQ, "https://git.test", opener=self.opener("assembler"))
         except rm.Refused as e:
             self.assertNotIn("s3cr3t", str(e))
 
@@ -375,7 +375,7 @@ class Gate(MergeBench):
 
     def test_wrong_identity_does_not_run_the_gate(self):
         r, a = self.merge_only()
-        with mock.patch.object(rm, "check_identity", side_effect=rm.Refused("identity-mismatch:linus!=x")):
+        with mock.patch.object(rm, "check_identity", side_effect=rm.Refused("identity-mismatch:assembler!=x")):
             a = self.check(r, a)
         self.assertEqual(self.runs(), [])
         self.assertIn("identity check failed", a.wake_text)

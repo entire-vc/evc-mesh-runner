@@ -104,7 +104,7 @@ class TypedCapWake(CapBench):
     def test_foreign_comment_wakes_whatever_the_declared_wait(self):
         r, mesh, gl, t, rec = self.capped(f"⏳ WAIT mr:g/app!9 until=merged after={SHA}:opened")
         self.assertFalse(self.woke(r, mesh, t, rec))
-        mesh.add_comment(t["id"], "please look", author="linus")
+        mesh.add_comment(t["id"], "please look", author="assembler")
         self.assertTrue(self.woke(r, mesh, t, rec))
         self.assertIn("comment from someone else", r._cap_wake_reasons[t["id"]])
 
@@ -170,7 +170,7 @@ class TypedCapWake(CapBench):
         r.gitlab = None                                           # nothing can evaluate the declared wait
         mesh.links[t["id"]] = [link(pipeline="pending")]
         self.assertFalse(self.woke(r, mesh, t, rec))
-        mesh.add_comment(t["id"], "please look", author="linus")  # other inputs still wake
+        mesh.add_comment(t["id"], "please look", author="assembler")  # other inputs still wake
         self.assertTrue(self.woke(r, mesh, t, rec))
 
     def test_a_provider_failure_is_not_a_satisfied_wait(self):

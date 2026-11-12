@@ -424,7 +424,7 @@ mesh-runner status --config runner.toml   # local view of attempts
 
 ### `[runner]` options
 
-The `[runner]` table has 39 options; every other key in it is either one of the two native-result
+The `[runner]` table has 40 options; every other key in it is either one of the two native-result
 adoption paths or a retired option. All are optional except `mesh_url`.
 
 | group | keys |
@@ -432,10 +432,15 @@ adoption paths or a retired option. All are optional except `mesh_url`.
 | Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers` |
 | Daily budgets and caps | `daily_start_cap`, `daily_next_budget`, `daily_wait_budget`, `daily_step_budget`, `max_compactions` |
 | Interactive sessions | `tmux_binary`, `interactive_idle_minutes`, `interactive_max_sessions`, `turn_first_output_minutes`, `turn_idle_minutes` ([turn watchdog](docs/turn-watchdog.md)) |
-| Waits and wakes | `comment_wake`, `comment_wake_always_from`, `time_wait_ignore_names`, `workspace_wait_release_minutes`, `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
+| Waits and wakes | `comment_wake`, `comment_wake_always_from`, `hold_labels` (below), `time_wait_ignore_names`, `workspace_wait_release_minutes`, `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
 | Questions and reviews | `login_ask_check`, `repo_access_contacts` ([repository access](docs/repository-access.md)), `decision_request_metadata_only_recipients` ([metadata producer](docs/decision-metadata-producer.md)), `cardless_question_lanes` (answer desk, below), `review_own_hold_hours`, `reviewer_select_command` ([reviewer merge](docs/reviewer-merge.md)) |
 | Merge waits | `merge_command`, `merge_command_cwd`, `merge_rerun_minutes` |
 | Host gates | `min_free_gb`, `archive_root`, `archive_require_mount`, `memory_hold_free_pct`, `memory_release_free_pct`, `memory_hold_swap_mb`, `memory_release_swap_mb`, `load_hold_per_cpu`, `load_release_per_cpu` |
+
+`hold_labels` (list of label names, default `["awaiting-owner"]`): a card carrying one of them is never
+continued automatically by a starvation or queue wake, like a card labelled `no-runner`,
+`rescue-exhausted` or `park:*`. Set it to the label your team puts on a card that waits for a person;
+the list replaces the default.
 
 `cardless_question_lanes` (list of lane names, `["*"]` = every lane of this runner, default `[]` = off):
 a question one lane asks a listed lane of the same runner with `ask_agent` gets no `[decision]` request
@@ -950,10 +955,20 @@ Every `interval_seconds` (120), per `[[catalog.workspace]]`:
 
 Pool states are read from files other host jobs write; the runner never probes a provider for them.
 `observations` (`quota-observations/v1`: provider numbers per window) is mapped with `thresholds`
-(default: block new launches at 90 %, transfer at 95 %, readmit below 80 % after 10 min).
+(default: block new launches and transfer at 99 %, readmit below 95 % after 10 min).
 `harness_limits` (`harness-limits/v1`) holds usage limits a lane's own session printed: while one is
 in effect the account's pools are `exhausted`. No data, stale data or an error is `unknown`, never
 0 %. Without `observations` every pool is reported `unknown`.
+
+A blocked pool whose reset time is known (`reset_at` of the reading, or the end of a harness limit)
+does not depend on readings until then: without a fresh reading it stays blocked (source
+`reset_pending` in `pools.json`) until that time, and is `available` after it (source
+`reset_elapsed`) until a fresh reading says otherwise. The first launch on it then refreshes the
+login and the reading. A blocked pool without a reset time is `unknown` once its reading is stale.
+
+A lane the start gate holds with one `route:` reason for 30 minutes gets one `operator_alert`
+(`route_hold:<lane>`) in `events.jsonl`, once per episode: a passed start gate or any other hold
+reason, route or not, ends it.
 
 Each pass writes `home/state.json` (`status: ok|error`, `outcome`, `revision`, `last_report_at`, and
 `version_mismatch` when the catalog's controller version differs from this host's) and

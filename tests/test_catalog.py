@@ -7,7 +7,7 @@ import urllib.error
 from pathlib import Path
 
 from mesh_runner import RUNNER_NAME, __version__
-from mesh_runner.catalog import (ControllerClient, PoolObserver, WorkspaceController, iso, load_thresholds,
+from mesh_runner.catalog import (BLOCKED, ControllerClient, PoolObserver, WorkspaceController, iso, load_thresholds,
                                  read_applied, read_json)
 from mesh_runner.config import ConfigError, load
 
@@ -241,9 +241,22 @@ class PoolObserverTest(unittest.TestCase):
         obs = PoolObserver().observe({"p/5h"}, NOW)
         self.assertEqual((obs["p/5h"]["state"], obs["p/5h"]["verified"]), ("unknown", False))
 
+    def thresholds(self, **defaults):
+        path = self.dir / "thresholds.json"
+        path.write_text(json.dumps({"defaults": defaults}))
+        return load_thresholds(path)
+
+    def test_fallback_thresholds_are_the_owner_rule(self):
+        # leave a pool only at 99 %, come back below 95 %
+        self.assertEqual(load_thresholds(None)["defaults"],
+                         {"new_launch_block": 0.99, "transfer": 0.99, "readmit_below": 0.95, "min_pause_sec": 600})
+        for frac, state in ((0.98, "available"), (0.99, "transfer"), (1.0, "exhausted")):
+            q = self.write("q.json", "quota-observations/v1", [self.quota("p/5h", frac)])
+            self.assertEqual(PoolObserver(observations=q).observe({"p/5h"}, NOW)["p/5h"]["state"], state, frac)
+
     def test_threshold_carries_its_threshold_ref(self):
         q = self.write("q.json", "quota-observations/v1", [self.quota("p/5h", 0.92)])
-        o = PoolObserver(observations=q, thresholds=load_thresholds(None))
+        o = PoolObserver(observations=q, thresholds=self.thresholds(new_launch_block=0.90, transfer=0.95))
         local = o.observe({"p/5h"}, NOW)
         self.assertEqual(local["p/5h"]["state"], "threshold")
         rep = o.for_report(local)["p/5h"]
@@ -254,13 +267,14 @@ class PoolObserverTest(unittest.TestCase):
         record = self.quota("p/5h", 0.92)
         record["reset_at"] = iso(NOW + 4 * 86400)
         q = self.write("q.json", "quota-observations/v1", [record])
-        local = PoolObserver(observations=q).observe({"p/5h"}, NOW)
-        # A reset is metadata, not exhaustion; the existing 90% policy still applies.
+        local = PoolObserver(observations=q, thresholds=self.thresholds(new_launch_block=0.90)).observe(
+            {"p/5h"}, NOW)
+        # A reset is metadata, not exhaustion; the configured threshold policy still applies.
         self.assertEqual(local["p/5h"]["state"], "threshold")
         self.assertEqual(local["p/5h"]["reset_at"], record["reset_at"])
 
     def test_transfer_is_reported_as_threshold(self):
-        q = self.write("q.json", "quota-observations/v1", [self.quota("p/5h", 0.97)])
+        q = self.write("q.json", "quota-observations/v1", [self.quota("p/5h", 0.995)])
         o = PoolObserver(observations=q)
         local = o.observe({"p/5h"}, NOW)
         self.assertEqual(local["p/5h"]["state"], "transfer")
@@ -276,6 +290,147 @@ class PoolObserverTest(unittest.TestCase):
         self.assertEqual(PoolObserver(observations=q).observe({"p/5h"}, NOW, prior)["p/5h"]["state"], "threshold")
         prior = {"p/5h": {"state": "threshold", "blocked_since": NOW - 1000}}
         self.assertEqual(PoolObserver(observations=q).observe({"p/5h"}, NOW, prior)["p/5h"]["state"], "available")
+
+    # a blocked pool returns by its reset time, not by whether readings keep coming
+    def blocked_then(self, records, reset_in=3600, then=600):
+        """Block p/5h at NOW with a reading whose window resets in ``reset_in`` s; observe again
+        ``then`` s later with ``records`` as the only observations, the first pass as prior."""
+        first = self.quota("p/5h", 0.995, age=10)
+        first["reset_at"] = iso(NOW + reset_in)
+        o = PoolObserver(observations=self.write("q.json", "quota-observations/v1", [first]))
+        prior = o.observe({"p/5h"}, NOW)
+        self.assertEqual((prior["p/5h"]["state"], prior["p/5h"]["reset_at"]), ("transfer", iso(NOW + reset_in)))
+        self.write("q.json", "quota-observations/v1", records)
+        return o, prior, o.observe({"p/5h"}, NOW + then, prior)["p/5h"]
+
+    def test_blocked_pool_with_stale_reading_stays_blocked_until_its_reset(self):
+        stale = self.quota("p/5h", 0.995, age=10)       # the same record, 30+ min old at the next pass
+        stale["observed_at"] = iso(NOW - 10)
+        o, prior, now = self.blocked_then([stale], reset_in=3 * 3600, then=2 * 3600)
+        self.assertEqual((now["state"], now["source"], now["blocked_since"]), ("transfer", "reset_pending", NOW))
+        self.assertEqual(o.for_report({"p/5h": now})["p/5h"]["state"], "threshold")
+        # an auth_error record (the collector lost its token) is no reading either
+        err = {"catalog_pool": "p/5h", "pool_id": "p/5h", "status": "auth_error", "observed_at": iso(NOW + 7000),
+               "max_age": 1800, "source": "claude_ratelimit_headers", "window": "5h"}
+        self.assertEqual(self.blocked_then([err], reset_in=3 * 3600, then=7200)[2]["state"], "transfer")
+
+    def test_blocked_pool_is_available_after_its_reset_until_a_fresh_reading(self):
+        o, prior, now = self.blocked_then([], reset_in=3600, then=3601)
+        self.assertEqual((now["state"], now["source"], now["verified"]), ("available", "reset_elapsed", True))
+        self.assertNotIn("blocked_since", now)
+        self.assertEqual(o.for_report({"p/5h": now})["p/5h"]["state"], "available")
+        later = o.observe({"p/5h"}, NOW + 9000, {"p/5h": now})["p/5h"]          # still no reading
+        self.assertEqual((later["state"], later["source"]), ("available", "reset_elapsed"))
+        self.write("q.json", "quota-observations/v1", [self.quota("p/5h", 0.995, age=-9000 + 10)])
+        fresh = o.observe({"p/5h"}, NOW + 9000, {"p/5h": later})["p/5h"]        # a fresh reading decides again
+        self.assertEqual((fresh["state"], fresh["source"]), ("transfer", "claude_ratelimit_headers"))
+
+    def test_blocked_pool_without_reset_time_is_unknown_when_stale(self):
+        first = self.quota("p/5h", 0.995, age=10)
+        o = PoolObserver(observations=self.write("q.json", "quota-observations/v1", [first]))
+        prior = o.observe({"p/5h"}, NOW)
+        self.write("q.json", "quota-observations/v1", [])
+        self.assertEqual(o.observe({"p/5h"}, NOW + 7200, prior)["p/5h"]["state"], "unknown")
+
+    def test_fresh_reading_before_reset_keeps_hysteresis(self):
+        low = self.quota("p/5h", 0.5, age=-300 + 10)
+        self.assertEqual(self.blocked_then([low], reset_in=3600, then=300)[2]["state"], "threshold")
+        self.assertEqual(self.blocked_then([self.quota("p/5h", 0.5, age=-900 + 10)], then=900)[2]["state"],
+                         "available")
+
+    def test_partial_reading_keeps_the_block_until_reset_then_returns(self):
+        # regression: the 7d window blocked the pool, then only the 5h window stays fresh and low
+        def win(window, frac, age, reset=None):
+            r = self.quota("p", frac, age=age)
+            r.update(window=window, reset_at=reset)
+            return r
+        o = PoolObserver(observations=self.write("q.json", "quota-observations/v1",
+                                                 [win("5h", 0.2, 10), win("7d", 0.995, 10, iso(NOW + 7200))]))
+        prior = o.observe({"p"}, NOW)
+        self.assertEqual((prior["p"]["state"], prior["p"]["reset_at"]), ("transfer", iso(NOW + 7200)))
+        dead_7d = {**win("7d", 0.995, 10), "status": "auth_error", "used_fraction": None}
+        self.write("q.json", "quota-observations/v1", [win("5h", 0.2, -3600 + 10), dead_7d])
+        before = o.observe({"p"}, NOW + 3600, prior)["p"]
+        self.assertEqual((before["state"], before["source"], before["blocked_since"]),
+                         ("transfer", "reset_pending", NOW))
+        self.write("q.json", "quota-observations/v1", [win("5h", 0.2, -7300 + 10), dead_7d])
+        after = o.observe({"p"}, NOW + 7300, {"p": before})["p"]
+        self.assertEqual((after["state"], after["source"]), ("available", "reset_elapsed"))
+        # without a reset time a partial pool stays unknown, as before
+        o2 = PoolObserver(observations=self.write("q.json", "quota-observations/v1",
+                                                  [win("5h", 0.2, 10), win("7d", 0.995, 10)]))
+        p2 = o2.observe({"p"}, NOW)
+        self.write("q.json", "quota-observations/v1", [win("5h", 0.2, -3600 + 10), dead_7d])
+        self.assertEqual(o2.observe({"p"}, NOW + 3600, p2)["p"]["state"], "unknown")
+
+    def test_partial_polls_from_the_first_interval_keep_the_blocking_reset(self):
+        # regression: the first partial poll lands inside min_pause_sec (t+120)
+        def win(window, frac, at, reset=None, status="available"):
+            r = self.quota("p", frac, age=-(at - 10))
+            r.update(window=window, reset_at=reset, status=status)
+            return r
+        o = PoolObserver(observations=self.write("q.json", "quota-observations/v1",
+                                                 [win("5h", 0.2, 0, iso(NOW + 1800)),
+                                                  win("7d", 0.995, 0, iso(NOW + 7200))]))
+        seen = [o.observe({"p"}, NOW)["p"]]
+        for at in (120, 720, 7300):
+            self.write("q.json", "quota-observations/v1",
+                       [win("5h", 0.2, at, iso(NOW + 1800)), win("7d", None, at, status="auth_error")])
+            seen.append(o.observe({"p"}, NOW + at, {"p": seen[-1]})["p"])
+        got = [(e["state"], e.get("reset_at"), e.get("window")) for e in seen]
+        block = iso(NOW + 7200)
+        self.assertEqual(got[0], ("transfer", block, "7d"))
+        self.assertIn(got[1][0], BLOCKED)
+        self.assertEqual(got[1][1:], (block, "7d"))           # not the 5h window's reset, not lost
+        self.assertEqual(got[2], (got[1][0], block, "7d"))
+        self.assertEqual(seen[2]["source"], "reset_pending")
+        self.assertEqual((got[3][0], seen[3]["source"]), ("available", "reset_elapsed"))
+        self.assertEqual(seen[1]["blocked_since"], NOW)
+
+    def test_a_fresh_blocking_window_does_not_shorten_the_block_of_a_window_without_data(self):
+        # regression: 7d blocks until t+7200; at t+120 only 5h is fresh, blocking until t+1800
+        def win(window, frac, at, reset=None, status="available"):
+            r = self.quota("p", frac, age=-(at - 10))
+            r.update(window=window, reset_at=reset, status=status)
+            return r
+        o = PoolObserver(observations=self.write("q.json", "quota-observations/v1",
+                                                 [win("5h", 0.2, 0, iso(NOW + 1800)),
+                                                  win("7d", 0.995, 0, iso(NOW + 7200))]))
+        seen = [o.observe({"p"}, NOW)["p"]]
+        for at, five in ((120, 0.995), (1900, 0.2), (7300, 0.2)):
+            self.write("q.json", "quota-observations/v1",
+                       [win("5h", five, at, iso(NOW + 1800 if at < 1800 else NOW + 1800 + 18000)),
+                        win("7d", None, at, status="auth_error")])
+            seen.append(o.observe({"p"}, NOW + at, {"p": seen[-1]})["p"])
+        got = [(e["state"], e.get("reset_at"), e.get("window")) for e in seen]
+        self.assertEqual(got[1], ("transfer", iso(NOW + 7200), "7d"))     # the later of the two resets
+        self.assertIn(got[2][0], BLOCKED)                                   # 5h renewed, 7d still blocked
+        self.assertEqual((seen[2]["source"], got[2][1]), ("reset_pending", iso(NOW + 7200)))
+        self.assertEqual((got[3][0], seen[3]["source"]), ("available", "reset_elapsed"))
+        # a fresh blocking window with the later reset keeps its own
+        o2 = PoolObserver(observations=self.write("q.json", "quota-observations/v1",
+                                                  [win("5h", 0.995, 0, iso(NOW + 9000)),
+                                                   win("7d", None, 0, status="auth_error")]))
+        mine = o2.observe({"p"}, NOW + 120, {"p": seen[0]})["p"]
+        self.assertEqual((mine["reset_at"], mine["window"]), (iso(NOW + 9000), "5h"))
+
+    def test_hysteresis_on_a_full_low_reading_keeps_the_blocking_reset(self):
+        low = self.quota("p/5h", 0.5, age=-120 + 10)
+        low["reset_at"] = iso(NOW + 600)
+        held = self.blocked_then([low], reset_in=3600, then=120)[2]
+        self.assertEqual((held["state"], held["reset_at"]), ("threshold", iso(NOW + 3600)))
+
+    def test_codex_record_with_reset_time_carries_it_and_its_window(self):
+        rec = {"provider": "openai", "account_ref": "codex/acct", "catalog_pool": "codex/acct/5h",
+               "pool_id": "codex/acct/5h", "status": "available", "used_fraction": 0.995, "window": "5h",
+               "reset_at": iso(NOW + 5400), "observed_at": iso(NOW - 30), "max_age": 1800,
+               "source": "codex_rate_limits"}
+        o = PoolObserver(observations=self.write("q.json", "quota-observations/v1", [rec]))
+        got = o.observe({"codex/acct/5h"}, NOW)["codex/acct/5h"]
+        self.assertEqual((got["state"], got["reset_at"], got["window"]), ("transfer", iso(NOW + 5400), "5h"))
+        self.write("q.json", "quota-observations/v1", [])
+        back = o.observe({"codex/acct/5h"}, NOW + 5401, {"codex/acct/5h": got})["codex/acct/5h"]
+        self.assertEqual((back["state"], back["source"]), ("available", "reset_elapsed"))
 
     def test_harness_limit_exhausts_the_pool(self):
         q = self.write("q.json", "quota-observations/v1", [self.quota("p/7d", 0.1)])

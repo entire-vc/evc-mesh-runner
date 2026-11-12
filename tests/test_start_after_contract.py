@@ -54,9 +54,9 @@ EVENT_WAITS = {
     "pipeline": lambda: {"kind": "pipeline", "target": "g/app#99", "since": iso(), "started": iso()},
     "merge": lambda: {"kind": "merge", "target": "g/app!7", "since": iso(), "started": iso()},
     "card": lambda: {"kind": "card", "target": "abcdef01", "since": iso(), "started": iso()},
-    "decision": lambda: {"kind": "decision", "handle": "howard", "since": iso(), "started": iso(),
+    "decision": lambda: {"kind": "decision", "handle": "planner", "since": iso(), "started": iso(),
                          "note": "which option?"},
-    "blocking": lambda: {"kind": "blocking", "handle": "pavel", "since": iso(), "started": iso(),
+    "blocking": lambda: {"kind": "blocking", "handle": "morgan", "since": iso(), "started": iso(),
                          "note": "which option?"},
     "queue": lambda: {"kind": "queue", "since": iso(), "started": iso()},
 }

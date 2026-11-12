@@ -41,7 +41,7 @@ class ExternalTimeGrammar(unittest.TestCase):
 
     def test_explicit_external_reference_does_not_depend_on_natural_language(self):
         # A cited source may mention a card or person; prose is never the validator.
-        self.assertEqual(parse_outcome(external(why='approved by @Pavel on #abcdef12'), NOW).kind, 'time')
+        self.assertEqual(parse_outcome(external(why='approved by @Morgan on #abcdef12'), NOW).kind, 'time')
         for kind in ('backup', 'export', 'scheduled-job', 'measurement'):
             self.assertEqual(parse_outcome(external(event=kind), NOW).kind, 'time')
 

@@ -31,7 +31,7 @@ class PresendQuota(unittest.TestCase):
                               'assert any(e.get("is_error") and "usage limit" in e.get("result", "") for e in events)\n'
                               'pathlib.Path(' + repr(str(called)) + ').write_text("called")\n'
                               'print("no capacity");sys.exit(1)\n')
-            agent = AgentConfig(name='Riker', key='fixture-key', harness='claude', profile_dir=profile, repos=[],
+            agent = AgentConfig(name='Steward', key='fixture-key', harness='claude', profile_dir=profile, repos=[],
                                 on_limit_command=[sys.executable, str(switch)])
             cfg = RunnerConfig(mesh_url='http://127.0.0.1:1', state_dir=state, agents=[agent])
             store = Store(state / 'runner.sqlite'); self.addCleanup(store.db.close)
@@ -95,7 +95,7 @@ class PresendQuota(unittest.TestCase):
     def test_untyped_result_text_does_not_authorize_quota_policy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); profile = root / 'profile'; profile.mkdir()
-            agent = AgentConfig(name='Riker', key='fixture', harness='claude', profile_dir=profile, repos=[])
+            agent = AgentConfig(name='Steward', key='fixture', harness='claude', profile_dir=profile, repos=[])
             cfg = RunnerConfig(mesh_url='http://127.0.0.1:1', state_dir=root / 'state', agents=[agent])
             store = Store(cfg.state_dir / 'runner.sqlite'); self.addCleanup(store.db.close)
             runner = AgentRunner(cfg, agent, store)
@@ -126,7 +126,7 @@ class PresendQuota(unittest.TestCase):
                     self.assertFalse(delivery_recovery.proven_quota_unsent(root, 'attempt', invalid))
                     self.assertFalse(delivery_recovery.proven_unsent(root, 'attempt', invalid))
                     self.assertNotEqual(delivery_recovery.recover(
-                        root, 'attempt', invalid, 'Riker', CapturedTmux(FRAME)), 'quota-unsent')
+                        root, 'attempt', invalid, 'Steward', CapturedTmux(FRAME)), 'quota-unsent')
             self.assertTrue(delivery_recovery.proven_quota_unsent(root, 'attempt', intent))
 
     def test_unknown_failure_wrong_identity_or_other_harness_is_not_quota_proof(self):
@@ -138,7 +138,7 @@ class PresendQuota(unittest.TestCase):
                 with self.subTest(changes=changes):
                     interactive.write_delivery(root, 'attempt', dict(valid, **changes))
                     self.assertFalse(delivery_recovery.proven_unsent(root, 'attempt', intent))
-                    self.assertNotEqual(delivery_recovery.recover(root, 'attempt', intent, 'Riker', CapturedTmux(FRAME)), 'quota-unsent')
+                    self.assertNotEqual(delivery_recovery.recover(root, 'attempt', intent, 'Steward', CapturedTmux(FRAME)), 'quota-unsent')
 
 
 

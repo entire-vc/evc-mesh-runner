@@ -78,7 +78,7 @@ class TurnContract(unittest.TestCase):
             self.assertIn("finish_task to=review", out.note)
 
     def test_a_marker_is_offered_only_after_a_refused_command(self):
-        # lanes wrote the marker in place of a command they never called ("habit"); the contract
+        # Lanes wrote the marker in place of a command they never called ("habit"); the contract
         # must not present it as an equal path: no marker beside a command, the fallback names the refusal
         for merge in (False, True):
             text = contract(merge)
@@ -96,7 +96,7 @@ class TurnContract(unittest.TestCase):
 
     def test_the_marker_grammar_is_unchanged(self):
         self.assertEqual(parse_line("↻ NEXT: the docs", None).kind, "next")
-        self.assertEqual(parse_line("❓ Blocking @alice: ship?", None).kind, "blocking")
+        self.assertEqual(parse_line("❓ Blocking @morgan: ship?", None).kind, "blocking")
 
     def test_it_is_no_longer_than_the_marker_contract_it_replaces(self):
         self.assertLessEqual(len(CONTRACT), 4513)            # 0.2.3's contract(False)

@@ -77,7 +77,7 @@ def profile_id(env: dict[str, str], cwd: Path) -> str:
 
 def account_label(harness: str, env: dict[str, str], cwd: Path | None = None) -> str:
     """The human name of the login a spawn uses: the account directory's name
-    (``~/.claude-accounts/team-a`` -> ``team-a``), never a credential.
+    (``~/.claude-accounts/ops-team`` -> ``ops-team``), never a credential.
     The default directory is named as such, so a personal login is recognisable."""
     home = Path(env.get("HOME") or Path.home())
     if harness == "codex":

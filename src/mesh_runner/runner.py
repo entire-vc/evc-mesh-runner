@@ -24,6 +24,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -99,7 +100,7 @@ from . import observation_budget
 from .wake import (_read_pinned, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
-                   blocked_mr_next_step, mr_merge_blocker, is_foreign, target_jobs_state, UnknownJobs)
+                   blocked_mr_next_step, mr_merge_blocker, is_foreign, split_provider, target_jobs_state, UnknownJobs)
 from .workspace import DIRTY_HOLD_NOTE, base_lock as maintenance_lock, RepoSpec, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, CheckpointSuspendError, git
 from .workspace_scope import (RECEIPT_KEY, assignment_problem, metadata_instructions, metadata_only, metadata_receipt,
                               read_only, recorded_scope)
@@ -273,6 +274,9 @@ OWN_PROFILE_DAYS = 3       # a lane's status lists auth holds of the logins it l
 UNKNOWN_QUIET_MINUTES = 15
 PAUSE_DENIAL = ": op_pause"      # note suffix of a launch refused because a pause landed mid-tick
 HOLD_RELOG_SECONDS = 1800
+# a lane the runtime route holds with one unchanged reason this long is an incident nobody sees in
+# the log: one operator alert
+ROUTE_HOLD_ALERT_SECONDS = 1800
 _EVENTS_LOCK = threading.Lock()
 MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]]{0,63}")   # a name, never a flag
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -539,6 +543,7 @@ class AgentRunner:
         self._resume_hold: dict[str, float] = {}              # attempt -> until
         self._capacity_resume: set[str] = set()               # attempts whose resume hold came from a capacity/profile refusal
         self._hold_route: str | None = None                   # routed harness when the lane hold was taken
+        self._route_hold_seen: tuple[str, dt.datetime] | None = None   # (route reason, first seen) of the lane
         # attempt -> (holder attempt, holder slot path, recheck at): resume held because its branch is
         # checked out in a slot of a live attempt; eligible again when that attempt ends or frees the slot
         self._branch_wait: dict[str, tuple[str, str, float]] = {}
@@ -1135,10 +1140,11 @@ class AgentRunner:
             return []
 
     def _queue_source(self, task: dict, checked: float):
-        if not queue_wait.eligible(task, self.agent_id):
+        if not queue_wait.eligible(task, self.agent_id, self.cfg.hold_labels):
             return None
         # Unlike _comments, a failed read cannot silently reuse an older source.
-        found = queue_wait.source(task, self.mesh.comments(task["id"]), self.agent_id, checked)
+        found = queue_wait.source(task, self.mesh.comments(task["id"]), self.agent_id, checked,
+                                  self.cfg.hold_labels)
         if found and found["observed_at"] < queue_wait.floor(self.store, self.agent.name, task["id"]):
             # A read that shows only an older request than one already served is partial
             # (a comment page that came back empty): never re-arm or re-deliver the old one.
@@ -1173,6 +1179,25 @@ class AgentRunner:
                                                 deadline=iso(first + ttl), last_reason=str(e)[:200]))
             self.store.event(a.id, "release_pending", str(e))
             log.warning("%s: release #%s failed (%s); token kept, retrying", self.agent.name, a.task8, e)
+        self.store.update(a, checkout={})
+
+    # Mesh turn-outcome rows whose command released the caller's checkout in the same step: wait_for,
+    # ask_agent and ask_human record a "wait" row, finish_task and hand_off a done/review/handoff row.
+    # Only continue_next ("next") keeps the lease.
+    MESH_RELEASED_ROWS = frozenset({"wait", "done", "review", "handoff"})
+
+    def _forget_lease_mesh_released(self, a: Attempt, outcome: Outcome | None) -> None:
+        """Drop the token of a lease Mesh already released with the turn's own command.
+
+        Whatever the runner does with the outcome next, that token is dead. A path that puts the
+        attempt back to ``ready`` (a wait sent back, a correction turn) must make the resume
+        acquire a new lease for the same session: ``_resume_one`` acquires only when the attempt
+        carries no token, so a kept dead token resumed the session without a checkout and every
+        turn command it called got 409."""
+        row_kind = str(((outcome.typed if outcome is not None else None) or {}).get("kind") or "")
+        if row_kind not in self.MESH_RELEASED_ROWS or not a.checkout.get("token"):
+            return
+        self.store.event(a.id, "checkout_released_by_mesh", row_kind)
         self.store.update(a, checkout={})
 
     def _send_release(self, task_id: str, lease: dict) -> None:
@@ -2372,6 +2397,7 @@ class AgentRunner:
             self._defer_outcome_read(a)
             return
         outcome, at = read.outcome, read.at
+        self._forget_lease_mesh_released(a, outcome)
         if outcome is not None and outcome.kind == "time":
             # Settlement is the admission boundary, including programmatic outcomes. A typed time wait
             # was built from Mesh's own fields (outcome.from_typed checks them); its line is only a
@@ -5849,8 +5875,7 @@ class AgentRunner:
             if (task.get("human_gate") is not False or task.get("completion_signal")
                     or task.get("checked_out_by") not in (None, "", self.agent_id)
                     or task.get("delegation_level") == "supervised"
-                    or any(label.startswith("park:") or label in
-                           ("no-runner", "awaiting-pavel", "rescue-exhausted") for label in labels)):
+                    or queue_wait.held(labels, self.cfg.hold_labels)):
                 return
             # Our event horizon is cleanup metadata, not an external start gate.
             # _resume_one removes it through the existing guarded on_end path.
@@ -7142,16 +7167,16 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "review_gate_hold", "")
         self._clear_hold_log(a.task8, "resume")
         self._remember_gate(a, gate)
-        if legacy_candidate or scope_recovery or self._quota_admission_required(a):
-            # Reserve may have selected an allowed account since the pre-gate
-            # environment read. Launch/auth checks must use that fresh route.
-            try:
-                env = self._fresh_env(a.task_id)
-            except (RuntimeError, OSError, subprocess.SubprocessError):
-                self._release_gate(a, "quota-route-environment-unavailable")
-                self._release_checkout(a)
-                self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
-                raise
+        # Reserve may have switched the lane's route since the pre-gate environment read (a quota
+        # restore, an allowed account): the launch follows the active record at the moment of the
+        # start, never the one read before the gate.
+        try:
+            env = self._fresh_env(a.task_id)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            self._release_gate(a, "quota-route-environment-unavailable")
+            self._release_checkout(a)
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            raise
         restored = []
         fresh_paths: list[str] = []
         prior_workspaces = list(a.workspaces)
@@ -7978,7 +8003,8 @@ class AgentRunner:
           behind it (``mr_merge_blocker``), or whose head pipeline is ``failed``/``canceled``/``skipped``
           after that red result was already delivered to the agent (``_red_head_delivered``): it
           will not merge as is. A red head not yet delivered is accepted once, so that the
-          evaluator's owner notice reaches the agent.
+          evaluator's owner notice reaches the agent. Behind a merge gate an MR that is only
+          behind is no blocker: the gate syncs it right before merging.
         The MR is the task's own when it is linked to the task, names the task id in its title,
         description or source branch, or was authored by this agent's GitLab user. A result that
         differs from the declared baseline and is new to the agent is left to wake the wait on the
@@ -8022,6 +8048,8 @@ class AgentRunner:
             if state != "opened":
                 raise ValueError("MR state unavailable")
             cause = mr_merge_blocker(row) if merged else ""
+            if cause == "need_rebase" and self.merge_enabled and not split_provider(target)[0]:
+                cause = ""                      # the merge gate syncs a branch that is only behind
             if cause:
                 # a conflict does not resolve itself, whoever owns the MR: only a new head does
                 return self._blocked_merge_text(target, row, cause)
@@ -8088,7 +8116,7 @@ class AgentRunner:
         else:
             what = f"{head} is behind its target branch, which merges fast-forward or semi-linear only;"
         return (f"MR {target}{what} it will not merge as is, so this wait for its merge cannot complete on "
-                "its own and was sent back. " + blocked_mr_next_step(target, cause, self.merge_enabled))
+                "its own and was sent back. " + blocked_mr_next_step(target, cause, self.merge_enabled, sha))
 
     def _delivered_manual_plain_wait(self, a: Attempt, target: str) -> str:
         """Send-back text for a plain ``pipeline`` wait (the default predicate: wake when it
@@ -8706,6 +8734,7 @@ class AgentRunner:
         if phase == "reserve" and self._agent_gate_hold:
             reason, until, source = self._agent_gate_hold
             if source in self._gate_hold and time.monotonic() < until:
+                self._note_route_hold(reason)
                 return reason, gate
         hook_env = self._hook_env(task_id, mode, phase, attempt, gate)
         if quota_required:
@@ -8719,6 +8748,8 @@ class AgentRunner:
                 return "account capacity admission was not confirmed by the start gate", gate
             if phase == "admit":
                 self._clear_agent_gate_hold()
+            if phase in ("reserve", "admit"):
+                self._route_hold_seen = None
             return "", gate
         if phase != "transport":
             self._gate_task_only = rc == GATE_HOLD_TASK
@@ -8727,6 +8758,8 @@ class AgentRunner:
                 access_recovery.remember(self, task_id, mode, self._kv(out).get("ACCESS_HOLD", ""))
             reason = gate_hold_reason(out)
             gate.update(self._kv(out))
+            if phase in ("reserve", "admit"):
+                self._note_route_hold(reason)
             if writer_hold(reason) and phase != "transport":
                 # another lane still writes this card: hold the card, never the lane's other starts
                 self._gate_task_only = True
@@ -8743,6 +8776,30 @@ class AgentRunner:
         log.warning("%s: start gate %s #%s rc=%s: %s", self.agent.name, phase, task_id[:8], rc,
                     (err or out).strip()[:200])
         return f"start gate failed ({phase}, rc {rc})", gate
+
+    def _note_route_hold(self, reason: str, at: dt.datetime | None = None) -> bool:
+        """One operator alert when the runtime route has held this lane with the same reason for
+        ROUTE_HOLD_ALERT_SECONDS, never repeated within the episode. The episode begins at the first hold with that reason and ends when
+        a start gate passes, the route gives another reason or the gate holds for a reason that is not
+        the route's. True when this call signalled."""
+        if not (reason.startswith("route:") or reason == GATE_PUBLIC_REASONS["profile"]):
+            self._route_hold_seen = None
+            return False
+        at = at or now()
+        seen = self._route_hold_seen
+        if seen is None or seen[0] != reason:
+            self._route_hold_seen = (reason, at)
+            return False
+        if (at - seen[1]).total_seconds() < ROUTE_HOLD_ALERT_SECONDS:
+            return False
+        since = iso(seen[1])
+        minutes = int((at - seen[1]).total_seconds() // 60)
+        text = (f"[mesh-runner] Lane {self.agent.name} has been held by its runtime route for {minutes} min "
+                f"with one reason: {reason[:200]}. It starts no work until the route changes. "
+                f"Held since {since}.")
+        return operator_alert.signal(self.store, "route_hold:" + self.agent.name, since, text, self.emit,
+                                     now=at, repeat_hours=math.inf, incident="route_hold",
+                                     lane=self.agent.name, reason=reason[:300])
 
     def _turn_end(self, task_id: str, mode: str, attempt: Attempt | None, gate: dict, outcome: str, *, require_confirmation: bool = False) -> bool:
         """Tell the operator's hook a turn is over (release what the gate reserved)."""

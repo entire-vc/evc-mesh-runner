@@ -40,7 +40,7 @@ class Addressee(Bench):
         deploy = RepoSpec("deploy", base, max_slots=2, project=ra.identity("gitlab", "git.example", "g/deploy"))
         self.cfg.host_repositories = [deploy]
         self.grant = None                                  # None = Mesh has no field (legacy)
-        self.cfg.repo_access_contacts = ("Ops", "Lead")
+        self.cfg.repo_access_contacts = ("Steward", "Director")
 
     def setup_run(self, t):
         mesh = FakeMesh([t])
@@ -62,7 +62,7 @@ class Addressee(Bench):
             r._task_backoff.clear()
             r.tick()
 
-    def assert_addressed(self, body, contact="Ops"):
+    def assert_addressed(self, body, contact="Steward"):
         first = body.splitlines()[0]
         self.assertTrue(first.startswith(f"@{contact} "), first)
         self.assertFalse(body.startswith("[runner"))         # the mention path drops runner-prefixed bodies
@@ -71,7 +71,7 @@ class Addressee(Bench):
         self.assertNotIn("next_actor=operator", body)
         self.assertIn(f'"next_actor": "{contact}"', body)
 
-    def delivered(self, body, contact="Ops"):
+    def delivered(self, body, contact="Steward"):
         """The contact's runner reading this comment as a mention files exactly one request card."""
         theirs = task(9, assignee_id="agent-lead")             # the refused lane's card, not the contact's
         mesh = FakeMesh([theirs])
@@ -84,7 +84,7 @@ class Addressee(Bench):
         return [t for t in mesh.created if "mention-request" in (t.get("labels") or [])]
 
     # AC1 -----------------------------------------------------------------------------------------
-    def test_no_membership_under_mesh_access_addresses_riker_once_with_the_full_action(self):
+    def test_no_membership_under_mesh_access_addresses_the_contact_once_with_the_full_action(self):
         self.grant = access(1, "g/app")
         t = task(1)
         mesh, r = self.setup_run(t)
@@ -101,7 +101,7 @@ class Addressee(Bench):
         self.assertFalse(self.starts())
         made = self.delivered(notes[0])
         self.assertEqual(len(made), 1)
-        self.assertIn("@Ops repository access for lane builder", made[0]["title"])
+        self.assertIn("@Steward repository access for lane builder", made[0]["title"])
         self.assertIn(rr.MESH_ACTIONS[rr.NO_MEMBERSHIP][1], made[0]["description"])
 
     # AC2 -----------------------------------------------------------------------------------------
@@ -161,13 +161,13 @@ class Addressee(Bench):
             with self.subTest(reason=v.reason):
                 self.assertFalse(v.needs_access)
                 self.assertNotIn("@", r._repo_preflight_key(v))
-                self.assertEqual(v.text(addressee="Ops", lane="builder"), v.text())
+                self.assertEqual(v.text(addressee="Steward", lane="builder"), v.text())
                 r._repo_preflight_note(t["id"], v)
         bodies = [c["body"] for c in mesh.comments_all(t["id"])]
         self.assertEqual(len(bodies), 2)
         for body in bodies:
             self.assertTrue(body.startswith("[runner]"))
-            self.assertFalse(addressed(body, "Ops"))
+            self.assertFalse(addressed(body, "Steward"))
             self.assertIn("next_actor=runner", body)
             self.assertEqual(self.delivered(body), [])
 
@@ -181,17 +181,17 @@ class Addressee(Bench):
 
     # delivery details ----------------------------------------------------------------------------
     def test_the_contact_lane_itself_addresses_the_next_contact(self):
-        # a lane's own mention files no card (author == addressee): Ops's lane addresses Lead
+        # a lane's own mention files no card (author == addressee): Steward's lane addresses Director
         self.grant = access(1)
         t = task(1)
         mesh, r = self.setup_run(t)
-        self.cfg.repo_access_contacts = ("Builder", "Lead")
+        self.cfg.repo_access_contacts = ("Builder", "Director")
         self.ticks(r)
         notes = self.notes(mesh, t)
         self.assertEqual(len(notes), 1)
-        self.assert_addressed(notes[0], "Lead")
+        self.assert_addressed(notes[0], "Director")
         self.assertFalse(addressed(notes[0], "Builder"))
-        self.assertEqual(len(self.delivered(notes[0], "Lead")), 1)
+        self.assertEqual(len(self.delivered(notes[0], "Director")), 1)
 
     def test_no_contact_configured_keeps_the_plain_comment(self):
         self.cfg.repo_access_contacts = ()
@@ -202,7 +202,7 @@ class Addressee(Bench):
         notes = self.notes(mesh, t)
         self.assertEqual(len(notes), 1)
         self.assertIn("next_actor=operator", notes[0])
-        self.assertFalse(addressed(notes[0], "Ops"))
+        self.assertFalse(addressed(notes[0], "Steward"))
 
     def test_a_card_held_before_addressing_is_addressed_once(self):
         # a card refused by the previous release (bare fingerprint mark) gets the addressed signal once
@@ -217,7 +217,7 @@ class Addressee(Bench):
         self.ticks(r, 4)
         notes = self.notes(mesh, t)
         self.assertEqual(len(notes), 2)
-        self.assertFalse(addressed(notes[0], "Ops"))
+        self.assertFalse(addressed(notes[0], "Steward"))
         self.assert_addressed(notes[1])
         self.assertFalse(self.starts())
 
@@ -243,10 +243,10 @@ class ContactsConfig(unittest.TestCase):
         self.assertEqual(self.load("").repo_access_contacts, ())
 
     def test_ordered_names_are_read(self):
-        cfg = self.load('repo_access_contacts = ["Ops", "Lead"]')
-        self.assertEqual(cfg.repo_access_contacts, ("Ops", "Lead"))
+        cfg = self.load('repo_access_contacts = ["Steward", "Director"]')
+        self.assertEqual(cfg.repo_access_contacts, ("Steward", "Director"))
 
     def test_not_a_bare_name_is_refused(self):
-        for bad in ('"Ops"', '["@Ops"]', '["two words"]', '[1]'):
+        for bad in ('"Steward"', '["@Steward"]', '["two words"]', '[1]'):
             with self.subTest(bad=bad), self.assertRaises(config_mod.ConfigError):
                 self.load(f"repo_access_contacts = {bad}")
