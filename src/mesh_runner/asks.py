@@ -45,6 +45,11 @@ DEFAULT_HARD_PATTERNS: tuple[str, ...] = (
     r"опубликов", r"публикац", r"пост\b", r"анонс", r"рассылк", r"пресс-?релиз",
     # outward contact in someone's name: a letter, an offer, a call (Mesh server keeps the same list)
     r"e-?mail", r"письм", r"whatsapp", r"вацап", r"ватсап", r"звон", r"позвон", r"phone\b",
+    r"call\b", r"calls\b", r"calling\b", r"letter", r"offer\b", r"offers\b", r"proposal", r"outreach",
+    r"reach(?:ing)? out\b",
+    r"write to\b", r"writing to\b", r"wrote to\b", r"reply to\b", r"contact\b", r"contacting\b",
+    r"message (?:him|her|them)\b", r"text (?:him|her|them)\b", r"dm\b",
+    r"написать (?:ему|ей|им|клиент|лид|заказчик|партн|поставщик)", r"напишу (?:ему|ей|им|клиент|лид|заказчик|партн|поставщик)", r"ответить (?:ему|ей|им|клиент|лид|заказчик|партн|поставщик)", r"отвечу (?:ему|ей|им|клиент|лид|заказчик|партн|поставщик)", r"связат",
     r"от (?:вашего|твоего|моего|его|её|ее|нашего) имени", r"on (?:your|his|her|my|our) behalf",
     r"in (?:your|his|her|my|our) name", r"кп\b", r"коммерческ",
     # something only the person can do with their own hands or logins: nobody else can answer it

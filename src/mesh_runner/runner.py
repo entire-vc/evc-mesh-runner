@@ -514,6 +514,10 @@ class AgentRunner:
         self._workspace_readiness_controller = (workspace_readiness.controller(cfg)
                                                if cfg.workspace_readiness_v1 else None)
         self._watchdog_fired: set[tuple[str, int]] = set()   # (attempt, turn): one watchdog kill per turn
+        # execution observations (Runner._start_observations sets the router; None = not published)
+        self.observations = None
+        self._obs_project: dict[str, str] = {}               # task id -> project id (one GET per task)
+        self._obs_home: dict[str, dict[str, str]] = {}       # attempt id -> HOME/CODEX_HOME of its launch
         # settled turns since start by (outcome source, harness); see _count_outcome
         self._outcome_sources: collections.Counter = collections.Counter()
         self._outcome_sources_lock = threading.Lock()
@@ -1300,8 +1304,47 @@ class AgentRunner:
         self.life.to(a, state, note=note[:1000])
         self.procs.pop(a.id, None)
         self.emit(state, a, note=note[:300])
+        if self.observations is not None:
+            self.observations.attempt_ended(a.id, state)
+            self._obs_home.pop(a.id, None)
         if report and state == "completed" and a.turns and self.cfg.completion_comment:
             self._comment(a.task_id, self._completion_line(a)[len("[runner] "):])
+
+    def _observe_start(self, a: Attempt, adapter, native_argv: list[str], env: dict) -> None:
+        """A turn was launched: tell the execution view which route it runs. Never fails a launch."""
+        try:
+            from .execution_observations import launch_route
+            if not self.observations.bound(self.agent_id):
+                return                            # no catalog binds this lane: nothing Mesh would accept
+            project = self._obs_project.get(a.task_id)
+            if not project:
+                task = self._task(a.task_id) or {}
+                project = str(task.get("project_id") or "")
+                if project:
+                    self._obs_project[a.task_id] = project
+            base = getattr(adapter, "base", adapter)
+            profile_model = base.profile_model() if a.harness == "codex" and hasattr(base, "profile_model") else ""
+            self._obs_home[a.id] = {k: env[k] for k in ("HOME", "CODEX_HOME") if isinstance(env.get(k), str)}
+            self.observations.turn_started(a.id, a.task_id, self.agent_id, a.harness,
+                                           launch_route(a.harness, list(native_argv), profile_model or ""),
+                                           project_id=project or None)
+        except Exception as e:                    # telemetry never touches the attempt
+            log.debug("%s: execution observation start skipped: %s", self.agent.name, type(e).__name__)
+
+    def _observe_settle(self, a: Attempt, r: TurnResult) -> None:
+        """A turn settled: the model the harness itself recorded for it (Claude's stream, Codex's
+        turn_context), never the configured one."""
+        try:
+            if a.harness == "codex":
+                codex = self.adapter_for("codex")
+                ctx = getattr(codex, "base", codex).observed_context(r.session_id or a.session_id,
+                                                                      self._obs_home.get(a.id) or {})
+                source = "adapter_turn_context"
+            else:
+                ctx, source = ({"model": r.model} if r.model else {}), "adapter_stream"
+            self.observations.turn_settled(a.id, ctx, "waiting", source)
+        except Exception as e:
+            log.debug("%s: execution observation settle skipped: %s", self.agent.name, type(e).__name__)
 
     def _report_spend(self, a: Attempt, r: TurnResult) -> None:
         """The turn's tokens and cost on the agent's Mesh record, as the queue feeder reported
@@ -1738,6 +1781,8 @@ class AgentRunner:
         self._last_beat[a.id] = time.monotonic()
         self._record_launch(a, resume)
         self.emit("resume" if resume else "start", a, title=a.title[:120], session=sid)
+        if self.observations is not None:
+            self._observe_start(a, adapter, interactive.native_tail(argv) if interactive_driver else argv, env)
         log.info("%s: %s #%s (%s) pid %s", self.agent.name, "resumed" if resume else "started",
                  a.task8, a.title[:60], proc.pid)
         return True
@@ -2219,6 +2264,8 @@ class AgentRunner:
         if result.session_id and result.session_id != a.session_id:
             self.store.update(a, session_id=result.session_id)
         self._report_spend(a, result)
+        if self.observations is not None:
+            self._observe_settle(a, result)
         self.procs.pop(a.id, None)
         task = self._task(a.task_id)
         if self._still_ours(task, a.mode) and not self._settle_native(a, task):
@@ -10418,6 +10465,27 @@ class Runner:
         threading.Thread(target=catalog_loop, name="catalog", daemon=True,
                          args=(controllers, stop, self.cfg.catalog.interval_seconds)).start()
         log.info("catalog controller %s for %d workspace(s)", self.cfg.catalog.controller_ref, len(controllers))
+        if self.cfg.catalog.execution_observations:
+            self._start_observations(controllers, stop)
+
+    def _start_observations(self, controllers, stop: threading.Event) -> None:
+        """One publisher per catalog workspace, behind one router shared by every lane
+        (`[catalog] execution_observations = true`): the org chart's observed route."""
+        from .execution_observations import Publisher, Router, RunnerHook, Transport, binding_lookup, loop
+        hooks = []
+        for ctl in controllers:
+            try:
+                pub = Publisher(Transport(ctl.client, ctl.controller_ref), ctl.controller_ref, time.time)
+                hooks.append(RunnerHook(pub, ctl.workspace_id, binding_lookup(ctl.catalog_dir, ctl.workspace_id)))
+            except Exception as e:
+                log.warning("execution observations %s: not started: %s", ctl.workspace_id[:8], type(e).__name__)
+        if not hooks:
+            return
+        router = Router(hooks)
+        for ar in self.agents:
+            ar.observations = router
+        threading.Thread(target=loop, name="execution-observations", daemon=True, args=(router, stop)).start()
+        log.info("execution observations for %d workspace(s)", len(hooks))
 
     def _start_chat(self, stop: threading.Event) -> None:
         services.start_chat(self, stop)

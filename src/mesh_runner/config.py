@@ -27,6 +27,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     manifest = "~/runtime/accounts.json"   # what this host can execute: controllers, accounts, modes, pools
     # interval_seconds = 120
     # observations = "~/runtime/quota-observations.json"    # quota-observations/v1; absent = pools unknown
+    # execution_observations = false   # true: publish what each attempt really runs (execution view)
     # harness_limits = "~/runtime/harness-limits.json"      # harness-limits/v1: usage limits lanes printed
     # thresholds = "~/runtime/thresholds.json"
     # launch_bindings / launch_cache = actual-launch evidence files (built-in host defaults; one path for every workspace)
@@ -341,6 +342,7 @@ class CatalogConfig:
     launch_bindings: Path | None = None
     launch_cache: Path | None = None
     workspaces: tuple = ()
+    execution_observations: bool = False   # publish attempt-scoped executions (execution_observations.py)
 
 
 def _catalog(raw, state_dir: Path) -> CatalogConfig:
@@ -348,14 +350,12 @@ def _catalog(raw, state_dir: Path) -> CatalogConfig:
     c = raw or {}
     if not isinstance(c, dict):
         raise ConfigError("[catalog] must be a table")
-    if "execution_observations" in c:
-        # this package ships no execution publisher: the key is only parsed so that no value can look accepted
-        observe = c["execution_observations"]
-        if not isinstance(observe, bool):
-            raise ConfigError(f"[catalog] execution_observations must be false or absent, got {observe!r}")
-        if observe:
-            raise ConfigError("[catalog] execution_observations = true is not supported: this runner build has no "
-                              "execution publisher")
+    observe = c.get("execution_observations", False)
+    if not isinstance(observe, bool):
+        raise ConfigError(f"[catalog] execution_observations must be true or false, got {observe!r}")
+    if observe and c.get("enabled", False) is not True:
+        raise ConfigError("[catalog] execution_observations = true needs [catalog] enabled: the publisher reports "
+                          "under the catalog controller of each workspace")
     if c.get("enabled", False) is not True:
         return CatalogConfig()
     if c.get("controller_ref", RUNNER_NAME) != RUNNER_NAME:
@@ -383,7 +383,7 @@ def _catalog(raw, state_dir: Path) -> CatalogConfig:
         harness_limits=_path(c.get("harness_limits")), thresholds=_path(c.get("thresholds")),
         launch_bindings=_path(c.get("launch_bindings")) or _path(catalog_launch.DEFAULT_BINDINGS),
         launch_cache=_path(c.get("launch_cache")) or _path(catalog_launch.DEFAULT_CACHE),
-        workspaces=tuple(spaces))
+        workspaces=tuple(spaces), execution_observations=observe)
 
 
 @dataclass

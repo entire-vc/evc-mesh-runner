@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.31 — 2026-11-12
+
+- Asks to write to, call or contact someone classify as hard in English too. A letter, an offer or a call was caught only in Russian; `call`, `letter`, `offer`, `proposal`, `outreach`, `reach out`, `write to`, `reply to`, `contact`, `dm` and their Russian counterparts now keep such an ask hard, so its stated default is never applied by the clock. Asking to write a test stays soft. The shared fixture `tests/fixtures/ask_class_cases.json` gains these cases.
+- The shared runner can publish what each attempt really runs. The execution publisher is part of the package (`mesh_runner.execution_observations`) and starts with `[catalog] execution_observations = true` (default off; needs `[catalog] enabled`). There is one publisher per `[[catalog.workspace]]` behind one router: an attempt is reported in the workspace whose `desired.json` binds its agent. Each turn reports the launch route from the native argv (`resolved_route.source = runner_launch`) and, when it settles, the model the harness itself recorded. A 403 on a report means the runner integration is off for that project: the batch is split per project and agent, the refused scope is skipped for 10 minutes and the others go on; 404 and 409 still fence. Rollback: set the key to false (or drop it) and redeploy.
+
 ## 0.2.30 — 2026-11-12
 
 - A new repository-access grant now starts a card that was refused for missing access on the next tick: the grant lifts exactly the backoff and resume holds the access refusal set, and a deadline set by another failure stays.
