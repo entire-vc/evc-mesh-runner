@@ -384,16 +384,81 @@ class FakeReader:
         return self.comment_rows.get(tid, [])
 
 
+class GateClass(unittest.TestCase):
+    """asks.gate_class is the class Mesh arms a marker gate with (server markerGateClass,
+    internal/service/human_gate_ask_class.go); the cases mirror that file's test tables."""
+
+    def test_live_questions(self):
+        cases = [
+            ("Утверждаешь план пяти витрин (Stage 1)?", "да, Local Sync с текущим H1", False, "no hard rule matched"),
+            ("Отправлять КП Галине (письмо от вашего имени, код в письме) или закрыть заявку без отправки?",
+             "закрыть", True, "keyword:кп"),
+            ("Одобряете этот текст для WhatsApp при недозвоне и берёте первый звонок Анне?", "да", True,
+             "keyword:whatsapp"),
+            ("Выставить счет", "да", True, "keyword:счет"),
+            ("Ценности команды описать так?", "да", False, "no hard rule matched"),
+            ("Repay the tech debt first or ship?", "ship", False, "no hard rule matched"),
+        ]
+        for question, default, hard, rule in cases:
+            with self.subTest(question=question):
+                v = asks.gate_class(question, [], default)
+                self.assertEqual((v.hard, v.rule), (hard, rule))
+
+    def test_tags_and_defaults(self):
+        self.assertEqual(asks.gate_class("Which layout? [hard]", [], "left"), asks.Verdict(True, "tag:hard"))
+        self.assertEqual(asks.gate_class("Pay the invoice now? [soft]", [], "Monday"), asks.Verdict(True, "keyword:pay"))
+        self.assertEqual(asks.gate_class("Which layout? [soft]", [], ""), asks.Verdict(False, "tag:soft"))
+        self.assertEqual(asks.gate_class("Which layout?", [], ""),
+                         asks.Verdict(True, "no default stated by the asker"))
+        self.assertEqual(asks.gate_class("Which layout?", [], asks.MARKER_FALLBACK_DEFAULT),
+                         asks.Verdict(True, "no default stated by the asker"))
+        self.assertEqual(asks.gate_class("Which layout?", ["Money"], "left"), asks.Verdict(True, "label:money"))
+
+
+class SharedFixture(unittest.TestCase):
+    """tests/fixtures/ask_class_cases.json is byte-identical to evc-mesh
+    internal/service/testdata/ask_class_cases.json, which the server's markerGateClass test
+    runs: one question set, one verdict on both sides."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).parent / "fixtures" / "ask_class_cases.json"
+        cls.fx = json.loads(path.read_text(encoding="utf-8"))
+
+    def test_rule_lists_match(self):
+        self.assertEqual(list(asks.DEFAULT_HARD_PATTERNS), self.fx["hard_patterns"],
+                         "update the shared fixture here and in evc-mesh together")
+        self.assertEqual(list(asks.DEFAULT_HARD_LABELS), self.fx["hard_labels"])
+        self.assertEqual(asks.MARKER_FALLBACK_DEFAULT, self.fx["fallback_default"])
+
+    def test_cases(self):
+        self.assertTrue(self.fx["cases"])
+        for tc in self.fx["cases"]:
+            with self.subTest(case=tc["name"]):
+                self.assertEqual(asks.marker_default(tc["body"], tc["slug"]), tc["default"])
+                v = asks.marker_gate_class(tc["body"], tc["slug"], tc["labels"])
+                self.assertEqual(("hard" if v.hard else "soft", v.rule), (tc["class"], tc["rule"]))
+                handle, body = asks.blocking_ask([{"body": tc["body"]}])
+                self.assertEqual((handle, body), (tc["slug"], tc["body"]))
+
+
 class Audit(unittest.TestCase):
     def rows(self):
         pay = dict(task(1, human_gate=True), title="Pay for the domain", _cat="todo")
-        design = dict(task(2, human_gate=True), title="Settings page", _cat="review")
+        design = dict(task(2, human_gate=True), title="Settings page", _cat="review",
+                      human_gate_class="hard", recommended_default="Layout A")
         labelled = dict(task(3, human_gate=True, labels=["legal"]), title="Terms", _cat="todo")
         free = dict(task(4), title="No gate", _cat="todo")
+        held_soft = dict(task(5, human_gate=True), title="Plan", _cat="todo",
+                         human_gate_class="soft", recommended_default="ship it")
+        no_default = dict(task(6, human_gate=True), title="Copy", _cat="todo", human_gate_class="hard",
+                          recommended_default=asks.MARKER_FALLBACK_DEFAULT)
         comments = {pay["id"]: [{"body": "❓ Blocking @person: Should we pay for the annual plan?"}],
-                    design["id"]: [{"body": "❓ Blocking @person: Layout A or B?"}],
-                    labelled["id"]: [{"body": "❓ Blocking @person: Which wording?"}]}
-        reader = FakeReader([pay, design, labelled, free], comments)
+                    design["id"]: [{"body": "❓ Blocking @person: Layout A or B?\nDefault: Layout A"}],
+                    labelled["id"]: [{"body": "❓ Blocking @person: Which wording?"}],
+                    held_soft["id"]: [{"body": "❓ Blocking @person: Approve the plan?\nDefault: ship it"}],
+                    no_default["id"]: [{"body": "❓ Blocking @person: Which headline?"}]}
+        reader = FakeReader([pay, design, labelled, free, held_soft, no_default], comments)
         cfg = mock.Mock(agents=[SimpleNamespace(name="x"), SimpleNamespace(name="y")], mesh_url="u", mesh_basic_auth="",
                         hard_ask_patterns=asks.DEFAULT_HARD_PATTERNS, hard_ask_labels=asks.DEFAULT_HARD_LABELS)
         return cfg, reader, ask_audit.open_gates(cfg, client_for=lambda ag: reader)
@@ -401,12 +466,16 @@ class Audit(unittest.TestCase):
     def test_each_open_gate_once_with_verdict_and_rule(self):
         _, reader, rows = self.rows()
         by_task = {r["task"]: r for r in rows}
-        self.assertEqual(len(rows), 3)                       # the second agent lists the same tasks
+        self.assertEqual(len(rows), 5)                       # the second agent lists the same tasks
         self.assertEqual((by_task["00000001"]["verdict"], by_task["00000001"]["rule"]), ("hard", "keyword:pay"))
-        self.assertEqual((by_task["00000002"]["verdict"], by_task["00000002"]["rule"]),
-                         ("soft", "no hard rule matched"))
+        # the rule calls it soft but Mesh holds it hard: the count the owner wants at zero
+        self.assertEqual((by_task["00000002"]["verdict"], by_task["00000002"]["rule"], by_task["00000002"]["held"]),
+                         ("soft", "no hard rule matched", "hard"))
         self.assertEqual((by_task["00000003"]["verdict"], by_task["00000003"]["rule"]), ("hard", "label:legal"))
-        self.assertEqual(ask_audit.summary(rows), {"gates": 3, "hard": 2, "soft": 1})
+        self.assertEqual((by_task["00000005"]["verdict"], by_task["00000005"]["held"]), ("auto", "soft"))
+        self.assertEqual((by_task["00000006"]["verdict"], by_task["00000006"]["rule"]),
+                         ("hard", "no default stated by the asker"))
+        self.assertEqual(ask_audit.summary(rows), {"gates": 5, "hard": 3, "soft": 1, "auto": 1})
         self.assertTrue(all(c[0] == "GET" for c in reader.calls))
 
     def test_cli_prints_the_table_and_totals_and_does_not_write(self):
@@ -423,7 +492,7 @@ class Audit(unittest.TestCase):
                 self.assertEqual(cli.main(["asks", "classify", "--config", str(conf)]), 0)
             text = out.getvalue()
             self.assertIn("keyword:pay", text)
-            self.assertIn("total 3: hard 2, soft 1", text)
+            self.assertIn("total 5: hard 3, soft 1, auto 1", text)
             out = io.StringIO()
             with mock.patch.object(ask_audit, "open_gates", return_value=rows), redirect_stdout(out):
                 cli.main(["asks", "classify", "--config", str(conf), "--json"])

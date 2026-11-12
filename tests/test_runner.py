@@ -3656,6 +3656,82 @@ class ParkedReview(Bench):
         self.assertEqual([c['resume'] for c in calls(self.calls)], [False, True])
         self.assertNotIn('parked', [k for _, k, _ in r.store.events(a.id)])
 
+    def unpark_review(self, *, where='resume', change=None, sessions_known=True):
+        r, t, a = self.start_review()
+        if where == 'resume':
+            a = self.finish_turn(r)
+        r.mesh.tasks[t['id']]['labels'] = ['park:external']
+        if where == 'resume':
+            r.tick()
+        else:
+            self.finish_turn(r)
+        self.assert_parked(r, t, a, where)
+        if change:
+            loss = json.loads(r.store.mark('builder', t['id'], 'ownership_loss')[0])
+            loss.update(change)
+            r.store.mark('builder', t['id'], 'ownership_loss', json.dumps(loss))
+        # mock: external boundary — native CLI session inventory on the routed account.
+        self.adapter.sessions_known = sessions_known
+        r.mesh.tasks[t['id']]['labels'] = []
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        r.mesh.add_comment(t['id'], 'Unparked; please continue the review.', author='author-agent')
+        r.tick()  # ordinary review feed re-admits the unparked card
+        later = self.finish_turn(r)
+        self.assertNotEqual(later.id, a.id)
+        self.assertEqual((later.mode, later.state, later.turns), ('review', 'ready', 1))
+        events = r.store.events(later.id)
+        returns = [json.loads(d) for _, k, d in events if k == 'ownership_return']
+        launches = [json.loads(d) for _, k, d in events if k == 'launch']
+        return r, a, later, returns, launches
+
+    def assert_unparked_review_resumes(self, where):
+        r, first, later, returns, launches = self.unpark_review(where=where)
+        self.assertEqual(later.session_id, first.session_id)
+        self.assertEqual(later.workspaces, first.workspaces)
+        self.assertEqual(len(returns), 1)
+        self.assertEqual((returns[0]['intent'], returns[0]['reason'], returns[0]['previous_attempt'],
+                          returns[0]['source']),
+                         ('resume', 'ownership_return_same_lane', first.id, 'runner_admission'))
+        self.assertEqual([(e['intent'], e['restart_reason']) for e in launches], [('resume', '')])
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False, True])
+        self.assertEqual(r.store.mark('builder', first.task_id, 'ownership_loss')[0], '')
+
+    def test_unparked_review_at_resume_keeps_session_with_ownership_provenance(self):
+        self.assert_unparked_review_resumes('resume')
+
+    def test_unparked_review_at_turn_end_keeps_session_with_ownership_provenance(self):
+        self.assert_unparked_review_resumes('turn end')
+
+    def assert_unparked_review_refuses(self, change, reason):
+        r, first, later, returns, launches = self.unpark_review(change=change)
+        self.assertNotEqual(later.session_id, first.session_id)
+        self.assertEqual([(e['intent'], e['reason']) for e in returns], [('start', reason)])
+        self.assertEqual([(e['intent'], e['restart_reason']) for e in launches], [('start', reason)])
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False, False])
+
+    def test_unparked_review_refuses_changed_paths(self):
+        self.assert_unparked_review_refuses({'workspaces': ['/elsewhere']}, 'path_changed')
+
+    def test_unparked_review_refuses_changed_harness(self):
+        self.assert_unparked_review_refuses({'harness': 'codex'}, 'cwd_or_harness_changed')
+
+    def test_unparked_review_refuses_changed_native_root(self):
+        self.assert_unparked_review_refuses({'cwd': '/elsewhere'}, 'cwd_or_harness_changed')
+
+    def test_unparked_review_refuses_terminal_card_history(self):
+        self.assert_unparked_review_refuses({'observed_status': 'done'}, 'ownership_return')
+
+    def test_unparked_review_refuses_missing_session(self):
+        self.assert_unparked_review_refuses({'session_id': ''}, 'session_missing')
+
+    def test_unparked_review_missing_on_routed_account_starts_fresh(self):
+        r, first, later, returns, launches = self.unpark_review(sessions_known=False)
+        self.assertNotEqual(later.session_id, first.session_id)
+        self.assertEqual([(e['intent'], e['reason']) for e in returns],
+                         [('resume', 'ownership_return_same_lane')])
+        self.assertEqual([(e['intent'], e['restart_reason']) for e in launches], [('start', 'session_missing')])
+        self.assertEqual([c['resume'] for c in calls(self.calls)], [False, False])
+
 
 class Limits(Bench):
     def test_limit_switch_command_retries_at_once_instead_of_pausing(self):
@@ -4132,6 +4208,23 @@ class CappedEventObservation(Bench):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetiredOpsReviewWait(Bench):
+    def test_persisted_wait_stays_held_after_comments_and_elapsed_time(self):
+        source = task(1)
+        mesh = FakeMesh([source])
+        runner = self.runner(mesh)
+        runner.refresh_me()
+        attempt = runner.store.create(self.agent.name, source["id"], "claude")
+        wait = dict(kind="ops-review", target="a" * 64, ops_review_request="a" * 64,
+                    since="2020-01-01T00:00:00Z", started="2020-01-01T00:00:00Z")
+        runner.store.update(attempt, state="waiting", wait=wait)
+        mesh.add_comment(source["id"], "eligible; review ready")
+        runner._wake_one(attempt)
+        saved = runner.store.get(attempt.id)
+        self.assertEqual(saved.state, "waiting")
+        self.assertEqual(saved.wait, wait)
 
 
 class WaitWorkspaceCheckpoint(Bench):

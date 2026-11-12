@@ -803,8 +803,9 @@ def mr_merge_blocker(row: dict | None) -> str:
 
 def blocked_mr_next_step(target: str, cause: str, merge_gate: bool) -> str:
     """The way out of a wait for the merge of MR ``target`` that will not merge as is: its head is
-    red (``cause`` ``red``), it conflicts with its target (``conflict``) or it must be rebased
-    (``need_rebase``). The way out is a new head, so the text never suggests another wait for the
+    red (``cause`` ``red``), it conflicts with its target (``conflict``) or it is behind a target
+    that merges fast-forward or semi-linear only (``need_rebase``). The way out is a new head, made
+    by merging the target into the branch, never by rewriting it (the merge gate's own rule), so the text never suggests another wait for the
     merge of the current one: measured, agents re-armed that same wait and it parked for good."""
     if split_provider(target)[0]:
         merge_gate = False                       # `merge:` has no provider-qualified form
@@ -813,11 +814,13 @@ def blocked_mr_next_step(target: str, cause: str, merge_gate: bool) -> str:
         fix = ("open the failed job, fix the cause and push (or retry it once if it is a proven flake), "
                "then obtain the review verdict on the new head")
     elif cause == "conflict":
-        fix = ("rebase the branch onto its target, resolve the conflicts and push, then have the review "
-               "cover the rebased delta and give its verdict on the new head")
+        fix = ("merge the target branch into the MR branch, resolve the conflicts and push normally (never "
+               "rebase or force-push a pushed branch), then have the review cover the merge delta and give "
+               "its verdict on the new head")
     else:
-        fix = ("rebase the branch onto its target and push, then have the review cover the rebased delta "
-               "and give its verdict on the new head")
+        fix = ("merge the target branch into the MR branch and push normally (never rebase or force-push a "
+               "pushed branch), then have the review cover the merge delta and give its verdict on the new "
+               "head")
     if merge_gate:
         then = (f"once it is SHIP, end with `⏳ WAIT merge:{project}!{iid or '<iid>'} after=<full-new-head-sha>` "
                 "and the merge gate merges it.")
@@ -1037,9 +1040,9 @@ def typed_event(gitlab, kind: str, target: str, wait: dict, delivered="", observ
         if (allow_action_required and cause and isinstance(sha, str)
                 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
                 and _owner_action_once(target, sha, 0, cause, delivered, observation) is not None):
-            # One notice per head and cause: a new head (the rebase) is judged afresh.
+            # One notice per head and cause: a new head (the catch-up merge) is judged afresh.
             what = ("has a merge conflict with its target branch" if cause == "conflict"
-                    else "must be rebased onto its target branch before it can merge")
+                    else "is behind its target branch, which merges fast-forward or semi-linear only")
             return (f"action required: MR {target} head {sha[:8]} {what}; it will not merge as is. "
                     + blocked_mr_next_step(target, cause, merge_gate))
         return ""

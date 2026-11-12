@@ -139,7 +139,7 @@ class Mapping(unittest.TestCase):
         self.assertEqual(off.note, outcome_mod.MERGE_NOT_ENABLED)
 
     def test_registered_waits(self):
-        for registration, ref, spelled in (("ops-review", HEX64, HEX64), ("native", HEX64, HEX64),
+        for registration, ref, spelled in (("native", HEX64, HEX64),
                                            ("gmail", "gmr_0123456789ab", "gmr_0123456789ab"),
                                            ("receipt", "00000001", "#00000001"),
                                            ("lifecycle", "00000001", "#00000001"),
@@ -152,6 +152,13 @@ class Mapping(unittest.TestCase):
                 self.same(out, f"⏳ WAIT {registration}:{spelled}: armed")
                 self.assertEqual((out.kind, out.target), (registration, ref))
                 self.assertTrue(out.is_wait)
+
+    def test_retired_ops_review_registration_is_refused(self):
+        out = from_typed(*wait_row(kind="registered", registration="ops-review",
+                                   registration_ref=HEX64), NOW, "00000001")
+        self.assertEqual(out.kind, "unparsed")
+        self.assertIn("unknown here", out.note)
+        self.assertFalse(out.is_wait)
 
     def test_ask_human_is_the_blocking_line_mesh_posted(self):
         out = from_typed(*wait_row("asked @alice", kind="human", addressee="alice",

@@ -49,6 +49,7 @@ from . import inputs
 from . import prompt as prompts
 from . import repo_admission
 from . import repo_requirements
+from . import repo_access
 from . import git_index_admission
 from . import maintenance
 from . import delivery_requests
@@ -69,7 +70,6 @@ from .adapters.codex import CodexAdapter
 from . import queue_wait
 from . import queue_order
 from . import native_result_wait, native_result_resume, native_result_rebind, native_result_config
-from . import ops_review_wait
 from . import receipt_wait
 from . import gmail_watch
 from . import lifecycle
@@ -87,6 +87,7 @@ from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
 from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, QUEUE_WAIT_GUIDANCE, MANUAL_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, declaration_lines, from_typed, parse_line, typed_unparsed
 from . import gate_owner
+from . import card_wait
 from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, blocking_edges, blocking_tasks, order,
                         parse_time, static_skip_reason)
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
@@ -109,6 +110,8 @@ DAILY_CAP_NOTES = ("turn budget",)   # failed by the per-day turn budget with no
 CHECKOUT_PENDING = "checkout_pending"   # store mark: {session_id, request_id} of an acquire whose answer was lost
 RELEASE_PENDING = "release_pending"     # store mark: the lease of a release whose answer never came (token kept)
 RELEASE_RETRY_SECONDS = (30, 120, 300)  # backoff between retries of a pending release; the last step repeats
+GATE_RELEASE_PENDING = "gate_release_pending"   # store mark: a gate reservation whose release was not confirmed
+GATE_RELEASE_WARN = 24 * 3600           # a gate release unconfirmed this long is reported (once a day); never dropped
 TURN_CAP_WINDOW = 10                # turn cap: how many recent outcomes are looked at for progress
 CAP_WAIT = "cap_wait"                # store mark: a capped task waiting for new input
 HANDBACK_WAIT = "handback_wait"      # store mark: the WAIT a review session handed the task back with
@@ -176,6 +179,25 @@ def cycle_signature(target8: str, other_task_id: str, other_wait: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+def unknown_comment(resolution: str, diagnostic: str, process_gone: bool) -> str:
+    """The card's comment when a turn's prompt delivery cannot be proven: what happened, what it means for the
+    card, what happens next. Readable without the code; the technical reason stays on the last line."""
+    after = (f"If nothing new appears, the runner ends this attempt by itself in {UNKNOWN_QUIET_MINUTES} min and "
+             "the card starts again in a fresh session." if process_gone else
+             f"Its process still runs; once it ends with nothing new, the attempt ends by itself after "
+             f"{UNKNOWN_QUIET_MINUTES} min and the card starts again in a fresh session.")
+    return ("[runner] The session did not confirm that it received the last prompt, so this turn's result is "
+            "unknown. The prompt is not sent again (it may have reached the session), and the card is held "
+            "meanwhile; nothing is needed from the card's owner. " + after + "\n"
+            "Technical: MANDATORY DELIVERY PENDING: " + resolution + diagnostic + "; operator signalled.")
+
+
+def quiet_comment(minutes: int) -> str:
+    return ("[runner] The held turn is closed: its session process is gone and nothing new arrived for "
+            f"{minutes} min, so whether it received the prompt cannot be settled any more. The prompt was not "
+            "sent again; the card starts in a fresh session, which reads the card and continues from its state.")
+
+
 def public_harness_error(text: str) -> str:
     """A bounded diagnostic for Mesh/prompts; arbitrary provider text stays local.
 
@@ -241,6 +263,9 @@ CHAT_CHECK_SECONDS = 60
 GATE_HOLD = 75                      # start gate exit code: hold starts of this agent (EX_TEMPFAIL)
 GATE_HOLD_TASK = 76                 # start gate exit code: hold this task only; try the agent's next
 GATE_HOLD_SECONDS = 120
+# An ``unknown`` attempt whose turn process group is gone and whose native evidence stayed unchanged this long is
+# ended by the runner the way an operator token ends it: nothing new can prove the delivery any more.
+UNKNOWN_QUIET_MINUTES = 15
 PAUSE_DENIAL = ": op_pause"      # note suffix of a launch refused because a pause landed mid-tick
 HOLD_RELOG_SECONDS = 1800
 _EVENTS_LOCK = threading.Lock()
@@ -394,6 +419,7 @@ GATE_PUBLIC_REASONS = {
     "profile": "runtime profile unavailable",
     "capacity": "runtime capacity unavailable",
     "review": "review admission unavailable",
+    "writer": "card writer still active",
     "unknown": "held by the start gate",
 }
 
@@ -403,6 +429,25 @@ GATE_PUBLIC_REASONS = {
 # capacity refusals are normalised; every other free-text reason keeps its own class.
 LEGACY_CAPACITY_REFUSAL = re.compile(
     r"(?:capacity: )?(?:runtime\.capacity: )?server admit hold acquire_refused:pool_(?:exhausted|full)\b")
+# The server admits one writer per card: the previous lane still holds the card's reservation.
+# Not a capacity shortage and not a hold of the whole lane: only this card waits for the holder.
+# The holder note comes from the operator client already sanitized and is re-validated here.
+TASK_WRITER_REFUSAL = re.compile(
+    r"(?:capacity: )?(?:runtime\.capacity: )?server admit hold acquire_refused:task_writer_active\b"
+    r"(?: \[holder=(?P<holder>[A-Za-z0-9][A-Za-z0-9_.-]{0,39})(?: state=(?P<state>[a-z_]{1,16}))?[^\]]*\])?")
+
+
+def writer_hold(reason: str) -> bool:
+    return reason.startswith(GATE_PUBLIC_REASONS["writer"])
+
+
+def _writer_reason(m: re.Match) -> str:
+    who = [f"holder={m['holder']}"] if m["holder"] else []
+    if m["state"]:
+        who.append(f"state={m['state']}")
+    return GATE_PUBLIC_REASONS["writer"] + (f" ({', '.join(who)})" if who else "")
+
+
 # Holds that a changed pool state or runtime route can make stale. Human, auth and
 # ownership holds are never in this set.
 CAPACITY_CLASS_REASONS = frozenset({GATE_PUBLIC_REASONS["capacity"], GATE_PUBLIC_REASONS["profile"]})
@@ -423,6 +468,9 @@ def gate_hold_reason(text: str) -> str:
     for line in lines:
         if re.match(r"[A-Z][A-Z0-9_]{0,40}=", line):
             continue
+        writer = TASK_WRITER_REFUSAL.match(line)
+        if writer:
+            return _writer_reason(writer)
         if "=" not in line:
             if LEGACY_CAPACITY_REFUSAL.match(line):
                 return GATE_PUBLIC_REASONS["capacity"]     # same class as the typed refusal
@@ -521,6 +569,9 @@ class AgentRunner:
                                   checkpoint_exclude_names=cfg.checkpoint_exclude_names,
                                   archive_root=cfg.archive_root,
                                   archive_require_mount=cfg.archive_require_mount)
+        # Mesh repository_access, last-known-good from the Store (survives a restart during an outage)
+        self.access = repo_access.AccessKeeper(store, agent.name)
+        self._apply_access()
         self.cats = StatusCategories(self.mesh)
         self.effects = Effects(self.mesh, self.cats, agent.name, enabled=cfg.mesh_effects, store=store,
                                decision_metadata_recipients=tuple(cfg.decision_request_metadata_only_recipients),
@@ -605,7 +656,8 @@ class AgentRunner:
     def _launch(self, base: Adapter) -> Adapter:
         return interactive.wrap(base, self.agent.name, self.launch_mode, self.cfg.state_dir,
                                 self.cfg.tmux_binary, self.cfg.interactive_max_sessions,
-                                background_wait_minutes=self.cfg.background_wait_minutes)
+                                background_wait_minutes=self.cfg.background_wait_minutes,
+                                memory_floor=(self.cfg.memory_hold_free_pct, self.cfg.memory_hold_swap_mb))
 
     def reap_interactive(self) -> None:
         """Close interactive sessions nobody will use warm (see interactive.reap). Runs in
@@ -824,6 +876,29 @@ class AgentRunner:
                                                         "resume_hold": self._resume_hold.get(a.id),
                                                         "cause": str(e)[:300]}
                 self.store.event(a.id, f"quarantine:{what}", f"{hold}s after repeated failure: {str(e)[:300]}")
+                self._notice_retained_lease(a, what, e)
+
+    def _notice_retained_lease(self, a: Attempt, what: str, e: Exception) -> None:
+        """A capture that keeps the lease fails the same way on every pass until someone repairs
+        the worktree or the runner: say so on the card once per attempt (a durable mark, so a
+        runner restart does not repeat it), with the finite cause only, never paths or output."""
+        text = str(e)
+        if what not in ("resume", "workspace-suspend", "ready-workspace-suspend") or "lease retained" not in text:
+            return
+        found = re.search(r"checkpoint: slim capture failed \(([a-z-]+)/([a-z-]+)", text)
+        cause = f"{found.group(1)}/{found.group(2)}" if found else "checkpoint"
+        key = f"lease_retained_notice:{a.id}"
+        said = self.store.mark(a.agent, a.task_id, key)
+        if said and said[0] or not self.store.claim(a.agent, a.task_id, key, cause):
+            return
+        try:
+            self.mesh.add_comment(a.task_id, f"[runner] Workspace snapshot keeps failing ({what}: {cause}); the "
+                                             "worktree lease is retained and the step is retried with a growing "
+                                             "backoff. Nothing is lost; the runner owner must repair the cause.")
+        except MeshError as err:
+            # Not said: release the claim so the next failing pass says it, instead of staying silent.
+            self.store.compare_mark(a.agent, a.task_id, key, cause, "")
+            log.warning("%s: retained-lease notice on #%s failed: %s", self.agent.name, a.task_id[:8], err)
 
     def _comment(self, task_id: str, text: str) -> None:
         try:
@@ -958,7 +1033,7 @@ class AgentRunner:
             return {}
         if not isinstance(note, dict) or not note.get("attempt") or note.get("attempt") == a.id:
             return {}
-        repos = {r.name for r in self.agent.repos}
+        repos = {r.name for r in self.lane_repos}
         return {Path(p).parent.name: p for p in note.get("workspaces") or []
                 if isinstance(p, str) and Path(p).parent.name in repos}
 
@@ -1393,7 +1468,7 @@ class AgentRunner:
         profile = self._auth_profile_id(routed, env)
         blocked = self._auth_blocked(a, env)
         if blocked:
-            self._authentication_failed(a, blocked)
+            self._authentication_failed(a, blocked, current_route=True)
             return False
         # Recheck under the Runner's existing single state-directory owner, after
         # workspace/auth checks and before changing session or durable outbox.
@@ -1489,6 +1564,12 @@ class AgentRunner:
         # Session preparation may have consumed free space.
         # Check again before the durable authorization callback or writer creation.
         if self.pool.disk_hold():
+            self._disk_hold_attempt(a)
+            return False
+        # Memory too, read now: the tick's cached reading may be 30 s old, and a session started into an
+        # exhausted swap does not take its prompt in time. Same hold as disk: nothing changes on the card.
+        if self.memgate.check(fresh=True):
+            log.info("%s: #%s start held: host short of memory (%s)", self.agent.name, a.task8, self.memgate.describe())
             self._disk_hold_attempt(a)
             return False
         interactive_driver = isinstance(adapter, interactive.InteractiveAdapter)
@@ -1752,9 +1833,11 @@ class AgentRunner:
         self._resume_hold[a.id] = time.monotonic() + delay
         log.info("%s: #%s provider outage (%d in a row); retry in %d s", name, a.task8, n, delay)
 
-    def _authentication_failed(self, a: Attempt, profile: str) -> None:
+    def _authentication_failed(self, a: Attempt, profile: str, current_route: bool = False) -> None:
+        """``current_route``: ``profile`` comes from the environment just built for this spawn,
+        so the lane is on the held profile now (not only when an earlier turn launched)."""
         self._auth_hold_attempt(a, profile)
-        if self._switch_on_auth(a, profile):
+        if self._switch_on_auth(a, profile, current_route):
             self._resume_hold.pop(a.id, None)  # next turn re-runs every admission/checkpoint gate
             self.store.update(a, note="authentication held; routed to another profile")
             return
@@ -1882,7 +1965,12 @@ class AgentRunner:
             wait = None
             if row.get("kind") == "wait":
                 try:
-                    wait = self.mesh.active_wait(a.task_id, self.agent_id)
+                    if row.get("wait_server_observed") is True and row.get("wait_id"):
+                        # The target may finish before the agent process exits.
+                        # Read this exact receipt even when it is already resolved.
+                        wait = self.mesh.wait_receipt(a.task_id, row["wait_id"])
+                    else:
+                        wait = self.mesh.active_wait(a.task_id, self.agent_id)
                 except (MeshError, OSError):
                     return TYPED_UNREADABLE
                 if not wait or (row.get("wait_id") and wait.get("id") != row.get("wait_id")):
@@ -2230,16 +2318,6 @@ class AgentRunner:
                 self._release_gate(a, "native-registration-held")
                 self._release_checkout(a)
                 return
-        ops_review_request = None
-        if outcome.kind == "ops-review":
-            try:
-                ops_review_request = self._ops_review_registration(a, outcome.target, task)
-            except (ValueError, OSError) as exc:
-                # Only fixed protocol reasons; never expose registry bytes, paths or JSON errors.
-                reason = str(exc) if type(exc) is ValueError else "private registry unavailable"
-                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line,
-                    note=ops_review_wait.WAIT_GUIDANCE + " Refused: " + reason))
-                return
         receipt_reg = None
         if outcome.kind == "receipt":
             receipt_reg = self._receipt_registration(a, outcome)
@@ -2338,7 +2416,7 @@ class AgentRunner:
             log.info("%s: #%s %s wait on %s sent back: it cannot complete on its own",
                      self.agent.name, a.task8, outcome.kind, outcome.target)
             return
-        idle_card = self._card_wait_told(a, outcome)
+        idle_card = "" if outcome.typed.get("server_observed") is True else self._card_wait_told(a, outcome)
         if idle_card:
             if sent_back():
                 return
@@ -2376,7 +2454,7 @@ class AgentRunner:
                 return
             self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, proceed))
             return
-        if not mesh_ask:
+        if not mesh_ask and outcome.typed.get("server_observed") is not True:
             outcome = self._live_task_card_wait(a, task, outcome)
         # the wait is accepted from here on: only now may it retire a delivery receipt
         self._forget_spent_ci_delivery(a, outcome)
@@ -2432,12 +2510,12 @@ class AgentRunner:
             wait.update(kind="queue", until="", queue_request=queue_wait.new_request(a.task_id, queue_contract))
         if native_receiver is not None:
             wait["native_receiver"] = native_receiver
-        if ops_review_request:
-            wait["ops_review_request"] = outcome.target
         if outcome.typed.get("wait_id"):
             # the Mesh wait this attempt now observes: resolved on Mesh when the attempt leaves it
             # (``_resolve_left_wait``); kept on the attempt so it survives a restart
             wait["mesh_wait_id"] = outcome.typed["wait_id"]
+            if outcome.typed.get("server_observed") is True:
+                wait["server_observed"] = True
         if mesh_ask:
             for key in ("decision_request_id", "human_gate_ref"):
                 if outcome.typed.get(key):
@@ -3008,11 +3086,17 @@ class AgentRunner:
         self._comment(a.task_id, text + " Repeated invalid/unverified recipient; released until a new comment or the failure cooldown passes.")
         return ""
 
-    def _switch_on_auth(self, a: Attempt, profile: str) -> bool:
+    def _switch_on_auth(self, a: Attempt, profile: str, current_route: bool = False) -> bool:
         """Optional policy: transient routing probes back off to once per 15 minutes.
 
         Exit 78 is a permanent policy/config hold; all other failures are transient.
         No probe clears authentication or creates a provider turn.
+
+        A successful route is not final: when the lane's fresh spawn environment is
+        on the held profile again (an operator pin or a pool restore returned it),
+        the lane is routed again once the backoff has passed. A turn that launched
+        before the route (``current_route`` false) never re-routes: the next spawn
+        re-checks the lane's current environment.
         """
         if not self.agent.on_auth_command or not auth.held(self.store, profile):
             return False
@@ -3033,10 +3117,13 @@ class AgentRunner:
             prior = json.loads(mark[0]) if mark and mark[0] else {}
         except ValueError:
             prior = {"routed": True}   # old once-only marker remains conservative
-        if prior.get("routed") or prior.get("permanent") or prior.get("retry_at", 0) > time.time():
-            if not prior.get("routed"):
-                suffix = "permanent routing hold" if prior.get("permanent") else "routing retry after backoff"
-                self.store.update(a, note=f"authentication held; fallback attempt {prior.get('tries', 0)}; {suffix}")
+        if prior.get("routed") and not current_route:
+            return False                       # launched before the route; the next spawn re-checks
+        if prior.get("permanent") or prior.get("retry_at", 0) > time.time():
+            suffix = ("permanent routing hold" if prior.get("permanent") else
+                      "routed, still on this profile; re-route after backoff" if prior.get("routed") else
+                      "routing retry after backoff")
+            self.store.update(a, note=f"authentication held; fallback attempt {prior.get('tries', 0)}; {suffix}")
             return False
         tries = prior.get("tries", 0) + 1
         state = {"tries": tries, "retry_at": time.time() + min(900, GATE_HOLD_SECONDS * 2 ** min(tries - 1, 4))}
@@ -4255,10 +4342,10 @@ class AgentRunner:
                 # Diagnose a refused/crashed harness without turning its prose into
                 # delivery evidence or authorizing another writer.
                 diagnostic = ("; " + public_harness_error(stderr)) if stderr.strip() else ""
-                self._comment(a.task_id, "MANDATORY DELIVERY PENDING: " + resolution + diagnostic
-                              + "; native evidence recheck required; automatic replay is held")
+                self._comment(a.task_id, unknown_comment(resolution, diagnostic, self._turn_gone(a)))
                 self.emit("prompt_delivery_unknown", a, pending=True, reason=resolution,
                           action="native-evidence-reconciliation")
+                self._unknown_alert(a, intent, resolution)
                 log.warning("%s #%s turn %s: mandatory delivery pending: %s; native evidence or owner resolution required",
                             self.agent.name, a.task8, intent.get("turn"), resolution)
         return False
@@ -4429,20 +4516,81 @@ class AgentRunner:
             return
         if a.pid and not self._turn_over(a):
             return
+        if not self._end_unknown(a, reason, "operator_resolution", "operator resolution: " + reason):
+            return                           # the attempt moved under us: the token is read again next pass
+        self._comment(a.task_id, "OPERATOR RESOLUTION: the attempt whose prompt delivery could not be proven is "
+                      f"ended ({reason}). Its pending prompt was not replayed; the card starts in a new attempt.")
+        op_resolve.consume(self.cfg.state_dir, a.id)
+        log.info("%s: #%s operator resolution: unknown attempt ended (%s)", self.agent.name, a.task8, reason[:120])
+
+    def _end_unknown(self, a: Attempt, reason: str, event: str, note: str) -> bool:
+        """The one way an ``unknown`` attempt ends without proof (operator token or the quiet rule): the
+        intent is archived in a mark, never consumed or replayed; the window closes; the attempt completes
+        and the card starts in a new attempt. False when the attempt moved under us."""
         intent = a.wait.get("interactive_prompt_intent")
         wait = {k: v for k, v in a.wait.items() if k != "interactive_prompt_intent"}
         archive = "operator_resolved_intent:" + a.id
         record = json.dumps({"intent": intent, "reason": reason, "at": iso()})
         if not self.store.update_with_marks(a, {archive: record}, expect="unknown", expect_wait=a.wait, wait=wait):
-            return                           # the attempt moved under us: the token is read again next pass
+            return False
         a = self.store.get(a.id)
         self._close_window(a)
-        self.store.event(a.id, "operator_resolution", reason)
-        self._finish(a, "completed", "operator resolution: " + reason)
-        self._comment(a.task_id, "OPERATOR RESOLUTION: the attempt whose prompt delivery could not be proven is "
-                      f"ended ({reason}). Its pending prompt was not replayed; the card starts in a new attempt.")
-        op_resolve.consume(self.cfg.state_dir, a.id)
-        log.info("%s: #%s operator resolution: unknown attempt ended (%s)", self.agent.name, a.task8, reason[:120])
+        self.store.event(a.id, event, reason)
+        self._finish(a, "completed", note)
+        return True
+
+    def _turn_gone(self, a: Attempt) -> bool:
+        return not a.pid or not group_alive(a.pid, a.stamp)
+
+    def _unknown_alert(self, a: Attempt, intent: dict, resolution: str) -> None:
+        """One operator signal per attempt and prompt that went to ``unknown`` (not per tick, not per lane):
+        the same structured ``operator_alert`` event the host's events bridge pages, plus a warning."""
+        key = "unknown:" + a.id + ":" + str(intent.get("token") or "")
+        if not self.store.add_mark("_runtime", "_operator_alert_" + key, "sent", iso()):
+            return
+        text = (f"{self.agent.name} #{a.task8}: the session did not confirm it took the prompt ({resolution}); "
+                f"the card is held. It ends by itself {UNKNOWN_QUIET_MINUTES} min after its process is gone with no "
+                f"new evidence; resolve.d/{a.id} ends it now.")
+        log.warning("operator alert [%s]: %s", key, text)
+        self.emit("operator_alert", a, alert=key, since=iso(), text=text[:500], reason=resolution)
+
+    def _quiet_resolution(self, a: Attempt) -> None:
+        """End an ``unknown`` attempt nobody can settle any more: its turn process group is gone and the native
+        evidence (journal, hook events, turn log, transcript) did not change for ``UNKNOWN_QUIET_MINUTES``. The
+        same path as an operator token: no replay, the card starts in a new attempt. A live process, a changing
+        evidence set or a retryable (proven-unsent) intent is left to the ordinary paths."""
+        a = self.store.get(a.id) or a
+        intent = (a.wait or {}).get("interactive_prompt_intent")
+        if a.state != "unknown" or not isinstance(intent, dict) or intent.get("retryable"):
+            return
+        key = "unknown_quiet:" + a.id
+        if a.pid and not self._turn_over(a):
+            self.store.mark(self.agent.name, a.task_id, key, "")       # alive: the quiet clock starts again
+            return
+        try:
+            seen = delivery_requests.evidence(self.cfg.state_dir, a)
+        except (OSError, ValueError, KeyError, TypeError):
+            # a read that fails (a file changing under it, a missing file) is no proof of quiet: the clock starts again
+            self.store.mark(self.agent.name, a.task_id, key, "")
+            return
+        mark = self.store.mark(self.agent.name, a.task_id, key)
+        try:
+            last = json.loads(mark[0]) if mark and mark[0] else {}
+        except ValueError:
+            last = {}
+        if not isinstance(last, dict) or last.get("evidence") != seen or not isinstance(last.get("since"), (int, float)):
+            self.store.mark(self.agent.name, a.task_id, key, json.dumps({"evidence": seen, "since": time.time()}))
+            return
+        quiet = time.time() - float(last["since"])
+        if quiet < UNKNOWN_QUIET_MINUTES * 60:
+            return
+        reason = (f"runner: the turn process is gone and its evidence did not change for {int(quiet // 60)} min "
+                  f"({intent.get('resolution') or 'delivery unproven'})")
+        if not self._end_unknown(a, reason, "quiet_resolution", reason):
+            return
+        self.store.mark(self.agent.name, a.task_id, key, "")
+        self._comment(a.task_id, quiet_comment(int(quiet // 60)))
+        log.info("%s: #%s unknown attempt ended after %d quiet min, no replay", self.agent.name, a.task8, quiet // 60)
 
     def settle_terminal_intents(self) -> None:
         """Retire proven-unsent or proven-delivered intents left on ended attempts, at most once a minute."""
@@ -4461,6 +4609,9 @@ class AgentRunner:
                     continue
                 self._guard(a, "prompt-delivery", lambda x:
                     self._reconcile_interactive_prompt(x) and self._turn_over(x) and self.settle(x))
+                current = self.store.get(a.id)
+                if current is not None and current.state == "unknown":
+                    self._guard(current, "quiet-resolution", self._quiet_resolution)
                 continue
             if not a.pid:
                 created = parse_time(a.created_at)
@@ -4907,6 +5058,10 @@ class AgentRunner:
             reason, spec = self._admission_drift(repo)
             if reason:
                 return 'rejected_config'
+            if self.access.mesh and not any(
+                    s.name == repo and repo_admission.spec_digest(s) == repo_admission.spec_digest(spec)
+                    for s in self.lane_repos):
+                return 'rejected_config'          # under Mesh access a config entry alone grants nothing
             if repo_admission.spec_digest(spec) != request['spec']:
                 return 'rejected_spec_mismatch'
             pool_name = self.pool._pool(repo)
@@ -5209,49 +5364,6 @@ class AgentRunner:
             # external response bodies. Existing checkpoint journal is the proof.
             log.warning('workspace request failed for attempt %s; inspect checkpoint journal', a.id)
             return 'failed_preserved'
-
-    def _ops_review_registration(self, a: Attempt, identity: str, task: dict) -> dict:
-        if not self.cfg.ops_review_wait_registry or not self.cfg.ops_review_wait_notifier_id:
-            raise ValueError("observer not configured")
-        if a.mode != "work" or self.cats.category(task) not in ("todo", "in_progress"):
-            raise ValueError("requires a source work task in todo/in_progress")
-        row = ops_review_wait.registration(self.cfg.ops_review_wait_registry, identity, task, self.agent_id)
-        if self.store.mark(a.agent, a.task_id, ops_review_wait.delivered_key(identity)):
-            raise ValueError("this request's eligibility receipt was already delivered")
-        return row
-
-    def _wake_ops_review(self, a: Attempt, task: dict) -> None:
-        identity = a.wait.get("target")
-        if not identity or a.wait.get("ops_review_request") != identity:
-            return
-        try:
-            row = self._ops_review_registration(a, identity, task)
-            if row.get("state") != "notified":
-                return
-            evidence = ops_review_wait.receipt(identity, row, self.mesh.comments_all(a.task_id),
-                                               self.cfg.ops_review_wait_notifier_id)
-        except (ValueError, OSError, MeshError):
-            return                           # fail closed; no age/comment/time fallback
-        if not evidence:
-            return
-        # Board's notified row is immutable. Re-read it under Store's CAS fence so a
-        # changed binding/intent/receipt cannot race a stale observation. Admission
-        # and lease checks still run normally after this event reaches the ready outbox.
-        def still():
-            try:
-                source = self._task(a.task_id)
-                if self.cats.category(source) not in ("todo", "in_progress"):
-                    return False
-                current = ops_review_wait.registration(self.cfg.ops_review_wait_registry, identity,
-                                                       source, self.agent_id)
-                return current == row
-            except (ValueError, OSError, MeshError):
-                return False
-        if self.life.to_ready(a,
-                marks={ops_review_wait.delivered_key(identity): evidence["comment_id"], "met_wake": a.id},
-                expect="waiting", expect_wait=a.wait, validate=still,
-                wake_text=prompts.wake_prompt(task, ops_review_wait.event_text(evidence))):
-            self.emit("wake", a, event="ops-review eligibility receipt delivered")
 
     def _receipt_registration(self, a: Attempt, outcome: Outcome) -> dict | None:
         """The live, undelivered registration this card's ``WAIT receipt:`` may bind to, else None."""
@@ -6146,6 +6258,24 @@ class AgentRunner:
                 wake_text=prompts.wake_prompt(task, QUOTA_TIME_WAIT_GUIDANCE)):
             self.store.event(a.id, "quota_time_wait_rejected")
 
+    def _wake_server_card(self, a: Attempt, task: dict) -> None:
+        # The source receipt is authoritative. Never fall through to legacy
+        # edge/cycle/target readers, including when this read fails.
+        expected = copy.deepcopy(a.wait)
+        receipt = self.mesh.wait_receipt(a.task_id, expected["mesh_wait_id"])
+        try:
+            met, event = card_wait.receipt_event(expected, receipt, a.task_id, self.agent_id)
+        except ValueError as exc:
+            self.store.event(a.id, "wake_receipt_invalid", str(exc))
+            return
+        if not event:
+            return
+        marks = {"met_wake": a.id} if met else {}
+        if self.life.to_ready(a, marks=marks, expect="waiting", expect_wait=expected,
+                wait=copy.deepcopy(expected), wake_text=prompts.wake_prompt(task, event)):
+            self.store.mark(self.agent.name, a.task_id, self.WAIT_RESOLVED, expected["mesh_wait_id"])
+            self.emit("wake", a, event=event)
+
     def _wake_one(self, a: Attempt) -> None:
         if self._maintenance_held(a):
             return                           # WAIT stays exactly as declared until the owner finishes
@@ -6158,8 +6288,11 @@ class AgentRunner:
         if quota_time_wait(a.wait):
             self._reject_quota_time_wait(a, task)
             return
+        if a.wait.get("kind") == "card" and a.wait.get("server_observed") is True:
+            self._wake_server_card(a, task)
+            return
         if a.wait.get("kind") == "ops-review":
-            self._wake_ops_review(a, task)
+            # Retired observer: preserve any legacy wait without a generic comment/time wake.
             return
         if a.wait.get("kind") == "native":
             self._wake_native(a, task)
@@ -6894,7 +7027,7 @@ class AgentRunner:
         try:
             blocked = self._auth_blocked(a, env)
             if blocked:
-                self._authentication_failed(a, blocked)
+                self._authentication_failed(a, blocked, current_route=True)
                 return
             if prior_scope:
                 task = self._task(a.task_id)  # the checkout may have changed the request scope
@@ -6924,7 +7057,7 @@ class AgentRunner:
             normal_held_paths = {r["path"] for r in normal_rows
                                  if r["attempt"] == a.id and r["state"] == "held"}
             normal_leased_repos = {r["pool"].split("/", 1)[1] for r in normal_leased_rows}
-            normal_configured_repos = {r.name for r in self.agent.repos}
+            normal_configured_repos = {r.name for r in self.lane_repos}
             needs_normal_admission = (
                 not a.workspaces
                 or bool(normal_held_paths.intersection(a.workspaces))
@@ -6952,7 +7085,7 @@ class AgentRunner:
                 # ambiguous (extra/unknown repo, snapshot disagreeing with the journal,
                 # a lease outside the journal) stays fail-closed.
                 expected_repos = {r["repo"] for r in journal}
-                configured = {r.name for r in self.agent.repos}
+                configured = {r.name for r in self.lane_repos}
                 if (len(expected_repos) != len(journal) or not expected_repos
                         or expected_repos - configured
                         or sorted(a.workspaces) != sorted(r["source"] for r in journal)):
@@ -6997,7 +7130,7 @@ class AgentRunner:
                     held_paths = {r["path"] for r in owned if r["state"] == "held"}
                     leased = [r for r in owned if r["state"] == "leased"]
                     by_repo = {r["pool"].split("/", 1)[1]: r for r in leased}
-                    configured = {r.name for r in self.agent.repos}
+                    configured = {r.name for r in self.lane_repos}
                     listed = set(a.workspaces)
                     active_paths = {r["path"] for r in leased}
                     if (len(by_repo) != len(leased) or set(by_repo) - configured
@@ -7008,7 +7141,7 @@ class AgentRunner:
                     if listed & held_paths:
                         self.store.update(a, workspaces=sorted(listed - held_paths))
                         a = self.store.get(a.id)
-                    if (self.pool.disk_hold() or any(self.pool.full(r.name) for r in self.agent.repos
+                    if (self.pool.disk_hold() or any(self.pool.full(r.name) for r in self.lane_repos
                                                     if r.name not in by_repo)):
                         self._release_gate(a, "workspace-admission-held")
                         self._release_checkout(a)
@@ -7016,7 +7149,7 @@ class AgentRunner:
                         self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
                         return
                     paths = []
-                    for repo in self.agent.repos:
+                    for repo in self.lane_repos:
                         if repo.name in by_repo:
                             paths.append(by_repo[repo.name]["path"])
                         else:
@@ -7037,7 +7170,7 @@ class AgentRunner:
             if isinstance(exc, InventoryError):
                 # A permanent refusal only changes with the config or the journal: back off
                 # exponentially per (attempt, config) and say why, instead of a 2 min loop.
-                key = (a.id, tuple(sorted(r.name for r in self.agent.repos)))
+                key = (a.id, tuple(sorted(r.name for r in self.lane_repos)))
                 n = self._inventory_failures[key] = self._inventory_failures.get(key, 0) + 1
                 delay = min(GATE_HOLD_SECONDS * 2 ** (n - 1), TASK_HOLD_SECONDS)
                 log.warning("%s: attempt %s refused resume (%s) workspaces=%d config=%s; retry in %ds",
@@ -7710,8 +7843,8 @@ class AgentRunner:
         - ``mr ... until=change`` on an MR whose head pipeline is ``failed``/``canceled`` (any MR),
           or ``manual`` (the task's own MR, review label or not): a new head or a retry is the
           agent's or the owner's action, not an event that will arrive by itself;
-        - ``mr ... until=merged`` on an open MR (any MR) that conflicts with its target or must be
-          rebased (``mr_merge_blocker``), or whose head pipeline is ``failed``/``canceled``/``skipped``
+        - ``mr ... until=merged`` on an open MR (any MR) that conflicts with its target or is
+          behind it (``mr_merge_blocker``), or whose head pipeline is ``failed``/``canceled``/``skipped``
           after that red result was already delivered to the agent (``_red_head_delivered``): it
           will not merge as is. A red head not yet delivered is accepted once, so that the
           evaluator's owner notice reaches the agent.
@@ -7822,7 +7955,7 @@ class AgentRunner:
         elif cause == "conflict":
             what = f"{head} has a merge conflict with its target branch;"
         else:
-            what = f"{head} must be rebased onto its target branch before it can merge;"
+            what = f"{head} is behind its target branch, which merges fast-forward or semi-linear only;"
         return (f"MR {target}{what} it will not merge as is, so this wait for its merge cannot complete on "
                 "its own and was sent back. " + blocked_mr_next_step(target, cause, self.merge_enabled))
 
@@ -8463,6 +8596,10 @@ class AgentRunner:
                 access_recovery.remember(self, task_id, mode, self._kv(out).get("ACCESS_HOLD", ""))
             reason = gate_hold_reason(out)
             gate.update(self._kv(out))
+            if writer_hold(reason) and phase != "transport":
+                # another lane still writes this card: hold the card, never the lane's other starts
+                self._gate_task_only = True
+                return reason, gate
             if rc == GATE_HOLD and phase in ("reserve", "admit") and not quota_required:
                 key = ("agent", reason)
                 failures = min(self._gate_failures.get(key, 0) + 1, 4)
@@ -8532,12 +8669,109 @@ class AgentRunner:
             del self._hold_log_at[k]
 
     def _release_gate(self, a: Attempt, outcome: str) -> None:
-        """Release what the gate holds for this task, once (the mark is cleared first)."""
+        """Release what the gate holds for this task, once. A server reservation is first written
+        to ``gate_release_pending`` and only then taken off the ``gate`` mark, so a crash while the
+        end hook runs leaves it recorded; the pending entry goes once the hook confirms the release
+        (``RELEASE_CONFIRMED=1``). Unconfirmed (``release_pending``, transport, no end hook), it stays
+        and ``retry_gate_releases`` resends it: dropping it would leave the card's writer slot taken
+        until the server's own reconcile, and every next owner is refused ``task_writer_active``."""
         gate = self._gate_of(a)
         if not gate:
             return
+        res = str(gate.get("RES_ID") or "")
+        if res:
+            first = now()
+            self._put_pending(a.task_id, {
+                "gate": gate, "mode": a.mode, "attempt": a.id, "outcome": outcome, "tries": 0,
+                "first_at": iso(first), "next_at": iso(first + dt.timedelta(seconds=RELEASE_RETRY_SECONDS[0]))})
         self.store.mark(self.agent.name, a.task_id, "gate", "")
-        self._turn_end(a.task_id, a.mode, a, gate, outcome)
+        confirmed = self._turn_end(a.task_id, a.mode, a, gate, outcome, require_confirmation=bool(res))
+        if not res:
+            return                       # nothing was reserved on the server
+        if confirmed:
+            self._drop_pending(a.task_id, res)
+            return
+        self.store.event(a.id, GATE_RELEASE_PENDING, outcome)
+        log.warning("%s: #%s gate release unconfirmed (%s); reservation kept, retrying",
+                    self.agent.name, a.task8, outcome)
+
+    def _pending_releases(self, task_id: str, agent: str | None = None) -> list[dict]:
+        """The unconfirmed gate releases of a card, one entry per server reservation."""
+        row = self.store.mark(agent or self.agent.name, task_id, GATE_RELEASE_PENDING)
+        try:
+            items = json.loads(row[0]) if row and row[0] else []
+        except ValueError:
+            return []
+        return [x for x in (items if isinstance(items, list) else [])
+                if isinstance(x, dict) and isinstance(x.get("gate"), dict) and x["gate"].get("RES_ID")]
+
+    def _save_pending(self, task_id: str, items: list[dict]) -> None:
+        self.store.mark(self.agent.name, task_id, GATE_RELEASE_PENDING, json.dumps(items) if items else "")
+
+    def _put_pending(self, task_id: str, entry: dict) -> None:
+        res = entry["gate"]["RES_ID"]
+        items = [x for x in self._pending_releases(task_id) if x["gate"]["RES_ID"] != res]
+        self._save_pending(task_id, items + [entry])
+
+    def _drop_pending(self, task_id: str, res: str) -> None:
+        self._save_pending(task_id, [x for x in self._pending_releases(task_id) if x["gate"]["RES_ID"] != res])
+
+    def retry_gate_releases(self) -> None:
+        """Each tick: resend the gate releases that were not confirmed, on their own backoff. An entry
+        is kept until a release is confirmed: a reservation the server already settled answers
+        already_released, so the retry itself ends it; only the report is rate-limited."""
+        for task_id in list(self.store.marked(self.agent.name, GATE_RELEASE_PENDING)):
+            items = self._pending_releases(task_id)
+            kept = []
+            for pend in items:
+                due = parse_time(pend.get("next_at"))
+                if due is not None and now() < due:
+                    kept.append(pend)
+                    continue
+                gate = pend["gate"]
+                try:
+                    attempt = self.store.get(pend.get("attempt") or "")
+                    if self._turn_end(task_id, pend.get("mode") or "work", attempt, gate,
+                                      pend.get("outcome") or "turn-end", require_confirmation=True):
+                        log.info("%s: #%s gate release confirmed on retry %d", self.agent.name, task_id[:8],
+                                 int(pend.get("tries") or 0) + 1)
+                        continue
+                except Exception as e:                   # never cost the rest of the tick
+                    log.warning("%s: gate release retry #%s: %s", self.agent.name, task_id[:8], type(e).__name__)
+                tries = int(pend.get("tries") or 0) + 1
+                step = RELEASE_RETRY_SECONDS[min(tries, len(RELEASE_RETRY_SECONDS) - 1)]
+                update = dict(pend, tries=tries, next_at=iso(now() + dt.timedelta(seconds=step)))
+                first = parse_time(pend.get("first_at")) or now()
+                warned = parse_time(pend.get("warned_at")) or first
+                if (now() - warned).total_seconds() >= GATE_RELEASE_WARN:
+                    update["warned_at"] = iso(now())
+                    log.warning("%s: #%s gate release unconfirmed for %dh after %d tries; still retrying",
+                                self.agent.name, task_id[:8], int((now() - first).total_seconds() // 3600), tries)
+                kept.append(update)
+            self._save_pending(task_id, kept)    # a lane's marks are written by its own thread only
+
+    def _local_writer(self, task_id: str) -> str:
+        """The writer hold of a card another lane of this runner still holds: a gate reservation of a
+        running turn or one whose release is pending. The server admits one writer per card, so a
+        start now would create an attempt only to have admit refuse it (``task_writer_active``).
+        Held before any attempt, checkout or lease; lifted by the holder's own release."""
+        for agent in sorted(self.store.mark_holders(task_id, GATE_RELEASE_PENDING)):
+            if self._pending_releases(task_id, agent):
+                # this lane's own unconfirmed release too: a new reservation waits until it is settled
+                return f"{GATE_PUBLIC_REASONS['writer']} (holder={agent}, state=release pending, local)"
+        for agent, raw in sorted(self.store.mark_holders(task_id, "gate").items()):
+            if agent == self.agent.name:
+                continue
+            try:
+                gate = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(gate, dict) or not gate.get("RES_ID"):
+                continue                         # nothing reserved on the server: no writer to wait for
+            if not any(x.task_id == task_id for x in self.store.by_state(agent, ACTIVE)):
+                continue                         # a stale mark without a live turn holds nothing locally
+            return f"{GATE_PUBLIC_REASONS['writer']} (holder={agent}, state=running, local)"
+        return ""
 
     def _renew_gate(self, a: Attempt) -> None:
         gate = self._gate_of(a)
@@ -8655,6 +8889,11 @@ class AgentRunner:
         held = self._gate_hold.get(task["id"])
         if held and time.monotonic() < held[1] and (len(held) < 3 or held[2] == (task.get("updated_at") or "")):
             return f"gate: {held[0]}"
+        writer = self._local_writer(task["id"])
+        if writer:
+            if reconcile:
+                self._log_hold("start", task["id"][:8], writer, episode="writer")
+            return f"gate: {writer}"
         if mode == "work":
             waiting = self._cap_wait(task["id"])
             if waiting and not self._inputs_changed(task, waiting):
@@ -8914,7 +9153,7 @@ class AgentRunner:
         """Every worktree of a repo is leased: open tasks of this agent hold them, and waiting
         ones do not count against the cap. A start now would check a task out only to abort it
         and ask an operator to clean slots that are in use; hold quietly until one frees."""
-        full = [r.name for r in self.agent.repos if self.pool.full(r.name)]
+        full = [r.name for r in self.lane_repos if self.pool.full(r.name)]
         hold = self.pool.disk_hold()
         if full and not hold:
             held = len(self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready")))
@@ -9032,7 +9271,7 @@ class AgentRunner:
                 # A profile hold is durable even without a fallback policy. Keep
                 # one ready attempt so a restart or the next feed tick cannot
                 # create another aborted start against the same held profile.
-                self._authentication_failed(a, blocked)
+                self._authentication_failed(a, blocked, current_route=True)
                 self._start_held = True
                 return False
             # Labels can change between listing and checkout. Only a fresh,
@@ -9046,7 +9285,7 @@ class AgentRunner:
                 self._finish(a, "aborted", "waiting for a human decision")
                 return False
             no_workspace = metadata_only(task, mode)
-            if not no_workspace and any(self.pool.full(r.name) for r in self.agent.repos):
+            if not no_workspace and any(self.pool.full(r.name) for r in self.lane_repos):
                 self._finish(a, "aborted", "workspace admission held after scope refresh")
                 self._task_backoff[a.task_id] = time.monotonic() + GATE_HOLD_SECONDS
                 return False
@@ -9056,7 +9295,7 @@ class AgentRunner:
             had_workspaces = bool(self.pool.leased_to(a.id))
             previous = {} if no_workspace else self._previous_workspaces(a)
             paths = [] if no_workspace else [str(self.pool.lease(a.id, r.name, preferred_path=previous.get(r.name)))
-                                             for r in self.agent.repos]
+                                             for r in self.lane_repos]
         except MeshError:
             self._finish(a, "aborted", "task unreadable after checkout; no turn started")
             self._task_backoff[a.task_id] = backoff
@@ -9091,7 +9330,7 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "gate", json.dumps(gate))
         if reason:
             self._gate_hold[task["id"]] = (reason, time.monotonic() + GATE_HOLD_SECONDS)
-            self._start_held = True
+            self._start_held = not writer_hold(reason)     # a writer hold is this card's alone
             self._log_hold("start at admit", a.task8, reason)
             self._finish(a, "aborted", f"held: {reason}")
             if mode == "review":
@@ -9099,7 +9338,7 @@ class AgentRunner:
             return False
         self._clear_hold_log(a.task8)                 # started: every hold episode of this task is over
         prompt, before_spawn, observed = self._prepare_first_start(a, task)
-        keep, why, loss = self._ownership_return_verdict(a, task) if mode == "work" else ("", "", {})
+        keep, why, loss = self._ownership_return_verdict(a, task)
         if why:
             self.store.event(a.id, "ownership_return", json.dumps({
                 "task": a.task_id, "lane": self.agent.name, "attempt": a.id, "turn": a.turns + 1,
@@ -9175,15 +9414,17 @@ class AgentRunner:
         leased = {r["pool"].split("/", 1)[1] for r in self.pool.rows()
                   if r["attempt"] == a.id and r["state"] == "leased"}
         verdict = repo_requirements.check(
-            links, self.gitlab.base_url, agent_repos=list(self.agent.repos), approved_repos=approved,
+            links, self.gitlab.base_url, agent_repos=list(self.lane_repos), approved_repos=approved,
             leased_repos=leased, checkpoint_open=bool(self.pool._checkpoint_rows(a.id)),
-            resuming=bool(a.workspaces), pool_full=self.pool.full, config_only=resume)
+            resuming=bool(a.workspaces), pool_full=self.pool.full, config_only=resume,
+            access=self.access.current)
         if not verdict.durable:
             return False
         seen = self.store.mark(self.agent.name, a.task_id, self.REPO_PREFLIGHT)
-        if not (seen and seen[0] == verdict.fingerprint):
-            self.store.mark(self.agent.name, a.task_id, self.REPO_PREFLIGHT, verdict.fingerprint)
-            self._comment(a.task_id, verdict.text() + "\n\nrepo_preflight=" + json.dumps(verdict.as_dict()))
+        key = self._repo_preflight_key(verdict)
+        if not (seen and seen[0] == key):
+            self.store.mark(self.agent.name, a.task_id, self.REPO_PREFLIGHT, key)
+            self._repo_preflight_note(a.task_id, verdict)
             self.store.event(a.id, "repo_preflight_refused", json.dumps(verdict.as_dict()))
         if resume:
             self._resume_hold[a.id] = backoff     # the attempt stays ready; no checkout, no model turn
@@ -9191,6 +9432,35 @@ class AgentRunner:
         self.life.to_aborted(a, note=f"repository preflight: {verdict.reason}")
         self._task_backoff[a.task_id] = backoff
         return True
+
+    def _repo_access_contact(self) -> str:
+        """Who grants this lane repository access: the first of ``repo_access_contacts`` that is not
+        this lane itself (by lane name or Mesh name; a lane's own mention files no card). "" = none."""
+        own = {self.agent.name.casefold(), str((self.me or {}).get("name") or "").casefold()}
+        return next((c for c in self.cfg.repo_access_contacts if c.casefold() not in own), "")
+
+    def _repo_preflight_key(self, verdict) -> str:
+        """The stored handoff mark: the fingerprint, plus the addressee of an access refusal, so the
+        same facts are handed off once per addressee (a card refused before addressing existed, or
+        under another contact, is addressed once more)."""
+        contact = self._repo_access_contact() if verdict.needs_access else ""
+        return verdict.fingerprint + (f"@{contact}" if contact else "")
+
+    def _repo_preflight_note(self, task_id: str, verdict) -> None:
+        """The one handoff comment of a refusal. An access refusal opens with ``@<contact>`` at the
+        start of a line and no ``[runner`` prefix, so the contact's runner files a request card for
+        it (``deliver_mentions``); runner-side reasons keep the plain runner comment."""
+        contact = self._repo_access_contact() if verdict.needs_access else ""
+        facts = verdict.as_dict()
+        if not contact:
+            self._comment(task_id, verdict.text() + "\n\nrepo_preflight=" + json.dumps(facts))
+            return
+        tail = "\n\nrepo_preflight=" + json.dumps({**facts, "next_actor": contact})
+        lane = str((self.me or {}).get("name") or "") or self.agent.name
+        try:
+            self.mesh.add_comment(task_id, verdict.text(addressee=contact, lane=lane) + tail)
+        except MeshError as e:
+            log.warning("%s: comment on #%s failed: %s", self.agent.name, task_id[:8], e)
 
     REPO_HOLD_RECHECK_SECONDS = 600
 
@@ -9212,8 +9482,9 @@ class AgentRunner:
         seen = self.store.mark(self.agent.name, tid, self.REPO_PREFLIGHT)
         if not (seen and seen[0]):
             return ""
-        # the card's version and this lane's repositories: either changing asks again at once
-        stamp = (task.get("updated_at") or "") + "|" + ",".join(sorted(spec.name for spec in self.agent.repos))
+        # the card's version, this lane's repositories and its access revision: any change asks again at once
+        stamp = ((task.get("updated_at") or "") + "|" + ",".join(sorted(spec.name for spec in self.lane_repos))
+                 + "|" + self.access.stamp())
         cached = self._repo_hold_checked.get(tid)
         if cached and cached[0] == stamp and time.monotonic() - cached[1] < self.REPO_HOLD_RECHECK_SECONDS:
             return cached[2]
@@ -9224,13 +9495,14 @@ class AgentRunner:
         approved = [spec for agent in self.cfg.agents for spec in agent.repos]
         # durable facts only: a full pool is a transient fact of the start path, and letting it into this
         # fingerprint would hand the same refusal off again every time a slot fills or frees
-        verdict = repo_requirements.check(links, self.gitlab.base_url, agent_repos=list(self.agent.repos),
-                                          approved_repos=approved)
+        verdict = repo_requirements.check(links, self.gitlab.base_url, agent_repos=list(self.lane_repos),
+                                          approved_repos=approved, access=self.access.current)
         reason = ""
         if verdict.durable:
-            if verdict.fingerprint != seen[0]:
-                self._comment(tid, verdict.text() + "\n\nrepo_preflight=" + json.dumps(verdict.as_dict()))
-                self.store.mark(self.agent.name, tid, self.REPO_PREFLIGHT, verdict.fingerprint)
+            key = self._repo_preflight_key(verdict)
+            if key != seen[0]:
+                self._repo_preflight_note(tid, verdict)
+                self.store.mark(self.agent.name, tid, self.REPO_PREFLIGHT, key)
             reason = f"repository preflight: {verdict.reason}; required={verdict.project or '-'}"
         else:
             self.store.mark(self.agent.name, tid, self.REPO_PREFLIGHT, "")
@@ -9421,6 +9693,37 @@ class AgentRunner:
         except MeshError:
             if not self.me:
                 raise
+            return                               # outage: the last valid repository access stands
+        # first action of every tick, before resume_ready/start_new: a changed grant applies now
+        if self.access.observe(self.me):
+            self._apply_access()
+
+    @property
+    def lane_repos(self) -> list:
+        """RepoSpecs this lane may lease now. Legacy (no explicit Mesh state yet): the config's
+        agents.repos, live. Mesh: host-inventory entries whose canonical project Mesh allows."""
+        return self.access.lane_repos(self.agent.repos, self.cfg.host_repositories)
+
+    def _apply_access(self) -> None:
+        """Hot-apply the permission: register newly allowed inventory clones in the pool. A revoked
+        repository stays registered while this lane holds rows of it, so running leases, release
+        and restore keep working; only new starts and turns see the narrower list."""
+        if hasattr(self, "_repo_hold_checked"):
+            self._repo_hold_checked.clear()       # a new revision re-reads every held card at once
+        if not self.access.mesh:
+            return
+        lane = self.lane_repos
+        with_rows = {r["pool"].split("/", 1)[1] for r in self.pool.rows()}
+        for spec in self.cfg.host_repositories:
+            if spec not in lane and spec.name not in with_rows:
+                continue
+            have = self.pool.repos.get(spec.name)
+            if have is None or (have != spec and spec.name not in with_rows):
+                self.pool.repos[spec.name] = spec
+            elif have != spec:
+                log.warning("%s: inventory repository %s differs from the registered one while it has "
+                            "slots; the registered clone stays until they are freed", self.agent.name, spec.name)
+        self.access.note_legacy_drift(self.agent.repos, lane)
 
     def keep_chat(self) -> None:
         """The agent's standing chat session (a bridge types into it), once a minute."""
@@ -9454,6 +9757,7 @@ class AgentRunner:
         self.refresh_me()
         self.heartbeat()
         self.retry_releases()
+        self.retry_gate_releases()
         delivery_requests.consume(self.cfg.state_dir, self.agent.name, self._delivery_recheck_request)
         self.settle_finished()
         self.reap_interactive()
@@ -9540,6 +9844,8 @@ class AgentRunner:
         rows = self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))
         out = {"agent": self.agent.name, "cap": self.cap(), "paused": self.paused(),
                "pause_tokens": op_pause.tokens(self.cfg.state_dir, self.agent.name),
+               "repository_access": {**self.access.describe(),
+                                     "lane_repos": sorted(r.name for r in self.lane_repos)},
                "auth_holds": auth.status(self.store),
                "attempts": [{"task": a.task8, "task_id": a.task_id, "state": a.state, "title": a.title[:60],
                              "session": a.session_id, "wait": a.wait.get("kind", ""), "harness": a.harness,

@@ -27,7 +27,7 @@ decision_request_metadata_only_recipients
 gmail_watch_reader gmail_watch_v1 interactive_idle_minutes interactive_max_sessions load_hold_per_cpu
 load_release_per_cpu login_ask_check max_compactions memory_hold_free_pct memory_hold_swap_mb
 memory_release_free_pct memory_release_swap_mb merge_command merge_command_cwd merge_rerun_minutes mesh_url
-min_free_gb ops_review_wait_notifier_id ops_review_wait_registry poll_seconds review_own_hold_hours
+min_free_gb poll_seconds repo_access_contacts review_own_hold_hours
 reviewer_select_command state_dir time_wait_ignore_names tmux_binary turn_first_output_minutes turn_idle_minutes
 workspace_wait_release_minutes
 """.split())
@@ -35,7 +35,6 @@ workspace_wait_release_minutes
 # file itself (native_result_config.py, docs/native-result-config.md), so the loader keeps reading them.
 PROTOCOL_KEYS = frozenset(native_result_config.FIELDS)
 
-NOTIFIER = "11111111-2222-3333-4444-555555555555"
 RECIPIENT = "66666666-7777-8888-9999-000000000000"
 
 
@@ -65,6 +64,7 @@ def _settable(tmp: str) -> dict:
         "load_hold_per_cpu": ("5.5", "load_hold_per_cpu", 5.5),
         "load_release_per_cpu": ("1.5", "load_release_per_cpu", 1.5),
         "login_ask_check": ('["check"]', "login_ask_check", ("check",)),
+        "repo_access_contacts": ('["infra", "lead"]', "repo_access_contacts", ("infra", "lead")),
         "max_compactions": ("2", "max_compactions", 2),
         "memory_hold_free_pct": ("10", "memory_hold_free_pct", 10.0),
         "memory_hold_swap_mb": ("200", "memory_hold_swap_mb", 200.0),
@@ -75,9 +75,6 @@ def _settable(tmp: str) -> dict:
         "merge_rerun_minutes": ("6.5", "merge_rerun_minutes", 6.5),
         "mesh_url": ('"http://mesh.other"', "mesh_url", "http://mesh.other"),
         "min_free_gb": ("1.5", "min_free_gb", 1.5),
-        "ops_review_wait_notifier_id": (f'"{NOTIFIER}"', "ops_review_wait_notifier_id", NOTIFIER),
-        "ops_review_wait_registry": ('"/private/board/registry.json"', "ops_review_wait_registry",
-                                     Path("/private/board/registry.json")),
         "poll_seconds": ("21", "poll_seconds", 21),
         "review_own_hold_hours": ("2.5", "review_own_hold_hours", 2.5),
         "reviewer_select_command": ('["select", "{author}"]', "reviewer_select_command", ("select", "{author}")),
@@ -203,15 +200,16 @@ class RunnerOptions(Base):
 
     def test_the_option_count_is_capped(self):
         self.assertLessEqual(len(RUNNER_OPTIONS), MAX_RUNNER_OPTIONS)
-        self.assertEqual(len(RUNNER_OPTIONS), 40)
+        self.assertEqual(len(RUNNER_OPTIONS), 39)
 
     def test_retired_and_settable_do_not_overlap(self):
         retired = set(config_mod.RETIRED_RUNNER_OPTIONS)
-        self.assertEqual(len(retired), 61)
+        self.assertEqual(len(retired), 63)
         self.assertEqual(retired & (RUNNER_OPTIONS | PROTOCOL_KEYS), set())
         fields = {f.name for f in dataclasses.fields(config_mod.RunnerConfig)}
-        # every retired key keeps its field (code and tests set it directly); basic_auth_env never had one
-        self.assertEqual(retired - fields, {"basic_auth_env"})
+        # Most retired keys keep fixed fields; removed observers have no runtime fields.
+        self.assertEqual(retired - fields, {"basic_auth_env", "ops_review_wait_registry",
+                                          "ops_review_wait_notifier_id"})
 
 
 class RetiredRunnerOptions(Base):
@@ -219,7 +217,7 @@ class RetiredRunnerOptions(Base):
         plain = self.load()
         defaults = {f.name: f.default for f in dataclasses.fields(config_mod.RunnerConfig)}
         for key, reason in sorted(config_mod.RETIRED_RUNNER_OPTIONS.items()):
-            if key == "basic_auth_env":
+            if key not in defaults:
                 continue
             with self.subTest(key=key):
                 with self.assertLogs("mesh_runner", "WARNING") as logs:
@@ -235,9 +233,21 @@ class RetiredRunnerOptions(Base):
     def test_a_retired_key_with_a_value_its_old_validator_refused_still_loads(self):
         for line in ('loop_streak_limit = -1', 'dead_slot_hours = -1', 'launch_mode = "tui"',
                      'checkpoint_exclude_names = [".git"]', 'review_verdict_pattern = "("',
-                     'merge_max_runs = 0', 'wake_budget_seconds = 0'):
+                     'merge_max_runs = 0', 'wake_budget_seconds = 0',
+                     'ops_review_wait_registry = "relative"', 'ops_review_wait_notifier_id = false'):
             with self.subTest(line=line), self.assertLogs("mesh_runner", "WARNING"):
                 self.load(line + "\n")
+
+    def test_removed_ops_review_fields_warn_and_ignore_arbitrary_values(self):
+        plain = self.load()
+        for value in ('true', 'false', '7', '"relative"', '[]', '{}'):
+            for key in ('ops_review_wait_registry', 'ops_review_wait_notifier_id'):
+                with self.subTest(key=key, value=value), self.assertLogs("mesh_runner", "WARNING") as logs:
+                    cfg = self.load(f"{key} = {value}\n")
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(f"{key} is no longer an option and is ignored", logs.output[0])
+                self.assertFalse(hasattr(cfg, key))
+                self.assertEqual(dataclasses.replace(cfg, config_path=plain.config_path), plain)
 
     def test_basic_auth_env_is_ignored(self):
         with mock.patch.dict(os.environ, {"MESH_BASIC_FOR_TEST": "user:pw"}):

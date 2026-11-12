@@ -8,7 +8,11 @@ cards without an MR link are not blocked.
 Reasons (`repo_requirements.py`): `undeclared_repo`, `no_membership`, `missing_approved_clone`,
 `no_assigned_checkout`, `checkpoint_conflict`, `no_free_slot`. Each durable reason names
 `next_actor` and the supported action (reviewed config/admission path, the existing
-`admit-workspace-repo` request). One handoff comment per distinct fact set (stored fingerprint); a
+`admit-workspace-repo` request); access reasons address the access granter with `@<Agent>`
+(`docs/repository-access.md`). One handoff comment per distinct fact set (stored fingerprint); a
 refused start aborts the attempt with no lease and no model turn. `no_free_slot` stays with the
 existing pool hold. The check never edits config, clones, uses another actor key, or touches
 foreign leases. Once the approved config carries the repo the same card starts normally.
+
+When Mesh `repository_access` is explicit for the lane, Mesh alone decides membership and the
+host inventory supplies the clone: see `docs/repository-access.md`.

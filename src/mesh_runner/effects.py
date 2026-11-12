@@ -602,7 +602,7 @@ class Effects:
             self._schedule(a, wait, wait["until"])
         else:
             self._drop_event_hold(a, wait)
-        if kind == "card":
+        if kind == "card" and not wait.get("server_observed"):
             self._add_edge(a, wait)
         if kind == "decision" and wait.get("handle"):
             if wait.get("decision_request_id") and not self._typed_question(a, wait):

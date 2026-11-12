@@ -309,6 +309,10 @@ class MeshClient:
             raise
         return out if isinstance(out, dict) else None
 
+    def wait_receipt(self, task_id: str, wait_id: str) -> dict:
+        """Read this source card's exact wait, including a server resolution."""
+        return self.request("GET", f"/tasks/{task_id}/wait", query={"wait_id": wait_id})
+
     def resolve_wait(self, task_id: str, wait_id: str, resolution: str, cause: str) -> dict:
         """End the agent's typed wait on Mesh: ``resolution`` met or cancelled (expired and invalid are
         Mesh's too), ``cause`` 1-200 characters. 200 also for a repeat of the same resolution; 409 when

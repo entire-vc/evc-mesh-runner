@@ -174,6 +174,9 @@ class RepoSpec:
     # Initialized child remotes only: never the parent transport, Git config
     # files or the harness environment.
     fetch_url_overrides: tuple[tuple[str, str], ...] = ()
+    # Host inventory only ([[repositories]]): the explicit canonical (provider, host, project_path)
+    # this clone holds. Empty for legacy agents.repos entries. Never a permission by itself.
+    project: tuple = ()
 
 
 def _route_identity(url: str) -> tuple[str, int | None, str]:

@@ -9,7 +9,6 @@ the attempt started and takes the last declaration line in it:
     ⏳ WAIT merge:<group>/<project>!<iid> after=<sha>      the runner runs the merge gate (opt-in)
     ⏳ WAIT card:#<8hex>                                   another task closes
     ⏳ WAIT decision:@<agent>                              another agent answers
-    ⏳ WAIT ops-review:<64hex request-id>                  registered source-owner eligibility receipt
     ⏳ WAIT gmail:gmr_<12hex>                              a registered Gmail observation fires (docs/gmail-watch.md)
     ⏳ WAIT <absoluteISO>: external=<reference> source=<https-url|card:#8hex> <why>
     ⏳ WAIT pipeline:<proj>#<id> until=success|change     a changed/successful pipeline (``after=`` optional)
@@ -69,7 +68,6 @@ _STALL = re.compile(_WAIT_HEAD + r"stall:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _MANUAL = re.compile(_WAIT_HEAD + r"manual:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _RECOVERY = re.compile(_WAIT_HEAD + r"recovery:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
 _GMAIL = re.compile(_WAIT_HEAD + r"gmail:(?P<id>gmr_[0-9a-f]{12})\b" + _EXPLANATION)
-_OPS_REVIEW = re.compile(_WAIT_HEAD + r"ops-review:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
 _NATIVE = re.compile(_WAIT_HEAD + r"native:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
 # ``until=<typed condition>`` names what the edge of this WAIT waits for (instead of the broad task_done).
 CARD_CONDITIONS = ("access_ready", "contract_ready", "artifact_published", "shipped", "deployed", "accepted")
@@ -149,7 +147,7 @@ class Outcome:
 
     @property
     def is_wait(self) -> bool:
-        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native", "gmail", "ops-review", "manual"}
+        return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native", "gmail", "manual"}
 
 
 def _explicit_wait_problem(line: str) -> str:
@@ -261,10 +259,8 @@ def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = 
         return Outcome("pipeline", f"{m['project']}#{m['id']}", note=note(m), line=line)
     if m := _MR.match(line):
         return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line)
-    if m := _OPS_REVIEW.match(line):
-        return Outcome("ops-review", m["id"], note=note(m), line=line)
     if re.match(_WAIT_HEAD + r"ops-review:", line):
-        return Outcome("unparsed", note="ops-review WAIT requires an exact 64-hex registered request id", line=line)
+        return Outcome("unparsed", note="ops-review WAIT is retired; submit the source task with finish_task to=review", line=line)
     if m := _NATIVE.match(line):
         return Outcome("native", m["id"], note=note(m), line=line)
     if re.match(_WAIT_HEAD + r"native:", line):
@@ -370,6 +366,8 @@ def _provenance(row: dict, wait: dict | None) -> dict:
     out = {"id": str(row.get("id") or ""), "kind": str(row.get("kind") or "")}
     if isinstance(wait, dict):
         out.update(wait_id=str(wait.get("id") or row.get("wait_id") or ""), wait_kind=str(wait.get("kind") or ""))
+        if wait.get("kind") == "card" and wait.get("server_observed") is True:
+            out["server_observed"] = True
         for key in ("decision_request_id", "human_gate_ref"):
             if wait.get(key):
                 out[key] = str(wait[key])
@@ -407,6 +405,10 @@ def _tail(note: str) -> str:
 
 def _typed_card(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
     target_id = str(wait.get("target_task_id") or "").lower()
+    if not target_id and wait.get("server_observed") is True and wait.get("resolved_at"):
+        # ON DELETE SET NULL may erase the target before the agent exits.
+        # The source receipt still settles this turn and wakes it as invalid.
+        return Outcome("card", note=_typed_note(row, wait), line="Mesh resolved the source card wait")
     if not _UUID.fullmatch(target_id):
         return typed_unparsed(row, wait, f"target_task_id `{target_id or 'missing'}` is not a card id")
     target = target_id[:8]
@@ -574,7 +576,6 @@ def _typed_merge(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome
 # A registered wait's sub-kind -> the shape of its reference and how the marker grammar spells it. The
 # card-scoped ones name this card's own 8-hex id; Mesh fills it in when the agent leaves it out.
 _REGISTRATIONS = {
-    "ops-review": (re.compile(r"[0-9a-f]{64}"), "{}"),
     "native": (re.compile(r"[0-9a-f]{64}"), "{}"),
     "gmail": (re.compile(r"gmr_[0-9a-f]{12}"), "{}"),
     "receipt": (re.compile(r"[0-9a-f]{8}"), "#{}"),
@@ -586,7 +587,7 @@ _REGISTRATIONS = {
 
 
 def _typed_registered(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
-    """A wait on one of the runner's own registrations (``⏳ WAIT ops-review:``, ``gmail:``, ``receipt:#``,
+    """A wait on one of the runner's own registrations (``⏳ WAIT native:``, ``gmail:``, ``receipt:#``,
     ...). The Outcome is the marker's: the runner validates the registration itself when it settles, as
     it does for the marker line."""
     reg = str(wait.get("registration") or "")
@@ -775,8 +776,6 @@ so fix what it names and call again.
       — a merge request is merged, gets a new successful head pipeline, or a new head pipeline result
   wait_for on=pipeline project_path=<group>/<project> pipeline_id=<id> until=finished|green|changed
       — a CI pipeline; a GitHub Actions run: provider=github project_path=<owner>/<repo> pipeline_id=<run id>
-  wait_for on=registered registration=ops-review registration_ref=<64hex request id>
-      — this source owner's registered Board eligibility receipt
   wait_for on=registered registration=queue  — a fresh ready unit after this card's queue-request source
   wait_for on=time until_at=<RFC3339 with Z or offset> event_ref=<stable reference>
       source=<https-url|comment:<uuid>|artifact:<uuid>> why=<what happens then>
@@ -806,7 +805,7 @@ is a marker instead:
   ⏳ WAIT card:#<8hex> | mr:<group>/<project>!<iid> | pipeline:<group>/<project>#<id> (mr:github:<org>/<repo>!<n>)
       CI baseline: until=change|success after=<full-head-sha>:<pipeline-id>:<status>, or for mr
       until=merged after=<full-head-sha>:opened; then optionally jobs=[<job>,<job>]
-  ⏳ WAIT decision:@<agent>: <question> | ops-review:<64hex> | queue:#<this-card-8hex>
+  ⏳ WAIT decision:@<agent>: <question> | queue:#<this-card-8hex>
   ⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
   ↻ NEXT: <note>      ❓ Blocking @<person>: <question>
 """ + DECISION_WAIT_GUIDANCE

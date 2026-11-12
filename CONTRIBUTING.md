@@ -9,3 +9,6 @@
 - Keep the runner policy-free: team-specific rules belong in an agent's profile or a
   preamble file, not in this code.
 - Conventional commit prefixes (`feat:`, `fix:`, `docs:`, `test:`, `chore:`).
+- Changelog: one file per change in `changelog.d/<card>-<slug>.md` (`changelog.d/README.md`).
+  Never edit `CHANGELOG.md` or the version outside the release commit (`docs/release-process.md`);
+  the `mr-policy` CI job refuses it.

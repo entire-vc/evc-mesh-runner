@@ -166,7 +166,8 @@ too: one that GitLab reports in conflict with its target (`has_conflicts`, or
 `detailed_merge_status` `conflict` / `need_rebase`), and one whose head pipeline is
 `failed`, `canceled` or `skipped` once that result was already delivered to the agent
 (a red head not yet delivered is accepted once, so the owner notice reaches it). The
-turn names the way out: fix and push (or rebase and push), get the review verdict on
+turn names the way out: fix and push (or merge the target branch into the MR branch and push;
+never rebase or force-push a pushed branch), get the review verdict on
 the new head, then `⏳ WAIT merge:...` when a merge gate is configured. While such a
 wait is parked, the owner is told once per head when the MR enters a merge conflict.
 
@@ -423,7 +424,7 @@ mesh-runner status --config runner.toml   # local view of attempts
 
 ### `[runner]` options
 
-The `[runner]` table has 40 options; every other key in it is either one of the two native-result
+The `[runner]` table has 38 options; every other key in it is either one of the two native-result
 adoption paths or a retired option. All are optional except `mesh_url`.
 
 | group | keys |
@@ -431,8 +432,8 @@ adoption paths or a retired option. All are optional except `mesh_url`.
 | Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers` |
 | Daily budgets and caps | `daily_start_cap`, `daily_next_budget`, `daily_wait_budget`, `daily_step_budget`, `max_compactions` |
 | Interactive sessions | `tmux_binary`, `interactive_idle_minutes`, `interactive_max_sessions`, `turn_first_output_minutes`, `turn_idle_minutes` ([turn watchdog](docs/turn-watchdog.md)) |
-| Waits and wakes | `comment_wake`, `comment_wake_always_from`, `time_wait_ignore_names`, `workspace_wait_release_minutes`, `ops_review_wait_registry`, `ops_review_wait_notifier_id` ([ops review](docs/ops-review-wait.md)), `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
-| Questions and reviews | `login_ask_check`, `decision_request_metadata_only_recipients` ([metadata producer](docs/decision-metadata-producer.md)), `cardless_question_lanes` (answer desk, below), `review_own_hold_hours`, `reviewer_select_command` ([reviewer merge](docs/reviewer-merge.md)) |
+| Waits and wakes | `comment_wake`, `comment_wake_always_from`, `time_wait_ignore_names`, `workspace_wait_release_minutes`, `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
+| Questions and reviews | `login_ask_check`, `repo_access_contacts` ([repository access](docs/repository-access.md)), `decision_request_metadata_only_recipients` ([metadata producer](docs/decision-metadata-producer.md)), `cardless_question_lanes` (answer desk, below), `review_own_hold_hours`, `reviewer_select_command` ([reviewer merge](docs/reviewer-merge.md)) |
 | Merge waits | `merge_command`, `merge_command_cwd`, `merge_rerun_minutes` |
 | Host gates | `min_free_gb`, `archive_root`, `archive_require_mount`, `memory_hold_free_pct`, `memory_release_free_pct`, `memory_hold_swap_mb`, `memory_release_swap_mb`, `load_hold_per_cpu`, `load_release_per_cpu` |
 
@@ -453,8 +454,8 @@ not ordinary options: the native-result adoption protocol checks them in the fil
 
 ### Retired options
 
-These `[runner]` keys are no longer options; no deployed config set them to anything but their
-default. The loader does not read them and their value is fixed at that default. A file that still
+These `[runner]` keys are no longer options. The loader does not read them; retained runtime
+fields keep their defaults, and removed observers have no runtime fields. A file that still
 sets one loads, and the runner logs one warning per key (`[runner] <key> is no longer an option and
 is ignored (...)`). The list, with each fixed value, is `RETIRED_RUNNER_OPTIONS` in
 `src/mesh_runner/config.py`. The per-agent `launch_mode`, `decision_wake`, `review_verdict_pattern`
@@ -469,6 +470,7 @@ and `review_own_verdict_pattern` in `[[agents]]` are not affected.
 `launch_mode`, `loop_streak_limit`, `max_failures`, `max_no_outcome`, `max_startup_failures`,
 `max_turn_minutes`, `max_turns`, `max_wait_hours`, `merge_max_runs`, `merge_queue_hours`,
 `merge_timeout_minutes`, `mesh_effects`, `metrics_file`, `no_outcome_route_after`,
+`ops_review_wait_notifier_id`, `ops_review_wait_registry` ([retired ops review](docs/ops-review-wait.md)),
 `provider_outage_backoff_cap_seconds`, `provider_outage_backoff_seconds`, `provider_outage_giveup_minutes`,
 `provider_outage_lanes`, `receipt_wait_v1`, `recovery_supersede_authors`, `review_gate_hold_minutes`,
 `review_gate_hold_pattern`, `review_label_prefix`, `review_own_verdict_pattern`, `review_refeed_hours`,
@@ -753,8 +755,14 @@ never on a timer. Details: `docs/requeue-on-event.md`.
   is put to the project lead instead of raising a human gate; the person can still override by
   commenting on the card.
 
+A `❓ Blocking @person` ask (the `ask_human` command or a hand-written marker) is classified by Mesh
+itself with the same rules (`asks.gate_class`): a question no hard rule matches, whose author stated
+a default, arms a soft gate, and Mesh applies that default at the deadline.
+
 `mesh_runner.cli asks classify --config runner.toml` lists the human gates open now with the
-hard or soft verdict and the rule that decided it. It only reads.
+verdict, the rule that decided it and the class Mesh holds (`held:`). `AUTO` is a gate Mesh holds
+soft (its default applies at the deadline); `SOFT` is one the rule calls soft but Mesh still holds
+hard, a count that should stay at zero. It only reads.
 
 ## Mesh extension
 

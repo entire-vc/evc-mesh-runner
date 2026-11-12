@@ -110,8 +110,9 @@ def _asks(argv: list[str]) -> int:
         if "verdict" not in r:
             print("errors: " + "; ".join(r["errors"]))
             continue
-        print(f"{r['verdict'].upper():4}  #{r['task']}  @{r['asked'] or '?':<14} {r['rule']:<28} {r['title']}")
-    print(f"total {totals['gates']}: hard {totals['hard']}, soft {totals['soft']}")
+        print(f"{r['verdict'].upper():4}  #{r['task']}  @{r['asked'] or '?':<14} held:{r.get('held', '?'):<4} "
+              f"{r['rule']:<30} {r['title']}")
+    print(f"total {totals['gates']}: hard {totals['hard']}, soft {totals['soft']}, auto {totals.get('auto', 0)}")
     return 0
 
 
