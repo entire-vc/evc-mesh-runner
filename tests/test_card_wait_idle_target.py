@@ -1,5 +1,5 @@
 """A ``WAIT card:#X`` is sent back when X itself waits on a timer, a person or a human gate."""
-from fakes import FakeMesh, task, write_replies
+from fakes import FakeMesh, task, write_replies, wait_card
 from mesh_runner.store import iso
 from test_runner import Bench
 
@@ -83,7 +83,7 @@ class CardWaitOnIdleTarget(Bench):
         r = self.runner(FakeMesh([t], max_concurrent=1))
         self.addCleanup(r.store.db.close)
         r.refresh_me()
-        write_replies(self.replies, {t['id'][:8]: '⏳ WAIT card:#deadbeef'})
+        write_replies(self.replies, {t['id'][:8]: wait_card("deadbeef")})
         r.start_new(1)
         self.assertEqual(self.finish_turn(r).state, 'waiting')
 

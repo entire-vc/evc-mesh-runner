@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from test_runner import Bench
-from fakes import FakeMesh, task, write_replies
+from fakes import FakeMesh, task, write_replies, wait_time
 from test_workspace import make_repo
 from mesh_runner.store import Store
 from mesh_runner.workspace import (POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE,
@@ -264,7 +264,7 @@ class Admission(Bench):
         for session in ('', 'previous-session'):
             with self.subTest(session=session):
                 runner, a, source = self.ready_with_lease(session)
-                write_replies(self.replies, {a.task8: '⏳ WAIT 2h: external work'})
+                write_replies(self.replies, {a.task8: wait_time(why="external work")})
                 with patch('mesh_runner.workspace.shutil.disk_usage',
                            return_value=type('D', (), {'free': 7 * 1024**3})()):
                     runner._resume_one(a)

@@ -5,7 +5,6 @@ Real files and a real tmux binary on a private socket cover gone and live window
 import hashlib
 import json
 import os
-import shutil
 import sys
 import tempfile
 import unittest
@@ -14,6 +13,7 @@ from pathlib import Path
 
 from mesh_runner import delivery_recovery, interactive
 from mesh_runner.adapters.base import read_events
+from tmux_support import needs_tmux
 
 PROMPT = "Task #0f1e2d3c: continue the card.\nUse only these physical paths: [\"/w/slot-1\"]."
 REFUSED = {"message": '{"type":"error","status":400,"error":{"type":"invalid_request_error",'
@@ -24,7 +24,7 @@ def rec(kind, payload):
     return {"timestamp": "2026-11-10T22:29:40.000Z", "type": kind, "payload": payload}
 
 
-@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+@needs_tmux
 class CodexFailedTurn(unittest.TestCase):
     def setUp(self):
         self._t = tempfile.TemporaryDirectory()

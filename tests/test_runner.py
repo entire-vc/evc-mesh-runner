@@ -12,7 +12,8 @@ from pathlib import Path
 
 from mesh_runner.mesh import MeshError
 from mesh_runner.outcome import Outcome
-from fakes import AGENT_ID, FAKE_AGENT, HarnessGate, FakeAdapter, FakeProfileAdapter, FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT
+import fakes
+from fakes import AGENT_ID, FAKE_AGENT, HarnessGate, FakeAdapter, FakeProfileAdapter, FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT, ask_agent, ask_human, finish, hand_off, next_turn, wait_card, wait_mr, wait_pipeline, wait_time, slow
 from test_workspace import make_repo
 
 from mesh_runner.adapters.base import group_alive, proc_stamp
@@ -43,7 +44,11 @@ class Bench(unittest.TestCase):
         profile.mkdir()
         self.agent = AgentConfig(name="builder", key="k", harness="claude", profile_dir=profile,
                                  repos=[RepoSpec("app", base, max_slots=4)],
-                                 env={"FAKE_REPLIES": str(self.replies), "FAKE_CALLS": str(self.calls)})
+                                 env={"FAKE_REPLIES": str(self.replies), "FAKE_CALLS": str(self.calls),
+                                      "FAKE_OUTCOMES": str(root / "outcomes.jsonl")})
+        # the Mesh turn commands the fake agent calls land here; FakeMesh serves them as Mesh does
+        fakes.OUTCOME_SINK = root / "outcomes.jsonl"
+        self.addCleanup(setattr, fakes, "OUTCOME_SINK", None)
         self.cfg = RunnerConfig(mesh_url="http://mesh", state_dir=root / "state", agents=[self.agent],
                                 wake_poll_seconds=0, heartbeat_seconds=0,
                                 load_hold_per_cpu=0)       # the host's real load must not hold a test's starts
@@ -177,8 +182,8 @@ class SettleSynchronization(Bench):
     def test_slow_ticks_do_not_spend_the_next_child_wait_budget(self):
         t1, t2 = task(1), task(2)
         mesh = FakeMesh([t1, t2], max_concurrent=1)
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 first",
-                                     t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 second"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="first"),
+                                     t2["id"][:8]: wait_time(why="second")})
         r = self.runner(mesh)
         r.tick()
         real_tick = r.tick
@@ -379,7 +384,7 @@ class Loop(Bench):
     def test_cap_bounds_parallel_sessions_and_waits_free_slots(self):
         t = [task(1, "high"), task(2), task(3, "low")]
         mesh = FakeMesh(t, max_concurrent=2)
-        write_replies(self.replies, {x["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 CI" for x in t})
+        write_replies(self.replies, {x["id"][:8]: wait_time(why="CI") for x in t})
         r = self.runner(mesh)
         r.tick()
         started = {a.task8 for a in r.store.by_state("builder", ("running", "starting"))}
@@ -396,7 +401,7 @@ class Loop(Bench):
     def test_wake_resumes_the_same_session(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead", t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"), t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -429,7 +434,7 @@ class Loop(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         gate = self.root / "background"
         self.agent.inline_env["FAKE_BG_GATE"] = str(gate)
-        write_replies(self.replies, {t["id"][:8]: f"BG:GATE:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: slow(f"BG:GATE:", wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         a = r.store.by_state(self.agent.name, ("running",))[0]
@@ -500,7 +505,7 @@ class Loop(Bench):
         r.tick()
         self.assertEqual(self.states(r), {})
         mesh.set_category(blocker["id"], "done")
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r._hold_cache.clear()                     # the dependency verdict is re-read after its TTL
         r.tick()
         self.assertIn(t["id"][:8], self.states(r))
@@ -545,7 +550,7 @@ class ReviewFindings(Bench):
     def test_one_broken_task_does_not_stop_the_others_or_heartbeats(self):
         t1, t2 = task(1, "high"), task(2)
         mesh = FakeMesh([t1, t2], max_concurrent=2)
-        write_replies(self.replies, {t1["id"][:8]: f"SLEEP:1:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"SLEEP:3:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: slow(f"SLEEP:1:", wait_time(why="soak window")), t2["id"][:8]: slow(f"SLEEP:3:", wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         mesh.broken_tasks.add(t1["id"])           # settling t1 now fails every tick
@@ -653,7 +658,7 @@ class ReviewFindings(Bench):
         import threading
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         self.cfg.poll_seconds = 0.2
         runner = Runner(self.cfg)
         runner.agents = [self.runner(mesh)]              # store built on this (main) thread
@@ -673,8 +678,8 @@ class ReviewFindings(Bench):
         t = task(1)
         mesh, gl = FakeMesh([t], max_concurrent=1), FakeGitLab()
         gl.mr_head["g/app!7"] = "9:success"
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT mr:g/app!7: review",
-                                     t["id"][:8] + ":resume": "⏳ WAIT mr:g/app!7: still"})
+        write_replies(self.replies, {t["id"][:8]: wait_mr("g/app", 7, note="review"),
+                                     t["id"][:8] + ":resume": wait_mr("g/app", 7, note="still")})
         r = self.runner(mesh, gl)
         r.tick()
         self.settle_all(r)
@@ -701,8 +706,8 @@ class ReviewFindings(Bench):
         t = task(1)
         mesh, gl = FakeMesh([t], max_concurrent=1), FakeGitLab()
         gl.pipelines["g/app#5"] = "running"
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT pipeline:g/app#5",
-                                     t["id"][:8] + ":resume": "⏳ WAIT pipeline:g/app#5"})
+        write_replies(self.replies, {t["id"][:8]: wait_pipeline("g/app", 5),
+                                     t["id"][:8] + ":resume": wait_pipeline("g/app", 5)})
         r = self.runner(mesh, gl)
         r.tick()
         self.settle_all(r)
@@ -722,7 +727,7 @@ class ReviewFindings(Bench):
         t = task(1)
         mesh, gl = FakeMesh([t], max_concurrent=1), FakeGitLab()
         gl.pipelines["g/app#5"] = "manual"
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT pipeline:g/app#5", t["id"][:8] + ":resume": "⏳ WAIT pipeline:g/app#5"})
+        write_replies(self.replies, {t["id"][:8]: wait_pipeline("g/app", 5), t["id"][:8] + ":resume": wait_pipeline("g/app", 5)})
         r = self.runner(mesh, gl)
         r.tick()
         self.settle_all(r)
@@ -738,7 +743,7 @@ class ReviewFindings(Bench):
     def test_healthy_unchanged_card_wait_does_not_wake_by_age(self):
         t = task(1)
         mesh = FakeMesh([t, task(0xabcdef12, assignee_id="someone-else")], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT card:#abcdef12", t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_card("abcdef12"), t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -751,8 +756,8 @@ class ReviewFindings(Bench):
     def test_time_wait_wakes_only_at_its_deadline(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 pilot window",
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 pilot window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="pilot window"),
+                                     t["id"][:8] + ":resume": wait_time(why="pilot window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -775,34 +780,13 @@ class ReviewFindings(Bench):
             r.store.update(a, wait=w)
         r._last_wake_check.clear()
 
-    def test_a_question_mesh_did_not_raise_is_told_once_then_waits(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "❓ Blocking @owner: which plan?"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        r.tick()
-        self.settle_all(r)
-        a = r.store.by_state("builder", ("failed",))[0]
-        self.assertTrue(a.note.startswith("wait correction required:"))
-        self.assertFalse(r.store.by_state("builder", ("waiting",)))
-        self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))       # the runner never sets it
-        told = calls(self.calls)[1]
-        self.assertTrue(told["resume"])
-        self.assertIn("Mesh raised no question to them", told["prompt"])
-        self.assertIn("❓ Blocking @owner:", told["prompt"])
-        for _ in range(3):
-            r.tick()
-        self.assertEqual(len(calls(self.calls)), 2)        # told once, no ping-pong without an answer
-
     def test_a_question_mesh_raised_waits_for_the_person(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         read = mesh.task
         # Mesh wraps the task ({"task": {...}}): the gate it raised must still be seen
         mesh.task = lambda tid: {"task": dict(read(tid), human_gate=True)} if calls(self.calls) else read(tid)
-        write_replies(self.replies, {t["id"][:8]: "❓ Blocking @owner: which plan?"})
+        write_replies(self.replies, {t["id"][:8]: ask_human("owner", "which plan?")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -810,86 +794,6 @@ class ReviewFindings(Bench):
         self.assertEqual(a.wait["kind"], "blocking")
         self.assertEqual(mesh.created, [])
         self.assertEqual(len(calls(self.calls)), 1)
-
-    def test_wait_decision_on_a_person_is_posted_as_a_blocking_ask(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        read = mesh.task
-        # Mesh raises the gate from the posted `❓ Blocking` line
-        mesh.task = lambda tid: ({"task": dict(read(tid), human_gate=True)}
-                                 if any("❓ Blocking @owner:" in c["body"] for c in mesh.comments(tid))
-                                 else read(tid))
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@owner: which plan?"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        a = r.store.by_state("builder", ("waiting",))[0]
-        self.assertEqual(a.wait["kind"], "blocking")
-        self.assertTrue(any("❓ Blocking @owner: which plan?" in c["body"] for c in mesh.comments(t["id"])))
-        self.assertEqual(len(calls(self.calls)), 1)        # the agent is not woken to repeat itself
-
-    def test_person_ask_dedup_is_per_question_and_addressee_and_survives_a_failed_post(self):
-        from unittest.mock import patch
-        from mesh_runner.outcome import Outcome
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@owner: which plan?"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        a = r.store.by_state("builder", ("failed",))[0]
-        self.assertTrue(a.note.startswith("wait correction required:"))
-
-        def asks():
-            return [c for c in mesh.comments(t["id"]) if "❓ Blocking @" in c["body"]]
-
-        def route(handle, note):
-            r._route_ask(a, t, Outcome(kind="decision", handle=handle, note=note), {}, "2026-10-21T00:00:00Z")
-        base = len(asks())
-        with patch.object(mesh, "add_comment", side_effect=MeshError(503, "down")):
-            route("owner2", "pick one?")
-        self.assertEqual(len(asks()), base)               # not delivered
-        route("owner2", "pick one?")
-        self.assertEqual(len(asks()), base + 1)           # retried after the failure
-        route("owner2", "pick one?")
-        self.assertEqual(len(asks()), base + 1)           # once delivered, not repeated
-        route("owner3", "pick one?")
-        self.assertEqual(len(asks()), base + 2)           # same text, new addressee
-        route("owner2", "other?")
-        route("owner2", "pick one?")
-        self.assertEqual(len(asks()), base + 3)           # A-B-A: A is not posted again
-
-    def test_a_refused_repeat_question_hands_the_agent_the_earlier_answer(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "❓ Blocking @owner: keep both machines?"})
-        comments = mesh.comments
-
-        def with_refusal(tid, limit=20):
-            out = comments(tid, limit)
-            if calls(self.calls):                    # every ask is refused, each time a new notice
-                out.append({"id": f"refusal-{len(calls(self.calls))}",
-                            "author_id": "00000000-0000-0000-0000-000000000000",
-                            "system_params": {"answered_at": "2026-10-10 11:24"},
-                            "author_type": "system", "system_code": "repeat_ask_refused",
-                            "body": "🔁 Auto: human_gate not armed — the previous question already has an "
-                                    "answer (2026-10-10 11:24): «разрешаю».",
-                            "created_at": dt.datetime.now(dt.timezone.utc).isoformat()})
-            return out
-        mesh.comments = with_refusal
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        r.tick()
-        self.settle_all(r)
-        told = calls(self.calls)[1]
-        self.assertIn("refused it as already answered", told["prompt"])
-        self.assertIn("«разрешаю»", told["prompt"])
-        self.assertIn("supersedes:", told["prompt"])
-        self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))
-        for _ in range(3):
-            r.tick()
-        self.assertEqual(len(calls(self.calls)), 2)        # the same refusal again does not resume it
 
     def test_a_policy_gate_notice_is_recognised_as_a_refusal(self):
         t = task(1)
@@ -908,7 +812,7 @@ class ReviewFindings(Bench):
     def test_a_repeated_refused_person_ask_does_not_wait_on_the_person(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "❓ Blocking @owner: rotate the key?"})
+        write_replies(self.replies, {t["id"][:8]: ask_human("owner", "rotate the key?")})
         r = self.runner(mesh)
         a = r.store.create("builder", t["id"], "claude")
         r.store.mark("builder", t["id"], "ask_not_raised", "no-marker:blocking")
@@ -920,24 +824,11 @@ class ReviewFindings(Bench):
         self.assertTrue(a.note.startswith("wait correction required:"))
         self.assertNotIn("person_ask", wait)
 
-    def test_blocking_addressed_to_an_agent_files_a_decision_request_not_a_gate(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "❓ Blocking @lead: list it from the personal account?"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        a = r.store.by_state("builder", ("waiting",))[0]
-        self.assertEqual(a.wait["kind"], "decision")
-        self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))
-        self.assertEqual(mesh.created[0]["assignee_id"], "agent-lead")
-        self.assertEqual(len(calls(self.calls)), 1)
-
     def test_turn_time_limit_kills_the_session(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.max_turn_minutes = 0
-        write_replies(self.replies, {t["id"][:8]: f"SLEEP:60:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: slow(f"SLEEP:60:", wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         time.sleep(1.1)
@@ -961,7 +852,7 @@ class ReviewFindings(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.straggler_grace_minutes = 0
-        write_replies(self.replies, {t["id"][:8]: f"BG:120:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: slow(f"BG:120:", wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r, timeout=20)
@@ -978,7 +869,7 @@ class ReviewFindings(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         # No capacity-capable gate: an outage recovers on the existing cadence.
         write_replies(self.replies, {t["id"][:8]: "ERROR:" + error,
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1004,7 +895,7 @@ class ReviewFindings(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         write_replies(self.replies, {t["id"][:8]: "ERROR:fatal: bad object 7e1a429bc0",
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         a = self.finish_turn(r)
@@ -1036,7 +927,7 @@ class ReviewFindings(Bench):
             "print('ACCOUNT_CAPACITY_READY=1' if required and ready else 'account capacity unavailable'); "
             "sys.exit(75 if required and not ready else 0)"]
         write_replies(self.replies, {t["id"][:8]: "ERROR:" + error,
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1059,7 +950,7 @@ class ReviewFindings(Bench):
     def test_resume_of_a_session_the_harness_does_not_know_starts_over(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead",
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"),
                                      t["id"][:8] + ":resume": "ERROR:No conversation found with session ID: x"})
         r = self.runner(mesh)
         r.tick()
@@ -1081,7 +972,7 @@ class ReviewFindings(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.max_failures = 1
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead",
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"),
                                      t["id"][:8] + ":resume": "ERROR:No conversation found with session ID: x"})
         r = self.runner(mesh)
         r.tick()
@@ -1127,7 +1018,7 @@ class ReviewFindings(Bench):
         mesh = FakeMesh([t, other], max_concurrent=1)
         old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=5)
         mesh.add_comment(t["id"], "old note from the lead", author="lead", at=old)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT card:#{other['id'][:8]}"})
+        write_replies(self.replies, {t["id"][:8]: wait_card(other["id"])})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1154,7 +1045,7 @@ class ReviewFindings(Bench):
         t1, t2 = task(1), task(2)
         mesh = FakeMesh([t1, t2], max_concurrent=2)
         self.agent.repos[0] = RepoSpec("app", self.agent.repos[0].base, max_slots=1)
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="soak window"), t2["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.assertEqual(len(self.states(r)), 1)
@@ -1170,7 +1061,7 @@ class ReviewFindings(Bench):
         t1, t2 = task(1), task(2)
         mesh = FakeMesh([t1], max_concurrent=1)
         self.agent.repos[0] = RepoSpec("app", self.agent.repos[0].base, max_slots=1)
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="soak window"), t2["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1188,12 +1079,80 @@ class ReviewFindings(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.max_turns = 3
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
         self.assertEqual(self.states(r)[t["id"][:8]], "failed")
         self.assertEqual(len(calls(self.calls)), 3)
+
+
+class TypedTurnCommands(Bench):
+    """The fake agent ends its turns with Mesh turn commands, as live lanes do: Mesh records the outcome,
+    opens the request or arms the gate and writes the command's comment; the runner only settles on it."""
+
+    def test_ask_agent_waits_on_the_request_mesh_opened_and_files_none_itself(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "approve the plan?")})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        a = r.store.by_state("builder", ("waiting",))[0]
+        self.assertEqual(a.wait["kind"], "decision")
+        self.assertEqual(mesh.created, [])                           # Mesh opened it, not the runner
+        self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))
+        self.assertFalse(any("❓" in c["body"] or "⏳" in c["body"] for c in mesh.comments_all(t["id"])))
+        for _ in range(3):
+            r.tick()
+        self.assertEqual(len(calls(self.calls)), 1)
+
+    def test_continue_next_runs_the_next_turn_in_the_same_session(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: next_turn("the tests"),
+                                     t["id"][:8] + ":resume": finish(evidence="tests green")})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        first, second = calls(self.calls)[:2]
+        self.assertEqual((second["resume"], second["sid"]), (True, first["sid"]))
+        self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "done")
+
+    def test_finish_task_done_and_review_end_the_attempt_without_another_turn(self):
+        for to, cat in (("done", "done"), ("review", "review")):
+            with self.subTest(to=to):
+                t = task(1 if to == "done" else 2)
+                mesh = FakeMesh([t], max_concurrent=1)
+                write_replies(self.replies, {t["id"][:8]: finish(to=to)})
+                before = len(calls(self.calls))
+                r = self.runner(mesh)
+                r.tick()
+                a = r.store.by_state("builder", ("running",))[0]
+                self.settle_all(r)
+                self.assertEqual(mesh.category(mesh.tasks[t["id"]]), cat)
+                self.assertEqual(r.store.get(a.id).state, "completed")
+                self.assertEqual(mesh.checkouts, {})
+                if to == "review":
+                    mesh.tasks[t["id"]]["assignee_id"] = "agent-lead"    # the reviewer the board assigns
+                for _ in range(3):
+                    r.tick()
+                self.assertEqual(len(calls(self.calls)) - before, 1)
+                r.store.db.close()
+
+    def test_hand_off_gives_the_card_away_and_the_lane_stops_working_it(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: hand_off("agent-lead", why="needs the lead's call")})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        for _ in range(3):
+            r.tick()
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
+        self.assertEqual(len(calls(self.calls)), 1)
+        self.assertFalse(r.store.by_state("builder", ("waiting", "ready", "running", "starting")))
+        self.assertTrue(any(c["body"].startswith("Handed over to agent-lead.") for c in mesh.comments_all(t["id"])))
 
 
 class Operations(Bench):
@@ -1207,7 +1166,7 @@ class Operations(Bench):
         self.assertEqual(self.states(r), {})
         self.assertTrue(r.status()["paused"])
         op_pause.release(self.cfg.state_dir, "builder", "maintenance")
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="soak window"), t2["id"][:8]: wait_time(why="soak window")})
         r.tick()
         self.assertEqual(len(self.states(r)), 2)
 
@@ -1217,7 +1176,7 @@ class Operations(Bench):
         env_file = self.root / "agent.env"
         env_file.write_text("export PROBE='first'\n")
         self.agent.env_file = env_file
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="soak window"), t2["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1231,7 +1190,7 @@ class Operations(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.metrics_file = self.root / "runner.prom"
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         from mesh_runner.runner import Runner as R
         runner = R.__new__(R)
         runner.cfg, runner.store, runner._lock = self.cfg, Store(self.root / "state" / "r.sqlite"), None
@@ -1251,7 +1210,7 @@ class MeshEffects(Bench):
     def test_runtime_state_follows_the_attempt(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"SLEEP:1:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: slow(f"SLEEP:1:", wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         self.assertEqual(mesh.runtime[t["id"]]["kind"], "working")
@@ -1268,7 +1227,7 @@ class MeshEffects(Bench):
         t1, t2, t3 = task(1), task(2), task(3)
         mesh = FakeMesh([blocker, t1, t2, t3], max_concurrent=1)
         mesh.deps[t3["id"]] = [{"dependency_type": "blocks", "depends_on_task_id": blocker["id"]}]
-        write_replies(self.replies, {t1["id"][:8]: f"SLEEP:1:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: "✅ done"})
+        write_replies(self.replies, {t1["id"][:8]: slow(f"SLEEP:1:", wait_time(why="soak window")), t2["id"][:8]: "✅ done"})
         r = self.runner(mesh)
         r.tick()
         self.assertEqual(mesh.runtime[t1["id"]]["kind"], "working")
@@ -1316,7 +1275,7 @@ class MeshEffects(Bench):
     def test_status_reports_the_waiting_queue(self):
         t1, t2 = task(1), task(2)
         mesh = FakeMesh([t1, t2], max_concurrent=1)
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="soak window"), t2["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.assertEqual(r.status()["queue"], 1)
@@ -1327,7 +1286,7 @@ class MeshEffects(Bench):
     def test_every_turn_reports_its_spend_to_mesh(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1353,8 +1312,8 @@ class MeshEffects(Bench):
         t, other = task(1), task(2, cat="in_progress")
         other["assignee_id"] = "someone-else"
         mesh = FakeMesh([t, other], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT card:#{other['id'][:8]}",
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_card(other["id"]),
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1365,98 +1324,11 @@ class MeshEffects(Bench):
         self.assertEqual(mesh.edges[t["id"]], [])
         self.settle_all(r)
 
-    def test_decision_wait_on_an_agent_files_and_closes_a_request(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead: approve the plan?",
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        self.assertEqual(len(mesh.created), 1)
-        req = mesh.created[0]
-        self.assertEqual(req["assignee_id"], "agent-lead")
-        self.assertIn("decision-request", req["labels"])
-        self.assertTrue(req["title"].startswith("[decision] approve the plan?"))
-        mesh.add_comment(t["id"], "approved", author="agent-lead")
-        r.tick()
-        self.assertEqual(mesh.category(mesh.tasks[req["id"]]), "done")
-        self.settle_all(r)
-
-    def test_wait_begun_without_effects_is_adopted(self):
-        # a wait that started under an older runner (or with effects off) still
-        # gets its decision request once effects are on
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead: approve the plan?"})
-        self.cfg.mesh_effects = False
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        self.assertEqual(mesh.created, [])
-        self.cfg.mesh_effects = True
-        r = self.runner(mesh)
-        r.tick()
-        r.tick()
-        self.assertEqual(len(mesh.created), 1)
-        self.assertEqual(mesh.created[0]["assignee_id"], "agent-lead")
-        self.assertFalse(mesh.tasks[t["id"]].get("start_after"))     # an event wait writes no hold
-
-    def test_ambiguous_decision_create_requires_reconciliation_instead_of_duplicate(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        mesh.fail_create = 1
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead: approve the plan?"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        r.tick()
-        r.tick()
-        self.assertEqual(mesh.fail_create, 0)        # the first try did fail
-        self.assertEqual(len(mesh.created), 0)       # 503 might have created it: do not repeat POST
-        r.tick()
-        self.assertEqual(len(mesh.created), 0)
-        self.assertEqual(r.effects._decision(t["id"])["state"], "creating")
-
-    def test_decision_wait_on_a_human_files_nothing_and_sets_no_gate(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@person"})
-        r = self.runner(mesh)
-        r.tick()
-        self.assertEqual(self.finish_turn(r).state, "ready")
-        self.assertEqual(mesh.created, [])
-        self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))   # only Mesh raises a person's gate
-        r.tick()
-        self.assertEqual(self.finish_turn(r).state, "failed")
-        self.assertIn("is for agents", calls(self.calls)[1]["prompt"])
-        self.assertEqual(mesh.created, [])
-        self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))
-
-    def test_unreadable_declaration_is_quoted_back_then_the_task_waits_for_new_input(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        self.agent.lead = "lead"
-        # a malformed event wait; a non-event WAIT is a time wait and ends in a correction hold instead
-        write_replies(self.replies, {t["id"][:8]: "done\n⏳ WAIT card:soon-ish"})
-        r = self.runner(mesh)
-        r.tick()
-        self.settle_all(r)
-        prompts_seen = [c["prompt"] for c in calls(self.calls)]
-        self.assertEqual(len(prompts_seen), 2)
-        self.assertIn("⏳ WAIT card:soon-ish", prompts_seen[1])     # the agent sees what was wrong
-        self.assertIn("⏳ WAIT card:#<8hex>", prompts_seen[1])      # and the forms that work
-        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)      # the second miss is not a give-up
-        self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")
-        self.assertEqual((r._cap_wait(t["id"]) or {}).get("kind"), "no outcome")
-        self.assertTrue(any("NO OUTCOME" in c["body"] for c in mesh.comment_log[t["id"]]))
-        self.assertFalse(any("RUNNER GAVE UP" in c["body"] for c in mesh.comment_log[t["id"]]))
-
     def test_resume_shows_every_comment_since_the_last_turn_not_only_the_wake_event(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead",
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"),
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1536,7 +1408,7 @@ class MeshEffects(Bench):
     def test_effort_label_reaches_the_session(self):
         t = task(1, labels=["effort:low"])
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1759,7 +1631,7 @@ class MeshEffects(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         r.tick()
         for turn in range(3):
@@ -1787,8 +1659,8 @@ class FastWaits(Bench):
     def test_a_card_wait_on_a_card_that_waits_on_this_agent_is_woken_as_a_cycle(self):
         t, other = task(1), task(0xabcdef12, assignee_id="someone-else")
         mesh = FakeMesh([t, other], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT card:#abcdef12",
-                                     t["id"][:8] + ":resume": "⏳ WAIT decision:@executor: step 0.1.1"})
+        write_replies(self.replies, {t["id"][:8]: wait_card("abcdef12"),
+                                     t["id"][:8] + ":resume": ask_agent("executor", "step 0.1.1")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1809,8 +1681,8 @@ class FastWaits(Bench):
     def test_an_unchanged_card_wait_does_not_start_a_blocking_ask_by_age(self):
         t = task(1)
         mesh = FakeMesh([t, task(0xabcdef12, assignee_id="someone-else")], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT card:#abcdef12",
-                                     t["id"][:8] + ":resume": "❓ Blocking @person: which seller?"})
+        write_replies(self.replies, {t["id"][:8]: wait_card("abcdef12"),
+                                     t["id"][:8] + ":resume": ask_human("person", "which seller?")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1824,8 +1696,8 @@ class FastWaits(Bench):
     def test_the_same_wait_declared_again_after_a_comment_is_not_counted_by_the_budget(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead",
-                                     t["id"][:8] + ":resume": "⏳ WAIT decision:@lead"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"),
+                                     t["id"][:8] + ":resume": ask_agent("lead", "ready?")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1837,8 +1709,8 @@ class FastWaits(Bench):
     def test_a_wait_on_a_different_handle_after_a_comment_is_counted_by_the_budget(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead",
-                                     t["id"][:8] + ":resume": "⏳ WAIT decision:@executor"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"),
+                                     t["id"][:8] + ":resume": ask_agent("executor", "ready?")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1850,8 +1722,8 @@ class FastWaits(Bench):
     def test_a_strangers_comment_on_a_decision_wait_does_not_make_the_next_wait_a_step(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead",
-                                     t["id"][:8] + ":resume": "⏳ WAIT decision:@executor"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"),
+                                     t["id"][:8] + ":resume": ask_agent("executor", "ready?")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1893,8 +1765,8 @@ class FastWaits(Bench):
         t = task(1)
         mesh, gl = FakeMesh([t], max_concurrent=1), FakeGitLab()
         gl.pipelines["g/app#5"] = "running"
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT pipeline:g/app#5",
-                                     t["id"][:8] + ":resume": "⏳ WAIT pipeline:g/app#6"})
+        write_replies(self.replies, {t["id"][:8]: wait_pipeline("g/app", 5),
+                                     t["id"][:8] + ":resume": wait_pipeline("g/app", 6)})
         r = self.runner(mesh, gl)
         r.tick()
         self.settle_all(r)
@@ -1907,8 +1779,8 @@ class FastWaits(Bench):
     def test_a_new_wait_after_a_plain_comment_on_a_card_wait_is_still_an_idle_wait(self):
         t = task(1)
         mesh = FakeMesh([t, task(0xabcdef12, assignee_id="someone-else")], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT card:#abcdef12",
-                                     t["id"][:8] + ":resume": "⏳ WAIT decision:@executor"})
+        write_replies(self.replies, {t["id"][:8]: wait_card("abcdef12"),
+                                     t["id"][:8] + ":resume": ask_agent("executor", "ready?")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -1926,8 +1798,8 @@ class FastWaits(Bench):
         self.cfg.daily_step_budget = 0
         self.agent.lead = "lead"
         gl.pipelines["g/app#5"] = "running"
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT pipeline:g/app#5",
-                                     t["id"][:8] + ":resume": "⏳ WAIT pipeline:g/app#6"})
+        write_replies(self.replies, {t["id"][:8]: wait_pipeline("g/app", 5),
+                                     t["id"][:8] + ":resume": wait_pipeline("g/app", 6)})
         r = self.runner(mesh, gl)
         r.tick()
         self.settle_all(r)
@@ -2078,7 +1950,7 @@ class FastWaits(Bench):
     def test_a_recheck_mark_of_another_attempt_is_not_counted(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 scheduled external window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="scheduled external window")})
         r = self.runner(mesh)
         r.store.mark("builder", t["id"], "recheck_wake", "some-old-attempt:3")
         r.tick()
@@ -2243,7 +2115,7 @@ class Reviews(Bench):
         review_gate = HarnessGate(self.root / "review")
         work_gate = HarnessGate(self.root / "work")
         write_replies(self.replies, {rev["id"][:8]: review_gate.reply("accepted"),
-                                    work["id"][:8]: work_gate.reply(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window")})
+                                    work["id"][:8]: work_gate.reply(wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         a = r.store.by_state("builder", ("running",))[0]
@@ -2294,7 +2166,7 @@ class Reviews(Bench):
         kid = task(2, cat="in_progress", parent_task_id=parent["id"])
         kid["assignee_id"] = "someone-else"
         mesh = FakeMesh([parent, kid], max_concurrent=1)
-        write_replies(self.replies, {parent["id"][:8]: "⏳ WAIT card:#" + kid["id"][:8]})
+        write_replies(self.replies, {parent["id"][:8]: wait_card(kid["id"])})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -2320,7 +2192,7 @@ class Hardening(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.agent.env_command = [sys.executable, "-c", "print('PROBE=lane-identity')"]
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         seen, lease = [], r.pool.lease
         r.pool.lease = lambda *a, **k: (seen.append(r.pool.env.get("PROBE")), lease(*a, **k))[1]
@@ -2370,7 +2242,7 @@ class Hardening(Bench):
                "os.environ.get('MESH_RUNNER_GATE_RESERVATION','')+' '+os.environ['MESH_RUNNER_OUTCOME']+'\\n')\n")
         self.agent.start_gate_command = [sys.executable, "-c", gate]
         self.agent.turn_end_command = [sys.executable, "-c", end]
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.assertEqual(calls(self.calls), [])
@@ -2388,7 +2260,7 @@ class Hardening(Bench):
         gate = ("import os,sys\n"
                 f"if os.environ['MESH_RUNNER_TASK']=={gated['id']!r}:\n print('waits for a human'); sys.exit(76)\n")
         self.agent.start_gate_command = [sys.executable, "-c", gate]
-        write_replies(self.replies, {free["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {free["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()                                   # the gated task first (urgent), then the free one
         self.settle_all(r)
@@ -2427,7 +2299,7 @@ class Hardening(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.max_compactions = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: f"COMPACT:2:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: slow(f"COMPACT:2:", wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -2457,7 +2329,7 @@ class Hardening(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         _, log_file = self._gate_scripts({})
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -2482,7 +2354,7 @@ class Hardening(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         vfile, log_file = self._gate_scripts({})
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -2508,7 +2380,7 @@ class Hardening(Bench):
                                   "print('MESH_RUNNER_HARNESS='+h);"
                                   "print('MESH_RUNNER_PROFILE=other-acct') if h=='codex' else None"]
         self.agent.alt = {"codex": {"profile": "base"}}
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window"), t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base", native="codex")}
         r.tick()
@@ -2535,7 +2407,7 @@ class Hardening(Bench):
                                   f"import pathlib,sys;h=pathlib.Path({str(route)!r}).read_text();"
                                   "sys.exit(3) if h=='fail' else print('MESH_RUNNER_HARNESS='+h)"]
         self.agent.alt = {"codex": {"profile": "base"}}
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base", native="codex")}
         r.tick()
@@ -2566,7 +2438,7 @@ class Hardening(Bench):
         r.tick()
         self.assertEqual(calls(self.calls), [])
         r.memgate._read, r.memgate._at = (lambda: (25.0, None)), None
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r.tick()
         self.settle_all(r)
         self.assertEqual(len(calls(self.calls)), 1)
@@ -2583,7 +2455,7 @@ class Hardening(Bench):
         self.assertIn("host load: HOLD", "\n".join(logs.output))
         self.assertEqual(r.status()["load_hold"][:10], "load5 80.0")
         r.loadgate._read, r.loadgate._at = (lambda: (20.0, 10)), None   # 2 per CPU
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r.tick()
         self.settle_all(r)
         self.assertEqual(len(calls(self.calls)), 1)
@@ -2593,7 +2465,7 @@ class Hardening(Bench):
         t1, t2 = task(1), task(2)
         mesh = FakeMesh([t1], max_concurrent=1)
         self.agent.env_command = [sys.executable, "-c", "print('PROBE=from-command')"]
-        write_replies(self.replies, {t1["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window", t2["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t1["id"][:8]: wait_time(why="soak window"), t2["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -2609,7 +2481,7 @@ class Hardening(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.agent.env_command = [sys.executable, "-c", "print('MESH_RUNNER_PROFILE=other-account')"]
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.adapter = FakeProfileAdapter(r.adapter.script, "base")
         r.tick()
@@ -2637,7 +2509,7 @@ class Hardening(Bench):
     def test_model_label_picks_the_model_for_every_turn(self):
         t1, t2 = task(1, labels=["model:opus"]), task(2)
         mesh = FakeMesh([t1, t2], max_concurrent=2)
-        write_replies(self.replies, {t1["id"][:8]: "↻ NEXT", t1["id"][:8] + ":resume": "✅ done",
+        write_replies(self.replies, {t1["id"][:8]: next_turn(), t1["id"][:8] + ":resume": "✅ done",
                                      t2["id"][:8]: "✅ done"})
         r = self.runner(mesh)
         for _ in range(3):
@@ -2663,7 +2535,7 @@ class Hardening(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 1
         self.cfg.project_leads = {"p1": "lead"}
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         # Each real NEXT turn must finish before settling. A shared polling deadline
         # accidentally made this routing test depend on two harness startup times.
@@ -2694,7 +2566,7 @@ class Hardening(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 1
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -2779,7 +2651,7 @@ class OwnWorkInReview(Bench):
     def test_a_wait_the_task_left_is_not_the_agents_work(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -2963,7 +2835,7 @@ class OwnWorkInReview(Bench):
         r._hold_cache.clear()
         # Exercise one completed review turn, not retries of a reply with no
         # outcome under settle_all's shared wall-clock deadline.
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?")})
         r.tick()
         review = self.finish_turn(r)
         self.assertEqual((review.mode, review.state, review.no_outcome), ("review", "waiting", 0))
@@ -3382,7 +3254,7 @@ class HandOffs(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 1
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -3412,7 +3284,7 @@ class HandOffs(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 1
         self.agent.lead = "faraway"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         with self.assertLogs("mesh_runner", "WARNING") as logs:
             r.tick()
@@ -3543,7 +3415,7 @@ class ParkedCard(Bench):
     def test_turn_that_parks_the_card_is_its_outcome(self):
         t = task(91)
         write_replies(self.replies, {t['id'][:8]: 'parked until the next op_pause',
-                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 x'})
+                                     t['id'][:8] + ':resume': wait_time(why="x")})
         r = self.runner(FakeMesh([t]))
         with self.assertLogs('mesh_runner', 'INFO') as logs:
             r.tick()
@@ -3560,8 +3432,8 @@ class ParkedCard(Bench):
 
     def test_next_on_a_parked_card_does_not_resume_it(self):
         t = task(92)
-        write_replies(self.replies, {t['id'][:8]: '↻ NEXT',
-                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 x'})
+        write_replies(self.replies, {t['id'][:8]: next_turn(),
+                                     t['id'][:8] + ':resume': wait_time(why="x")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         r.mesh.tasks[t['id']]['labels'] = ['park:external']
@@ -3572,8 +3444,8 @@ class ParkedCard(Bench):
 
     def test_ready_attempt_of_a_card_parked_meanwhile_is_not_resumed(self):
         t = task(93)
-        write_replies(self.replies, {t['id'][:8]: '↻ NEXT',
-                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 x'})
+        write_replies(self.replies, {t['id'][:8]: next_turn(),
+                                     t['id'][:8] + ':resume': wait_time(why="x")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         first = self.finish_turn(r)
@@ -3602,7 +3474,7 @@ class ParkedReview(Bench):
     def start_review(self, reply='↻ NEXT'):
         t = task(95, cat='review')
         write_replies(self.replies, {t['id'][:8]: reply,
-                                     t['id'][:8] + ':resume': '↻ NEXT: continued review'})
+                                     t['id'][:8] + ':resume': next_turn("continued review")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         a = r.store.by_state('builder', ('running',))[0]
@@ -3741,7 +3613,7 @@ class Limits(Bench):
         self.agent.on_limit_command = [sys.executable, "-c", f"open({str(flag)!r},'w').write('x'); print('to acct-2')"]
         # External operator hook confirms fresh capacity in both admission phases.
         self.agent.start_gate_command = [sys.executable, "-c", "print('ACCOUNT_CAPACITY_READY=1')"]
-        write_replies(self.replies, {t["id"][:8]: "ERROR:usage limit reached", t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: "ERROR:usage limit reached", t["id"][:8] + ":resume": wait_time(why="soak window")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -3794,7 +3666,7 @@ class CappedEventObservation(Bench):
         self.cfg.daily_start_cap = 20
         self.t = task(1)
         self.mesh, self.gl = FakeMesh([self.t, blocker], max_concurrent=1), FakeGitLab()
-        write_replies(self.replies, {self.t["id"][:8]: "⏳ WAIT card:#00000002"})
+        write_replies(self.replies, {self.t["id"][:8]: wait_card("00000002")})
         self.r = self.runner(self.mesh, self.gl)
         self.r.tick()
         self.settle_all(self.r)
@@ -3843,7 +3715,7 @@ class CappedEventObservation(Bench):
                                                       "author_id": "agent-lead", "body": c["body"]})
         self.r.store.db.close()
         self.r = self.runner(self.mesh, self.gl)
-        write_replies(self.replies, {self.t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {self.t["id"][:8]: next_turn()})
         self.r.tick()
         self.settle_all(self.r)
         self.r.tick()
@@ -3972,7 +3844,7 @@ class CappedEventObservation(Bench):
     def test_terminal_card_event_releases_unresolved_observation_once(self):
         self.unresolved_card()
         self.mesh.set_category(task(2)["id"], "done")
-        write_replies(self.replies, {self.t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {self.t["id"][:8]: next_turn()})
         self.r.tick()
         self.settle_all(self.r)
         self.r.tick()
@@ -4142,7 +4014,7 @@ class CappedEventObservation(Bench):
 
     def test_event_grants_one_turn_but_next_is_capped_again(self):
         self.cap()
-        write_replies(self.replies, {self.t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {self.t["id"][:8]: next_turn()})
         self.gl.pipelines["g/app#5"] = "success"
         self.r.tick()
         self.settle_all(self.r)
@@ -4153,7 +4025,7 @@ class CappedEventObservation(Bench):
 
     def test_next_target_replaces_the_old_observation(self):
         self.cap()
-        write_replies(self.replies, {self.t["id"][:8]: "⏳ WAIT pipeline:g/app#6"})
+        write_replies(self.replies, {self.t["id"][:8]: wait_pipeline("g/app", 6)})
         self.gl.pipelines["g/app#5"] = "success"
         self.r.tick()
         self.settle_all(self.r)
@@ -4231,7 +4103,7 @@ class WaitWorkspaceCheckpoint(Bench):
     def test_wait_returns_workspace_and_wake_resumes_session_on_same_path(self):
         t = task(71)
         self.cfg.workspace_wait_release_minutes = 30
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         self.settle_all(r)
@@ -4246,7 +4118,7 @@ class WaitWorkspaceCheckpoint(Bench):
         r._suspend_waiting(a)
         self.assertEqual(r.pool.leased_to(a.id), [])
         r.store.update(a, state='ready', wake_text='dependency met')
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r._resume_one(a)
         current = r.store.get(a.id)
         self.assertEqual(current.state, 'running')
@@ -4257,7 +4129,7 @@ class WaitWorkspaceCheckpoint(Bench):
     def test_same_path_restore_with_unknown_native_session_records_session_missing(self):
         t = task(74)
         self.cfg.workspace_wait_release_minutes = 30
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         self.settle_all(r)
@@ -4267,7 +4139,7 @@ class WaitWorkspaceCheckpoint(Bench):
         r.store.update(a, wait=wait)
         r._suspend_waiting(a)
         r.store.update(a, state='ready', wake_text='dependency met')
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         self.adapter.sessions_known = False        # the checkpoint matches, the harness no longer holds the session
         r._resume_one(a)
         self.settle_all(r)
@@ -4279,7 +4151,7 @@ class WaitWorkspaceCheckpoint(Bench):
     def test_same_path_restore_then_harness_reports_missing_session_records_session_missing(self):
         t = task(75)
         self.cfg.workspace_wait_release_minutes = 30
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         self.settle_all(r)
@@ -4290,7 +4162,7 @@ class WaitWorkspaceCheckpoint(Bench):
         r._suspend_waiting(a)
         r.store.update(a, state='ready', wake_text='dependency met')
         write_replies(self.replies, {t['id'][:8] + ':resume': 'ERROR:No conversation found with session ID: x',
-                                     t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+                                     t['id'][:8]: wait_time(why="external work")})
         r._resume_one(a)                  # restore keeps the session; the resumed turn then reports it missing
         self.settle_all(r)
         r.tick()
@@ -4305,8 +4177,8 @@ class WaitWorkspaceCheckpoint(Bench):
         # work -> another agent holds the card (a review returned with remarks, a lead's look) -> back.
         # Returning ownership must resume the existing session rather than start a fresh one.
         t = task(73)
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work',
-                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work"),
+                                     t['id'][:8] + ':resume': wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         self.settle_all(r)
@@ -4377,7 +4249,7 @@ class WaitWorkspaceCheckpoint(Bench):
 
     def _return_roundtrip(self, n, holder=None, mutate=None):
         t = task(n)
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         self.settle_all(r)
@@ -4435,8 +4307,8 @@ class WaitWorkspaceCheckpoint(Bench):
         self.agent.env_command = [sys.executable, "-c",
                                   f"import pathlib;print('MESH_RUNNER_HARNESS='+pathlib.Path({str(route)!r}).read_text())"]
         self.agent.alt = {"codex": {"profile": "base"}}
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work',
-                                     t['id'][:8] + ':resume': f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work"),
+                                     t['id'][:8] + ':resume': wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         r.alt_adapters = {"codex": FakeProfileAdapter(r.adapter.script, "base", native="codex")}
         # the harness's own session store is the boundary: the fixture codex keeps its session
@@ -4499,7 +4371,7 @@ class WaitWorkspaceCheckpoint(Bench):
 
     def test_ownership_loss_is_recorded_even_when_attempt_has_no_session_id(self):
         t = task(82)
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         r.tick()
         self.settle_all(r)
@@ -4523,7 +4395,7 @@ class WaitWorkspaceCheckpoint(Bench):
         and is the first the pool would hand out: the start asks for the old slot first, so the paths match
         and the session continues instead of a fresh start by path_changed."""
         t = task(83)
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r = self.runner(FakeMesh([t]))
         first_slot = r.pool.lease('another-attempt', 'app')                # occupies the first slot
         r.tick()
@@ -4648,7 +4520,7 @@ class WaitWorkspaceCheckpoint(Bench):
         self.agent.workspace_wait_release_minutes = 30
         t = task(74)
         mesh = FakeMesh([t])
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
         r = self.runner(mesh)
         a = r.store.create('builder', t['id'], 'claude')
         paths = [str(r.pool.lease(a.id, repo.name)) for repo in self.agent.repos]

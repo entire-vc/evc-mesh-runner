@@ -13,7 +13,7 @@ from mesh_runner import workspace_requests as requests
 from mesh_runner.workspace import git
 from mesh_runner.store import iso
 from test_runner import Bench
-from fakes import FakeMesh, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, task, write_replies, FUTURE_AT, wait_time
 
 
 class WorkspaceRequests(Bench):
@@ -46,8 +46,8 @@ class WorkspaceRequests(Bench):
         r, attempts = self.parked(18)
         repair = task(50)
         r.mesh.tasks[repair['id']] = repair
-        write_replies(self.replies, {repair['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work',
-                                    attempts[0].task8: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {repair['id'][:8]: wait_time(why="external work"),
+                                    attempts[0].task8: wait_time(why="external work")})
         a = attempts[0]
         dependency = task(51, assignee_id='agent-lead')
         r.mesh.tasks[dependency['id']] = dependency
@@ -214,7 +214,7 @@ class WorkspaceRequests(Bench):
         # Controlled owner clearing is a test fixture action, never request logic.
         r.mesh.tasks[a.task_id]['human_gate'] = False
         r.mesh.tasks[a.task_id]['labels'] = []
-        write_replies(self.replies, {a.task8: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'})
+        write_replies(self.replies, {a.task8: wait_time(why="external work")})
         current = restarted.store.get(a.id)
         restarted.store.update(current, state='ready', wake_text='controlled owner event')
         restarted._resume_one(current)

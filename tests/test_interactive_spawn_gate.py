@@ -19,8 +19,10 @@ from pathlib import Path
 from mesh_runner import interactive
 from mesh_runner.adapters.base import group_alive, interrupt_group, proc_stamp, read_events
 from mesh_runner.adapters.claude import ClaudeAdapter
+from mesh_runner.delivery_recovery import explain as explain_delivery
 from fakes import FakeMesh, task
-from test_interactive import FAKE_HARNESS, TMUX
+from test_interactive import FAKE_HARNESS
+from tmux_support import TMUX, check_tmux
 from test_runner import Bench
 
 
@@ -53,8 +55,7 @@ class BoundaryInteractiveAdapter(interactive.InteractiveAdapter):
 class InteractiveSpawnGate(Bench):
     def setUp(self):
         super().setUp()
-        if not TMUX:
-            self.skipTest('private tmux test requires tmux')
+        check_tmux(self)
         self.socket = 'mr-spawn-gate-%s-%s' % (os.getpid(), id(self))
         self.native = self.root / 'native.py'
         # The fixture's diagnostic prompt echo contains Runner instructions, including
@@ -350,8 +351,11 @@ class InteractiveSpawnGate(Bench):
             a = recovered.store.get(receipt['attempt'])
             self.assertEqual(a.state, 'unknown')
             observed, = recovered.status()['attempts']
+            # status carries the operator explanation of the unresolved delivery
             self.assertEqual(observed['prompt_delivery'],
-                             {'pending': True, 'turn': 2, 'resolution_required': True, 'reason': 'native-running-or-incomplete'})
+                             {'pending': True, 'turn': 2, 'resolution_required': True, 'reason': 'native-running-or-incomplete',
+                              'explanation': explain_delivery('native-running-or-incomplete')})
+            self.assertEqual(observed['prompt_delivery']['explanation']['replay'], 'forbidden')
             self.assertTrue(any(json.loads(row)['kind'] == 'prompt_delivery_unknown'
                                 for row in (self.cfg.state_dir / 'events.jsonl').read_text().splitlines()))
             self.assert_pending(recovered, a)

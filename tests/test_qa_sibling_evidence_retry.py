@@ -10,7 +10,7 @@ import time
 from unittest import mock
 
 from test_runner import Bench
-from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time
 import mesh_runner.runner as mod
 import mesh_runner.store as store_clock
 
@@ -30,7 +30,9 @@ raise SystemExit(76)
 class Clock:
     def __init__(self):
         self.elapsed = 0
-        self.origin = dt.datetime.now(dt.timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        # Three hours back, not a fixed hour: the fake harness stamps its typed outcome with the real
+        # clock, and the runner reads only outcomes newer than the turn start (origin + ~152 min).
+        self.origin = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).replace(second=0, microsecond=0)
 
     def now(self):
         return self.origin + dt.timedelta(seconds=self.elapsed)
@@ -66,7 +68,7 @@ class SiblingEvidenceRetry(Bench):
         mode.write_text(REASON)
         gate_log.write_text('')
         self.agent.start_gate_command = [sys.executable, str(gate), str(mode), str(gate_log)]
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 synthetic review follow-up'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="synthetic review follow-up")})
         runners = []
 
         def boot():
@@ -139,8 +141,10 @@ class SiblingEvidenceRetry(Bench):
                     r.start_new(1)
                     parked(r, 4)  # actual QA verdict still needs observable card change
                 self.assertEqual(r._review_state_sig(t), signature)
-                self.assertEqual(len(mesh.comment_log[t['id']]), 1)
-                self.assertIn('independence remains required', mesh.comment_log[t['id']][0]['body'])
+                # one runner notice; a started review turn's wait_for adds the agent's own comment
+                notices = [c['body'] for c in mesh.comment_log[t['id']] if not c['body'].startswith('Waiting on ')]
+                self.assertEqual(len(notices), 1)
+                self.assertIn('independence remains required', notices[0])
         finally:
             for r in runners:
                 for proc in r.procs.values():

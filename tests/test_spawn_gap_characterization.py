@@ -14,7 +14,7 @@ from pathlib import Path
 
 from mesh_runner.adapters.base import group_alive, interrupt_group, proc_stamp
 from mesh_runner.store import Store
-from fakes import FakeAdapter, FakeMesh, FUTURE_AT, task, write_replies
+from fakes import FakeAdapter, FakeMesh, FUTURE_AT, task, write_replies, next_turn, slow
 from test_runner import Bench
 
 
@@ -42,7 +42,7 @@ class SpawnCrashCharacterization(Bench):
         t = task(901)
         gate = self.root / 'harness'
         witness = self.root / 'boundary.json'
-        write_replies(self.replies, {t['id'][:8]: f'GATE:{gate}:↻ NEXT'})
+        write_replies(self.replies, {t['id'][:8]: slow(f"GATE:{gate}:", next_turn())})
         self.adapter = CrashAdapter(self.root / 'agent.py', witness)
         controller = os.fork()
         if controller == 0:
@@ -97,7 +97,7 @@ class SpawnCrashCharacterization(Bench):
     def test_normal_registered_worker_is_adopted_and_settles_without_second_spawn(self):
         t = task(902)
         gate = self.root / 'harness'
-        write_replies(self.replies, {t['id'][:8]: f'GATE:{gate}:↻ NEXT'})
+        write_replies(self.replies, {t['id'][:8]: slow(f"GATE:{gate}:", next_turn())})
         original = self.runner(FakeMesh([t]))
         original.tick()
         a = original.store.by_state('builder', ('running',))[0]

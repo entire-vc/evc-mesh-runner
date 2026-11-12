@@ -1,4 +1,5 @@
-"""`⏳ WAIT manual:#<this-card>`: a lead-decided passive wait on a card labelled `wake:manual`.
+"""`wait_for on=manual` (marker `⏳ WAIT manual:#<this-card>`): a lead-decided passive wait on a card
+labelled `wake:manual`.
 
 No observer exists for it, so it has no timer and no age re-check: only a comment by someone
 else (or the owner's own NEXT) resumes the session. Without the label, or naming another card,
@@ -6,10 +7,10 @@ it is refused like any unreadable outcome, so it never becomes a silent park."""
 import datetime as dt
 import unittest
 
-from fakes import FakeMesh, calls, task, write_replies
+from fakes import FakeMesh, calls, task, wait_manual, write_replies
 from test_runner import Bench
 
-from mesh_runner.outcome import MANUAL_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, parse_outcome
+from mesh_runner.outcome import MANUAL_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, from_typed, parse_outcome
 from mesh_runner.wake import check
 
 NOW = dt.datetime(2026, 11, 10, 18, 0, tzinfo=dt.timezone.utc)
@@ -38,6 +39,32 @@ class Parse(unittest.TestCase):
             self.assertNotEqual(o.note, TIME_WAIT_GUIDANCE, line)
 
 
+class Typed(unittest.TestCase):
+    """The record Mesh writes for `wait_for on=manual` (evc-mesh typed_outcome_command_service.go): kind
+    manual, no target, the card itself as task_id, the note required."""
+    TASK = "abcdef12-0000-4000-8000-000000000000"
+
+    def outcome(self, **wait):
+        row = {"id": "o-1", "kind": "wait", "wait_id": "w-1", "task_id": self.TASK, "note": ""}
+        return from_typed(row, {"id": "w-1", "kind": "manual", "task_id": self.TASK, **wait}, NOW, "abcdef12")
+
+    def test_it_is_the_markers_manual_wait_on_this_card(self):
+        o = self.outcome(note="вход: новый attachment-артефакт")
+        self.assertEqual((o.kind, o.target, o.is_wait, o.note), ("manual", "abcdef12", True,
+                                                               "вход: новый attachment-артефакт"))
+        self.assertEqual(o.line, "⏳ WAIT manual:#abcdef12: вход: новый attachment-артефакт")
+        self.assertEqual(o.typed["wait_kind"], "manual")
+
+    def test_without_a_reason_or_naming_another_card_it_gets_the_manual_guidance(self):
+        for wait in ({"note": ""}, {"note": "x", "target_task_id": "12345678-0000-4000-8000-000000000000"}):
+            o = self.outcome(**wait)
+            self.assertEqual((o.kind, o.note), ("unparsed", MANUAL_WAIT_GUIDANCE), wait)
+
+    def test_the_guidance_names_the_turn_command_not_the_marker(self):
+        self.assertIn("wait_for on=manual", MANUAL_WAIT_GUIDANCE)
+        self.assertNotIn("⏳", MANUAL_WAIT_GUIDANCE)
+
+
 class Wake(unittest.TestCase):
     def woken(self, w, comments, mode="all"):
         return check(None, None, None, {}, w, "me", comments, NOW, comment_wake=mode, agent_name="builder")
@@ -62,7 +89,7 @@ class Wake(unittest.TestCase):
 
 class Settlement(Bench):
     def line(self, t, target=None):
-        return f"⏳ WAIT manual:#{target or t['id'][:8]} — вход: новый attachment-артефакт"
+        return wait_manual("вход: новый attachment-артефакт")
 
     def test_a_labelled_card_sleeps_until_someone_else_writes(self):
         t = task(1, labels=["passive-wait", "wake:manual"])
@@ -91,16 +118,6 @@ class Settlement(Bench):
         t = task(1, labels=["passive-wait"])
         mesh = FakeMesh([t], max_concurrent=1)
         write_replies(self.replies, {t["id"][:8]: self.line(t)})
-        r = self.runner(mesh)
-        r.tick()
-        a = self.finish_turn(r)
-        self.assertEqual((a.state, a.no_outcome, a.wait), ("ready", 1, {}))
-        self.assertIn("wake:manual", a.wake_text)
-
-    def test_naming_another_card_is_refused(self):
-        t = task(1, labels=["wake:manual"])
-        mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: self.line(t, target="abcdef12")})
         r = self.runner(mesh)
         r.tick()
         a = self.finish_turn(r)

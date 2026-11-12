@@ -26,6 +26,93 @@ FUTURE_AT = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=60)).strftime(
 
 
 AGENT_ID = "agent-1"
+
+# Where the fake agent records the Mesh turn commands it "called" (set by the Bench fixture per test);
+# FakeMesh serves them back as turn-outcome rows and the active wait, the way the live MCP does.
+OUTCOME_SINK: Path | None = None
+
+
+def mesh_turn(command: str, text: str = "", **fields) -> dict:
+    """A fake agent's reply that ends the turn with a Mesh turn command, as a live lane does:
+    ``text`` is the turn's final prose (no marker line), the command is recorded in Mesh.
+
+    command: ``next`` (continue_next, ``note``), ``wait`` (wait_for: ``on`` plus that kind's fields),
+    ``ask_agent`` (``to``, ``question``), ``ask_human`` (``to``, ``question``), ``finish``
+    (finish_task, ``to``=review|done) or ``handoff`` (hand_off, ``to``=agent id)."""
+    return {"mesh_turn": command, "text": text, **fields}
+
+
+def slow(prefix: str, turn: dict) -> dict:
+    """The same turn command behind a harness prefix of the fake agent (``SLEEP:<s>:``, ``BG:<d>:``,
+    ``GATE:<path>:``, ``COMPACT:<n>:``): the command is recorded when the turn ends."""
+    return dict(turn, pre=turn.get("pre", "") + prefix)
+
+
+def next_turn(note: str = "", text: str = "") -> dict:
+    return mesh_turn("next", text, note=note)
+
+
+def wait_card(target: str, note: str = "", condition: str = "", text: str = "") -> dict:
+    """wait_for on=card; ``target`` a full card id (a short one is padded, as the MCP resolves it)."""
+    fields = {"target_task_id": target if len(target) == 36 else target[:8] + "-0000-4000-8000-000000000000"}
+    if condition:
+        fields["target_condition"] = condition
+    return mesh_turn("wait", text, on="card", note=note, **fields)
+
+
+def wait_time(until_at: str = "", why: str = "soak window", event_ref: str = "fixture-window",
+              source: str = "https://status.example.com/fixture-window", text: str = "") -> dict:
+    """wait_for on=time with its published source."""
+    return mesh_turn("wait", text, on="time", until_at=until_at or FUTURE_AT, event_ref=event_ref,
+                     source=source, why=why, note=why)
+
+
+def wait_pipeline(project: str, pipeline_id: int, until: str = "finished", jobs=(), note: str = "",
+                  text: str = "", **baseline) -> dict:
+    fields = dict(project_path=project, pipeline_id=int(pipeline_id), until=until, note=note, **baseline)
+    if jobs:
+        fields["required_jobs"] = list(jobs)
+    return mesh_turn("wait", text, on="pipeline", **fields)
+
+
+def wait_mr(project: str, iid: int, until: str = "", provider: str = "gitlab", jobs=(), note: str = "",
+            text: str = "", **baseline) -> dict:
+    """wait_for on=mr; no ``until`` is the plain form (merged, or the head pipeline's result)."""
+    fields = dict(project_path=project, mr_iid=int(iid), provider=provider, note=note, **baseline)
+    if until:
+        fields["until"] = until
+    if jobs:
+        fields["required_jobs"] = list(jobs)
+    return mesh_turn("wait", text, on="mr", **fields)
+
+
+def wait_merge(project: str, iid: int, sha: str, note: str = "", text: str = "") -> dict:
+    return mesh_turn("wait", text, on="merge", project_path=project, mr_iid=int(iid), after_sha=sha, note=note)
+
+
+def wait_registered(registration: str, ref: str, note: str = "", text: str = "") -> dict:
+    return mesh_turn("wait", text, on="registered", registration=registration, registration_ref=ref, note=note)
+
+
+def wait_manual(note: str, text: str = "") -> dict:
+    """wait_for on=manual: Mesh records it on the card itself (no target, no timer), only under ``wake:manual``."""
+    return mesh_turn("wait", text, on="manual", note=note)
+
+
+def ask_agent(to: str, question: str, text: str = "") -> dict:
+    return mesh_turn("ask_agent", text, to=to, question=question)
+
+
+def ask_human(to: str, question: str, text: str = "") -> dict:
+    return mesh_turn("ask_human", text, to=to, question=question)
+
+
+def finish(to: str = "done", evidence: str = "criteria met", text: str = "") -> dict:
+    return mesh_turn("finish", text, to=to, evidence=evidence)
+
+
+def hand_off(to: str, why: str = "", text: str = "") -> dict:
+    return mesh_turn("handoff", text, to=to, why=why)
 STATUSES = [
     {"id": "s-todo", "category": "todo"}, {"id": "s-prog", "category": "in_progress"},
     {"id": "s-rev", "category": "review"}, {"id": "s-done", "category": "done"},
@@ -160,6 +247,7 @@ class FakeMesh:
 
     def my_tasks(self, cat):
         self.my_tasks_calls = getattr(self, "my_tasks_calls", []) + [cat]
+        self._sync_turns()
         cats = cat.split(",")
         return [dict(t) for t in self.tasks.values()
                 if t.get("assignee_id") == AGENT_ID and self.category(t) in cats]
@@ -174,6 +262,7 @@ class FakeMesh:
             raise MeshError(403, "agent is not a member of this project")
         if tid not in self.tasks:
             raise MeshError(404, "not found")
+        self._sync_turns()
         out = dict(self.tasks[tid])
         out.setdefault("version", 1)
         if getattr(self, "shows_runtime", False):     # a Mesh that returns the card's runtime state
@@ -190,9 +279,11 @@ class FakeMesh:
         raise NotImplementedError(path)
 
     def comments(self, tid, limit=20):
+        self.recorded_turns(tid)
         return list(self.comment_log.get(tid, []))[-limit:]
 
     def comments_all(self, tid):
+        self.recorded_turns(tid)
         return list(self.comment_log.get(tid, []))
 
     def add_comment(self, tid, body, author=AGENT_ID, at=None):
@@ -201,19 +292,104 @@ class FakeMesh:
         self.comment_log.setdefault(tid, []).append(c)
         return c
 
+    def recorded_turns(self, tid):
+        """(row, wait) pairs the fake agent's turn commands recorded for ``tid`` (see ``mesh_turn``), oldest
+        first: what Mesh's turn-outcomes table holds after a live lane called wait_for / continue_next /
+        ask_agent / ask_human. finish_task and hand_off change the card itself and are applied when read."""
+        out = []
+        for rec in self._turn_records():
+            if not tid.startswith(rec["task8"]) or tid not in self.tasks:
+                continue
+            row, wait = rec["row"], rec.get("wait")
+            # Mesh records the command under the calling agent: the identity this runner works as.
+            try:
+                caller = (self.me() or {}).get("id")
+            except Exception:
+                caller = None
+            row = dict(row, task_id=tid, agent_id=caller or row.get("agent_id"))
+            if wait is not None:
+                wait = dict(wait, task_id=tid)
+            out.append((row, wait))
+            self._apply_turn(tid, rec)
+        return out
+
+    def _turn_records(self):
+        sink = getattr(self, "outcome_sink", None) or OUTCOME_SINK
+        if sink is None or not Path(sink).exists():
+            return []
+        return [json.loads(line) for line in Path(sink).read_text().splitlines()]
+
+    def _sync_turns(self):
+        """Apply every recorded turn command to the cards (status, assignee, gate, comment), as Mesh has
+        by the time anyone reads a card after the command returned."""
+        for rec in self._turn_records():
+            tid = next((t for t in self.tasks if t.startswith(rec["task8"])), None)
+            if tid is not None:
+                self._apply_turn(tid, rec)
+
+    def _apply_turn(self, tid, rec):
+        """What Mesh did to the card when the command ran, once per recorded call: the command's comment,
+        ask_human's gate, finish_task's status, hand_off's assignee."""
+        done = self.__dict__.setdefault("_applied_turns", set())
+        if rec["row"]["id"] in done:
+            return
+        done.add(rec["row"]["id"])
+        # Mesh writes the command's own comment, authored by the agent, in the same transaction
+        # (typed_outcome_command_service.go): it moves the lane's comment cursor like any comment.
+        row, wait = rec["row"], rec.get("wait") or {}
+        note = row.get("note") or ""
+        body = {"next": "Continuing: " + note if note else "Continuing with the next step.",
+                "wait": (f"❓ Blocking @{wait.get('addressee')}: {wait.get('question')}" if wait.get("kind") == "human"
+                         else f"❔ **Question to {(wait.get('note') or '').removeprefix('asked ')}** · request "
+                              f"`{wait.get('decision_request_id')}`\n\n{wait.get('question')}"
+                         if wait.get("kind") == "decision"
+                         else f"Waiting on {wait.get('kind', 'an event')}." + ("\n\n" + note if note else "")),
+                "done": "Finished.\n\n" + note, "review": "Handed to review.\n\n" + note,
+                "handoff": f"Handed over to {rec.get('to')}.\n\n" + note}.get(row["kind"], note)
+        c = {"id": str(uuid.uuid4()), "author_id": AGENT_ID, "author_name": AGENT_ID, "body": body,
+             "created_at": row["created_at"]}
+        log = self.comment_log.setdefault(tid, [])
+        at = next((i for i, o in enumerate(log) if (o.get("created_at") or "") > c["created_at"]), len(log))
+        log.insert(at, c)
+        t = self.tasks[tid]
+        if wait.get("kind") == "human":                # ask_human raises the person's gate on the card
+            t["human_gate"] = True
+        if rec["row"]["kind"] in ("done", "review"):
+            t["status_id"] = "s-rev" if rec["row"]["kind"] == "review" else "s-done"
+        elif rec["row"]["kind"] == "handoff":
+            t["assignee_id"], t["status_id"] = rec["to"], "s-todo"
+        if rec["row"]["kind"] in ("done", "review", "handoff"):
+            # finish_task and hand_off release the caller's checkout in the same step (Mesh MCP
+            # turn_outcomes.go): a runner that sees the card closed mid-turn finds no lease left.
+            self.checkouts.pop(tid, None)
+
     def turn_outcomes(self, tid, limit=5):
-        """Typed turn outcomes (Mesh turn commands), newest first; set ``mesh.outcomes[tid]``.
+        """Typed turn outcomes (Mesh turn commands), newest first: the fake agent's recorded commands
+        (``mesh_turn``) and ``mesh.outcomes[tid]`` a test sets directly.
         ``mesh.typed_error`` (a MeshError or OSError) makes the read fail; ``typed_reads`` counts reads."""
         self.typed_reads = getattr(self, "typed_reads", 0) + 1
         if getattr(self, "typed_error", None) is not None:
             raise self.typed_error
-        return list(getattr(self, "outcomes", {}).get(tid, []))[:limit]
+        rows = [row for row, _ in self.recorded_turns(tid)]
+        rows += list(getattr(self, "outcomes", {}).get(tid, []))
+        rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+        return rows[:limit]
 
     def active_wait(self, tid, agent_id):
+        """The agent's active wait on ``tid``: one a test set in ``mesh.waits``, else the wait of the newest
+        recorded turn command (a later continue_next / finish_task / hand_off ends it, as in Mesh)."""
         self.typed_reads = getattr(self, "typed_reads", 0) + 1
         if getattr(self, "wait_error", None) is not None:
             raise self.wait_error
-        return getattr(self, "waits", {}).get(tid)
+        if tid in getattr(self, "waits", {}):
+            return self.waits[tid]
+        recorded = self.recorded_turns(tid)
+        if not recorded or recorded[-1][1] is None:
+            return None
+        wait = recorded[-1][1]
+        if wait["id"] in {w for _, w, _, _ in getattr(self, "resolved", [])}:
+            return None
+        return wait
 
     def resolve_wait(self, tid, wait_id, resolution, cause):
         """POST /tasks/:id/waits/:wait_id/resolve: recorded in ``mesh.resolved``; ``mesh.resolve_errors``
@@ -398,7 +574,9 @@ class HarnessGate:
         self.started = path.with_suffix(".started")
         self.released = path.with_suffix(".released")
 
-    def reply(self, text: str) -> str:
+    def reply(self, text):
+        if isinstance(text, dict):                     # a typed turn: gate the text, keep the command
+            return slow(f"GATE:{self.path}:", text)
         return f"GATE:{self.path}:{text}"
 
     def release(self):
@@ -447,6 +625,9 @@ replies = json.load(open(os.environ["FAKE_REPLIES"]))
 m = re.search(r"#([0-9a-f]{8})", prompt)
 key = m.group(1) if m else ""
 reply = replies.get(key + (":resume" if "--resume" in args else ""), replies.get(key, ""))
+turn_command = None
+if isinstance(reply, dict):                      # the turn ends with a Mesh turn command (mesh_turn)
+    turn_command, reply = reply, reply.get("pre", "") + reply.get("text", "")
 if not reply.startswith("DIE:"):
     if "--settings" in args:
         settings = json.load(open(args[args.index("--settings") + 1]))
@@ -503,6 +684,35 @@ open(os.environ["FAKE_CALLS"], "a").write(json.dumps({"task": key, "sid": sid, "
                                                       if "--model" in args else "",
                                                       "effort": args[args.index("--effort") + 1]
                                                       if "--effort" in args else ""}) + "\n")
+if turn_command is not None and os.environ.get("FAKE_OUTCOMES"):
+    import datetime, uuid
+    cmd = dict(turn_command)
+    command = cmd.pop("mesh_turn"); cmd.pop("text", None); cmd.pop("pre", None)
+    at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    oid, wid = str(uuid.uuid4()), str(uuid.uuid4())
+    row = {"id": oid, "agent_id": "agent-1", "created_at": at, "note": cmd.get("note", "")}
+    wait = None
+    if command == "next":
+        row["kind"] = "next"
+    elif command == "wait":
+        row["kind"] = "wait"
+        wait = dict({k: v for k, v in cmd.items() if k != "on"}, kind=cmd["on"], id=wid)
+    elif command == "ask_agent":
+        row.update(kind="wait", note="asked " + cmd["to"])
+        wait = {"id": wid, "kind": "decision", "decision_request_id": str(uuid.uuid4()),
+                "note": "asked " + cmd["to"], "question": cmd["question"]}
+    elif command == "ask_human":
+        row.update(kind="wait", note=cmd["question"])
+        wait = {"id": wid, "kind": "human", "addressee": cmd["to"], "question": cmd["question"],
+                "human_gate_ref": "gate-" + oid[:8]}
+    elif command == "finish":                    # Mesh records finish_task as done / review
+        row.update(kind="review" if cmd.get("to") == "review" else "done", note=cmd.get("evidence", ""))
+    else:                                        # handoff
+        row.update(kind="handoff", note=cmd.get("why", ""))
+    if wait is not None:
+        row["wait_id"] = wid
+    rec = {"task8": key, "row": row, "wait": wait, "to": cmd.get("to", "")}
+    open(os.environ["FAKE_OUTCOMES"], "a").write(json.dumps(rec) + "\n")
 print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "model": "fake-model"}))
 for _ in range(compactions):
     print(json.dumps({"type": "system", "subtype": "compact_boundary", "session_id": sid}))

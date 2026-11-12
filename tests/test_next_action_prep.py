@@ -6,7 +6,7 @@ from types import SimpleNamespace as NS
 from mesh_runner import next_action
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import AgentRunner
-from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time, wait_card
 from test_runner import Bench
 
 TID = "c1a9f668-c831-4861-9ec7-f99d573c5819"
@@ -153,7 +153,7 @@ class SelectorIntegration(Bench):
         self.mesh.tasks[self.blocker["id"]] = self.blocker
         self.mesh.deps[self.t["id"]] = [self.edge]
         self.mesh.next_action = lambda tid: self.reads.append(tid) or self.proj
-        write_replies(self.replies, {self.t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 prep done"})
+        write_replies(self.replies, {self.t["id"][:8]: wait_time(why="prep done")})
 
     def starts(self):
         return [c for c in calls(self.calls) if c["task"] == "00000001"]
@@ -201,7 +201,7 @@ class SelectorIntegration(Bench):
         generation must still reach the consumer: one wake, same attempt, edge stays open."""
         self.agent.next_action_prep = True
         self.edge["task_id"] = self.t["id"]            # a well-formed Mesh row, as the stale-observation guard requires
-        write_replies(self.replies, {self.t["id"][:8]: f"⏳ WAIT card:#{self.blocker['id'][:8]}"})
+        write_replies(self.replies, {self.t["id"][:8]: wait_card(self.blocker["id"])})
         r = self.runner(self.mesh)
         self.settle_all(r)
         first = self.mark(r)

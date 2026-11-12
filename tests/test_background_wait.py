@@ -23,6 +23,7 @@ from mesh_runner.config import load
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.tui_driver import Driver, background_agents
 from mesh_runner.watchdog import Signal, judge
+from tmux_support import needs_tmux
 
 RULE = "─" * 60
 
@@ -166,7 +167,7 @@ class Detector(unittest.TestCase):
             self.assertFalse(d.progress["held"])
 
 
-@unittest.skipUnless(ti.TMUX, "tmux not installed")
+@needs_tmux
 class HeldPrompt(unittest.TestCase):
     """The first turn runs normally; the second goes into the same live session while the
     screen shows a background agent for its first checks. The fake harness and private tmux

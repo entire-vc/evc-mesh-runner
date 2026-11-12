@@ -7,10 +7,10 @@ from pathlib import Path
 
 from mesh_runner import config
 from mesh_runner.effects import runtime_state
-from mesh_runner.outcome import CONTRACT, MERGE_WAIT_GUIDANCE, contract, parse_line
+from mesh_runner.outcome import CONTRACT, MERGE_MARKER_GUIDANCE, MERGE_WAIT_GUIDANCE, contract, parse_line
 from mesh_runner.prompt import no_outcome_prompt, start_prompt
 from mesh_runner.store import iso
-from fakes import FakeGitLab, FakeMesh, task, write_replies, FUTURE_AT
+from fakes import FakeGitLab, FakeMesh, task, write_replies, FUTURE_AT, wait_time
 from test_runner import Bench
 
 NOW = dt.datetime.now(dt.timezone.utc)      # parser tests only
@@ -113,7 +113,8 @@ class Parser(MergeBench):
         for text in (CONTRACT, contract(), contract(False)):
             self.assertNotIn("WAIT merge:", text)
             self.assertNotIn("on=merge", text)
-        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, ""), CONTRACT)
+        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, "").replace(MERGE_MARKER_GUIDANCE, ""),
+                         CONTRACT)
         t = task(1)
         for merge in (True, False):
             for text in (start_prompt(t, "builder", [], [], merge=merge),
@@ -640,7 +641,7 @@ class ReleasedWorkspace(MergeBench):
         a = self.check(r, a)
         self.assertEqual(a.state, "ready")
         self.assertIn("merged at " + "c" * 40, a.wake_text)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 verifying"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="verifying")})
         r._resume_one(a)
         resumed = r.store.get(a.id)
         self.assertEqual(resumed.state, "running")

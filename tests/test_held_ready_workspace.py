@@ -11,7 +11,7 @@ from mesh_runner.workspace import WorkspaceError
 from mesh_runner.workspace_scope import RECEIPT_KEY
 import test_workspace_requests as requests_fixture
 from test_runner import Bench
-from fakes import write_replies
+from fakes import write_replies, wait_time
 
 
 class HeldReady(Bench):
@@ -58,7 +58,7 @@ class HeldReady(Bench):
         self.assertFalse(restarted.procs)
         self.assertEqual(bool(r.mesh.tasks[a.task_id].get('human_gate')), human)
         r.mesh.tasks[a.task_id]['human_gate'] = False  # authorized owner fixture action
-        write_replies(self.replies, {a.task8: '⏳ WAIT 2h: external work'})
+        write_replies(self.replies, {a.task8: wait_time(why="external work")})
         restarted._resume_one(held)
         resumed = restarted.store.get(a.id)
         self.assertEqual(resumed.state, 'running')

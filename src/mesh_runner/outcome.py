@@ -664,6 +664,22 @@ def _typed_decision(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outc
     return Outcome("decision", handle=handle, note=note, line=line)
 
 
+def _typed_manual(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
+    """A lead-decided passive wait (``wait_for on=manual``): Mesh records it on this card itself, with no
+    target and no timer, and only on a card labelled ``wake:manual``. The Outcome is the
+    ``⏳ WAIT manual:#<this card>`` marker's, so the runner checks the label again when it settles."""
+    own = (task8 or str(wait.get("task_id") or row.get("task_id") or "")[:8]).lower()
+    if not re.fullmatch(r"[0-9a-f]{8}", own):
+        return typed_unparsed(row, wait, "the manual wait names no card")
+    other = str(wait.get("target_task_id") or "").lower()
+    if other and other[:8] != own:
+        return Outcome("unparsed", note=MANUAL_WAIT_GUIDANCE, line=f"⏳ WAIT manual:#{other[:8]}")
+    note = _typed_note(row, wait)
+    if not note:
+        return Outcome("unparsed", note=MANUAL_WAIT_GUIDANCE, line=f"⏳ WAIT manual:#{own}")
+    return Outcome("manual", own, note=note, line=f"⏳ WAIT manual:#{own}" + _tail(note))
+
+
 # Mesh wait kind -> builder. A new kind on the server is one entry here; until it has one, a wait of that
 # kind is a precise `unparsed`, never no outcome.
 TYPED_WAITS = {
@@ -675,6 +691,7 @@ TYPED_WAITS = {
     "time": _typed_time,
     "decision": _typed_decision,
     "human": _typed_human,
+    "manual": _typed_manual,
 }
 
 
@@ -749,10 +766,11 @@ QUEUE_WAIT_GUIDANCE = (
 
 
 MANUAL_WAIT_GUIDANCE = (
-    "invalid manual wait: `⏳ WAIT manual:#<this-card-8hex> — <why>` is accepted only on this card itself and only "
-    "while it carries the `wake:manual` label (a lead's decision that no observable event exists). It has no timer "
-    "and no age re-check: a comment by someone else on this card resumes it, or your own `↻ NEXT`. Without that "
-    "decision, declare an observable condition (card, mr, pipeline, decision) or finish the card."
+    "invalid manual wait: `wait_for on=manual note=<why>` is accepted only on this card itself and only while it "
+    "carries the `wake:manual` label (a lead's decision that no observable event exists). It has no timer and no "
+    "age re-check: a comment by someone else on this card resumes it, or your own `continue_next`. Without that "
+    "decision, end the turn with an observable condition (wait_for on=card, mr or pipeline; ask_agent) or "
+    "finish_task."
 )
 
 
@@ -765,7 +783,9 @@ resolves it. A known external scheduled event may still use wait_for on=time whi
 
 # What every agent sees at the end of a turn's prompt. The turn commands are the evc-mesh MCP tools
 # (internal/mcp/turn_outcomes.go): their names, parameters and values are copied from there. The marker
-# lines stay as the fallback the parser still reads, until the outcome_source counter shows nobody uses them.
+# lines stay as the fallback the parser still reads, until the outcome_source counter shows nobody uses them;
+# they are offered only after a refused command (a lane that writes them instead of calling is the "habit"
+# failure), never as an equal path.
 _CONTRACT_TEMPLATE = """\
 End every turn on this task by calling exactly ONE Mesh turn command (Mesh MCP tool, task_id = this card).
 It records the outcome, writes the comment and keeps or releases your checkout; a refusal writes nothing,
@@ -800,12 +820,13 @@ Waits sleep until their event: CI waits never wake because time passes. No relat
 invented 6h/24h retries; a missing observer is an integration blocker. Internal retry/backoff never writes a
 task's start_after. Provider quotas, account resets and Retry-After are account routing, never a task wait.
 Your session is kept: when the condition is met you are resumed in this same conversation.
-Only if the Mesh command is unavailable or fails for a reason you cannot fix, post ONE comment whose last line
-is a marker instead:
+Only if the Mesh command is unavailable or fails: call it first, a marker line never replaces a call. When
+Mesh refused or errored for a reason you cannot fix, post ONE comment quoting the command and its error,
+ending with the same outcome:
   ⏳ WAIT card:#<8hex> | mr:<group>/<project>!<iid> | pipeline:<group>/<project>#<id> (mr:github:<org>/<repo>!<n>)
       CI baseline: until=change|success after=<full-head-sha>:<pipeline-id>:<status>, or for mr
       until=merged after=<full-head-sha>:opened; then optionally jobs=[<job>,<job>]
-  ⏳ WAIT decision:@<agent>: <question> | queue:#<this-card-8hex>
+@@MERGE_MARKER@@  ⏳ WAIT decision:@<agent>: <question> | queue:#<this-card-8hex>
   ⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
   ↻ NEXT: <note>      ❓ Blocking @<person>: <question>
 """ + DECISION_WAIT_GUIDANCE
@@ -815,13 +836,15 @@ is a marker instead:
 MERGE_WAIT_GUIDANCE = (
     "  wait_for on=merge project_path=<group>/<project> mr_iid=<iid> after_sha=<full head sha>  — after a SHIP\n"
     "      verdict on the current head: the runner runs the merge gate itself and wakes you when merged or\n"
-    "      blocked. Do not re-run the merge gate in a loop yourself.\n"
-    "      Marker: ⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>\n")
+    "      blocked. Do not re-run the merge gate in a loop yourself.\n")
+# Its marker sits with the other fallback lines, never next to the command as an equal path.
+MERGE_MARKER_GUIDANCE = "  ⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>\n"
 
 
 def contract(merge: bool = False) -> str:
-    """The outcome contract text; ``merge``: include the `WAIT merge:` guidance."""
-    return _CONTRACT_TEMPLATE.replace("@@MERGE_WAIT@@", MERGE_WAIT_GUIDANCE if merge else "")
+    """The outcome contract text; ``merge``: include the merge wait and its fallback line."""
+    return (_CONTRACT_TEMPLATE.replace("@@MERGE_WAIT@@", MERGE_WAIT_GUIDANCE if merge else "")
+            .replace("@@MERGE_MARKER@@", MERGE_MARKER_GUIDANCE if merge else ""))
 
 
 CONTRACT = contract()

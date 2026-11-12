@@ -6,7 +6,7 @@ import json
 import time
 from unittest import mock
 
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT, ask_agent, next_turn, slow, wait_time
 from test_runner import Bench
 
 from mesh_runner.config import AgentConfig
@@ -65,7 +65,7 @@ class StartCap(CapBench):
     def test_unchanged_inputs_do_not_start_and_new_comment_starts_once(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
@@ -77,12 +77,14 @@ class StartCap(CapBench):
         self.settle_all(r)
         self.assertEqual(len(calls(self.calls)), 1)
         self.assertFalse(r._cap_wait(t["id"]))         # the new input is being worked
-        self.assertEqual(len(self.bodies(mesh, t)) - 1, 1)   # one cap comment, plus the agent's own wait
+        # one cap comment; the rest are the new input and the wait_for comment Mesh wrote for the agent
+        self.assertEqual(sum("START CAP" in b for b in self.bodies(mesh, t)), 1)
+        self.assertEqual(len(self.bodies(mesh, t)), 3)
 
     def test_a_comment_after_the_last_session_is_not_swallowed_by_the_start_cap(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
@@ -353,7 +355,7 @@ class OtherCaps(CapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         r.tick()
         for turn in range(3):
@@ -372,43 +374,24 @@ class OtherCaps(CapBench):
         r.tick()
         self.assertEqual(len(calls(self.calls)), before)              # nothing new: nothing starts
 
-    def test_turn_cap_on_a_decision_wait_still_files_the_request(self):
-        # The cap used to run before the ask was routed: the card went back to todo waiting for
-        # "new input", but the addressee was never asked, so nothing could ever arrive.
+    def test_turn_cap_on_an_ask_agent_wait_requeues_and_files_no_second_request(self):
+        # ask_agent: Mesh opened the request and addressed the agent before the cap ran; the runner
+        # requeues the card and files nothing itself (its own filing is the marker path's, see
+        # test_outcome_marker_scenarios.MarkerCaps). The addressee's answer is the new input.
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
         self.cfg.daily_wait_budget = 0
         self.peer("lead", repos=[])                    # an addressee this runner serves
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead: approve the plan?"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "approve the plan?")})
         r = self.runner(mesh)
         r.tick()
         self.finish_turn(r)
-        self.assertEqual(len(mesh.created), 1)
-        req = mesh.created[0]
-        self.assertEqual(req["assignee_id"], "agent-lead")
-        self.assertIn("decision-request", req["labels"])
+        self.assertEqual(mesh.created, [])
         self.assertIn("cap: requeued (turn budget)", self.notes(r, t))
         self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")
         mesh.add_comment(t["id"], "approved", author="agent-lead")
         self.assertNotIn("waiting for new input", r.hold_reason(dict(mesh.tasks[t["id"]]), "work") or "")
-
-    def test_turn_cap_files_the_request_when_the_agent_shares_its_slug_with_a_service_user(self):
-        t = task(1)
-        mesh = FakeMesh([t], max_concurrent=1)
-        self.cfg.daily_next_budget = 2
-        self.cfg.daily_wait_budget = 0
-        self.peer("lead", repos=[])
-        lead_id = next(a["id"] for a in mesh.agents if a["name"] == "lead")
-        mesh.recipients = [
-            {"id": lead_id, "kind": "agent", "slug": "lead", "display_name": "lead"},
-            {"id": "u-lead", "kind": "user", "slug": "lead", "display_name": "lead (QA)",
-             "is_service_user": True, "agent_id": lead_id}]
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead: approve the plan?"})
-        r = self.runner(mesh)
-        r.tick()
-        self.finish_turn(r)
-        self.assertEqual(len(mesh.created), 1)
 
     def test_turn_cap_does_not_file_a_request_under_a_human_gate(self):
         t = task(1)
@@ -416,7 +399,7 @@ class OtherCaps(CapBench):
         self.cfg.daily_next_budget = 2
         self.cfg.daily_wait_budget = 0
         self.peer("lead", repos=[])
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@lead: approve the plan?"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "approve the plan?")})
         r = self.runner(mesh)
         r.tick()
         mesh.tasks[t["id"]]["human_gate"] = True
@@ -428,7 +411,7 @@ class OtherCaps(CapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
         self.cfg.daily_wait_budget = 0
-        write_replies(self.replies, {t["id"][:8]: "⏳ WAIT decision:@owner: which plan?"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("owner", "which plan?")})
         r = self.runner(mesh)
         r.tick()
         self.finish_turn(r)
@@ -441,7 +424,7 @@ class OtherCaps(CapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.max_compactions = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: f"COMPACT:2:⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window"})
+        write_replies(self.replies, {t["id"][:8]: slow(f"COMPACT:2:", wait_time(why="soak window"))})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -515,7 +498,7 @@ class RequeueRefused(CapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         r.tick()
         for turn in range(3):
@@ -621,7 +604,7 @@ class EventWokenStarts(CapBench):
         """A card whose agent started it up to the cap; ``wait`` is what its last session was parked on."""
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
@@ -735,7 +718,7 @@ class EventWokenStarts(CapBench):
         # the production case: the cap parked the card (cap wait), then a comment woke it
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
@@ -756,7 +739,7 @@ class EventWokenStarts(CapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         other = task(2, cat="done")
         mesh.tasks[other["id"]] = other
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         self.agent.repos[0] = dataclasses.replace(self.agent.repos[0], max_slots=16)   # closed sessions keep their leases
         r = self.runner(mesh)
         r.refresh_me()
@@ -793,7 +776,7 @@ class EventWokenStarts(CapBench):
         mesh.links = {t["id"]: [{"url": "u", "link_type": "pr", "status": "merged", "status_synced_at": old,
                                  "pipeline_status": "success", "pipeline_updated_at": old}]}
         mesh.deps[t["id"]] = [{"depends_on_task_id": other["id"], "dependency_type": "blocks"}]
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r = self.runner(mesh)
         r.refresh_me()
         for i in range(5):                             # crashes and retries: nothing new reached the card

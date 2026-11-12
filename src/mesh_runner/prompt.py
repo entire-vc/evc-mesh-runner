@@ -259,8 +259,8 @@ def no_outcome_prompt(task: dict, line: str = "", why: str = "", merge: bool = F
     else:
         head = f"[runner] Your last turn on task #{task['id'][:8]} ended without an outcome.\n"
     return head + f"""End the turn now with ONE Mesh turn command (wait_for, continue_next, ask_agent, ask_human,
-finish_task or hand_off). Only if the command is unavailable or fails, post the closing comment with the marker
-line instead.
+finish_task or hand_off): call it, do not write it as a line. A marker line is read only after Mesh refused
+that command; then quote the command and the error in the same comment.
 {contract(merge)}{delivery_note(task)}"""
 
 

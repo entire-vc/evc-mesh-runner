@@ -7,7 +7,7 @@ from unittest import mock
 
 from mesh_runner.store import iso
 from mesh_runner.wake import GitLab
-from fakes import AGENT_ID, FakeMesh, task, write_replies
+from fakes import AGENT_ID, FakeMesh, task, write_replies, wait_pipeline
 from test_runner import Bench
 
 
@@ -362,7 +362,7 @@ class CIIdleBudget(Bench):
         r, t, gl = self.setup_flow()
         a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
         self.wake_ci(r, a, gl)
-        write_replies(self.replies, {t['id'][:8] + ':resume': '⏳ WAIT pipeline:g/app#2'})
+        write_replies(self.replies, {t['id'][:8] + ':resume': wait_pipeline("g/app", 2)})
         self.assertEqual(r.resume_ready(1), 0)
         a = r.store.get(a.id)
         self.assertEqual(r.procs[a.id].wait(timeout=10), 0)

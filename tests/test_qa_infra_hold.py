@@ -4,7 +4,7 @@ import sys
 from unittest import mock
 
 from test_runner import Bench
-from fakes import FakeMesh, task, write_replies, calls, FUTURE_AT
+from fakes import FakeMesh, task, write_replies, calls, FUTURE_AT, wait_time
 import mesh_runner.runner as mod
 import mesh_runner.store as clock
 
@@ -76,13 +76,16 @@ class QAInfraHold(Bench):
                     self.assertEqual(len(calls(self.calls)), prior_calls)
                 # The next scheduled probe discovers recovery without requiring a card edit.
                 self.agent.start_gate_command = [sys.executable, '-c', 'raise SystemExit(0)']
-                write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 review follow-up'})
+                write_replies(self.replies, {t['id'][:8]: wait_time(why="review follow-up")})
                 with mock.patch.object(mod, 'now', return_value=same_day_retry + dt.timedelta(minutes=61)), mock.patch.object(clock, 'now', return_value=same_day_retry + dt.timedelta(minutes=61)):
                     r._gate_hold.clear(); r._hold_cache.clear()
                     r._start_one(review())
                 self.settle_all(r)
                 self.assertEqual(len(calls(self.calls)), prior_calls + 1)
-                self.assertEqual(len(mesh.comment_log[t['id']]), retry_notices)
+                # the runner's notices stay as they were; the agent's wait_for wrote its own comment
+                bodies = [c['body'] for c in mesh.comment_log[t['id']]]
+                self.assertEqual(sum(b.startswith('Waiting on time.') for b in bodies), 1)
+                self.assertEqual(len(bodies) - 1, retry_notices)
                 r.store.db.close()
 
     def test_unknown_reason_does_not_become_review_hold(self):

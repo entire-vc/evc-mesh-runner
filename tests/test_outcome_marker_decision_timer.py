@@ -1,4 +1,8 @@
-"""Resume guidance reaches a real child; deterministic adoption is not live agent compliance."""
+"""Resume guidance reaches a real child; deterministic adoption is not live agent compliance.
+
+Marker-line fallback: the agent writes ``⏳ WAIT decision:@<agent>`` and the runner files the decision request
+itself, then adopts it across a timer. With ``ask_agent`` Mesh opens the request, so this runner-side filing
+and adoption is the marker parser's and goes away with it."""
 import datetime as dt
 from unittest.mock import patch
 

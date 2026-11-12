@@ -3,7 +3,7 @@ import json
 from dataclasses import replace
 from unittest.mock import patch
 
-from fakes import FakeMesh, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, task, write_replies, FUTURE_AT, next_turn, wait_time
 from test_runner import Bench
 from test_workspace import make_repo
 from mesh_runner.workspace import RepoSpec, WorkspaceError
@@ -31,7 +31,7 @@ class MetadataDecision(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
         held = runner.pool.lease("other-attempt", "app")
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 queue empty"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="queue empty")})
         with patch("mesh_runner.runner.time.time", return_value=NOW):
             runner.tick()
             a = self.finish_turn(runner)
@@ -68,7 +68,7 @@ class MetadataDecision(Bench):
         t = decision()
         runner = self.runner(FakeMesh([t], max_concurrent=1))
         held = runner.pool.lease("other-attempt", "app")
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 awaiting evidence"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="awaiting evidence")})
         runner.tick()
         attempt, = runner.store.by_state(self.agent.name, ("running",))
         self.assertEqual((attempt.agent, attempt.workspaces), (self.agent.name, []))
@@ -83,7 +83,7 @@ class MetadataDecision(Bench):
         choice = decision(2)
         runner = self.runner(FakeMesh([normal, choice], max_concurrent=1))
         runner.pool.lease("other-attempt", "app")
-        write_replies(self.replies, {choice["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 awaiting evidence"})
+        write_replies(self.replies, {choice["id"][:8]: wait_time(why="awaiting evidence")})
         runner.tick()
         attempt, = runner.store.by_state(self.agent.name, ("running",))
         self.assertEqual(attempt.task_id, choice["id"])
@@ -125,7 +125,7 @@ class MetadataDecision(Bench):
         t = decision()
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         self.assertEqual(first.workspaces, [])
@@ -161,7 +161,7 @@ class MetadataDecision(Bench):
     def test_global_parallel_capacity_still_limits_metadata_starts(self):
         choices = [decision(1), decision(2)]
         runner = self.runner(FakeMesh(choices, max_concurrent=1))
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 awaiting evidence" for t in choices})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="awaiting evidence") for t in choices})
         runner.tick()
         started = runner.store.by_state(self.agent.name, ("running",))
         self.assertEqual(len(started), 1)
@@ -176,7 +176,7 @@ class MetadataDecision(Bench):
             result = checkout(*args, **kw)
             mesh.tasks[t["id"]]["labels"].append(WORKSPACE_REQUIRED)
             return result
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 now code work"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="now code work")})
         with patch.object(mesh, "checkout", side_effect=change_scope):
             runner.tick()
         a = self.finish_turn(runner)
@@ -187,12 +187,12 @@ class MetadataDecision(Bench):
         t = decision()
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         self.assertEqual((first.state, first.workspaces), ("ready", []))
         mesh.tasks[t["id"]]["labels"].append(WORKSPACE_REQUIRED)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 working from leased checkout"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="working from leased checkout")})
         runner.tick()
         resumed = runner.store.get(first.id)
         self.assertEqual(resumed.state, "running")
@@ -205,7 +205,7 @@ class MetadataDecision(Bench):
         t = decision()
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         self.assertEqual(first.workspaces, [])
@@ -222,7 +222,7 @@ class MetadataDecision(Bench):
         t = decision()
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT", t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 awaiting evidence"})
+        write_replies(self.replies, {t["id"][:8]: next_turn(), t["id"][:8] + ":resume": wait_time(why="awaiting evidence")})
         runner.tick()
         first = self.finish_turn(runner)
         runner.pool.lease("other-attempt", "app")
@@ -240,7 +240,7 @@ class MetadataDecision(Bench):
         runner.store.update(a, state="ready")
         runner.store.mark(self.agent.name, t["id"], RECEIPT_KEY,
                           json.dumps({"attempt": "a-different-attempt", "scope": "metadata-only"}))
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 normal admission"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="normal admission")})
         runner.tick()
         resumed = runner.store.get(a.id)
         self.assertEqual(resumed.state, "running")
@@ -251,7 +251,7 @@ class MetadataDecision(Bench):
         t = decision()
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         mesh.tasks[t["id"]]["human_gate"] = True
@@ -267,7 +267,7 @@ class MetadataDecision(Bench):
              patch.object(runner, "_spawn") as spawn:
             runner.tick()
         spawn.assert_not_called()
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         with patch.object(runner.pool, "disk_hold", return_value="worktree disk below floor"), \
@@ -284,7 +284,7 @@ class MetadataDecision(Bench):
         t = decision()
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         runner.tick()
         first = self.finish_turn(runner)
         mesh.tasks[t["id"]]["labels"].append(WORKSPACE_REQUIRED)
@@ -299,8 +299,8 @@ class MetadataDecision(Bench):
         self.assertEqual(runner.store.get(first.id).workspaces, [])
         mesh.tasks[t["id"]]["labels"].remove(WORKSPACE_REQUIRED)
         restarted = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 admitted code work",
-                                     t["id"][:8] + ":resume": f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 admitted code work"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="admitted code work"),
+                                     t["id"][:8] + ":resume": wait_time(why="admitted code work")})
         with patch.object(restarted.pool, "lease", wraps=restarted.pool.lease) as resumed_lease:
             restarted.tick()
         resumed_lease.assert_called_once_with(first.id, "lib")
@@ -329,7 +329,7 @@ class MetadataDecision(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         runner = self.runner(mesh)
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 awaiting evidence"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="awaiting evidence")})
         runner.tick()
         a = self.finish_turn(runner)
         paths = list(a.workspaces)
@@ -393,14 +393,14 @@ class MetadataAttemptIsolation(Bench):
     def test_metadata_attempt_is_launched_read_only(self):
         t = decision()
         runner = self.runner(FakeMesh([t], max_concurrent=1))
-        write_replies(self.replies, {t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 awaiting evidence"})
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="awaiting evidence")})
         argv, = self.argv_of_first_turn(runner)
         self.assertIn("--disallowedTools", argv)
 
     def test_code_attempt_keeps_its_tools(self):
         plain = task(2)
         runner = self.runner(FakeMesh([plain], max_concurrent=1))
-        write_replies(self.replies, {plain["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 x"})
+        write_replies(self.replies, {plain["id"][:8]: wait_time(why="x")})
         argv, = self.argv_of_first_turn(runner)
         self.assertNotIn("--disallowedTools", argv)
 
@@ -408,6 +408,6 @@ class MetadataAttemptIsolation(Bench):
         from test_metadata_alert import diagnostic
         t = diagnostic(3)
         runner = self.runner(FakeMesh([t], max_concurrent=1))
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         argv, = self.argv_of_first_turn(runner)
         self.assertNotIn("--disallowedTools", argv)

@@ -9,7 +9,7 @@ from mesh_runner.mesh import MeshError
 from mesh_runner.store import iso, now
 import test_held_ready_workspace as held_fixture
 from test_runner import Bench
-from fakes import write_replies
+from fakes import write_replies, wait_time
 
 
 class ReadyMaintenance(Bench):
@@ -85,7 +85,7 @@ class ReadyMaintenance(Bench):
         restarted.check_wakes()
         self.assertEqual(restarted.pool.leased_to(a.id), [])
         self.assertEqual(restarted.store.get(a.id).wait, old_wait)
-        write_replies(self.replies, {a.task8: '⏳ WAIT 2h: external work'})
+        write_replies(self.replies, {a.task8: wait_time(why="external work")})
         restarted.resume_ready(1)
         restored = restarted.store.get(a.id)
         self.assertEqual(restored.state, 'running')

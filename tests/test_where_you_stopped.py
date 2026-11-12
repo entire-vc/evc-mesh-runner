@@ -9,7 +9,7 @@ from pathlib import Path
 
 from mesh_runner import prompt as prompts
 
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies
+from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, next_turn
 from test_runner import Bench
 
 BLOCK = "[runner] Where you stopped."
@@ -24,7 +24,7 @@ class WhereYouStopped(Bench):
         return prev
 
     def first_prompt(self, mesh, t):
-        write_replies(self.replies, {t["id"][:8]: "Step done.\n↻ NEXT: more"})
+        write_replies(self.replies, {t["id"][:8]: next_turn("more", text="Step done.")})
         r = self.runner(mesh)
         r.tick()
         self.finish_turn(r)

@@ -53,7 +53,12 @@ host or provider is a different repository.
   new action off once.
 - A new revision drops the held-card cache at once (`_repo_hold_checked`), also when the lane's
   local repository names did not change (e.g. `no_membership` -> `missing_approved_clone`).
-- Grant: newly allowed inventory clones are registered in the pool hot; the next tick starts the card.
+- Grant: newly allowed inventory clones are registered in the pool hot, and the failed-start backoff an
+  access refusal set is dropped; the next tick starts the card. A deadline another
+  failure set since stays.
+- A Mesh grant is the runner's permission only: the lane still fetches with its own forge identity.
+  Give that user at least Reporter on the project before the `PUT`, else the start fails on
+  `git fetch` and the whole lane's starts pause for `abort_backoff_minutes`.
 - Revoke: a running process is not stopped and its leases are not released; the repository stays
   registered in the pool while the lane holds slots of it. New starts, and resumes whose card needs
   it, are checked against the current permission. Under Mesh access a config entry alone does not
@@ -92,6 +97,9 @@ files no card): the contact's own lanes address the next name in the list.
 3. Install the release by the ordinary path; check `status.json` -> `repository_access.source == "legacy"` for every lane.
 4. Per lane, write the initial list through `PUT /agents/{id}/repository-access` (operator, or
    runtime_manager for another lane). The next tick shows `source: "mesh"`, the revision and `lane_repos`.
+   Each granted project needs the lane's forge user as a member (Reporter or above) first. A lane
+   whose `agents.repos` include a clone without a forge origin (a local bare repository) cannot
+   move to Mesh access: the inventory has no entry for it and the explicit list would drop it.
 
 Rollback: reinstall the previous release. It ignores `[[repositories]]` and the stored record and
 goes back to `agents.repos`. The Mesh API cannot set a lane's list back to `null`, so one lane

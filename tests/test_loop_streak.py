@@ -3,7 +3,7 @@ import datetime as dt
 import json
 import unittest
 
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT, next_turn, wait_time
 from test_requeue_on_cap import CapBench
 from test_runner import Bench
 
@@ -225,7 +225,7 @@ class ProgressIsNeverStopped(LoopBench):
     def test_the_same_wait_with_a_new_comment_each_time_is_not_a_loop(self):
         r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 review of the change")
         self.settle_all(r)
-        write_replies(self.replies, {self.t["id"][:8]: f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 review of the change"})
+        write_replies(self.replies, {self.t["id"][:8]: wait_time(why="review of the change")})
         for i in range(12):
             self.mesh.add_comment(self.t["id"], f"ping {i}", author="someone")
             r.tick()                                   # the comment wakes the session and it starts a turn
@@ -454,7 +454,7 @@ class Routing(CapBench):
         self.cfg.max_turns = 60
         self.t = task(1)
         self.mesh = FakeMesh([self.t], max_concurrent=1)
-        write_replies(self.replies, {self.t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {self.t["id"][:8]: next_turn()})
 
     def test_a_loop_is_requeued_like_any_cap(self):
         self.agent.lead = "lead"

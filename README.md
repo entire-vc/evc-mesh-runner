@@ -424,7 +424,7 @@ mesh-runner status --config runner.toml   # local view of attempts
 
 ### `[runner]` options
 
-The `[runner]` table has 38 options; every other key in it is either one of the two native-result
+The `[runner]` table has 39 options; every other key in it is either one of the two native-result
 adoption paths or a retired option. All are optional except `mesh_url`.
 
 | group | keys |
@@ -809,13 +809,18 @@ registry is SQLite, and a restarted runner re-attaches to live turns. Stopping t
 scheduling, not work.
 
 ```sh
-# install: a release tree exported from the repository (git archive <ref> | tar -x -C <dir>)
+# install: the release commit, the head of release/<version> (= <release-merge>^2), never the merge
+git archive <release-sha> | tar -x -C <dir>
 python3 <dir>/ops/install.py --source <dir>            # catalog name = mesh_runner.__version__
 # go back to a version already in the catalog
 python3 ops/install.py --activate 0.1.44
-# what is configured, what runs, what the catalog holds
+# what is configured (with the commit it was exported from), what runs, what the catalog holds
 python3 ops/install.py --status
 ```
+
+`git archive` writes the exported commit and its parents into `SOURCE_COMMIT` (`export-subst`);
+`--status` shows it as `commit.sha`, and `--source` refuses a tree exported from a merge commit
+(`--allow-merge-commit` overrides). A tree copied from a checkout has no sha (`commit.why`).
 
 `install.py` copies the tree into the catalog (`~/.mesh-runner-catalog/agent-runner/<version>`),
 loads the live config with the new code, points the launchd job at the new release, stops and

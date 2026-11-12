@@ -7,7 +7,7 @@ from pathlib import Path
 
 from mesh_runner import cap_rearm
 from mesh_runner.store import Store
-from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time
 from test_requeue_on_cap import CapBench
 
 
@@ -126,7 +126,7 @@ class RearmRunner(CapBench):
     def test_recovery_starts_once_with_same_inputs_and_keeps_start_accounting(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t['id'][:8]: f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak'})
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="soak")})
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)

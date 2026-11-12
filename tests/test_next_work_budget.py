@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fakes import AGENT_ID, FakeMesh, task, write_replies
+from fakes import AGENT_ID, FakeMesh, task, write_replies, next_turn
 from test_requeue_on_cap import CapBench
 
 
@@ -14,7 +14,7 @@ class NextWorkBudget(CapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         digests = iter(range(1000))
         r._work_digest = (lambda a: str(next(digests))) if changing else (lambda a: "same")
@@ -42,7 +42,7 @@ class UnknownDigest(NextWorkBudget):
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
         self.agent.lead = "lead"
-        write_replies(self.replies, {t["id"][:8]: "↻ NEXT"})
+        write_replies(self.replies, {t["id"][:8]: next_turn()})
         r = self.runner(mesh)
         calls = iter(["a", ""] * 10)
         r._work_digest = lambda a: next(calls)         # known at start, unreadable at the end
