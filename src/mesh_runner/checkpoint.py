@@ -1023,6 +1023,10 @@ class Checkpoints:
         """Copy only the delta files (APFS clones where possible), parents with their recorded modes."""
         dst.mkdir()
         dirs = set(delta['dirs'])
+        # Parents of an empty kept directory are part of the snapshot too (`_delta_keep`): without
+        # their recorded modes a 0700 parent comes out 0755 and the capture never verifies.
+        for name in delta['dirs']:
+            dirs.update('/'.join(Path(name).parts[:i]) for i in range(1, len(Path(name).parts)))
         for name in delta['files']:
             src, out = source / name, dst / name
             dirs.update('/'.join(Path(name).parts[:i]) for i in range(1, len(Path(name).parts)))

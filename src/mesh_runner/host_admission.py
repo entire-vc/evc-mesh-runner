@@ -112,6 +112,8 @@ def make_room(tmux, root: Path, cap: int, *, own_key: str = "", read_own_meta, p
             continue
         if pid_alive(int(meta.get("busy_pid") or 0)) or (own_key and window == own_key):
             continue
+        if _delivery_unresolved(directory, window):
+            continue                    # a prompt went in and its driver is gone: the window is the evidence
         idle.append((float(meta.get("last_end") or 0), session, window, directory))
     need = held - cap + 1
     if len(idle) < need:
@@ -211,6 +213,16 @@ class HostAdmission:
             path.unlink(missing_ok=True)
             raise
         return Lease(path, fd)
+
+
+def _delivery_unresolved(directory: Path, key: str) -> bool:
+    """The window's prompt was pasted (journal phase ``send-intent``) and nobody recorded whether the session took
+    it. Closing the window would drop its hook events, the only native proof, as ``reap`` already refuses to."""
+    from mesh_runner.interactive import read_delivery
+    try:
+        return read_delivery(Path(directory), key).get("phase") == "send-intent"
+    except (OSError, ValueError):
+        return False
 
 
 def _read_own_meta(directory: Path, key: str) -> dict | None:

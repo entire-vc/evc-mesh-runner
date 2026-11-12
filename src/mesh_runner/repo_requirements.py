@@ -35,6 +35,12 @@ SAFE_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+")   # no markup ca
 
 # The only state that clears by itself; every other reason needs a named actor to act.
 TRANSIENT = {NO_SLOT}
+# Reasons only whoever grants repository access or creates host clones can clear. Their handoff opens
+# with an @-address line, so the addressee's runner files a request card: a bare
+# `next_actor=operator` reached nobody. Runner-side reasons
+# (checkpoint, checkout, slot) are the runner's own and address nobody.
+ACCESS_REASONS = frozenset({UNDECLARED, NO_MEMBERSHIP, MISSING_CLONE})
+# Who that is comes from `[runner] repo_access_contacts` (docs/repository-access.md).
 
 ACTIONS = {
     UNDECLARED: ("operator", "add the repository to the approved native config and apply it through the reviewed "
@@ -46,6 +52,13 @@ ACTIONS = {
     NO_CHECKOUT: ("runner", "request scoped repo admission for the waiting attempt (`mesh-runner admit-workspace-repo`)"),
     CHECKPOINT: ("runner", "finish or restore the existing checkpoint; admission is refused while it is mid-phase"),
     NO_SLOT: ("runner", "wait for a free worktree slot; nothing to hand off"),
+}
+# The lane's permission comes from Mesh repository_access (docs/repository-access.md): other actions.
+MESH_ACTIONS = {
+    NO_MEMBERSHIP: ("operator", "grant the repository in this agent's Mesh repository access (agent settings); "
+                                "the runner applies it on its next tick, no restart"),
+    MISSING_CLONE: ("operator", "create the approved base clone on this host and declare it in the host inventory "
+                                "([[repositories]] with provider/host/project_path), then let the runner re-evaluate"),
 }
 
 
@@ -78,10 +91,22 @@ class Verdict:
             out["historical"] = list(self.historical)
         return out
 
-    def text(self) -> str:
+    @property
+    def needs_access(self) -> bool:
+        """The first blocker is one only an access granter can clear (access reasons sort first)."""
+        return self.reason in ACCESS_REASONS
+
+    def text(self, addressee: str = "", lane: str = "") -> str:
+        """The handoff comment. With ``addressee`` (access reasons only) it opens with an @-address
+        line, not with ``[runner``: the mention path ignores runner-prefixed bodies."""
         more = "".join(f"; also {r}={p}" for r, p in self.also)
-        return (f"[runner] repository preflight: {self.reason}; required={self.project or '-'}{more}; "
-                f"next_actor={self.next_actor}; action: {self.action}")
+        actor = addressee if addressee and self.needs_access else self.next_actor
+        line = (f"[runner] repository preflight: {self.reason}; required={self.project or '-'}{more}; "
+                f"next_actor={actor}; action: {self.action}")
+        if actor == self.next_actor:
+            return line
+        return (f"@{addressee} repository access for lane {lane or '-'}: {self.reason} "
+                f"{self.project or '-'}\n{line}")
 
 
 def _mr_links(links: list[dict], base_url: str) -> list[tuple[str, bool]]:
@@ -142,7 +167,7 @@ def check(links: list[dict], base_url: str, *, agent_repos: list, approved_repos
           leased_repos: set | None = None, checkpoint_open: bool = False, resuming: bool = False,
           config_only: bool = False,
           pool_full: Callable[[str], bool] = lambda name: False,
-          project_of: Callable[[object], str] | None = None) -> Verdict:
+          project_of: Callable[[object], str] | None = None, access=None) -> Verdict:
     """Match the card's required repositories against the lane's actual configuration.
 
     ``agent_repos``    RepoSpecs this agent will lease at start.
@@ -150,20 +175,38 @@ def check(links: list[dict], base_url: str, *, agent_repos: list, approved_repos
                         used only to tell 'undeclared' from 'declared, but not for this agent'.
     ``leased_repos``    repository names this attempt already holds a lease on.
     ``config_only``     resume of an existing attempt: skip checkpoint/checkout/slot facts.
+    ``access``          explicit Mesh repository_access (repo_access.Access) or None for legacy config.
+                        With it ``agent_repos`` are host-inventory specs carrying their canonical
+                        project; Mesh alone decides membership: not allowed -> no_membership, allowed
+                        but no inventory entry or no clone -> missing_approved_clone.
     """
-    project_of = project_of or (lambda spec: clone_project(spec.base, spec.remote))
     wanted = required_projects(links, base_url)
     history = tuple(historical_projects(links, base_url))
     if not wanted:
         return Verdict(NO_REPO, fingerprint=_digest(["none"]), historical=history)
-    mine = {project_of(s): s for s in agent_repos}
-    theirs = {project_of(s): s for s in (approved_repos or [])}
+    if access is not None:
+        from .repo_access import card_identity
+        by_ident = {tuple(s.project): s for s in agent_repos if getattr(s, "project", ())}
+    else:
+        project_of = project_of or (lambda spec: clone_project(spec.base, spec.remote))
+        mine = {project_of(s): s for s in agent_repos}
+        theirs = {project_of(s): s for s in (approved_repos or [])}
     found: list[tuple[str, str, object]] = []        # every blocking fact, so one handoff names them all
     for project in wanted:
-        spec = mine.get(project)
-        if spec is None:
-            found.append((NO_MEMBERSHIP if project in theirs else UNDECLARED, project, theirs.get(project)))
-            continue
+        if access is not None:
+            ident = card_identity(base_url, project)
+            if not access.allows(ident):
+                found.append((NO_MEMBERSHIP, project, None))
+                continue
+            spec = by_ident.get(tuple(ident))
+            if spec is None:
+                found.append((MISSING_CLONE, project, None))
+                continue
+        else:
+            spec = mine.get(project)
+            if spec is None:
+                found.append((NO_MEMBERSHIP if project in theirs else UNDECLARED, project, theirs.get(project)))
+                continue
         if not (Path(spec.base) / ".git").exists() and not Path(spec.base).joinpath("HEAD").exists():
             found.append((MISSING_CLONE, project, spec))
             continue
@@ -177,12 +220,16 @@ def check(links: list[dict], base_url: str, *, agent_repos: list, approved_repos
             found.append((NO_SLOT, project, spec))
     if not found:
         return Verdict(OK, ",".join(wanted), fingerprint=_digest([OK, wanted]), historical=history)
-    # canonical order (durable before slot wait, then reason/project): link order never changes the handoff
-    found.sort(key=lambda f: (f[0] in TRANSIENT, f[0], f[1]))
+    # canonical order (durable before slot wait, access before runner-side, then reason/project): link order
+    # never changes the handoff, and an access blocker is never hidden behind a runner-side one
+    found.sort(key=lambda f: (f[0] in TRANSIENT, f[0] not in ACCESS_REASONS, f[0], f[1]))
     reason, project, spec = found[0]
-    actor, action = ACTIONS[reason]
+    actor, action = (MESH_ACTIONS if access is not None else {}).get(reason) or ACTIONS[reason]
     repo = getattr(spec, "name", "")
     also = tuple((r, p) for r, p, _ in found[1:])
-    fp = _digest([reason, project, repo] + ([sorted(also)] if also else []))
+    # the permission source and its revision are facts: a lane moved to Mesh, or a changed grant that still
+    # leaves the card blocked, hands the new state off once
+    fp = _digest([reason, project, repo] + ([sorted(also)] if also else [])
+                 + (["mesh", getattr(access, "revision", None)] if access is not None else []))
     # history is left out of the fingerprint: a finished MR never re-opens a handoff of the same blockers
     return Verdict(reason, project, repo, actor, action, fp, also, history)

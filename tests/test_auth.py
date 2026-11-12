@@ -629,6 +629,43 @@ class AuthRouting(Bench):
         r._authentication_failed(a, profile)
         self.assertEqual(len(count.read_text().splitlines()), 5)
 
+    def test_lane_returned_to_held_profile_is_routed_again_after_backoff(self):
+        """A stored routed=true must not silence the route when the lane's fresh
+        spawn environment is on the held profile again (operator pin / pool restore)."""
+        r, mesh, t, a, profile = self.expire()
+        route, count = self.route_to_codex(r)
+        key = auth.PREFIX + profile
+
+        def ticks(n=1):
+            for _ in range(n):
+                r._resume_hold.clear()
+                r.tick()
+
+        def marker():
+            return json.loads(r.store.mark(self.agent.name, key, "auth_route_attempt")[0])
+
+        ticks()                                   # launch check on the held profile: first route
+        self.assertEqual(len(count.read_text().splitlines()), 1)
+        self.assertTrue(route.exists() and marker()["routed"])
+        route.unlink()                            # the lane is returned to the held source before a spawn
+        ticks(3)                                  # inside the backoff: a no-op route cannot loop
+        self.assertEqual(len(count.read_text().splitlines()), 1)
+        self.assertIn("re-route after backoff", r.store.get(a.id).note)
+        m = marker()
+        m["retry_at"] = 0                         # backoff elapsed (the evening case: hours later)
+        r.store.mark(self.agent.name, key, "auth_route_attempt", json.dumps(m))
+        ticks()                                   # one tick: routed to the next pool again
+        self.assertEqual(len(count.read_text().splitlines()), 2)
+        self.assertTrue(route.exists())
+        self.assertEqual(marker()["tries"], 2)
+        self.assertEqual(len(calls(self.calls)), 1)          # no provider turn was spent
+        self.assertTrue(auth.held(r.store, profile))         # routing never clears the hold
+        m = marker()
+        m["retry_at"] = 0
+        r.store.mark(self.agent.name, key, "auth_route_attempt", json.dumps(m))
+        r._authentication_failed(a, profile)      # a turn launched before the route: no re-route
+        self.assertEqual(len(count.read_text().splitlines()), 2)
+
     def test_held_before_start_retains_one_ready_attempt_without_abort_storm(self):
         r, mesh, t, a, profile = self.expire()
         self.route_to_codex(r, rc=1)

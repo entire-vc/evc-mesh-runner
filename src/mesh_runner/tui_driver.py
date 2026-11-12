@@ -230,8 +230,12 @@ class Cancelled(Exception):
 class Driver:
     def __init__(self, harness: str, agent: str, state: Path, tmux: Tmux, max_sessions: int, cwd: Path,
                  session_id: str, mode: str, key: str, argv: list[str], out=None, env: dict | None = None,
-                 python: str | None = None, clock=time.time, sleep=time.sleep, timeouts: dict | None = None):
+                 python: str | None = None, clock=time.time, sleep=time.sleep, timeouts: dict | None = None,
+                 memory_floor: tuple[float, float] = (0.0, 0.0), memory_reader=None):
         self.harness, self.agent, self.dir = harness, agent, Path(state)
+        # (hold free %, hold swap MB) of the runner's memory gate: no window starts while the host is under it
+        self.memory_floor = (float(memory_floor[0]), float(memory_floor[1]))
+        self.memory_reader = memory_reader
         self.tmux, self.max_sessions, self.cwd = tmux, max_sessions, Path(cwd)
         self.sid, self.mode, self.key, self.argv = session_id, mode, key, list(argv)
         self.out = out or sys.stdout
@@ -789,6 +793,16 @@ class Driver:
         return make_room(self.tmux, self.dir.parent, self.max_sessions, own_key=self.key, read_own_meta=read_own_meta,
                          pid_alive=pid_alive, forget=forget, chat_prefix=CHAT_PREFIX)
 
+    def memory_short(self) -> str:
+        """The host reading under the memory floor right now ("" when there is room or no floor). A start into an
+        exhausted swap is slower than the prompt's accept wait: resumed sessions could miss
+        their prompt and leave their delivery unproven."""
+        free_pct, swap_mb = self.memory_floor
+        if free_pct <= 0:
+            return ""
+        from mesh_runner import hostmem
+        return hostmem.short_now(free_pct, swap_mb, self.memory_reader or hostmem.read_host)
+
     def new_window(self, command: list[str]) -> None:
         """Create the window; a session another driver creates or kills meanwhile is retried."""
         # remain-on-exit in the same tmux command: a harness that dies at once leaves its
@@ -831,13 +845,21 @@ class Driver:
         inner = f". {f}; rm -f {f}; exec {' '.join(shlex.quote(x) for x in argv)}"
         try:
             deadline = self.clock() + self.t["cap_wait"]
+            told = False
             while True:
                 with self.host_lock():                   # count, evict and create as one step
-                    if self.make_room():
+                    short = self.memory_short()          # read now, not the runner's cached reading
+                    if not short and self.make_room():
                         self.new_window(["/usr/bin/env", "-i", "/bin/sh", "-c", inner])
                         self.save()                      # busy before the lock lets anyone count it
                         break
-                if self.clock() > deadline:              # every live window runs a turn
+                if short and not told:
+                    print(f"interactive: host short of memory ({short}), the window waits", file=sys.stderr, flush=True)
+                    told = True
+                if self.clock() > deadline:
+                    if short:                            # nothing was pasted: the runner retries the start
+                        raise DriverError(f"host short of memory ({short}); the session was not started")
+                    # every live window runs a turn
                     raise DriverError(f"host session cap reached ({self.max_sessions} live sessions, all busy)")
                 self.check_cancel()
                 self.beat()
@@ -1542,12 +1564,18 @@ class Driver:
         parts = ["%s=%.1f" % (n, marks[b] - marks[a]) for n, a, b in order if a in marks and b in marks]
         print("timing: " + " ".join(parts), file=sys.stderr, flush=True)
 
-    def run(self, prompt: str) -> int:
-        # claim the window first: the reaper and other drivers' make_room skip a busy one
+    def claim_window(self) -> None:
+        """Claim the window first: the reaper and other drivers' make_room skip a busy one. Under the host start
+        lock, the one make_room runs under: its read of "idle" and its close are one step, so a claim cannot land
+        between them and the window of a turn that has begun is never closed as idle."""
         self.private_dir()
-        self.meta = read_meta(self.dir, self.key)
-        self.meta["busy_pid"] = os.getpid()
-        self.save()
+        with self.host_lock():
+            self.meta = read_meta(self.dir, self.key)
+            self.meta["busy_pid"] = os.getpid()
+            self.save()
+
+    def run(self, prompt: str) -> int:
+        self.claim_window()
         self.prompt = prompt        # bound before the first beat: rollout discovery tells cards apart by it
         self.beat(force=True)
         ok, close = False, False
@@ -1636,7 +1664,8 @@ def main(argv: list[str] | None = None) -> int:
                     tmux=Tmux(opts.get("tmux", "tmux")), max_sessions=int(opts.get("max_sessions", 20)),
                     cwd=Path(opts["cwd"]), session_id=opts.get("session", ""), mode=opts.get("mode", "start"),
                     key=opts["key"], argv=harness,
-                    timeouts=timeouts_from(opts))
+                    timeouts=timeouts_from(opts),
+                    memory_floor=(float(opts.get("memory_hold_free_pct", 0)), float(opts.get("memory_hold_swap_mb", 0))))
 
     def interrupt(signum, frame):
         driver.cancelled = True

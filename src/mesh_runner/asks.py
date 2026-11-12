@@ -43,6 +43,10 @@ DEFAULT_HARD_PATTERNS: tuple[str, ...] = (
     # external publication on behalf of people or the company
     r"publish", r"announce", r"post\b", r"tweet", r"press[- ]release", r"newsletter", r"mass[- ]mail",
     r"опубликов", r"публикац", r"пост\b", r"анонс", r"рассылк", r"пресс-?релиз",
+    # outward contact in someone's name: a letter, an offer, a call (Mesh server keeps the same list)
+    r"e-?mail", r"письм", r"whatsapp", r"вацап", r"ватсап", r"звон", r"позвон", r"phone\b",
+    r"от (?:вашего|твоего|моего|его|её|ее|нашего) имени", r"on (?:your|his|her|my|our) behalf",
+    r"in (?:your|his|her|my|our) name", r"кп\b", r"коммерческ",
     # something only the person can do with their own hands or logins: nobody else can answer it
     r"log[- ]?in\b", r"sign[- ]?in\b", r"click\b", r"press\b", r"captcha", r"2fa\b", r"screenshot", r"iphone",
     r"botfather", r"physical", r"connect\b",
@@ -99,14 +103,156 @@ def classify(question: str, labels, patterns=DEFAULT_HARD_PATTERNS,
     return Verdict(False, "no hard rule matched")
 
 
-def blocking_question(comments: list[dict]) -> tuple[str, str]:
-    """(handle, question) of the newest ``❓ Blocking @handle`` ask in the comments, the
-    question being that line and everything after it in the same comment; ('', '') if none."""
+# What Mesh writes as the default of a marker that stated none: a placeholder, not an answer.
+MARKER_FALLBACK_DEFAULT = "применить рекомендацию исполнителя / закрыть как есть"
+_HARD_TAG = re.compile(r"\[\s*hard\s*\]", re.IGNORECASE)
+_SOFT_TAG = re.compile(r"\[\s*soft\s*\]", re.IGNORECASE)
+
+
+def gate_class(question: str, labels, default: str | None, patterns=DEFAULT_HARD_PATTERNS,
+               hard_labels=DEFAULT_HARD_LABELS, marker_line: str | None = None) -> Verdict:
+    """The class Mesh arms a ``❓ Blocking`` gate with (server ``markerGateClass``): a ``[hard]``
+    tag, then a hard rule (over a ``[soft]`` tag), then ``[soft]``; a soft question still stays
+    hard without a default its asker stated, since nothing could be applied at the deadline.
+    The tags count on ``marker_line`` (the marker's own line) when given, else anywhere."""
+    question = question or ""
+    tag_text = question if marker_line is None else marker_line
+    if _HARD_TAG.search(tag_text):
+        return Verdict(True, "tag:hard")
+    verdict = classify(_SOFT_TAG.sub(" ", question), labels, patterns, hard_labels)
+    if verdict.hard:
+        return verdict
+    if _SOFT_TAG.search(tag_text):
+        return Verdict(False, "tag:soft")
+    if not (default or "").strip() or default.strip() == MARKER_FALLBACK_DEFAULT:
+        return Verdict(True, "no default stated by the asker")
+    return verdict
+
+
+_LINE_DEFAULT = re.compile(
+    r"^[\s>*\-•]*\**\s*(?:recommended[ _-]?default|default(?:\s+if\s+no\s+answer)?|"
+    r"по\s+умолчанию|рекомендую\s+по\s+умолчанию|дефолт)\**\s*[:—-]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_INLINE_DEFAULT = re.compile(
+    r"(?:^|[^\w])(?:recommended[ _-]?default|default|по\s+умолчанию|дефолт)\**\s*[:—]\**\s*(.+)$", re.IGNORECASE)
+
+
+def _ask_lines(body: str, handle: str) -> tuple[str, list[str]] | None:
+    """(marker line, [marker tail, *lines after it]) of the marker naming handle, quotes and
+    code stripped; None when no marker names it."""
+    lines = strip_quoted_spans(body or "").split("\n")
+    for i, line in enumerate(lines):
+        m = outcome._BLOCKING.match(line)
+        if m and m.group("handle").lower() == (handle or "").lower():
+            return line, [m.group("note"), *lines[i + 1:]]
+    return None
+
+
+def marker_default(body: str, handle: str) -> str:
+    """Server ``markerDefault``: the default the ask states on its marker line, else on a
+    ``Default:`` line after it; never one above the marker, which is context. '' if none."""
+    found = _ask_lines(body, handle)
+    if not found:
+        return ""
+    rest = found[1]
+    m = _INLINE_DEFAULT.search(rest[0])
+    if m and m.group(1).strip().strip("*").strip():
+        return m.group(1).strip().strip("*").strip()
+    m = _LINE_DEFAULT.search("\n".join(rest[1:]))
+    if m and m.group(1).strip().strip("*").strip():
+        return m.group(1).strip().strip("*").strip()
+    return ""
+
+
+def marker_gate_class(body: str, handle: str, labels, patterns=DEFAULT_HARD_PATTERNS,
+                      hard_labels=DEFAULT_HARD_LABELS) -> Verdict:
+    """The class Mesh arms the ``❓ Blocking @handle`` marker of one comment body with, read the
+    way Mesh reads it: quotes and code stripped, the tags taken from the marker's own line, the
+    question being that line's tail and the rest of the comment, the default the ask's own."""
+    found = _ask_lines(body, handle)
+    if not found:
+        return Verdict(True, "unsure: no marker for the handle")
+    line, rest = found
+    return gate_class("\n".join(rest), labels, marker_default(body, handle), patterns, hard_labels,
+                      marker_line=line)
+
+
+_FENCE = re.compile(r"^(`+|~+)")
+
+
+def _strip_inline_code(line: str) -> str:
+    out, i = [], 0
+    while i < len(line):
+        if line[i] != "`":
+            out.append(line[i])
+            i += 1
+            continue
+        j = i
+        while j < len(line) and line[j] == "`":
+            j += 1
+        n, closed, k = j - i, -1, j
+        while k < len(line):
+            if line[k] != "`":
+                k += 1
+                continue
+            m = k
+            while m < len(line) and line[m] == "`":
+                m += 1
+            if m - k == n:
+                closed = m
+                break
+            k = m
+        if closed == -1:
+            break  # unterminated run: the rest of the line is dropped, as on the server
+        i = closed
+    return "".join(out)
+
+
+def strip_quoted_spans(body: str) -> str:
+    """Server ``stripQuotedSpans``: blank fenced blocks and ``>`` quote lines, drop inline code
+    spans, one output line per input line. Text quoted in an ask is not the ask."""
+    out, fence = [], None
+    for line in body.split("\n"):
+        trimmed = line.lstrip(" \t")
+        run = _FENCE.match(trimmed)
+        if fence:
+            if run and run.group(1)[0] == fence[0] and len(run.group(1)) >= len(fence):
+                fence = None
+            out.append("")
+            continue
+        if run and len(run.group(1)) >= 3:
+            fence = run.group(1)
+            out.append("")
+            continue
+        if trimmed.startswith(">"):
+            out.append("")
+            continue
+        out.append(_strip_inline_code(line))
+    return "\n".join(out)
+
+
+def blocking_ask(comments: list[dict]) -> tuple[str, str]:
+    """(handle, comment body) of the newest ``❓ Blocking @handle`` ask in the comments, quotes
+    and code not counting as an ask; ('', '') if none."""
     for c in reversed(comments):
-        lines = (c.get("body") or "").splitlines()
-        for i, line in enumerate(lines):
+        body = c.get("body") or ""
+        for line in strip_quoted_spans(body).split("\n"):
             m = outcome._BLOCKING.match(line)
             if m:
-                rest = [m.group("note").strip(), *[x.strip() for x in lines[i + 1:]]]
-                return m.group("handle"), " ".join(x for x in rest if x)
+                return m.group("handle"), body
+    return "", ""
+
+
+def blocking_question(comments: list[dict]) -> tuple[str, str]:
+    """(handle, question) of the newest ``❓ Blocking @handle`` ask in the comments, the
+    question being that line and everything after it in the same comment, quotes and code
+    stripped; ('', '') if none."""
+    handle, body = blocking_ask(comments)
+    if not handle:
+        return "", ""
+    lines = strip_quoted_spans(body).split("\n")
+    for i, line in enumerate(lines):
+        m = outcome._BLOCKING.match(line)
+        if m and m.group("handle") == handle:
+            rest = [m.group("note").strip(), *[x.strip() for x in lines[i + 1:]]]
+            return handle, " ".join(x for x in rest if x)
     return "", ""

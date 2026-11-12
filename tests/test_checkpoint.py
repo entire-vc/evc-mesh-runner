@@ -1500,6 +1500,27 @@ class SlimSnapshot(unittest.TestCase):
         self.assertTrue((target / 'empty' / 'deeper').is_dir())
         self.assertEqual(fingerprint(target, None, (), cp.read(checkpoint).get('ignored', [])), cp.read(checkpoint)['fingerprint'])
 
+    def test_empty_dir_under_private_parent_verifies_across_volumes(self):
+        # Pools on another volume than the checkpoints: a slim capture that does not verify has no
+        # fallback there. A 0700 parent of an empty untracked directory must keep its mode.
+        p = self.source
+        (p / 'docs').mkdir(mode=0o700)
+        (p / 'docs' / 'evidence' / 'run' / 'tests').mkdir(parents=True)
+        (p / 'docs').chmod(0o700)
+        (p / 'docs' / 'evidence').chmod(0o700)
+        (p / 'note.md').write_text('untracked work')
+        base = self._base(p)
+        cp = Checkpoints(self.root / 'cp')
+        with patch('mesh_runner.checkpoint._same_volume', return_value=False):
+            checkpoint = cp.create('s7', p, {'base_sha': base})
+        data = cp.read(checkpoint)
+        self.assertEqual(data['delta']['dirs'], ['docs/evidence/run/tests'])
+        self.assertNotIn('slim_failed', data)
+        self.assertEqual((checkpoint / 'tree' / 'docs' / 'evidence').stat().st_mode & 0o777, 0o700)
+        target = self._restore_elsewhere(cp, checkpoint)
+        self.assertEqual((target / 'docs').stat().st_mode & 0o777, 0o700)
+        self.assertTrue((target / 'docs' / 'evidence' / 'run' / 'tests').is_dir())
+
     def test_large_untracked_file_is_left_out_and_small_one_kept(self):
         p = self.source
         (p / 'dump.bin').write_bytes(b'0' * 2000)

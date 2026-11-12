@@ -120,13 +120,15 @@ class MemoryGate:
         s = "?" if self.swap is None else f"{self.swap:.0f}MB"
         return f"free {f}, swap free {s}"
 
-    def check(self) -> bool:
-        """True = hold new sessions now."""
+    def check(self, fresh: bool = False) -> bool:
+        """True = hold new sessions now. ``fresh`` reads the host now instead of the cached reading:
+        the last look right before a session starts (a 30 s old reading could let starts through into an
+        exhausted swap)."""
         if self.t.hold_free_pct <= 0:
             return False
         with self._lock:
             now = self._clock()
-            if self._at is None or now - self._at >= self._cache:
+            if fresh or self._at is None or now - self._at >= self._cache:
                 self._at = now
                 try:
                     self.free, self.swap = self._read()
@@ -138,6 +140,22 @@ class MemoryGate:
                     log.warning("host memory: %s new sessions (%s)",
                                 "HOLD" if self.holding else "resume", self.describe())
             return self.holding
+
+
+def short_now(hold_free_pct: float, hold_swap_mb: float, reader=read_host) -> str:
+    """The reading that is under a hold threshold right now ("" when none is, or nothing can be read).
+    Stateless: the interactive driver asks it under the host start lock, right before it creates a window."""
+    if hold_free_pct <= 0:
+        return ""
+    try:
+        free, swap = reader()
+    except Exception:
+        return ""
+    if not decide(False, free, swap, Thresholds(hold_free_pct, 0.0, hold_swap_mb, 0.0)):
+        return ""
+    f = "?" if free is None else f"{free:.0f}%"
+    s = "?" if swap is None else f"{swap:.0f}MB"
+    return f"free {f}, swap free {s}"
 
 
 @dataclass

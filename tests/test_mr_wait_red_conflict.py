@@ -110,7 +110,7 @@ class MergeWaitOnBlockedMR(Bench):
         cases = {
             'has_conflicts': (mr_row('success', has_conflicts=True), 'has a merge conflict'),
             'detailed_conflict': (mr_row('success', detailed_merge_status='conflict'), 'has a merge conflict'),
-            'need_rebase': (mr_row('success', detailed_merge_status='need_rebase'), 'must be rebased'),
+            'need_rebase': (mr_row('success', detailed_merge_status='need_rebase'), 'is behind its target branch'),
             'running_head': (mr_row('running', has_conflicts=True), 'has a merge conflict'),
             'no_pipeline': ({'sha': SHA, 'state': 'opened', 'labels': [], 'has_conflicts': True,
                              'head_pipeline': None}, 'has a merge conflict'),
@@ -120,8 +120,9 @@ class MergeWaitOnBlockedMR(Bench):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(mr, linked=False)
                 a = self.turn(r, t, merged_line())
-                self.assert_sent_back(a, needle, 'rebase the branch onto its target',
-                                      'cover the rebased delta')
+                self.assert_sent_back(a, needle, 'merge the target branch into the MR branch',
+                                      'cover the merge delta')
+                self.assertNotIn('rebase the branch onto', a.wake_text)
                 r.store.db.close()
 
     def test_green_mr_without_conflict_is_accepted(self):
@@ -185,7 +186,7 @@ class ConflictOwnerNotice(unittest.TestCase):
         second = {}
         event = typed_event(gl, 'mr', MR, self.wait(), lambda key: first['value'], second,
                             allow_action_required=True)
-        self.assertIn('must be rebased', event)
+        self.assertIn('is behind its target branch', event)
         self.assertNotEqual(first['key'], second['key'])
 
     def test_a_skipped_head_is_red_only_behind_a_merge_gate(self):

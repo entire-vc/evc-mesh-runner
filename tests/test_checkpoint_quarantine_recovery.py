@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from mesh_runner.mesh import MeshError
 from mesh_runner.adapters.base import proc_stamp
 from mesh_runner.workspace import RepoSpec, WorkspaceError
 from mesh_runner.workspace_scope import RECEIPT_KEY
@@ -187,3 +188,67 @@ class CheckpointQuarantineRecovery(Bench):
         self.assertEqual(r.store.get(a.id).state, 'ready')
         self.assertFalse(r.procs)
         self.assertEqual(len(self.events(r, a, 'checkpoint_quarantine_recheck')), 1)
+
+    def test_cross_volume_capture_failure_is_said_on_the_card_once(self):
+        extra = self.root / 'extra'
+        extra.mkdir()
+        self.agent.repos.append(RepoSpec('extra', make_repo(extra), max_slots=1))
+        r, (a,) = self.parked()
+        path = r.pool.lease(a.id, 'extra')
+        r.store.update(a, state='ready', workspaces=[*a.workspaces, str(path)])
+        subprocess.run(['git', '-C', str(path), 'update-index', '--skip-worktree', 'README'], check=True)
+        (path / 'README').write_text('hidden change\n')   # real slim replay mismatch, retains the lease
+        clock = time.monotonic()
+        # mock: external boundaries — the monotonic clock and the volume of the checkpoint store.
+        with patch('mesh_runner.checkpoint._same_volume', return_value=False):
+            with self.assertRaisesRegex(WorkspaceError, 'cross volumes; lease retained'):
+                r.pool.suspend(a.id, r._suspend_metadata(a), writer_stopped=True)
+            for offset in (0, 901):
+                with patch('mesh_runner.runner.time.monotonic', return_value=clock + offset):
+                    for _ in range(3):
+                        r._guard(a, 'resume', r._resume_one)
+            # A runner restart loses the in-memory strikes and quarantine; the store keeps the notice.
+            r._quarantine.clear(); r._strikes.clear(); r._errors.clear()
+            with patch('mesh_runner.runner.time.monotonic', return_value=clock + 5000):
+                for _ in range(3):
+                    r._guard(a, 'resume', r._resume_one)
+        self.assertEqual(len(self.events(r, a, 'quarantine:resume')), 3)
+        said = [c['body'] for c in r.mesh.comments_all(a.task_id) if 'snapshot keeps failing' in c['body']]
+        self.assertEqual(said, ['[runner] Workspace snapshot keeps failing (resume: verify-fingerprint/'
+                                'replay-mismatch); the worktree lease is retained and the step is retried with '
+                                'a growing backoff. Nothing is lost; the runner owner must repair the cause.'])
+        self.assertNotIn(str(path), said[0])
+        self.assertTrue(r.pool.leased_to(a.id))
+
+    def test_retained_lease_notice_that_mesh_refused_is_said_on_the_next_failure(self):
+        extra = self.root / 'extra'
+        extra.mkdir()
+        self.agent.repos.append(RepoSpec('extra', make_repo(extra), max_slots=1))
+        r, (a,) = self.parked()
+        path = r.pool.lease(a.id, 'extra')
+        r.store.update(a, state='ready', workspaces=[*a.workspaces, str(path)])
+        subprocess.run(['git', '-C', str(path), 'update-index', '--skip-worktree', 'README'], check=True)
+        (path / 'README').write_text('hidden change\n')
+        add_comment, refused = r.mesh.add_comment, []
+
+        def flaky(tid, body, *args, **kw):
+            if 'snapshot keeps failing' in body and not refused:
+                refused.append(body)
+                raise MeshError(503, 'unavailable')
+            return add_comment(tid, body, *args, **kw)
+
+        clock = time.monotonic()
+        # mock: external boundaries — the Mesh API (one refused write), the monotonic clock, the volume.
+        with patch('mesh_runner.checkpoint._same_volume', return_value=False), \
+                patch.object(r.mesh, 'add_comment', side_effect=flaky):
+            with self.assertRaisesRegex(WorkspaceError, 'cross volumes; lease retained'):
+                r.pool.suspend(a.id, r._suspend_metadata(a), writer_stopped=True)
+            for offset in (0, 901, 5000):
+                with patch('mesh_runner.runner.time.monotonic', return_value=clock + offset):
+                    for _ in range(3):
+                        r._guard(a, 'resume', r._resume_one)
+        self.assertEqual(len(refused), 1)
+        said = [c['body'] for c in r.mesh.comments_all(a.task_id) if 'snapshot keeps failing' in c['body']]
+        self.assertEqual(len(said), 1)
+        self.assertEqual(r.store.mark(a.agent, a.task_id, f'lease_retained_notice:{a.id}')[0],
+                         'verify-fingerprint/replay-mismatch')

@@ -52,7 +52,7 @@ class TurnContract(unittest.TestCase):
     def test_every_wait_the_old_contract_covered_has_its_command(self):
         text = contract(True)
         for form in ("wait_for on=card", "wait_for on=mr", "wait_for on=pipeline", "wait_for on=merge",
-                     "wait_for on=time", "registration=ops-review", "registration=queue", "ask_agent",
+                     "wait_for on=time", "registration=queue", "ask_agent",
                      "ask_human", "continue_next", "finish_task", "hand_off", "after_sha=", "after_pipeline_id",
                      "after_status=opened", "required_jobs=", "provider=github", "event_ref=", "source=", "why="):
             self.assertIn(form, text)
@@ -68,6 +68,13 @@ class TurnContract(unittest.TestCase):
                      "❓ Blocking @<person>: <question>", "until=merged after=<full-head-sha>:opened",
                      "external=<stable-reference> source=<https-url|card:#8hex>"):
             self.assertIn(line, CONTRACT[fallback:])
+
+    def test_retired_ops_review_wait_is_not_advertised_or_accepted(self):
+        self.assertNotIn("ops-review", contract(True))
+        for ref in ("a" * 64, "bad", ""):
+            out = parse_line("⏳ WAIT ops-review:" + ref, None)
+            self.assertEqual(out.kind, "unparsed")
+            self.assertIn("finish_task to=review", out.note)
 
     def test_the_marker_grammar_is_unchanged(self):
         self.assertEqual(parse_line("↻ NEXT: the docs", None).kind, "next")

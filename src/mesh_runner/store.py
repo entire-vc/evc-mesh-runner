@@ -187,6 +187,12 @@ class Store:
         rows = self.db.execute("SELECT task_id, value FROM marks WHERE agent=? AND key=? AND value!=''", (agent, key))
         return {r[0]: r[1] for r in rows}
 
+    def mark_holders(self, task_id: str, key: str) -> dict[str, str]:
+        """Every lane of this store with a non-empty ``key`` mark on the task: agent -> value."""
+        rows = self.db.execute("SELECT agent, value FROM marks WHERE task_id=? AND key=? AND value!=''",
+                               (task_id, key))
+        return {r[0]: r[1] for r in rows}
+
     def tasks_seen(self, agent: str, since: dt.datetime) -> set[str]:
         """Tasks this agent had an attempt on, or kept a mark for, since ``since``."""
         cutoff = iso(since)

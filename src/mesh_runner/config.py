@@ -17,7 +17,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # gmail_watch_v1 = false           # enables `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     # gmail_watch_reader = ["ssh", "-o", "BatchMode=yes", "<host>", "<readonly-wrapper>"]   # fixed argv; JSON request on stdin
 
-    # The [runner] table has 39 operator options (README "[runner] options") plus native_result_dir /
+    # The [runner] table has 38 operator options (README "[runner] options") plus native_result_dir /
     # native_result_channels_dir, which the native-result adoption protocol reads from this file
     # (docs/native-result-config.md). Keys that used to be options are listed in RETIRED_RUNNER_OPTIONS
     # below: a file that still sets one loads with a warning, and the value stays fixed.
@@ -105,10 +105,9 @@ DEFAULT_VERDICT_PATTERN = (r"^\W*(?:verify|verdict|review)\b[^\n]*?\b(?P<verdict
 DEFAULT_OWN_VERDICT_PATTERN = r"^\W*(?:verify|verdict)\b\W*(?P<verdict>(?-i:SHIP|DO-NOT-SHIP))\b" + _SHA
 
 
-# [runner] keys that are no longer options: no config of this deployment set them to anything but their
-# default. The loader does not read them; each RunnerConfig field keeps the value an absent key gave (its
-# dataclass default). A file that still carries one loads, with one warning per key. Name -> why / the
-# value it is fixed at. The single list: the loader and tests/test_retired_options.py read it.
+# [runner] keys that are no longer options. The loader ignores their values; retained runtime fields
+# keep their dataclass defaults, and removed observers have no fields. Older files load with one
+# warning per key. Name -> retirement reason / fixed value. The loader and tests read this single list.
 RETIRED_RUNNER_OPTIONS: dict[str, str] = {
     "abort_backoff_minutes": "its value is fixed at 15",
     "background_wait_minutes": "its value is fixed at 45.0",
@@ -147,6 +146,8 @@ RETIRED_RUNNER_OPTIONS: dict[str, str] = {
     "mesh_effects": "its value is fixed at true",
     "metrics_file": "its value is fixed at none (no metrics file)",
     "no_outcome_route_after": "its value is fixed at 3",
+    "ops_review_wait_notifier_id": "the separate ops-review route has been retired",
+    "ops_review_wait_registry": "the separate ops-review route has been retired",
     "provider_outage_backoff_cap_seconds": "its value is fixed at 7200",
     "provider_outage_backoff_seconds": "its value is fixed at 120",
     "provider_outage_giveup_minutes": "its value is fixed at 360",
@@ -390,6 +391,9 @@ class RunnerConfig:
     mesh_url: str
     state_dir: Path
     agents: list[AgentConfig]
+    # Host clone inventory (top-level [[repositories]], not a [runner] option): base clones on this host
+    # with their explicit canonical project. Lanes lease from it only what Mesh repository_access allows.
+    host_repositories: list = field(default_factory=list)
     poll_seconds: int = 20
     wake_poll_seconds: int = 120
     # one shared deadline for every read and backoff of a single WAIT observation (docs/wait-observation-budget.md)
@@ -449,8 +453,6 @@ class RunnerConfig:
     # Directory names a WAIT snapshot leaves out (when nothing under them is tracked): build caches.
     checkpoint_exclude_names: tuple = (".gocache", "node_modules", "target", ".venv", "__pycache__", "var")
     recovery_supersede_authors: tuple = ()   # Mesh agent ids besides the receipt author whose comment may supersede a recovery gate
-    ops_review_wait_registry: Path | None = None  # private Board registry; observer off when absent
-    ops_review_wait_notifier_id: str = ""          # exact Board Mesh actor UUID, paired with registry
     receipt_wait_v1: bool = False      # `WAIT receipt:#<card8>` on an operator-armed Telegram receipt registration
     gmail_watch_v1: bool = False       # `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     gmail_watch_reader: tuple = ()     # fixed argv of the read-only wrapper (JSON on stdin/stdout); never a shell string
@@ -614,6 +616,11 @@ class RunnerConfig:
     # (a login ask about a live session), stdout = the reason shown to the lane; anything else lets the
     # question through. Runs on the final text of every lane, Codex included. () = off.
     login_ask_check: tuple = ()
+    # Mesh agent names, in order, that grant repository access and create host clones. A durable access
+    # refusal (undeclared_repo, no_membership, missing_approved_clone) opens its handoff comment with
+    # `@<first that is not the refused lane itself>`, so that agent's runner files a request card
+    # (docs/repository-access.md). () = no addressee: the plain `next_actor=operator` comment.
+    repo_access_contacts: tuple = ()
     hard_ask_patterns: tuple = asks.DEFAULT_HARD_PATTERNS     # keyword fragments of a hard question
     hard_ask_labels: tuple = asks.DEFAULT_HARD_LABELS         # task labels that make a question hard
     # slugs of Mesh users that are test or service accounts: nobody answers them (the roster
@@ -695,6 +702,14 @@ def _string_list(value, name: str, default: tuple) -> tuple:
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise ConfigError(f"{name} must be a list of strings")
     return tuple(value)
+
+
+def _repo_access_contacts(value) -> tuple:
+    names = _string_list(value, "repo_access_contacts", ())
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
+            raise ConfigError(f"repo_access_contacts: {name!r} must be a bare Mesh agent name (no @)")
+    return names
 
 
 def _github_hosted(section: dict) -> tuple:
@@ -839,6 +854,41 @@ def editor_port(cfg: "RunnerConfig") -> int:
     return cfg.extension_port + 1 if "editor" in cfg.service_processes else cfg.extension_port
 
 
+def _repo_spec(x: dict, where: str, project: tuple = ()) -> RepoSpec:
+    overrides = x.get("fetch_url_overrides", {})
+    if not isinstance(overrides, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                              for k, v in overrides.items()):
+        raise ConfigError("fetch_url_overrides must be a table of URL strings")
+    return RepoSpec(name=x["name"], base=_path(x["base"]), remote=x.get("remote", "origin"),
+                    branch=x.get("branch", "main"), max_slots=int(x.get("max_slots", 4)),
+                    fetch_url_overrides=tuple(overrides.items()), project=project)
+
+
+def _host_repositories(raw) -> list:
+    """``[[repositories]]``: the host clone inventory. Every entry states its canonical project
+    explicitly (``provider``, ``host``, ``project_path``); names and projects are unique."""
+    from .repo_access import identity
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(x, dict) for x in raw):
+        raise ConfigError("[[repositories]] must be an array of tables")
+    out, names, projects = [], set(), set()
+    for x in raw:
+        if not isinstance(x.get("name"), str) or not x["name"].strip() or "/" in x["name"] or not x.get("base"):
+            raise ConfigError("[[repositories]]: every entry needs a name without '/' and a base")
+        try:
+            ident = identity(x.get("provider", "gitlab"), x.get("host"), x.get("project_path"))
+        except ValueError as e:
+            raise ConfigError(f"[[repositories]] {x.get('name')!r}: {e}") from None
+        spec = _repo_spec(x, "[[repositories]]", ident)
+        if spec.name in names or ident in projects:
+            raise ConfigError(f"[[repositories]]: duplicate name or project for {spec.name!r}")
+        names.add(spec.name)
+        projects.add(ident)
+        out.append(spec)
+    return out
+
+
 def load(path: str | Path) -> RunnerConfig:
     from .native_result_config import sha, unrelated
     source_raw = Path(path).read_bytes()
@@ -860,13 +910,6 @@ def load(path: str | Path) -> RunnerConfig:
         raise ConfigError("archive_require_mount needs archive_root")
     if not r.get("mesh_url"):
         raise ConfigError("[runner] mesh_url is required")
-    ops_registry = r.get("ops_review_wait_registry")
-    ops_notifier = r.get("ops_review_wait_notifier_id")
-    if ops_registry is not None or ops_notifier is not None:
-        if (not isinstance(ops_registry, str) or not ops_registry or not _path(ops_registry).is_absolute()
-                or not isinstance(ops_notifier, str) or not re.fullmatch(
-                    r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", ops_notifier)):
-            raise ConfigError("ops-review observer requires an absolute registry path and canonical notifier UUID")
     recipients = r.get("decision_request_metadata_only_recipients", [])
     if (not isinstance(recipients, list) or any(not isinstance(v, str) or not re.fullmatch(
             r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", v) for v in recipients)):
@@ -916,15 +959,7 @@ def load(path: str | Path) -> RunnerConfig:
         harness = a.get("harness", "claude")
         if harness not in ("claude", "codex"):
             raise ConfigError(f"agent {a.get('name')}: harness must be claude or codex")
-        repos = []
-        for x in a.get("repos") or []:
-            overrides = x.get("fetch_url_overrides", {})
-            if not isinstance(overrides, dict) or any(not isinstance(k, str) or not isinstance(v, str)
-                                                      for k, v in overrides.items()):
-                raise ConfigError("fetch_url_overrides must be a table of URL strings")
-            repos.append(RepoSpec(name=x["name"], base=_path(x["base"]), remote=x.get("remote", "origin"),
-                                  branch=x.get("branch", "main"), max_slots=int(x.get("max_slots", 4)),
-                                  fetch_url_overrides=tuple(overrides.items())))
+        repos = [_repo_spec(x, f"agent {a.get('name')} repos") for x in a.get("repos") or []]
         ident = a.get("identity")
         if "project_ids" in a:
             # removed lane option: Mesh membership decides which projects a lane serves
@@ -988,6 +1023,7 @@ def load(path: str | Path) -> RunnerConfig:
         mesh_url=r["mesh_url"],
         state_dir=_path(r.get("state_dir") or _default_state_dir()),
         agents=agents,
+        host_repositories=_host_repositories(raw.get("repositories")),
         poll_seconds=int(r.get("poll_seconds", 20)),
         daily_start_cap=int(r.get("daily_start_cap", 0)),
         comment_wake=comment_wake,
@@ -999,8 +1035,6 @@ def load(path: str | Path) -> RunnerConfig:
         archive_root=_path(r.get("archive_root")),
         archive_require_mount=_path(r.get("archive_require_mount")),
         workspace_wait_release_minutes=float(r.get("workspace_wait_release_minutes", 0.0)),
-        ops_review_wait_registry=_path(ops_registry),
-        ops_review_wait_notifier_id=ops_notifier or "",
         gmail_watch_v1=r.get("gmail_watch_v1") is True,
         gmail_watch_reader=_argv(r.get("gmail_watch_reader"), "gmail_watch_reader"),
         time_wait_ignore_names=[str(n) for n in (r.get("time_wait_ignore_names") or [])],
@@ -1032,6 +1066,7 @@ def load(path: str | Path) -> RunnerConfig:
         tgpeek_editor_control_secret_file=control_secret_file,
         config_path=str(Path(path).resolve()),
         login_ask_check=tuple(_string_list(r.get("login_ask_check"), "login_ask_check", ())),
+        repo_access_contacts=_repo_access_contacts(r.get("repo_access_contacts")),
         merge_command=_merge_command(r.get("merge_command")),
         merge_command_cwd=_path(r.get("merge_command_cwd")),
         native_result_adoption=native_pin,

@@ -243,7 +243,8 @@ class InteractiveAdapter(Adapter):
 
     def __init__(self, base: Adapter, agent: str, state_dir: Path, tmux: str = "tmux",
                  max_sessions: int = 20, python: str | None = None,
-                 background_wait_minutes: float = BACKGROUND_WAIT_MINUTES):
+                 background_wait_minutes: float = BACKGROUND_WAIT_MINUTES,
+                 memory_floor: tuple[float, float] = (0.0, 0.0)):
         super().__init__(base.binary, base.extra_args)
         self.base = base
         self.name = base.name
@@ -253,6 +254,7 @@ class InteractiveAdapter(Adapter):
         self.max_sessions = max_sessions
         self.python = python or sys.executable
         self.background_wait_minutes = background_wait_minutes
+        self.memory_floor = memory_floor
 
     # the runner routes a Codex lane to another profile by setting `profile` on its adapter:
     # it must reach the wrapped adapter, which builds the command line and names the model
@@ -286,7 +288,10 @@ class InteractiveAdapter(Adapter):
         return [self.python, str(DRIVER), "--harness", self.name, "--agent", self.agent,
                 "--state", str(self.dir), "--tmux", self.tmux, "--max-sessions", str(self.max_sessions),
                 "--cwd", str(cwd), "--session", session_id or "", "--mode", "resume" if resume else "start",
-                "--background-wait-minutes", "%g" % self.background_wait_minutes, "--", *harness]
+                "--background-wait-minutes", "%g" % self.background_wait_minutes,
+                *(("--memory-hold-free-pct", "%g" % self.memory_floor[0],
+                   "--memory-hold-swap-mb", "%g" % self.memory_floor[1]) if self.memory_floor[0] > 0 else ()),
+                "--", *harness]
 
     def start_argv(self, session_id: str, cwd: Path, add_dirs: list[Path]) -> list[str]:
         return self._argv(session_id, cwd, add_dirs, False)
@@ -344,11 +349,12 @@ class InteractiveAdapter(Adapter):
 
 
 def wrap(base: Adapter, agent: str, mode: str, state_dir: Path, tmux: str, max_sessions: int,
-         background_wait_minutes: float = BACKGROUND_WAIT_MINUTES) -> Adapter:
+         background_wait_minutes: float = BACKGROUND_WAIT_MINUTES,
+         memory_floor: tuple[float, float] = (0.0, 0.0)) -> Adapter:
     if mode == "headless" or not hasattr(base, "interactive_argv"):
         return base
     return InteractiveAdapter(base, agent, state_dir, tmux, max_sessions,
-                              background_wait_minutes=background_wait_minutes)
+                              background_wait_minutes=background_wait_minutes, memory_floor=memory_floor)
 
 
 # ---------------------------------------------------------------------- reaper

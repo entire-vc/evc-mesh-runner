@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.28 — 2026-11-12
+
+- End a turn whose prompt delivery stays unproven without an operator: once its processes are gone and its native evidence stays unchanged for 15 minutes, the prompt is archived (never replayed) and the card starts in a new attempt. The transition emits one operator alert and the card says what happens next. No session window starts below the configured memory floor, read right before the window opens, and a driver claims its window under the host start lock so another driver cannot close it as idle.
+
+## 0.2.27 — 2026-11-12
+
+- A blocked merge wait asks the owner to merge the target branch in and push normally, matching the merge gate, instead of asking for a rebase.
+- Slim checkpoints keep the modes of an empty directory's parents, so such captures verify.
+- Granted cross-workspace card waits wake from the source card's server-side receipt; revoking the grant wakes the owner without treating the condition as met. Requires the matching Mesh API.
+- Changelog entries live in one file per change under changelog.d/; ops/release.py sets the version in all three files and collects the entries in the release commit, and the mr-policy check enforces it. See docs/release-process.md.
+
+## 0.2.26 — 2026-11-12
+
+- Route a lane again when its launch returns to a login that is on hold.
+- A card whose previous lane still holds its reservation waits alone, with the holder named, instead of holding back the whole lane; an unconfirmed gate release is resent with backoff.
+- asks classify reports the gate class Mesh holds; outward contact in someone's name is a hard ask.
+- Repository-access refusals are addressed to the configured repo_access_contacts, once per fingerprint and addressee.
+- Repository access is read from Mesh on every tick, separate from the host's [[repositories]] inventory; the last valid state survives outages and only a newer revision replaces it. See docs/repository-access.md.
+
+## 0.2.25 — 2026-11-11
+
+- An unparked review resumes its own compatible session, using the same ownership-return checks as work admission.
+
 ## 0.2.24 — 2026-11-11
 
 - Honor park labels at the end of review turns and before review resume, keeping the existing session.
