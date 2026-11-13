@@ -33,7 +33,8 @@ class Predicate(unittest.TestCase):
         cases = (([link, edge(2)], "deadbeef", False),
                  ([link, edge(2, satisfied=False)], "deadbeef", True),
                  ([link, edge(2, satisfied=False)], "00000002", False),
-                 ([link, edge(2, satisfied=False), edge(3, satisfied=False)], "00000002", True))
+                 ([link, edge(2, satisfied=False), edge(3, satisfied=False)], "00000002", False),
+                 ([link, edge(2, satisfied=False), edge(3, satisfied=False)], "deadbeef", True))
         for edges, target, blocked in cases:
             with self.subTest(edges=edges, target=target):
                 self.assertEqual(blocks_stale_observation({"outgoing": edges}, TID, target), blocked)
@@ -139,6 +140,19 @@ class Predicate(unittest.TestCase):
             with self.subTest(identity=value):
                 self.assertTrue(blocks_stale_observation({"outgoing": [e]}, TID, "00000001"))
 
+    def test_block_to_current_target_admits_observer_beside_other_blockers(self):
+        # Seen live: a WAIT on a closed target (edge satisfied) beside an open sibling block;
+        # the guard held it until the sibling closed too and nobody saw why.
+        cases = (([edge(1), edge(2, satisfied=False)], "00000001", False),
+                 ([edge(1, satisfied=False), edge(2)], "00000001", False),
+                 ([edge(1), edge(2), edge(3, satisfied=False)], "00000003", False),
+                 ([edge(1), edge(2, satisfied=False)], "deadbeef", True),
+                 ([dict(edge(1), condition="deployed", condition_satisfied=False), edge(2, satisfied=False)],
+                  "00000001", True))
+        for edges, target, blocked in cases:
+            with self.subTest(edges=edges, target=target):
+                self.assertEqual(blocks_stale_observation({"outgoing": edges}, TID, target), blocked)
+
     def test_existing_single_current_unsatisfied_edge_contract(self):
         self.assertFalse(blocks_stale_observation({"outgoing": [edge(1, satisfied=False)]}, TID, "00000001"))
         self.assertTrue(blocks_stale_observation({"outgoing": [edge(1, satisfied=False)]}, TID, "deadbeef"))
@@ -180,6 +194,27 @@ class SameAttemptWake(Bench):
         self.assertEqual(b.wait["target"], original_wait["target"])
         self.assertFalse(r.procs)
         self.assertFalse(self.calls.exists())
+
+    def test_closed_target_wakes_beside_open_sibling_block(self):
+        # Seen live: the closed target's edge is satisfied, another block is still open.
+        r, a = self.prepare(body="FYI progress only")
+        awaited = r.mesh.tasks[task(2)["id"]]
+        awaited["status_id"] = "s-done"
+        r.mesh.deps[a.task_id] = [dict(edge(2, a.task_id), depends_on_task_id=awaited["id"]),
+                                  dict(edge(3, a.task_id, satisfied=False), depends_on_task_id=task(3)["id"])]
+        r._wake_one(a)
+        b = r.store.get(a.id)
+        self.assertEqual((b.id, b.state), (a.id, "ready"))
+        self.assertIn(f"task #{awaited['id'][:8]} is done", b.wake_text)
+        self.assertFalse(r.procs)
+
+    def test_open_target_beside_open_sibling_block_keeps_waiting(self):
+        r, a = self.prepare(body="FYI progress only")
+        r.mesh.deps[a.task_id] = [dict(edge(2, a.task_id, satisfied=False), depends_on_task_id=task(2)["id"]),
+                                  dict(edge(3, a.task_id, satisfied=False), depends_on_task_id=task(3)["id"])]
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, "waiting")
+        self.assertFalse(r.procs)
 
     def test_informational_link_alone_is_not_a_wake_event(self):
         r, a = self.prepare(body="FYI progress only")

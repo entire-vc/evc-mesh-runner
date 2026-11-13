@@ -414,6 +414,24 @@ class GateClass(unittest.TestCase):
                          asks.Verdict(True, "no default stated by the asker"))
         self.assertEqual(asks.gate_class("Which layout?", ["Money"], "left"), asks.Verdict(True, "label:money"))
 
+    def test_gate_class_reads_the_default_with_the_question(self):
+        # Without a marker the audit classifies the held gate_reason and recommended_default
+        # apart; what applies at the deadline is the default, so its money words count too.
+        self.assertEqual(asks.gate_class("Включаем канал бота обратно?", [], "да, оплатить и включить"),
+                         asks.Verdict(True, "keyword:оплат"))
+        self.assertEqual(asks.gate_class("Включаем канал бота обратно?", [], "да, включить"),
+                         asks.Verdict(False, "no hard rule matched"))
+        # A live gate's question verbatim: hard on the question alone, with a default that names
+        # no money, and with the default the live gate carried.
+        q = ("Пополнить общий баланс на $20 через https://openrouter.ai/settings/credits или оставить "
+             "этот канал отключённым?")
+        self.assertEqual(asks.gate_class(q, [], "да"), asks.Verdict(True, "keyword:пополн"))
+        self.assertEqual(asks.gate_class(q, [], "да, пополнить"), asks.Verdict(True, "keyword:пополн"))
+        # A missing question fails closed even with a stated default that would read soft.
+        for missing in ("", "   ", None, "[soft]"):
+            self.assertEqual(asks.gate_class(missing, [], "да, включить"),
+                             asks.Verdict(True, "unsure: no question text"))
+
 
 class SharedFixture(unittest.TestCase):
     """tests/fixtures/ask_class_cases.json is byte-identical to the Mesh server's

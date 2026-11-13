@@ -27,12 +27,21 @@ raise SystemExit(76)
 '''
 
 
+SPAN_MINUTES = 215                     # the last clock step of public_case is at 214 min
+
+
 class Clock:
     def __init__(self):
         self.elapsed = 0
         # Three hours back, not a fixed hour: the fake harness stamps its typed outcome with the real
         # clock, and the runner reads only outcomes newer than the turn start (origin + ~152 min).
         self.origin = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).replace(second=0, microsecond=0)
+        # The scenario spans ~215 min and the runner's notice is once per UTC day: a window that crosses
+        # midnight posts a second notice. Then it ends before that midnight instead; its turn start
+        # (origin + ~152 min) stays in the real past, since the real clock is at most 35 min short of it.
+        boundary = (self.origin + dt.timedelta(days=1)).replace(hour=0, minute=0)
+        if self.origin + dt.timedelta(minutes=SPAN_MINUTES) >= boundary:
+            self.origin = boundary - dt.timedelta(minutes=SPAN_MINUTES + 5)
 
     def now(self):
         return self.origin + dt.timedelta(seconds=self.elapsed)
@@ -59,7 +68,7 @@ class SiblingEvidenceRetry(Bench):
         t = task(1, cat='review')
 
         class Mesh(FakeMesh):
-            def add_comment(self, tid, body, author='agent-1', at=None):
+            def add_comment(self, tid, body, author='agent-1', at=None, key=''):
                 return super().add_comment(tid, body, author=author, at=at or clock.now())
 
         mesh = Mesh([t])

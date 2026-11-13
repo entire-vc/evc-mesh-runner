@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.2.39 — 2026-11-13
+
+- **A decision request that answered a question is no longer reopened when the same question comes
+  again.** Every request remembers the questions answered on it, not only its last one; a verbatim
+  or normalized repeat of any of them is attached without a move or a comment, also after the
+  re-check hands it back, and a marker-line repeat is sent back naming the request as the answer
+  reference. A changed question, or a request closed without an answer (cancelled), is asked
+  again as before. The turn contract offers `wait_for on=card target_condition=artifact_published
+  criterion=<named result>` and says an answered `ask_agent` question is refused
+  (`already_answered`); an `artifact_published` wait that Mesh releases because the card closed
+  without the result (`released_by=closure_without_evidence`) wakes with the card's status, who
+  closed it and the missing result instead of "met".
+- **A wait that can no longer complete by itself no longer parks for good.** `mr ... until=success`
+  on a merge request whose red head was already told is now sent back at declaration, as
+  `until=merged` already was. A typed MR `until=merged` or `until=success` wait that already stands
+  (declared before such a rule existed) is judged by the same rules once per wait and runner
+  process, after its observer found nothing new, so an upgrade re-checks every standing wait;
+  pipeline waits, `until=change`, a `manual` head and the no-review-label rule are left alone there, because
+  someone else may still complete them. A wait whose every check fails to read (timeout,
+  transport) wakes its owner with the cause after 3 failures in a row spanning at least 6 hours;
+  one successful check resets the count, which survives a restart.
+- **A card wait is no longer sent back when its target waits for a published external event or
+  when the wait itself is for acceptance.** A wait `until=accepted|deployed|shipped` names a release
+  gate already and is accepted whatever the target waits for. A target whose `on=time` wait carries
+  an event and a source (a scheduled external event, not a measurement window) holds a plain card
+  wait too. A target on a bare timer or on a person is still sent back for a plain wait.
+
+## 0.2.38 — 2026-11-12
+
+- **The runner's writes to Mesh are safe to repeat.** The per-turn spend report
+  (`POST /agents/me/sessions/report`) and every runner comment carry an `Idempotency-Key` derived from what
+  the write is (its kind, the attempt, the turn), never from its text. A write whose answer was lost
+  (timeout, reset) is sent again with the same key, and Mesh answers the repeat without writing again; a
+  write rebuilt after a restart with other text is refused by Mesh (`idempotency_key_reused`) and counted as
+  already written. A runner note without a named key is keyed by its text and the UTC hour.
+  `[runner] idempotency_keys = false` sends no key and repeats no write (rollback without a release).
+  See [repeat-safe writes](docs/idempotent-writes.md).
+- **A card WAIT wakes when its target closes even if the card has other blocking links.** The guard
+  that keeps a WAIT from observing a retired target counted every blocking link of the card, so a WAIT
+  whose target sat beside another open blocker (or beside satisfied ones) was held silently, with no log
+  line, until every other blocker closed too. A fully known `task_done` link to the current target now
+  admits the ordinary observer; the owner is woken by its own target and re-declares on what still
+  blocks. Links not naming the target, typed links and unknown or paginated link sets still hold the WAIT.
+
+## 0.2.37 — 2026-11-12
+
+- **A card wait whose uniqueness check outlasts one wake is pinned on a later attempt instead of
+  never.** On first sight of a waited card the runner asks every other agent of the process whether
+  the same short id reads as a different card. A large sweep could exceed the
+  wake read budget, so it failed as `kind=timeout stage=GET /tasks/by-short-id/:id`, the wait
+  was never pinned and every attempt started the sweep again. What each agent answered is now kept for 10 minutes per short id; the next
+  attempt asks only the agents that have not answered, so the sweep finishes in two or three
+  attempts. The card that decides a wake is still read fresh; faults are not remembered.
+- **A top-up, a balance or an amount of money now makes an ask hard, and the default is read with
+  the question.** "Top up the shared balance by $20?" with a default such as "yes, top it up" used
+  to classify soft, so its default would have applied by itself at the deadline. The hard list now
+  holds top-up, balance, credits and deposit stems and amounts in a currency (`$20`, `20$`,
+  `1500 ₽`, `20 usd`), and `gate_class` reads the stated default together with the question, as
+  Mesh does with the marker's `Default:` line. The shared fixture with the server is updated.
+- **An ask that asks nothing stays hard.** A marker carrying only a default (and perhaps a
+  deadline or a class tag), or an empty question with a stated default, now fails closed as
+  "unsure: no question text" instead of reading the default as its question.
+
+## 0.2.36 — 2026-11-12
+
+- **Slots are locked against a foreign `git worktree prune`, and a slot whose admin dir was removed
+  recovers without an operator.** A prune run where the slot's path was not visible deleted the admin
+  dirs of live slots; the held rows then filled the pool and stopped the lane. Every slot is now locked
+  (new ones when made, existing ones by the periodic slot pass; eviction unlocks first). A held orphan
+  whose work nobody resumes is archived onto a `refs/mesh-runner/archive/orphan-*` ref, its directory
+  moved to `<archive>/orphan-admin/<agent>/` and its row dropped; a leased orphan is rebuilt in place on
+  suspend, so its attempt checkpoints and resumes. `pool_hold` now names the held slots and their notes.
+  See `docs/architecture.md`.
+
+## 0.2.35 — 2026-11-12
+
+- **An answered decision request keeps its working copies for the next question.** A decision
+  request is closed when answered and its asker reopens it with the next question; the return
+  already continues the addressee's session, but the pool treated the closed request as gone and
+  handed its free slots to the lane's next cards, so the return found other paths and started fresh
+  (`path_changed`). The ownership-loss note now records that the card is a decision request, and the
+  pool keeps such slots aside like those of any card that may come back. Cancelled requests and
+  ordinary closed cards are unchanged; at the pool maximum the slots are still handed out, and a
+  return that lost a path still starts fresh.
+
 ## 0.2.34 — 2026-11-12
 
 - **A blocked pool returns by its reset time, and a long route hold is signalled.** A pool left at the threshold used to turn `unknown` as soon as its reading went stale (an expired collector token), so lanes stayed on their reserve with no end. Now a blocked pool with a known reset time stays blocked until that time whatever the readings do, and is reported `available` (source `reset_elapsed`) once it has passed, until a fresh reading says otherwise. The code fallback thresholds block and transfer at 99 % and readmit below 95 %. A lane held by one `route:` reason for 30 minutes raises one `operator_alert` (`route_hold:<lane>`). A resume re-reads the lane's route after the start gate, so a gate that restores the lane to its primary is followed by the launch.

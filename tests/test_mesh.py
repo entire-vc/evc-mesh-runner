@@ -166,5 +166,64 @@ class RateLimitRetry(unittest.TestCase):
         self.assertIsNone(self.m._parse_retry_after("soon"))
         self.assertEqual(self.m._parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), 0.0)
 
+
+class Recording:
+    """Opener that records every request; the first ``lose`` sends lose their response."""
+    def __init__(self, lose=0):
+        self.lose, self.reqs = lose, []
+
+    def __call__(self, req, timeout=None):
+        self.reqs.append(req)
+        if len(self.reqs) <= self.lose:
+            raise TimeoutError("timed out")          # the server may have applied it; the answer is gone
+        return io.BytesIO(b'{"ok": true}')
+
+
+class SessionReportIdempotencyKey(unittest.TestCase):
+    def key(self, req):
+        return req.get_header("Idempotency-key")
+
+    def test_repeat_after_a_lost_response_carries_the_same_key(self):
+        import mesh_runner.mesh as m
+        op = Recording(lose=3)                       # the send and both same-key repeats lose their answer
+        c = MeshClient("https://m", "k", opener=op)
+        with unittest.mock.patch("mesh_runner.mesh.time.sleep", lambda s: None):
+            with self.assertRaises(m.MeshError):
+                c.session_report("t1", 100, 5, "model-a", 0.01, report_id="attempt-1:1")
+            c.session_report("t1", 100, 5, "model-a", 0.01, report_id="attempt-1:1")
+        self.assertEqual(len(op.reqs), 4)
+        self.assertEqual(len({self.key(r) for r in op.reqs}), 1)
+        k1, k2 = (self.key(r) for r in op.reqs[2:])
+        self.assertTrue(k1)
+        self.assertEqual(k1, k2)
+        self.assertEqual(str(__import__("uuid").UUID(k1)), k1)       # a UUID
+        self.assertEqual(op.reqs[0].data, op.reqs[1].data)            # the same report, byte for byte
+
+    def test_another_report_gets_another_key(self):
+        op = Recording()
+        c = MeshClient("https://m", "k", opener=op)
+        c.session_report("t1", 100, 5, "model-a", 0.01, report_id="attempt-1:1")
+        c.session_report("t1", 100, 5, "model-a", 0.01, report_id="attempt-1:2")
+        c.session_report("t1", 100, 5, "model-a", 0.01, report_id="attempt-2:1")
+        keys = [self.key(r) for r in op.reqs]
+        self.assertEqual(len(set(keys)), 3)
+
+    def test_rate_limited_repeat_resends_the_same_key(self):
+        slept = []
+        with unittest.mock.patch("mesh_runner.mesh.time.sleep", slept.append):
+            op = RateLimited(1, "0")
+            seen = []
+            orig = op.__call__
+            c = MeshClient("https://m", "k", opener=lambda req, timeout=None: (seen.append(req), orig(req, timeout))[1])
+            c.session_report("t1", 1, 1, "m", 0.0, report_id="attempt-1:1")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(self.key(seen[0]), self.key(seen[1]))
+
+    def test_without_a_report_id_no_key_is_sent(self):
+        op = Recording()
+        MeshClient("https://m", "k", opener=op).session_report("t1", 1, 1, "m", 0.0)
+        self.assertIsNone(self.key(op.reqs[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

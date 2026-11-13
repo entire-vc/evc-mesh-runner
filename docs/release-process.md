@@ -15,6 +15,13 @@ requests never touch the version or `CHANGELOG.md`, so they never conflict with 
 - Merge requests go into `main` through the ordinary merge gate whenever they are ready: green
   pipeline and an independent SHIP verdict on the head commit. Merging one does not make another
   stale: nothing to rebase for the changelog.
+- Files that reach the public export carry no internal card id (`#` and 8 hex) and no team member
+  name, in code, comments, docs or fragment text. `mr-policy` scans the whole tree at the head of
+  every merge request (release branches too) except `NOT_EXPORTED` in `ops/check_mr_policy.py`, and
+  lists each hit with its line. The card belongs in the fragment's file name, the branch and the
+  merge request; tests use a stub id from `STUB_CARD_IDS`. The names are kept there only as sha256
+  of the word. `tests/test_release_flow.py` runs the same scan on the checkout, so a `main` that
+  gained one goes red too.
 
 ## The release branch
 

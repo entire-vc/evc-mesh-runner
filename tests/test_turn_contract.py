@@ -4,13 +4,13 @@ import re
 import unittest
 
 from mesh_runner import prompt as prompts
-from mesh_runner.outcome import CONTRACT, MERGE_MARKER_GUIDANCE, MERGE_WAIT_GUIDANCE, contract, parse_line
+from mesh_runner.outcome import CONTRACT, DECISION_WAIT_GUIDANCE, MERGE_MARKER_GUIDANCE, MERGE_WAIT_GUIDANCE, contract, parse_line
 
 from fakes import task
 
 # copied from evc-mesh-mcp internal/mcp/turn_outcomes.go (registerTurnOutcomeTools)
 TOOLS = {
-    "wait_for": {"task_id", "on", "target_task_id", "target_condition", "vcs_link_id", "provider", "project_path",
+    "wait_for": {"task_id", "on", "target_task_id", "target_condition", "criterion", "vcs_link_id", "provider", "project_path",
                  "mr_iid", "pipeline_id", "required_jobs", "until", "after_sha", "after_pipeline_id",
                  "after_status", "registration", "registration_ref", "until_at", "event_ref", "source", "why", "note"},
     "continue_next": {"task_id", "note"},
@@ -23,7 +23,7 @@ TOOLS = {
 VALUES = {
     "on": {"card", "mr", "pipeline", "time", "merge", "registered"},
     "until": {"merged", "green", "changed", "finished"},
-    "target_condition": {"task_done", "shipped", "deployed", "accepted"},
+    "target_condition": {"task_done", "shipped", "deployed", "accepted", "artifact_published"},
     "provider": {"gitlab", "github"},
     "registration": {"ops-review", "gmail", "receipt", "lifecycle", "stall", "recovery", "queue", "native"},
     "result_kind": {"change", "defect", "research", "content", "ops"},
@@ -97,6 +97,18 @@ class TurnContract(unittest.TestCase):
     def test_the_marker_grammar_is_unchanged(self):
         self.assertEqual(parse_line("↻ NEXT: the docs", None).kind, "next")
         self.assertEqual(parse_line("❓ Blocking @morgan: ship?", None).kind, "blocking")
+
+    def test_a_named_result_wait_and_the_answered_refusal_are_offered(self):
+        # a result another card produces in parts is waited on as that result, not as the card's
+        # closure; an answered question is refused, not asked again
+        for merge in (False, True):
+            text = " ".join(contract(merge).split())
+            self.assertIn("target_condition=shipped|deployed|accepted|artifact_published", text)
+            self.assertIn("artifact_published criterion=<named result>", text)
+            self.assertIn("not its closure", text)
+        self.assertIn("already_answered", " ".join(DECISION_WAIT_GUIDANCE.split()))
+        self.assertIn("a new question says what changed", " ".join(DECISION_WAIT_GUIDANCE.split()))
+        self.assertTrue(CONTRACT.endswith(DECISION_WAIT_GUIDANCE))
 
     def test_it_is_no_longer_than_the_marker_contract_it_replaces(self):
         self.assertLessEqual(len(CONTRACT), 4513)            # 0.2.3's contract(False)

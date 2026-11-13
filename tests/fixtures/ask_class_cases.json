@@ -37,6 +37,15 @@
   "бюджет",
   "купит",
   "покупк",
+  "top[- ]?up",
+  "credits?\\b",
+  "deposit",
+  "balance",
+  "пополн",
+  "баланс",
+  "перевод(?:ести)? (?:денег|средств)",
+  "[$€₽£][\\s ]?\\d",
+  "\\d[\\d.,]*[\\s ]?(?:usd|eur|руб|₽|\\$)",
   "secret",
   "key\\b",
   "keys\\b",
@@ -473,6 +482,114 @@
    "default": "утвердить план как есть",
    "class": "hard",
    "rule": "keyword:рассылк"
+  },
+  {
+   "name": "top-up of a shared balance, default names no money (verbatim question)",
+   "body": "❓ Blocking @morgan: Пополнить общий баланс на $20 через https://openrouter.ai/settings/credits или оставить этот канал отключённым?\n\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:пополн"
+  },
+  {
+   "name": "top-up of a shared balance, live default (verbatim question)",
+   "body": "❓ Blocking @morgan: Пополнить общий баланс на $20 через https://openrouter.ai/settings/credits или оставить этот канал отключённым?\n\nDefault: да, пополнить",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да, пополнить",
+   "class": "hard",
+   "rule": "keyword:пополн"
+  },
+  {
+   "name": "top-up of a shared balance, verbatim question and default",
+   "body": "❓ Blocking @morgan: Пополнить общий баланс на $20 через https://openrouter.ai/settings/credits или оставить этот канал отключённым?\n\nDefault: Рекомендую пополнить на $20; без явного решения платежи не выполняются.",
+   "slug": "morgan",
+   "labels": [],
+   "default": "Рекомендую пополнить на $20; без явного решения платежи не выполняются.",
+   "class": "hard",
+   "rule": "keyword:пополн"
+  },
+  {
+   "name": "english top up credits",
+   "body": "❓ Blocking @morgan: top up the API credits so the bot answers again?\nDefault: yes, top up",
+   "slug": "morgan",
+   "labels": [],
+   "default": "yes, top up",
+   "class": "hard",
+   "rule": "keyword:top up"
+  },
+  {
+   "name": "amount in roubles after the number",
+   "body": "❓ Blocking @morgan: продлить канал ещё на месяц за 1500 ₽?\nDefault: продлить",
+   "slug": "morgan",
+   "labels": [],
+   "default": "продлить",
+   "class": "hard",
+   "rule": "keyword:1500 ₽"
+  },
+  {
+   "name": "amount with a trailing dollar sign",
+   "body": "❓ Blocking @morgan: оставить лимит канала на 20$ в месяц?\nDefault: оставить",
+   "slug": "morgan",
+   "labels": [],
+   "default": "оставить",
+   "class": "hard",
+   "rule": "keyword:20$"
+  },
+  {
+   "name": "money only in the default",
+   "body": "❓ Blocking @morgan: включаем канал бота обратно?\nDefault: да, оплатить и включить",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да, оплатить и включить",
+   "class": "hard",
+   "rule": "keyword:оплат"
+  },
+  {
+   "name": "a number without a currency stays soft",
+   "body": "❓ Blocking @morgan: поднять лимит ретраев до 20?\nDefault: поднять до 20",
+   "slug": "morgan",
+   "labels": [],
+   "default": "поднять до 20",
+   "class": "soft",
+   "rule": "no hard rule matched"
+  },
+  {
+   "name": "a marker asking nothing, default on its own line",
+   "body": "❓ Blocking @morgan:\n\nDefault: да, включить",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да, включить",
+   "class": "hard",
+   "rule": "unsure: no question text"
+  },
+  {
+   "name": "a marker asking nothing, default inline",
+   "body": "❓ Blocking @morgan: Default: да, включить",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да, включить",
+   "class": "hard",
+   "rule": "unsure: no question text"
+  },
+  {
+   "name": "a marker with only tags, a default and a deadline",
+   "body": "❓ Blocking @morgan: [soft]\n[hard]\nDefault: да\nDeadline: 2026-11-13T12:00:00Z",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "unsure: no question text"
+  },
+  {
+   "name": "a question on the line after the marker stays soft",
+   "body": "❓ Blocking @morgan:\nКакой макет взять?\nDefault: левый",
+   "slug": "morgan",
+   "labels": [],
+   "default": "левый",
+   "class": "soft",
+   "rule": "no hard rule matched"
   }
  ]
 }

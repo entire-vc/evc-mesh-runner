@@ -7,6 +7,7 @@ import time
 import weakref
 from dataclasses import dataclass
 
+from . import observation_budget as budget
 from .mesh import MeshClient, MeshError
 
 PRIORITY_RANK = {"urgent": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
@@ -76,6 +77,16 @@ _READERS: "weakref.WeakSet[StatusCategories]" = weakref.WeakSet()
 _READ_BY: "weakref.WeakValueDictionary[str, StatusCategories]" = weakref.WeakValueDictionary()
 _NOBODY: dict[str, float] = {}           # "p:<project>" / "t:<task>" -> monotonic until
 NOBODY_SECONDS = 600
+# The cross-tenant uniqueness sweep asks every other reader once, one GET each. At fleet size it can
+# outlast one wake's read budget (measured: 65 readers took 76.7 s against 45 s), and a sweep that
+# restarts from zero on every attempt never finishes, so the wait is never pinned. What each reader
+# answered (the id it read, "" for a denial or a missing card) is kept per short ref for SWEPT_SECONDS:
+# the next attempt asks only the readers that have not answered yet. Faults are not remembered.
+_SWEPT: "dict[str, tuple[float, weakref.WeakKeyDictionary]]" = {}
+SWEPT_SECONDS = NOBODY_SECONDS
+# One sweep per short ref at a time: a concurrent attempt waits (within its own read budget) and then
+# asks only the readers the first one left unanswered, so no reader is asked twice while answers are fresh.
+_SWEEP_LOCKS: dict[str, threading.RLock] = {}
 
 
 def _read_elsewhere(key: str, me, read, strict: bool = False):
@@ -112,6 +123,22 @@ AMBIGUOUS = object()     # a short ref that more than one reader resolves to dif
 
 
 def _read_unique_elsewhere(key: str, me, read, pinned: str = "", known_id: str = ""):
+    """See ``_sweep_unique``; serialized per key (``_SWEEP_LOCKS``). A wait for a running sweep that
+    outlasts this caller's read budget fails as a spent budget does: a timeout, never an answer."""
+    with _SHARED_LOCK:
+        lock = _SWEEP_LOCKS.setdefault(key, threading.RLock())
+    obs = budget.current()
+    left = -1 if obs is None else max(0.0, obs.deadline - time.monotonic())
+    if not lock.acquire(timeout=left):
+        raise MeshError(0, "observation budget spent waiting for a sweep in progress", kind="timeout",
+                        stage=obs.stage if obs is not None else "")
+    try:
+        return _sweep_unique(key, me, read, pinned=pinned, known_id=known_id)
+    finally:
+        lock.release()
+
+
+def _sweep_unique(key: str, me, read, pinned: str = "", known_id: str = ""):
     """Like ``_read_elsewhere`` for a short card ref, but never guesses across tenants.
     With ``pinned`` (the full UUID resolved earlier) only a card of that id is accepted.
     Unpinned, every other reader is asked once: two different full ids for the same short
@@ -124,17 +151,35 @@ def _read_unique_elsewhere(key: str, me, read, pinned: str = "", known_id: str =
         if not known_id and time.monotonic() < _NOBODY.get(key, 0):
             return None                    # (a known id still compares: access may have changed, and it pins once)
         others = [r for r in _READERS if r.mesh is not me]
+        until, answers = _SWEPT.get(key, (0.0, None))
+        if answers is None or time.monotonic() >= until:
+            answers = weakref.WeakKeyDictionary()
+            _SWEPT[key] = (time.monotonic() + SWEPT_SECONDS, answers)
+        remembered = {r: answers[r] for r in others if r in answers}
     found: dict[str, tuple] = {known_id: (None, {"id": known_id})} if known_id else {}
     fault = None
     for reader in others:
+        if reader in remembered:
+            tid = remembered[reader]           # answered in an earlier attempt: not asked again
+            if not tid or (pinned and tid != pinned):
+                continue
+            found.setdefault(tid, (reader, None))   # the card itself is read fresh below if it is the result
+            if pinned:
+                break
+            continue
         try:
             got = read(reader)
         except MeshError as e:
             if e.status not in (403, 404, 410):
                 fault = fault or e
+            else:
+                with _SHARED_LOCK:
+                    answers[reader] = ""
             continue
         got = got.get("task", got) if isinstance(got, dict) else got
         tid = str((got or {}).get("id") or "")
+        with _SHARED_LOCK:
+            answers[reader] = tid
         if pinned and tid != pinned:
             continue                           # another tenant's card with the same short ref
         found.setdefault(tid, (reader, got))
@@ -147,7 +192,22 @@ def _read_unique_elsewhere(key: str, me, read, pinned: str = "", known_id: str =
     if known_id:
         return {"id": known_id}            # every other reader answered and none sees another card
     if found:
-        reader, got = next(iter(found.values()))
+        expected, (reader, got) = next(iter(found.items()))
+        if got is None:
+            # the answer was remembered, the card was not: a stale copy must not decide a wake
+            try:
+                got = read(reader)
+            except MeshError as e:
+                if e.status not in (403, 404, 410):
+                    raise
+                got = None
+            got = got.get("task", got) if isinstance(got, dict) else got
+            if str((got or {}).get("id") or "") != expected:
+                # its access changed, or the ref now reads as another card: never return a card
+                # other than the one remembered (and pinned); ask that reader again next time
+                with _SHARED_LOCK:
+                    answers.pop(reader, None)
+                return None
         if reader is not None:
             with _SHARED_LOCK:
                 _READ_BY[key] = reader

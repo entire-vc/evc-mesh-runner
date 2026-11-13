@@ -424,12 +424,12 @@ mesh-runner status --config runner.toml   # local view of attempts
 
 ### `[runner]` options
 
-The `[runner]` table has 40 options; every other key in it is either one of the two native-result
+The `[runner]` table has 41 options; every other key in it is either one of the two native-result
 adoption paths or a retired option. All are optional except `mesh_url`.
 
 | group | keys |
 |---|---|
-| Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers` |
+| Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers`, `idempotency_keys` ([repeat-safe writes](docs/idempotent-writes.md)) |
 | Daily budgets and caps | `daily_start_cap`, `daily_next_budget`, `daily_wait_budget`, `daily_step_budget`, `max_compactions` |
 | Interactive sessions | `tmux_binary`, `interactive_idle_minutes`, `interactive_max_sessions`, `turn_first_output_minutes`, `turn_idle_minutes` ([turn watchdog](docs/turn-watchdog.md)) |
 | Waits and wakes | `comment_wake`, `comment_wake_always_from`, `hold_labels` (below), `time_wait_ignore_names`, `workspace_wait_release_minutes`, `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |

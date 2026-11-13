@@ -6,7 +6,8 @@ merge request delivers and `<slug>` is lowercase words joined by hyphens
 never write the same file, so they never conflict here.
 
 The file holds the entry exactly as it will read in `CHANGELOG.md`: one or more list items, no
-headings. The file name carries the card; the entry text does not repeat it.
+headings. The file name carries the card; the entry text does not repeat it (`mr-policy` refuses a
+card id in the text: the changelog is published).
 
 ```markdown
 - **What changed, in one sentence.** Why it matters, what an operator sees, the new

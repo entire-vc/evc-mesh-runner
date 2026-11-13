@@ -527,6 +527,9 @@ class RunnerConfig:
     # continuation (starvation or queue wake): the deployment's human-hold label(s)
     hold_labels: tuple = ("awaiting-owner",)
     session_reports: bool = True      # spend of every turn reported to Mesh (agents/me/sessions/report)
+    # Idempotency-Key on the runner's own writes (comments, spend report) and the same key on a repeat
+    # after a lost answer; false = no key and no repeat of a write (rollback without a release)
+    idempotency_keys: bool = True
     completion_comment: bool = True    # time, turns and cost on the task when an attempt completes
     review_starts_per_tick: int = 1    # a backlog of old review tasks must not crowd out work
     # a review card the agent itself just worked on is not fed back to it for this long, unless
@@ -892,6 +895,12 @@ def _host_repositories(raw) -> list:
     return out
 
 
+def _bool_option(value, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"[runner] {key} must be true or false, got {value!r}")
+    return value
+
+
 def load(path: str | Path) -> RunnerConfig:
     from .native_result_config import sha, unrelated
     source_raw = Path(path).read_bytes()
@@ -1089,6 +1098,7 @@ def load(path: str | Path) -> RunnerConfig:
         load_hold_per_cpu=_idle_hours(r.get("load_hold_per_cpu", 4.0), "load_hold_per_cpu"),
         load_release_per_cpu=_idle_hours(r.get("load_release_per_cpu", 0.0), "load_release_per_cpu"),
         announce_controllers=r.get("announce_controllers", False) is True,
+        idempotency_keys=_bool_option(r.get("idempotency_keys", True), "idempotency_keys"),
         session_metadata=_session_metadata(raw.get("session_metadata")),
         chat_enabled=chat.get("enabled", False) is True,
         chat_agents=tuple(_string_list(chat.get("agents"), "[chat] agents", ())),

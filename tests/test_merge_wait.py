@@ -183,7 +183,7 @@ class Declaration(MergeBench):
         self.assertEqual([(c["class"], c["wake"]["predicate"]) for c in constraints], [("local_wait", "merge")])
 
     def test_declaration_on_a_behind_mr_parks_and_runs_the_gate(self):
-        # an MR only behind its target is the gate's to sync, not a reason to send back
+        # An MR only behind its target is the gate's to sync, not a reason to send back
         t = task(1)
         gl = FakeGitLab()
         gl.mr_rows[TARGET] = mr_row(head=(10, "success"), detailed_merge_status="need_rebase")

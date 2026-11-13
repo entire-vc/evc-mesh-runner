@@ -1,7 +1,12 @@
 """A wait for the merge of an MR that will not merge as is (a red head already told, or a merge
 conflict with its target) is sent back at declaration instead of parking for good."""
+import datetime as dt
+import socket
 import unittest
+from unittest import mock
 
+from mesh_runner.store import iso
+from mesh_runner.outcome import parse_line
 from mesh_runner.wake import blocked_mr_next_step, ci_delivery_key, mr_merge_blocker, typed_event
 from fakes import FakeGitLab, FakeMesh, task, write_replies
 from test_runner import Bench
@@ -164,7 +169,7 @@ class MergeWaitOnBlockedMR(Bench):
         self.assertNotIn('WAIT merge:', a.wake_text)
 
 
-    # -- behind only, merge gate ------------------------
+    # -- behind only, merge gate (merge-and-release rule 2) ------------------------------------
 
     def test_behind_mr_behind_a_merge_gate_is_accepted(self):
         # the gate syncs a branch that is only behind right before merging: the wait is not sent back
@@ -201,6 +206,131 @@ class MergeWaitOnBlockedMR(Bench):
         # a provider-qualified target has no merge: wait, so no gate either
         self.assertIn('merge the target branch',
                       blocked_mr_next_step('github:o/r!5', 'need_rebase', True, SHA))
+
+
+def success_line(sha=SHA, status='failed'):
+    return f'⏳ WAIT mr:{MR} until=success after={sha}:14845:{status}'
+
+
+class SuccessWaitOnRedMR(MergeWaitOnBlockedMR):
+    """``until=success`` on an MR whose red head was already told: no new head pipeline comes by
+    itself, so it is sent back like ``until=merged``; told once first by the owner notice."""
+
+    def test_redeclared_success_wait_after_the_red_notice_is_sent_back(self):
+        for status, linked in (('failed', True), ('canceled', True), ('failed', False)):
+            with self.subTest(status=status, linked=linked):
+                self.tearDown(), self.setUp()
+                r, t, gl = self.flow(mr_row(status), linked=linked)
+                a = self.turn(r, t, success_line(status=status))
+                self.assertEqual(a.state, 'waiting')        # not told yet: accepted once
+                r._wake_one(a)
+                a = r.store.get(a.id)
+                self.assertEqual(a.state, 'ready')
+                self.assertIn('the success predicate is not met', a.wake_text)
+                a = self.turn(r, t, success_line(status=status), first=False)
+                self.assertEqual(a.state, 'ready')
+                for needle in (f'pipeline 14845 finished: {status}', 'you were already told',
+                               'was sent back', 'open the failed job'):
+                    self.assertIn(needle, a.wake_text)
+                r.store.db.close()
+
+    def test_success_wait_on_a_running_or_new_red_head_is_accepted(self):
+        for mr, line in ((mr_row('running'), success_line(status='running')),
+                         (mr_row('failed', sha=SHA2, pid=14900), f'⏳ WAIT mr:{MR} until=success after={SHA2}:14900:failed')):
+            with self.subTest(line=line):
+                self.tearDown(), self.setUp()
+                r, t, gl = self.flow(mr_row('failed'))
+                r.store.mark(self.agent.name, t['id'], ci_delivery_key(MR, 14845), f'{SHA}:14845:failed')
+                gl.mr_rows[MR] = mr
+                a = self.turn(r, t, line)
+                self.assertEqual(a.state, 'waiting')
+                r.store.db.close()
+
+
+class StandingWaitOnRedMR(MergeWaitOnBlockedMR):
+    """A wait declared before the refusal rules (the red head already told, then the same MR
+    re-armed) is judged by those rules once, after its evaluator found nothing new."""
+
+    def told_then_standing(self, line, mr=None):
+        r, t, gl = self.flow(mr or mr_row('failed'))
+        a = self.turn(r, t, merged_line())
+        r._wake_one(a)                                   # the one owner notice for this red head
+        a = r.store.get(a.id)
+        self.assertIn('action required', a.wake_text)
+        told = a.wait['ci_action_delivery']              # acknowledged by the turn that carried it
+        r.store.mark(self.agent.name, t['id'], told['key'], told['value'])
+        o = parse_line(line, dt.datetime.now(dt.timezone.utc))
+        r.store.update(a, state='waiting', wake_text='',
+                       wait={'kind': o.kind, 'target': o.target, **o.extra, 'since': iso(), 'started': iso()})
+        return r, t, gl, r.store.get(a.id)
+
+    def test_standing_success_or_merge_wait_on_a_told_red_head_wakes_once(self):
+        for line in (success_line(), merged_line()):
+            with self.subTest(line=line):
+                self.tearDown(), self.setUp()
+                r, t, gl, a = self.told_then_standing(line)
+                with self.assertLogs('mesh_runner', 'INFO') as logs:
+                    r._wake_budgeted(a)
+                got = r.store.get(a.id)
+                self.assertEqual(got.state, 'ready')
+                self.assertIn('you were already told', got.wake_text)
+                self.assertIn('was sent back', got.wake_text)
+                self.assertTrue(any('woke: MR g/app!56' in m for m in logs.output))
+                r.store.db.close()
+
+    def test_standing_wait_with_timing_out_reads_wakes_within_the_bound(self):
+        r, t, gl, a = self.told_then_standing(success_line())
+        real = gl.get_mr
+        gl.get_mr = mock.Mock(side_effect=socket.timeout('The read operation timed out'))
+        clock = {'t': dt.datetime(2026, 11, 7, tzinfo=dt.timezone.utc)}
+        with mock.patch('mesh_runner.runner.now', lambda: clock['t']):
+            for _ in range(2):
+                r._wake_budgeted(r.store.get(a.id))
+                clock['t'] += dt.timedelta(hours=3)
+            self.assertEqual(r.store.get(a.id).state, 'waiting')   # 2 failures over 3h: still inside the bound
+            r._wake_budgeted(r.store.get(a.id))                     # the 3rd, 6h after the first
+        got = r.store.get(a.id)
+        self.assertEqual(got.state, 'ready')
+        self.assertIn('failed 3 times in a row over 6.0h', got.wake_text)
+        self.assertIn('kind=timeout', got.wake_text)
+        gl.get_mr = real
+
+    def test_a_read_that_recovers_inside_the_bound_sends_the_wait_back(self):
+        r, t, gl, a = self.told_then_standing(success_line())
+        real = gl.get_mr
+        gl.get_mr = mock.Mock(side_effect=socket.timeout('The read operation timed out'))
+        r._wake_budgeted(r.store.get(a.id))
+        self.assertEqual(r.store.get(a.id).state, 'waiting')
+        gl.get_mr = real
+        r._wake_budgeted(r.store.get(a.id))
+        got = r.store.get(a.id)
+        self.assertEqual(got.state, 'ready')
+        self.assertIn('was sent back', got.wake_text)
+
+    def test_standing_waits_that_may_still_complete_stay(self):
+        cases = (
+            ('green', mr_row('success', labels=[]), merged_line()),          # a reviewer may still label it
+            ('running', mr_row('running'), success_line(status='running')),
+            ('change', mr_row('failed'), f'⏳ WAIT mr:{MR} until=change after={SHA}:14845:failed'),
+        )
+        for name, mr, line in cases:
+            with self.subTest(name=name):
+                self.tearDown(), self.setUp()
+                r, t, gl, a = self.told_then_standing(line)
+                gl.mr_rows[MR] = mr
+                for _ in range(2):
+                    r._wake_budgeted(r.store.get(a.id))
+                self.assertEqual(r.store.get(a.id).state, 'waiting')
+                r.store.db.close()
+
+    def test_a_manual_head_is_left_to_its_reviewer(self):
+        r, t, gl, a = self.told_then_standing(success_line())
+        gl.mr_rows[MR] = mr_row('manual')
+        for line in (success_line(status='manual'), merged_line()):
+            with self.subTest(line=line):
+                o = parse_line(line, dt.datetime.now(dt.timezone.utc))
+                self.assertEqual(r._dead_wait_text(a, 'mr', MR, o.extra.get('ci_change'), o.extra.get('mr_state'),
+                                                   parked=True), '')
 
 
 class ConflictOwnerNotice(unittest.TestCase):

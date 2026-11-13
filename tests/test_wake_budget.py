@@ -3,12 +3,14 @@
 Real MeshClient over a local HTTP fixture, real runner, Store and SQLite; the only fake is the
 Mesh server itself (the true external boundary).
 """
+import datetime as dt
 import json
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fakes import AGENT_ID, STATUSES, task
@@ -158,8 +160,9 @@ class WakeBudget(Bench):
         """The attempt's whole row (state, session, workspaces lease, checkout, wait) and its marks
         (checkpoint and delivery receipts), straight from SQLite."""
         row = tuple(r.store.db.execute('SELECT * FROM attempts WHERE id=?', (a.id,)).fetchone())
-        marks = tuple(tuple(m) for m in r.store.db.execute(
-            'SELECT * FROM marks WHERE agent=? AND task_id=? ORDER BY key', (a.agent, a.task_id)))
+        marks = tuple(tuple(m) for m in r.store.db.execute(   # the failure-bound counter is bookkeeping
+            'SELECT * FROM marks WHERE agent=? AND task_id=? AND key!=? ORDER BY key',
+            (a.agent, a.task_id, AgentRunner.READ_FAILURES)))
         return row, marks
 
     def failed_events(self, r, a):
@@ -221,6 +224,53 @@ class WakeBudget(Bench):
             r.check_wakes()
         self.assertEqual(self.snapshot(r, a), before)   # no ready state, no wake text, no errors counter
         self.assertEqual(len(self.failed_events(r, a)), 8)
+
+    def test_channel_failures_in_a_row_over_the_bound_wake_the_owner_once(self):
+        r, (a,), target = self.flow(budget_s=3)
+        self.srv.modes[target['id'][:8]] = 'reset'
+        clock = {'t': dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)}
+        with mock.patch('mesh_runner.runner.now', lambda: clock['t']):
+            for _ in range(5):                          # many failures, but within minutes: no wake
+                r.check_wakes()
+                clock['t'] += dt.timedelta(minutes=10)
+            self.assertEqual(r.store.get(a.id).state, 'waiting')
+            clock['t'] += dt.timedelta(hours=6)
+            r.check_wakes()                             # the 6th failure in a row, 6h after the first
+        woke = r.store.get(a.id)
+        self.assertEqual(woke.state, 'ready')
+        self.assertIn('failed 6 times in a row over 6.8h', woke.wake_text)
+        self.assertIn('kind=transport', woke.wake_text)
+        self.assertIn('UNKNOWN', woke.wake_text)
+        self.assertNotIn(KEY, woke.wake_text)
+        self.assertEqual(len(self.failed_events(r, a)), 6)
+        self.assertEqual(r.store.mark(a.agent, a.task_id, AgentRunner.READ_FAILURES)[0], '')
+
+    def test_a_successful_check_resets_the_failure_count(self):
+        r, (a,), target = self.flow(budget_s=3)
+        clock = {'t': dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)}
+        with mock.patch('mesh_runner.runner.now', lambda: clock['t']):
+            for step in ('reset', 'reset', 'ok', 'reset', 'reset'):
+                if step == 'ok':
+                    self.srv.modes.clear()
+                else:
+                    self.srv.modes[target['id'][:8]] = 'reset'
+                r.check_wakes()
+                clock['t'] += dt.timedelta(hours=3)
+            self.assertEqual(r.store.get(a.id).state, 'waiting')   # 2 in a row over 3h: below the bound
+            self.srv.modes[target['id'][:8]] = 'reset'
+            r.check_wakes()                                           # 3 in a row over 6h
+        self.assertEqual(r.store.get(a.id).state, 'ready')
+
+    def test_the_failure_count_survives_a_restart(self):
+        r, (a,), target = self.flow(budget_s=3)
+        self.srv.modes[target['id'][:8]] = 'reset'
+        clock = {'t': dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc)}
+        with mock.patch('mesh_runner.runner.now', lambda: clock['t']):
+            r.check_wakes(); clock['t'] += dt.timedelta(hours=4)
+            r.check_wakes(); clock['t'] += dt.timedelta(hours=4)
+            r._read_failures.clear()                   # a new runner process: memory gone, the mark stays
+            r.check_wakes()
+        self.assertEqual(r.store.get(a.id).state, 'ready')
 
     def test_retry_is_still_allowed_inside_the_budget(self):
         r, (a,), _ = self.flow(budget_s=20)

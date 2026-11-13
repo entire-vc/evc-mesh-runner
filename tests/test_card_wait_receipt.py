@@ -25,6 +25,21 @@ class ReceiptEvent(unittest.TestCase):
         self.assertTrue(met)
         self.assertIn("met", message)
 
+    def test_closure_without_evidence_names_status_closer_and_missing_result(self):
+        met, message = self.event(resolved_at="2026-11-12T10:00:00Z", resolution="met",
+                                  released_by="closure_without_evidence",
+                                  target_task_id="0f1e2d3c-0000-4000-8000-000000000001",
+                                  target_status="Cancelled", target_closed_by="Morgan",
+                                  criterion="  load test report\n attached ")
+        self.assertTrue(met)
+        self.assertIn("card #0f1e2d3c closed (Cancelled, by Morgan", message)
+        self.assertIn("without the named result «load test report attached»", message)
+        self.assertNotIn("as met", message)
+        # positive control: evidence on the edge is the ordinary met wake
+        met, message = self.event(resolved_at="now", resolution="met", released_by="evidence")
+        self.assertTrue(met)
+        self.assertNotIn("without the named result", message)
+
     def test_revocation_wakes_without_certifying_target(self):
         met, message = self.event(resolved_at="now", resolution="invalid", resolve_cause="grant_revoked")
         self.assertFalse(met)

@@ -135,6 +135,8 @@ class RestoreSlotPreference(unittest.TestCase):
     def _prune(self, pool, path):
         """What a slot pruner does to a free slot: the worktree and its inventory row go away."""
         import subprocess
+        # slots are locked against a foreign prune; the pruner unlocks before it removes one
+        subprocess.run(['git', '-C', str(self.base), 'worktree', 'unlock', str(path)], check=True)
         subprocess.run(['git', '-C', str(self.base), 'worktree', 'remove', '--force', str(path)], check=True)
         self.store.db.execute("DELETE FROM slots WHERE path=? AND state='free'", (str(path),))
         self.assertFalse(Path(path).exists())
@@ -212,6 +214,27 @@ class RestoreSlotPreference(unittest.TestCase):
                         json.dumps({"observed_status": "done", "workspaces": [str(left)]}))
         self.assertEqual(pool._returning_sources(), set())
         self.assertEqual(pool.lease('newcomer', 'app'), left)
+
+    def test_an_answered_decision_request_keeps_its_slot_aside(self):
+        """A decision request is closed (done) when answered and reopened by its asker with the next question,
+        and that return keeps the session (``decision_request_reopened``): its slot is a returning one. A
+        cancelled request and an ordinary closed card name nothing, as before."""
+        import json
+        pool = WorkspacePool(self.store, self.root / 'pool',
+                             [RepoSpec('app', self.base, max_slots=4)], owner='agent')
+        self.pool.restore('attempt')
+        left = pool.lease('left', 'app')
+        pool.release('left')
+        self.store.mark('agent', 'task-req', 'ownership_loss',
+                        json.dumps({"observed_status": "done", "decision_request": True, "workspaces": [str(left)]}))
+        self.assertEqual(pool._returning_sources(), {str(left)})
+        newcomer = pool.lease('newcomer', 'app')
+        self.assertNotEqual(newcomer, left)
+        pool.release('newcomer')
+        for status, flag in (("cancelled", True), ("done", False), ("done", "yes")):
+            self.store.mark('agent', 'task-req', 'ownership_loss',
+                            json.dumps({"observed_status": status, "decision_request": flag, "workspaces": [str(left)]}))
+            self.assertEqual(pool._returning_sources(), set(), (status, flag))
 
     def test_the_only_free_slot_is_still_taken_when_a_suspended_attempt_left_it(self):
         self.assertEqual(self.pool.lease('one', 'app'), self.first)

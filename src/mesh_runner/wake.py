@@ -1246,6 +1246,11 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
         # comment answers it, so after the re-check interval the asker gets it back, once per wait
         if now - started >= interval:
             wait["recheck_due"] = True
+            if wait.get("attached_answered"):
+                return (f"re-check: decision wait @{wait.get('handle') or ''} repeats a question already answered "
+                        f"on request #{wait['attached_closed']} (closed as done), which was not reopened, so "
+                        f"nobody was asked again. Answer reference: request #{wait['attached_closed']}: read that "
+                        "answer and continue; a new question must say what changed")
             return (f"re-check: decision wait @{wait.get('handle') or ''} repeats the question of request "
                     f"#{wait['attached_closed']}, which is closed and was not reopened, so nobody was asked again. "
                     "Continue with what the thread holds, or ask a materially different question")
