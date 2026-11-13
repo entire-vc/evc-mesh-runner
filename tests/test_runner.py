@@ -1292,8 +1292,34 @@ class MeshEffects(Bench):
         self.settle_all(r)
         self.assertEqual(mesh.reports, [{"task": t["id"], "in": 100, "out": 5, "model": "fake-model", "cost": 0.01}])
         a = r.store.by_state("builder", ("waiting",))[0]
+        self.assertEqual(mesh.report_ids, [f"{a.id}:{a.turns}"])     # the turn names the report (its key)
         r._report_spend(a, r.adapter_for(a.harness).parse(Path(a.log_path)))   # a second settle of that turn
         self.assertEqual(len(mesh.reports), 1)
+
+    def _spend_after_lost_answer(self, keys):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        mesh.lose_report_answer = 1
+        self.cfg.idempotency_keys = keys
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        # restart between send and answer: a NEW runner on the same state file settles the turn again
+        r2 = self.runner(mesh)
+        a = r2.store.by_state("builder", ("waiting",))[0]
+        r2._report_spend(a, r2.adapter_for(a.harness).parse(Path(a.log_path)))
+        r3 = self.runner(mesh)                                                   # and once more
+        r3._report_spend(a, r3.adapter_for(a.harness).parse(Path(a.log_path)))
+        return mesh, f"{a.id}:{a.turns}"
+
+    def test_keyed_spend_report_with_a_lost_answer_is_resent_with_the_same_key(self):
+        mesh, turn = self._spend_after_lost_answer(keys=True)
+        self.assertEqual(mesh.report_ids, [turn, turn])     # resent once, same key; marked on the answer
+
+    def test_unkeyed_spend_report_with_a_lost_answer_is_not_resent(self):
+        mesh, turn = self._spend_after_lost_answer(keys=False)
+        self.assertEqual(mesh.report_ids, [turn])           # rollback: marked before the post, as before
 
     def test_skip_reasons_map_to_mesh_states(self):
         from mesh_runner.effects import skip_state
@@ -4459,6 +4485,73 @@ class WaitWorkspaceCheckpoint(Bench):
         self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason']),
                          ('resume', 'decision_request_reopened', ''))
         self.assertEqual((launches[0]['intent'], launches[0]['restart_reason']), ('resume', ''))
+
+    def test_an_answered_decision_request_keeps_its_slot_for_the_next_question(self):
+        """The request was answered and closed (done), another card took its free slot, and the asker
+        reopened it with the next question: the verdict allows the session (decision_request_reopened)
+        but the paths were gone,
+        so it started fresh by path_changed. The slot of an answered request is kept aside like any other
+        card that may come back; the other card gets a slot of its own."""
+        t = task(90)
+        t['labels'] = ['decision-request']
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.settle_all(r)
+        first = [x for x in r.store.by_state('builder', ('waiting',)) if x.task_id == t['id']][0]
+        r.mesh.tasks[t['id']]['assignee_id'] = ''
+        r.tick()
+        self.assertEqual(r.store.get(first.id).state, 'completed')
+        note = json.loads(r.store.mark('builder', t['id'], 'ownership_loss')[0])
+        self.assertIs(note['decision_request'], True)
+        note['observed_status'] = 'done'                                  # answered: the request closed
+        r.store.mark('builder', t['id'], 'ownership_loss', json.dumps(note))
+        other = r.pool.lease('another-card', 'app')                        # the lane's next card
+        self.assertNotIn(str(other), first.workspaces)
+        r.mesh.tasks[t['id']]['assignee_id'] = AGENT_ID                    # reopened with the next question
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        r.tick()
+        self.settle_all(r)
+        later = [x for x in r.store.by_state('builder', ('waiting', 'running', 'starting', 'ready', 'completed'))
+                 if x.task_id == t['id'] and x.id != first.id][0]
+        self.assertEqual(later.workspaces, first.workspaces)
+        self.assertEqual(later.session_id, first.session_id)
+        ret = [json.loads(d) for _, k, d in r.store.events(later.id) if k == 'ownership_return']
+        self.assertEqual((ret[0]['intent'], ret[0]['reason'], ret[0]['restart_reason']),
+                         ('resume', 'decision_request_reopened', ''))
+
+    def test_an_answered_decision_request_whose_slot_is_leased_still_starts_fresh(self):
+        """Negative control: the kept-aside order is a preference, not a reservation. At the pool maximum the
+        old slot goes to other work, and the return then starts fresh by path_changed: a path the session
+        knew is never resumed while somebody else holds it."""
+        t = task(91)
+        t['labels'] = ['decision-request']
+        write_replies(self.replies, {t['id'][:8]: wait_time(why="external work")})
+        r = self.runner(FakeMesh([t]))
+        r.tick()
+        self.settle_all(r)
+        first = [x for x in r.store.by_state('builder', ('waiting',)) if x.task_id == t['id']][0]
+        r.mesh.tasks[t['id']]['assignee_id'] = ''
+        r.tick()
+        note = json.loads(r.store.mark('builder', t['id'], 'ownership_loss')[0])
+        note['observed_status'] = 'done'
+        r.store.mark('builder', t['id'], 'ownership_loss', json.dumps(note))
+        # other work fills the pool (max_slots=4); at the maximum the kept-aside slot is handed out too
+        holders = {str(r.pool.lease(f'other-{i}', 'app')): f'other-{i}' for i in range(4)}
+        self.assertIn(first.workspaces[0], holders)
+        for path, holder in holders.items():
+            if path != first.workspaces[0]:
+                r.pool.release(holder)                 # every other slot is free; the old one stays leased
+        r.mesh.tasks[t['id']]['assignee_id'] = AGENT_ID
+        r.mesh.tasks[t['id']]['updated_at'] = '2026-11-01T00:00:00Z'
+        r.tick()
+        self.settle_all(r)
+        later = [x for x in r.store.by_state('builder', ('waiting', 'running', 'starting', 'ready', 'completed'))
+                 if x.task_id == t['id'] and x.id != first.id][0]
+        self.assertNotEqual(later.workspaces, first.workspaces)
+        self.assertNotEqual(later.session_id, first.session_id)
+        ret = [json.loads(d) for _, k, d in r.store.events(later.id) if k == 'ownership_return']
+        self.assertEqual((ret[0]['intent'], ret[0]['reason']), ('start', 'path_changed'))
 
     def test_a_cancelled_decision_request_starts_fresh_when_reopened(self):
         def withdrawn_request(r):

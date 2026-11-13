@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fakes import FakeMesh
-from test_runner import Bench
+from test_runner import Bench, task
 from test_workspace import make_repo
 
 from mesh_runner import pool_ops, workspace
@@ -329,6 +329,177 @@ class AdminLink(unittest.TestCase):
         self.assertEqual(self.a.unsafe_reason(slot, self.a.repos["app"]), "")
 
 
+def porcelain(base: Path) -> dict:
+    """{realpath: {key: value}} of `git worktree list --porcelain`."""
+    out, cur = {}, None
+    for line in git(base, "worktree", "list", "--porcelain").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            cur = out.setdefault(os.path.realpath(value), {})
+        elif cur is not None and key:
+            cur[key] = value
+    return out
+
+
+class LockAndRecover(unittest.TestCase):
+    """Slots are locked against a foreign `git worktree prune`, and a slot whose admin dir was removed
+    anyway goes back to work without an operator."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.base = make_repo(root)
+        self.store = Store(root / "s.sqlite")
+        self.pool = WorkspacePool(self.store, root / "pool", [RepoSpec("app", self.base, max_slots=2)],
+                                  identity=("Agent", "agent@example.com"), owner="agent-a")
+        self.repo = self.pool.repos["app"]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def prune_unseen(self, slot: Path) -> None:
+        """`git worktree prune` run by a process for which the slot's path does not exist."""
+        hidden = slot.with_name(slot.name + ".hidden")
+        os.rename(os.path.realpath(slot), hidden)
+        try:
+            git(self.base, "worktree", "prune")
+        finally:
+            os.rename(hidden, os.path.realpath(slot))
+
+    def row(self, slot: Path):
+        return next((r for r in self.pool.rows() if r["path"] == str(slot)), None)
+
+    def test_new_slot_is_locked_and_survives_a_prune_that_cannot_see_it(self):
+        slot = self.pool.lease("x1", "app")
+        entry = porcelain(self.base)[os.path.realpath(slot)]
+        self.assertEqual(entry.get("locked"), "mesh-runner:agent-a")
+        self.prune_unseen(slot)
+        self.assertTrue(admin_of(slot).is_dir())
+        self.assertIn("locked", porcelain(self.base)[os.path.realpath(slot)])
+        self.assertEqual(self.pool.unsafe_reason(slot, self.repo), "")
+
+    def test_positive_control_an_unlocked_slot_loses_its_admin_dir(self):
+        slot = self.pool.lease("x1", "app")
+        git(self.base, "worktree", "unlock", str(slot))
+        self.prune_unseen(slot)
+        self.assertFalse(admin_of(slot).exists())
+        self.assertIn("missing", self.pool.unsafe_reason(slot, self.repo))
+
+    def test_lock_pass_locks_slots_made_before_locking(self):
+        slot = self.pool.root / "app" / "slot-1"
+        slot.parent.mkdir(parents=True)
+        git(self.base, "worktree", "add", "--quiet", "--detach", str(slot), "origin/main")
+        self.pool._set(slot, "app", "leased", "x1")
+        self.assertEqual(self.pool.lock_slots(), [str(slot)])
+        self.assertIn("locked", porcelain(self.base)[os.path.realpath(slot)])
+        self.assertEqual(self.pool.lock_slots(), [])           # already locked: no git call, nothing new
+
+    def test_release_reuse_and_eviction_work_on_a_locked_slot(self):
+        slot = self.pool.lease("x1", "app")
+        self.pool.release("x1")
+        self.assertEqual(self.row(slot)["state"], "free")
+        self.assertEqual(self.pool.lease("x2", "app"), slot)
+        self.pool.release("x2")
+        self.assertIn("locked", porcelain(self.base)[os.path.realpath(slot)])
+        self.assertEqual(pool_ops.evict(self.pool, idle_hours=0, keep=0, limit=5, apply=True), [str(slot)])
+        self.assertFalse(slot.exists())
+        self.assertNotIn(os.path.realpath(slot), porcelain(self.base))
+        self.assertIsNone(self.row(slot))
+
+    def test_failed_eviction_locks_the_slot_again(self):
+        slot = self.pool.lease("x1", "app")
+        self.pool.release("x1")
+        real_git = workspace.git
+
+        def failing(cwd, *args, **kw):
+            if args[:2] == ("worktree", "remove"):
+                raise WorkspaceError("simulated")
+            return real_git(cwd, *args, **kw)
+        with patch.object(pool_ops, "git", failing):
+            self.assertEqual(pool_ops.evict(self.pool, idle_hours=0, keep=0, limit=5, apply=True), [])
+        self.assertTrue(slot.is_dir())
+        self.assertIn("locked", porcelain(self.base)[os.path.realpath(slot)])
+
+    def orphan(self, attempt: str = "") -> Path:
+        """A free slot with an edit, a new file and an ignored file, whose admin dir is then removed."""
+        slot = self.pool.lease("x1", "app")
+        self.pool.release("x1")
+        (slot / "README").write_text("edited\n")
+        (slot / "notes.txt").write_text("new\n")
+        (slot / "cache").mkdir()
+        (slot / "cache" / "blob").write_text("ignored\n")
+        shutil.rmtree(admin_of(slot))
+        self.pool.audit_admin()
+        if attempt:
+            self.store.db.execute("UPDATE slots SET attempt=? WHERE path=?", (attempt, str(slot)))
+        self.assertEqual(self.row(slot)["state"], "held")
+        return slot
+
+    def test_held_orphan_is_archived_and_a_fresh_slot_takes_its_place(self):
+        slot = self.orphan()
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            self.assertEqual(self.pool.recover_orphans(set()), [str(slot)])
+        self.assertIsNone(self.row(slot))
+        self.assertFalse(slot.exists())
+        refs = git(self.base, "for-each-ref", "--format=%(refname)", workspace.ARCHIVE_REF_PREFIX).split()
+        self.assertEqual(len(refs), 1, refs)
+        self.assertEqual(git(self.base, "show", f"{refs[0]}:README"), "edited")
+        self.assertEqual(git(self.base, "show", f"{refs[0]}:notes.txt"), "new")
+        parked = list((Path(self.tmp.name) / "slot-archive" / "orphan-admin" / "agent-a").iterdir())
+        self.assertEqual(len(parked), 1)
+        self.assertEqual((parked[0] / "cache" / "blob").read_text(), "ignored\n")    # ignored files moved along
+        self.assertTrue(any(refs[0] in line for line in logs.output), logs.output)
+        fresh = self.pool.lease("x2", "app")
+        self.assertEqual(fresh, slot)
+        self.assertEqual(self.pool.unsafe_reason(fresh, self.repo), "")
+        self.assertIn("locked", porcelain(self.base)[os.path.realpath(fresh)])
+
+    def test_clean_orphan_needs_no_archive_ref(self):
+        slot = self.pool.lease("x1", "app")
+        self.pool.release("x1")
+        shutil.rmtree(admin_of(slot))
+        self.pool.audit_admin()
+        self.assertEqual(self.pool.recover_orphans(set()), [str(slot)])
+        self.assertEqual(git(self.base, "for-each-ref", workspace.ARCHIVE_REF_PREFIX), "")
+
+    def test_orphan_of_an_open_or_unknown_attempt_stays_held(self):
+        slot = self.orphan(attempt="x9")
+        self.assertEqual(self.pool.recover_orphans({"x9"}), [])        # open
+        self.assertEqual(self.pool.recover_orphans(set()), [])         # not in the store: cannot be disproved
+        self.assertEqual(self.row(slot)["state"], "held")
+        self.assertTrue(slot.is_dir())
+
+    def test_foreign_admin_is_not_an_orphan(self):
+        slot = self.pool.lease("x1", "app")
+        self.pool.release("x1")
+        (slot / ".git").write_text(f"gitdir: {Path(self.tmp.name) / 'elsewhere'}\n")
+        self.pool.audit_admin()
+        self.assertEqual(self.pool.recover_orphans(set()), [])
+        self.assertEqual(self.row(slot)["state"], "held")
+
+    def test_leased_orphan_is_rebuilt_on_suspend_and_restores(self):
+        slot = self.pool.lease("x1", "app")
+        git(slot, "checkout", "-q", "-b", "feature")
+        (slot / "feature.txt").write_text("committed\n")
+        git(slot, "add", "feature.txt")
+        git(slot, "commit", "-q", "-m", "feature")
+        (slot / "README").write_text("edited\n")
+        (slot / "notes.txt").write_text("new\n")
+        shutil.rmtree(admin_of(slot))
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            self.assertEqual(len(self.pool.suspend("x1", {}, writer_stopped=True)), 1)
+        self.assertTrue(any("rebuilt" in line and "on branch feature" in line for line in logs.output), logs.output)
+        self.assertEqual(self.row(slot)["state"], "free")
+        paths, _ = self.pool.restore("x1")
+        target = Path(paths[0])
+        self.assertEqual(self.pool.unsafe_reason(target, self.repo), "uncommitted changes")
+        self.assertEqual(git(target, "symbolic-ref", "--short", "HEAD"), "feature")
+        self.assertEqual((target / "README").read_text(), "edited\n")
+        self.assertEqual((target / "notes.txt").read_text(), "new\n")
+        self.assertEqual((target / "feature.txt").read_text(), "committed\n")
+        self.assertIn("locked", porcelain(self.base)[os.path.realpath(slot)])
+
+
 class MaintenancePass(Bench):
     def test_the_periodic_slot_pass_runs_the_admin_audit(self):
         r = self.runner(FakeMesh([]))
@@ -336,10 +507,33 @@ class MaintenancePass(Bench):
         r.pool.release("a1")
         shutil.rmtree(admin_of(slot))
         r._last_recheck = -1e9      # monotonic() can be under 600 s on a fresh CI host
-        with self.assertLogs("mesh_runner", "WARNING"):
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
             r.recheck_slots()
-        row = next(x for x in r.pool.rows() if x["path"] == str(slot))
-        self.assertEqual((row["state"], row["note"]), ("held", workspace.POOL_ADMIN_HOLD_NOTE))
+        # held by the audit, then recovered in the same pass: nobody's work was in it
+        self.assertTrue(any(workspace.POOL_ADMIN_HOLD_NOTE in line for line in logs.output), logs.output)
+        self.assertTrue(any("orphaned worktree" in line and "recovered" in line for line in logs.output), logs.output)
+        self.assertNotIn(str(slot), [x["path"] for x in r.pool.rows()])
+        self.assertFalse(slot.exists())
+
+    def test_the_periodic_slot_pass_locks_unlocked_slots(self):
+        r = self.runner(FakeMesh([]))
+        slot = r.pool.lease("a1", "app")
+        r.pool.release("a1")
+        git(r.pool.repos["app"].base, "worktree", "unlock", str(slot))
+        r._last_recheck = -1e9
+        r.recheck_slots()
+        self.assertTrue((admin_of(slot) / "locked").is_file())
+
+    def test_pool_hold_names_the_held_slot(self):
+        mesh = FakeMesh([task(1)], max_concurrent=2)
+        self.agent.repos[0] = RepoSpec("app", self.agent.repos[0].base, max_slots=1)
+        r = self.runner(mesh)
+        slot = r.pool.lease("a1", "app")
+        r.pool._set(slot, "app", "held", note=f"{workspace.POOL_ADMIN_HOLD_NOTE}: admin dir x is missing")
+        self.assertTrue(r._pool_full())
+        hold = r.status()["pool_hold"]
+        self.assertIn("worktree pool full: app", hold)
+        self.assertIn(f"held: {slot} ({workspace.POOL_ADMIN_HOLD_NOTE}: admin dir x is missing)", hold)
 
 
 if __name__ == "__main__":

@@ -566,7 +566,7 @@ def deliver_comments(store, mesh, resume_agent: str) -> int:
                 already = any(key_line(row["idempotency_key"]) in (c.get("body") or "") for c in existing)
                 if not already:
                     body = json.loads(row["payload_json"])["text"] + "\n" + key_line(row["idempotency_key"])
-                    mesh.add_comment(row["target"], body)
+                    mesh.add_comment(row["target"], body, key="gmail|" + str(row["idempotency_key"]))
                     sent += 1
                 db.execute("UPDATE gmail_outbox SET attempts=attempts+1 WHERE outbox_id=?", (row["outbox_id"],))
                 ack(db, row["idempotency_key"])

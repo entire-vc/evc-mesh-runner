@@ -56,6 +56,7 @@ class CompactWithoutSourceSlot(unittest.TestCase):
         return git(p, 'rev-parse', 'HEAD')
 
     def _drop_slot(self, p: Path) -> None:
+        git(self.base, 'worktree', 'unlock', str(p))          # pool slots are locked against a foreign prune
         git(self.base, 'worktree', 'remove', '--force', str(p))
         self.assertFalse(p.exists())
 

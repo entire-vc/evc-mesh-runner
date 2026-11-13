@@ -106,18 +106,29 @@ class InstanceLock:
 
 
 # ---------------------------------------------------------------------- the services
+def gmail_clients(cfg) -> list:
+    """One Mesh client per lane for the Gmail service; ``[runner] idempotency_keys`` applies to them as
+    to the lanes' own clients, so the rollback also covers the Gmail outbox comments."""
+    from .mesh import MeshClient
+    lanes = []
+    for a in cfg.agents:
+        mesh = MeshClient(cfg.mesh_url, a.key, basic_auth=cfg.mesh_basic_auth, bearer=cfg.extension_token)
+        mesh.idempotency_keys = cfg.idempotency_keys
+        lanes.append((a.name, mesh))
+    return lanes
+
+
 def run_gmail(cfg, stop: threading.Event) -> int:
     """The Gmail observer of every lane, every ``poll_seconds``: each due registration is read (one reader
     call at a time, each bounded by ``gmail_watch_timeout_seconds``) and committed, then pending comments are
     posted with the lane's key. A lane whose Mesh identity is unknown yet is retried on the next pass."""
     from . import gmail_watch
-    from .mesh import MeshClient, MeshError
+    from .mesh import MeshError
     from .store import Store
     store = Store(cfg.state_dir / "runner.sqlite")
     gmail_watch.ensure_schema(store.db)
     reader = gmail_watch.SubprocessReader(list(cfg.gmail_watch_reader), cfg.gmail_watch_timeout_seconds)
-    lanes = [(a.name, MeshClient(cfg.mesh_url, a.key, basic_auth=cfg.mesh_basic_auth, bearer=cfg.extension_token))
-             for a in cfg.agents]
+    lanes = gmail_clients(cfg)
     ids: dict[str, str] = {}
     busy: set[str] = set()
     log.info("gmail service: %d lane(s)", len(lanes))

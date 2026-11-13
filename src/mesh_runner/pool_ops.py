@@ -193,7 +193,16 @@ def evict(pool: WorkspacePool, *, idle_hours: float, keep: int, limit: int, appl
                 continue
             pool.store.db.execute("CREATE TABLE IF NOT EXISTS pool_evictions (path TEXT, evicted_at TEXT)")
             try:
-                git(repo.base, "worktree", "remove", str(path), timeout=max(0.1, min(30, deadline - time.monotonic())), env=pool.env)
+                # A slot is locked against a foreign `git worktree prune`; `worktree remove` refuses a locked
+                # worktree, so unlock it first (never `remove -f -f`) and lock it again when removal fails.
+                unlocked = pool._unlock(path, repo)
+                try:
+                    git(repo.base, "worktree", "remove", str(path),
+                        timeout=max(0.1, min(30, deadline - time.monotonic())), env=pool.env)
+                except WorkspaceError:
+                    if unlocked:
+                        pool._lock_quietly(path, repo)
+                    raise
             except WorkspaceError:
                 # No deletion fallback. Retain row/held even after uncertain subprocess outcome.
                 continue

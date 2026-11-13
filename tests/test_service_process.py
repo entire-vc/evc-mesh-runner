@@ -309,7 +309,7 @@ class GmailSplit(unittest.TestCase):
     def test_the_gmail_service_scans_every_lane_with_its_identity(self):
         cfg = NS(state_dir=Path(tempfile.mkdtemp()), gmail_watch_reader=["/bin/true"], gmail_watch_timeout_seconds=5,
                  gmail_watch_interval_seconds=120.0, poll_seconds=0, mesh_url="https://mesh.test", mesh_basic_auth="",
-                 extension_token=None, agents=[NS(name="a", key="ka"), NS(name="b", key="kb")])
+                 extension_token=None, idempotency_keys=True, agents=[NS(name="a", key="ka"), NS(name="b", key="kb")])
         stop = threading.Event()
         seen = []
 

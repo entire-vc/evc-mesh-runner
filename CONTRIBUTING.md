@@ -12,3 +12,7 @@
 - Changelog: one file per change in `changelog.d/<card>-<slug>.md` (`changelog.d/README.md`).
   Never edit `CHANGELOG.md` or the version outside the release commit (`docs/release-process.md`);
   the `mr-policy` CI job refuses it.
+- No internal card ids (`#` and 8 hex) or team member names in code, comments, docs or changelog
+  text: this repository is published. The card goes into the fragment's file name, the branch and
+  the merge request; a test fixture uses a stub id (`STUB_CARD_IDS` in `ops/check_mr_policy.py`).
+  `mr-policy` and `tests/test_release_flow.py` refuse it.

@@ -91,7 +91,8 @@ def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
 
     Do not pick an older marker. Valid informational links do not constrain
     observation. A known empty or fully satisfied blocking set may use the
-    ordinary observer, as may one fully known block to the current target.
+    ordinary observer, as may a set holding one fully known task_done block to
+    the current target (other blockers beside it do not retire the target).
     Unsupported or ambiguous edges preserve WAIT.
     """
     if (not isinstance(rows, dict) or not isinstance(rows.get('outgoing'), list)
@@ -127,11 +128,14 @@ def blocks_stale_observation(rows: dict, task_id: str, target: str) -> bool:
     # retarget; unknown/false verdicts still require the task_done-only path.
     if all(edge["condition_satisfied"] for edge in edges):
         return False
-    if len(edges) != 1:
-        return True
-    # The guard accepts a satisfied edge to the current target too; the normal
-    # observer still decides whether that awaited event has actually occurred.
-    return sole_dependency({"outgoing": edges}, task_id, target, allow_satisfied=True) is None
+    # A fully known task_done block to the current target corroborates the declared WAIT,
+    # whatever other blockers the card has: the target is not retired, so the ordinary
+    # observer may report its own event (it closed). Other blockers stay with the owner, who
+    # re-declares on them when woken. Counting siblings here held a WAIT whose target closed
+    # until every sibling closed too, with no log line. The guard accepts
+    # a satisfied edge to the current target too; the observer still decides the event.
+    return not any(sole_dependency({"outgoing": [edge]}, task_id, target, allow_satisfied=True)
+                   for edge in edges)
 
 
 def removed_wait_edge(rows: dict, wait: dict, task_id: str) -> str | None:

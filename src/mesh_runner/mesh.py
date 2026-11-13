@@ -9,6 +9,7 @@ import base64
 import datetime
 import email.utils
 import json
+import logging
 import math
 import random
 import subprocess
@@ -17,15 +18,18 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 from . import coalesced_http
 from . import observation_budget as budget
 
+log = logging.getLogger("mesh_runner")
+
 DEFAULT_TIMEOUT = 30
 # a GET is safe to repeat: a lone transport failure (timeout, TLS handshake, DNS) is retried
-# before the tick is failed; writes are never repeated here
+# before the tick is failed; an unkeyed write is never repeated here
 GET_RETRY_DELAYS = (1.0, 3.0)
 # 429 from the rate-limit middleware (it sends Retry-After) is answered before any handler runs, so
 # repeating is safe. Sleep Retry-After (capped) plus jitter; a separate budget from transport retries.
@@ -34,6 +38,35 @@ RATE_LIMIT_MAX_SLEEP = 30.0
 RATE_LIMIT_DEFAULT_SLEEP = 2.0
 # producer the Runner declares on POST /tasks/:id/move (activity_log.source)
 MOVE_SOURCE = "mesh-runner"
+# Idempotency-Key of a spend report: uuid5 of the report id under this namespace, so the same report
+# carries the same key on every send (a 429 repeat, a settle that runs again) and another report a new one
+SESSION_REPORT_KEY_NS = uuid.UUID("5b0c6f1e-2f7d-4c55-9a51-0d8e3b6a7c42")
+
+
+def session_report_key(report_id: str) -> str:
+    """Idempotency-Key for one spend report: stable for ``report_id``, different for any other."""
+    return str(uuid.uuid5(SESSION_REPORT_KEY_NS, report_id))
+
+
+# Idempotency-Key of the Runner's other writes (its comments): uuid5 of the kind of write and what
+# names it (the attempt, the turn, the task), never of the body, so a write rebuilt after a restart
+# with other text still carries the key of the first send and Mesh refuses it instead of posting twice
+WRITE_KEY_NS = uuid.UUID("0f3c2a9e-6b1d-4e8a-a4f7-2c5d9e1b7a30")
+# a keyed write whose answer was lost (status 0: timeout, reset) is sent again with the same key;
+# Mesh answers the repeat from the stored first answer and writes nothing more
+LOST_ANSWER_DELAYS = (1.0, 3.0)
+IDEMPOTENCY_KEY_REUSED = "idempotency_key_reused"
+IDEMPOTENCY_IN_PROGRESS = "idempotency_request_in_progress"
+
+
+def write_key(kind: str, *parts: str) -> str:
+    """Idempotency-Key for one Runner write: the same ``kind`` and ``parts`` give the same key."""
+    return str(uuid.uuid5(WRITE_KEY_NS, "|".join([kind, *(str(p) for p in parts)])))
+
+
+def error_code(e: "MeshError") -> str:
+    """The machine-readable ``error_code`` of a Mesh refusal, '' when it has none."""
+    return str(e.body.get("error_code") or "") if isinstance(e.body, dict) else ""
 
 
 def _parse_retry_after(value: Any) -> float | None:
@@ -82,6 +115,8 @@ class MeshClient:
                  basic_auth: str = "", bearer=None):
         self.base = base_url.rstrip("/") + "/api/v1"
         self._key = agent_key
+        # [runner] idempotency_keys: false sends no Idempotency-Key and repeats no lost write (rollback)
+        self.idempotency_keys = True
         # a self-hosted Mesh behind an HTTP basic-auth gate: "user:pass" in Authorization,
         # the agent key stays in X-Agent-Key, so the two never collide
         self._basic = ("Basic " + base64.b64encode(basic_auth.encode()).decode()) if basic_auth else ""
@@ -94,16 +129,27 @@ class MeshClient:
         return f"MeshClient({self.base!r})"
 
     # -- transport -------------------------------------------------------------
-    def request(self, method: str, path: str, body: Any = None, query: dict | None = None) -> Any:
-        delays = list(GET_RETRY_DELAYS) if method == "GET" else []
+    def request(self, method: str, path: str, body: Any = None, query: dict | None = None,
+                headers: dict | None = None, idem_key: str = "") -> Any:
+        """One API call. ``idem_key`` (a write) is sent as ``Idempotency-Key`` unless keys are off;
+        a keyed write whose answer was lost is then sent again with the same key, and a repeat that
+        finds the first send still running waits its Retry-After."""
+        keyed = bool(idem_key) and self.idempotency_keys and method != "GET"
+        if keyed:
+            headers = {**(headers or {}), "Idempotency-Key": idem_key}
+        delays = list(GET_RETRY_DELAYS) if method == "GET" else list(LOST_ANSWER_DELAYS) if keyed else []
         limited = 0
         while True:
             try:
-                return self._request(method, path, body, query)
+                return self._request(method, path, body, query, headers=headers)
             except MeshError as e:
                 # a write is repeated only when the server named a Retry-After: that header comes from
-                # the rate-limit middleware, a handler-level 429 might have applied side effects
-                if (e.status == 429 and limited < RATE_LIMIT_RETRIES
+                # the rate-limit middleware, a handler-level 429 might have applied side effects; a
+                # keyed write also when Mesh says the same key is still being processed
+                in_progress = keyed and e.status == 409 and error_code(e) == IDEMPOTENCY_IN_PROGRESS
+                if in_progress and (e.retry_after or 0) > RATE_LIMIT_MAX_SLEEP:
+                    raise                          # never repeat before the server's Retry-After
+                if ((e.status == 429 or in_progress) and limited < RATE_LIMIT_RETRIES
                         and (method == "GET" or e.retry_after is not None)):
                     limited += 1
                     wait = e.retry_after if e.retry_after is not None else RATE_LIMIT_DEFAULT_SLEEP
@@ -184,7 +230,8 @@ class MeshClient:
         return self._request("GET", path, timeout=timeout, max_bytes=1024 * 1024)
 
     def _request(self, method: str, path: str, body: Any = None, query: dict | None = None,
-                 *, timeout: float | None = None, max_bytes: int | None = None) -> Any:
+                 *, timeout: float | None = None, max_bytes: int | None = None,
+                 headers: dict | None = None) -> Any:
         url = self.base + path
         if query:
             url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
@@ -195,6 +242,7 @@ class MeshClient:
             **({"Authorization": "Bearer " + self._bearer()} if self._bearer
                else {"Authorization": self._basic} if self._basic else {}),
             **({"Content-Type": "application/json"} if data is not None else {}),
+            **(headers or {}),
         })
         try:
             allowed = budget.cap(self.timeout if timeout is None else timeout, method, path)
@@ -288,8 +336,19 @@ class MeshClient:
             page += 1
         raise MeshError(0, "comment history exceeds the page bound")      # fail closed, never a partial read
 
-    def add_comment(self, task_id: str, body: str) -> dict:
-        return self.request("POST", f"/tasks/{task_id}/comments", {"body": body})
+    def add_comment(self, task_id: str, body: str, key: str = "") -> dict:
+        """Post a comment. ``key`` names this write (kind, attempt, turn); it becomes the request's
+        Idempotency-Key, so a repeat after a lost answer or a restart posts nothing new. A key
+        already used for another body means this write happened before: nothing is posted and
+        ``{"idempotent_reused": True}`` is returned."""
+        try:
+            return self.request("POST", f"/tasks/{task_id}/comments", {"body": body},
+                                idem_key=write_key("comment", task_id, key) if key else "")
+        except MeshError as e:
+            if key and self.idempotency_keys and e.status == 409 and error_code(e) == IDEMPOTENCY_KEY_REUSED:
+                log.info("comment on #%s already written under key %s; not posted again", task_id[:8], key)
+                return {"idempotent_reused": True}
+            raise
 
     def dependencies(self, task_id: str) -> dict:
         return self.request("GET", f"/tasks/{task_id}/dependencies") or {}
@@ -356,13 +415,20 @@ class MeshClient:
             body["expected_status_id"] = expected_status_id
         return self.request("POST", f"/tasks/{task_id}/move", body)
 
-    def session_report(self, task_id: str, tokens_in: int, tokens_out: int, model: str, cost: float) -> None:
-        """Spend of one turn on the agent's Mesh record (POST /agents/me/sessions/report)."""
+    def session_report(self, task_id: str, tokens_in: int, tokens_out: int, model: str, cost: float,
+                       report_id: str = "") -> None:
+        """Spend of one turn on the agent's Mesh record (POST /agents/me/sessions/report).
+
+        ``report_id`` names the report (the turn it accounts for). It becomes the request's
+        ``Idempotency-Key``: a repeat of the same report sends the same key, so a Mesh that honours
+        it applies the report once; another report gets another key. A Mesh that does not know the
+        header ignores it."""
         body = {"tokens_in": int(tokens_in), "tokens_out": int(tokens_out), "model": model or "",
                 "estimated_cost": round(float(cost), 4)}
         if task_id:
             body["task_id"] = task_id
-        self.request("POST", "/agents/me/sessions/report", body)
+        self.request("POST", "/agents/me/sessions/report", body,
+                     idem_key=session_report_key(report_id) if report_id else "")
 
     def vcs_links(self, task_id: str) -> list[dict]:
         """Merge requests, commits and branches linked to the task. Mesh keeps each

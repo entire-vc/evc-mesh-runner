@@ -26,7 +26,9 @@ a task assigned to it. This module keeps those in step with the attempt:
   of filing, the same source and addressee reuse that task (the new question is
   a comment on it, a closed one is reopened) instead of filing another; the same
   question again (``normalized_question``) is attached to its request with no
-  comment and no reopen (``identical_no_reopen``);
+  comment and no reopen (``identical_no_reopen``); a repeat of any question
+  already answered on that request (closed as done) never reopens it, not even
+  after a re-check, and the asker is sent back with the answer reference;
   a person is asked by Mesh from the agent's ``❓ Blocking`` line, never here.
 
 Every call is best effort: a failed side effect is logged and retried by the
@@ -1093,12 +1095,31 @@ class Effects:
             return normalized_question(asked, task_id) == normalized_question(note, task_id)
         return asked == self._question_text({"note": note})
 
+    def _asked_on(self, task_id: str, entry: dict | None, note: str) -> bool:
+        """``note`` repeats a question already put on the request ``entry`` stands for: its current
+        question or any question answered on it before (``answered``), not only the last one."""
+        entry = entry or {}
+        return any(self._same_question(task_id, q, note)
+                   for q in (entry.get("question"), *(entry.get("answered") or ())) if q is not None)
+
+    @staticmethod
+    def _answered_history(reuse: dict, closed_done: bool) -> list[str]:
+        """The questions answered on a request: those it carried before, plus its current one when
+        the request was closed as done (an answer, not a cancellation). Newest last. Never truncated:
+        an evicted question could reopen its request again; the reuse window bounds the history,
+        since the whole entry expires with ``decision_reuse_hours``."""
+        history = [q for q in (reuse.get("answered") or ()) if q]
+        current = reuse.get("question")
+        if closed_done and current and current not in history:
+            history.append(current)
+        return history
+
     def _identical(self, task_id: str, entry: dict | None, wait: dict) -> bool:
-        """``wait`` repeats the question of the request ``entry`` stands for, from the same asker:
+        """``wait`` repeats a question of the request ``entry`` stands for, from the same asker:
         attached to that request as it is (``identical_no_reopen``)."""
         entry = entry or {}
         return (self.identical_no_reopen and entry.get("lane") in (None, "", self.lane)
-                and self._same_question(task_id, entry.get("question"), wait.get("note") or ""))
+                and self._asked_on(task_id, entry, wait.get("note") or ""))
 
     def _recent(self, task_id: str) -> dict:
         """Requests filed for this source, by recipient id (kept after they close)."""
@@ -1136,6 +1157,8 @@ class Effects:
                  "filed_at": self._filed_at(record, prev if same_card else None),
                  "question": record.get("question"), "asked_at": record.get("asked_at"),
                  "lane": record.get("lane")}
+        if record.get("answered"):
+            entry["answered"] = list(record["answered"])
         # expired entries go, the current recipient's included: an expired request is never reused
         kept = {r: e for r, e in {**recent, recipient: entry}.items() if self._fresh(e)}
         if kept != recent:
@@ -1182,9 +1205,10 @@ class Effects:
             return ""                       # a person or ourselves: never handled here
         entry = self._reusable(a.task_id, addressee["id"], self._decision(a.task_id))
         asked = parse_time((entry or {}).get("asked_at"))
-        if not entry or asked is None or not self._same_question(a.task_id, entry.get("question"), note):
+        if not entry or asked is None or not self._asked_on(a.task_id, entry, note):
             return ""
         name = str(addressee.get("name") or handle)
+        req8 = str(entry["request"]["id"])[:8]
 
         def by_addressee(c: dict) -> bool:
             author = c.get("author_id") or (c.get("author") or {}).get("id")
@@ -1196,20 +1220,43 @@ class Effects:
             on_request = self.mesh.comments(entry["request"]["id"])
         except MeshError:
             on_request = []
-        answers = [c for c in list(comments) + list(on_request) if by_addressee(c)
-                   and (c.get("body") or "").strip() and (parse_time(c.get("created_at")) or asked) > asked]
-        if not answers:
-            return ""
-        last = max(answers, key=lambda c: parse_time(c.get("created_at")))
-        quote = " ".join(last["body"].split())
-        if len(quote) > ANSWER_QUOTE:
-            quote = quote[:ANSWER_QUOTE - 1].rstrip() + "…"
-        return (f"@{name} already answered this exact question on this task after you asked it: «{quote}». "
+        if self._same_question(a.task_id, entry.get("question"), note):
+            # the request's current question: its answer is what the addressee wrote after it was asked
+            answers = [c for c in list(comments) + list(on_request) if by_addressee(c)
+                       and (c.get("body") or "").strip() and (parse_time(c.get("created_at")) or asked) > asked]
+            if not answers:
+                return ""
+            last = max(answers, key=lambda c: parse_time(c.get("created_at")) or asked)
+            quote = " ".join(last["body"].split())
+            if len(quote) > ANSWER_QUOTE:
+                quote = quote[:ANSWER_QUOTE - 1].rstrip() + "…"
+            said = f"after you asked it: «{quote}»"
+        else:
+            # an earlier question answered on this request before a later one was put on it: the
+            # newest comment there may answer the later question, so nothing is quoted as its answer
+            said = (f"earlier on request #{req8}, before a later question was put on it; read that request's "
+                    "thread for its answer")
+        return (f"@{name} already answered this exact question {said}. Answer reference: request "
+                f"#{req8}. Mesh refuses this repeat (`already_answered`): read that answer; a new question "
+                "must say what changed. "
                 "The same question will get the same answer, so this decision wait was sent back and "
                 f"nothing was asked again. Wait for the event that changes the answer "
                 "(`⏳ WAIT card:#<8hex>`, `⏳ WAIT mr:<group>/<project>!<iid>`, "
                 "`⏳ WAIT pipeline:<group>/<project>#<id>`, or a time with its reason), "
                 f"or ask @{name} a different question.")
+
+    def _request_answered(self, request_id: str) -> str:
+        """The status name of a request card closed as done (answered), '' otherwise or unreadable."""
+        try:
+            card = self.mesh.task(request_id)
+        except MeshError:
+            return ""
+        card = card.get("task", card) if isinstance(card, dict) else {}
+        if self.cats.category(card) != "done":
+            return ""
+        status = card.get("status")
+        name = status.get("name") if isinstance(status, dict) else status
+        return str(name or card.get("status_slug") or "done")
 
     def _end_decision(self, task_id: str, record: dict, why: str) -> bool:
         if record.get("state") == "closed":
@@ -1465,8 +1512,9 @@ class Effects:
         if active and active.get("state") != "closed":
             if (active.get("key") == key and active.get("attached_closed") and wait.get("rechecks")
                     and active.get("request")):
-                # attached to a closed request, handed back by the re-check and asked again: the asker
-                # still needs it, so the addressee is asked once more (the request is reopened)
+                # attached to a closed request, handed back by the re-check and asked again: a request
+                # closed as done answered it and stays closed (``_reuse_decision`` attaches again); one
+                # closed without an answer (cancelled) is reopened and the addressee asked once more
                 reuse = self._reusable(a.task_id, addressee["id"], active) or dict(active)
                 if self._reuse_decision(a, task, wait, addressee, key, reuse, ask=True):
                     return
@@ -1592,7 +1640,7 @@ class Effects:
         when that request cannot be reused (gone, reassigned, no todo status): file a new one.
         The same question is attached to it as it is (``_attach_identical``) unless ``ask``."""
         req = dict(reuse["request"])
-        identical = not ask and self._identical(a.task_id, reuse, wait)
+        identical = self._identical(a.task_id, reuse, wait)
         try:
             card = self.mesh.task(req["id"])
             card = card.get("task", card) if isinstance(card, dict) else {}
@@ -1601,9 +1649,13 @@ class Effects:
             if not project_id or assignee != addressee["id"]:
                 return self._forget_request(a.task_id, addressee["id"])   # someone else holds it now
             req["project_id"] = project_id
-            reopened = self.cats.category(card) in ("done", "cancelled")
-            if identical:
-                return self._attach_identical(a, wait, addressee, key, reuse, req, closed=reopened)
+            category = self.cats.category(card)
+            reopened = category in ("done", "cancelled")
+            answered = self._answered_history(reuse, category == "done")
+            if identical and not (ask and category == "cancelled"):
+                # an answered question is never asked again: no move, no comment on its request
+                return self._attach_identical(a, wait, addressee, key, dict(reuse, answered=answered), req,
+                                              closed=reopened, answered=category == "done")
             if reopened:
                 todo = next((s["id"] for s in self.mesh.statuses(project_id) if s.get("category") == "todo"),
                             None)
@@ -1611,7 +1663,8 @@ class Effects:
                     return False
                 self.mesh.move(req["id"], todo)     # idempotent: a retry after a failed comment repeats it
             asking = iso()
-            posted = self.mesh.add_comment(req["id"], self._decision_ask(a, task, wait, addressee, again=True))
+            posted = self.mesh.add_comment(req["id"], self._decision_ask(a, task, wait, addressee, again=True),
+                                           key=f"decision-reask|{a.id}|{a.turns}")
         except MeshError as e:
             if e.status in (404, 410):
                 return self._forget_request(a.task_id, addressee["id"])
@@ -1624,6 +1677,8 @@ class Effects:
                   "asked_at": _asked_at(posted, asking), "reused": int(reuse.get("reused") or 0) + 1}
         if reuse.get("create_id"):
             record["create_id"] = reuse["create_id"]
+        if answered:
+            record["answered"] = answered
         self._save_decision(a.task_id, record)
         wait["request"] = dict(req)
         log.info("%s: #%s decision request → %s: #%s reused%s", self.lane, a.task8, addressee.get("name"),
@@ -1631,7 +1686,7 @@ class Effects:
         return True
 
     def _attach_identical(self, a: Attempt, wait: dict, addressee: dict, key: str, reuse: dict, req: dict,
-                          closed: bool) -> bool:
+                          closed: bool, answered: bool = False) -> bool:
         """Bind a repeated question to the request that already carries it: no move, no comment.
         Reopening a request or commenting on it starts a new session for the addressee (measured:
         the same question minutes apart, each costing the addressee a fresh start to re-read the
@@ -1642,15 +1697,22 @@ class Effects:
                   "attached": int(reuse.get("attached") or 0) + 1}
         if reuse.get("create_id"):
             record["create_id"] = reuse["create_id"]
+        if reuse.get("answered"):
+            record["answered"] = list(reuse["answered"])
         if closed:
             # nobody is asked again: a bounded re-check hands the question back to the asker
             # instead of a wait on a closed request that only a stray comment would end; the same
-            # question declared after that re-check asks the addressee again
+            # question declared after that re-check asks the addressee again only when the request
+            # was closed without an answer (cancelled): an answered one is never reopened for it
             record["attached_closed"] = req["id"][:8]
+            if answered:
+                record["attached_answered"] = True
         self._save_decision(a.task_id, record)
         wait["request"] = dict(req)
         if closed:
             wait["attached_closed"] = req["id"][:8]
+            if answered:
+                wait["attached_answered"] = True
         if self.store is not None:
             self.store.event(a.id, "decision_attached", f"#{req['id'][:8]} {'closed' if closed else 'open'}")
         log.info("%s: #%s decision request → %s: #%s attached: the same question, not %s", self.lane, a.task8,
@@ -1724,7 +1786,7 @@ class Effects:
                     # the terminal card status is the authoritative receipt.
                     record["close_comment_attempted"] = True
                     self._save_decision(task_id, record)
-                    self.mesh.add_comment(req["id"], f"[runner] closed: {why}")
+                    self.mesh.add_comment(req["id"], f"[runner] closed: {why}", key=f"request-closed|{req['id']}")
                 self.mesh.move(req["id"], done)
             wait.pop("request", None)
             if blocked:

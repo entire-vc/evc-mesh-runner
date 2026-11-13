@@ -18,6 +18,10 @@ Rules (``docs/release-process.md``):
    non-empty ``CHANGELOG.md`` section for it and leaves no fragment behind. Its ``src/`` changes
    arrive only through merged merge requests (each carried its fragment through rule 2): a commit
    made on the release branch itself may change ``src/`` only in the version line.
+5. Every branch: no file that reaches the public export carries an internal card id
+   (``#`` + 8 hex) or a lane or person name. Card ids belong in the fragment's file name, the
+   branch and the merge request; a test fixture uses a stub id from ``STUB_CARD_IDS``. Names are
+   compared as sha256 of the word, so this file does not carry the list it guards.
 
 Inputs default to the GitLab merge request variables (``CI_MERGE_REQUEST_DIFF_BASE_SHA``,
 ``CI_MERGE_REQUEST_SOURCE_BRANCH_NAME``, ``CI_MERGE_REQUEST_LABELS``,
@@ -26,6 +30,7 @@ Inputs default to the GitLab merge request variables (``CI_MERGE_REQUEST_DIFF_BA
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import re
@@ -42,6 +47,26 @@ _spec.loader.exec_module(release)
 SKIP_LABEL = "no-changelog"
 SKIP_LINE = re.compile(r"^\s*changelog:\s*none\b", re.I | re.M)
 DOC = "docs/release-process.md"
+
+
+# Rule 5: the public export (docs/release-process.md). Scanned: every tracked file except these,
+# which never reach the export (operational CI config, the managed-runtime operator kit, internal
+# tools) or reach it only as a reviewed replacement (CHANGELOG.md: its new sections are collected
+# from changelog.d fragments, which are scanned). Everything else is scanned, including the few
+# paths the export policy also leaves out, so a new file is covered before anyone decides on it.
+NOT_EXPORTED = (".gitlab-ci.yml", "CHANGELOG.md", "ops/managed-runtime/", "tools/")
+CARD_ID = re.compile(r"#([0-9a-f]{8})\b", re.I)
+# Fixture stubs a test may use instead of a real card; extend only with an obviously synthetic id.
+STUB_CARD_IDS = frozenset({
+    "00000001", "00000002", "00000003", "00000004", "11111111", "aaaaaaaa", "bbbbbbbb", "cccccccc",
+    "0000aaaa", "0000bbbb", "0000cccc", "0000beef", "deadbeef", "abcdef12", "abc12345", "0f1e2d3c",
+    "1234abcd", "0123abcd", "11112222", "55556666", "aaaa1111", "bbbb2222",
+})
+WORD = re.compile(r"[A-Za-z0-9_]+")
+# Names private to a deployment, as sha256(word)[:16]; empty in the public tree.
+# A word matches only whole: a longer word that starts with a name is not it.
+PRIVATE_NAME_SHA256 = frozenset()
+EXPORT_REPORT_LIMIT = 40
 
 
 class CannotEvaluate(Exception):
@@ -77,6 +102,106 @@ def version_at(root: Path, rev: str, path: str) -> str | None:
         return release.read_version(path, text)
     except release.ReleaseError:
         return None
+
+
+def private_name(word: str) -> bool:
+    return hashlib.sha256(word.encode()).hexdigest()[:16] in PRIVATE_NAME_SHA256
+
+
+def not_exported(path: str) -> bool:
+    return any(path.startswith(entry) if entry.endswith("/") else path == entry
+               for entry in NOT_EXPORTED)
+
+
+def text_findings(path: str, text: str) -> list[str]:
+    """Card ids and private names in one exported file, one line per finding."""
+    found = []
+    for no, line in enumerate(text.splitlines(), 1):
+        for m in CARD_ID.finditer(line):
+            if m.group(1).lower() not in STUB_CARD_IDS:
+                found.append(f"{path}:{no}: card id #{m.group(1)}")
+        for m in WORD.finditer(line):
+            if private_name(m.group(0)):
+                found.append(f"{path}:{no}: internal name '{m.group(0)}'")
+    return found
+
+
+def tree_blobs(root: Path, head: str) -> list[tuple[str, str]]:
+    """(path, text) of every tracked text file at ``head`` that rule 5 scans."""
+    listing = git(root, "ls-tree", "-r", "-z", head).stdout.split("\0")
+    wanted = []
+    for row in listing:
+        meta, _, path = row.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == "blob" and not not_exported(path):
+            wanted.append((path, parts[2]))
+    if not wanted:
+        return []
+    res = subprocess.run(["git", "-C", str(root), "cat-file", "--batch"], capture_output=True,
+                         input="".join(f"{sha}\n" for _, sha in wanted).encode())
+    if res.returncode != 0:
+        raise CannotEvaluate(f"git cat-file --batch: {res.stderr.decode(errors='replace').strip()}")
+    out, pos, blobs = res.stdout, 0, []
+    for path, _ in wanted:
+        eol = out.index(b"\n", pos)
+        size = int(out[pos:eol].split()[2])
+        data = out[eol + 1:eol + 1 + size]
+        pos = eol + 1 + size + 1
+        if b"\0" in data:
+            continue                                     # binary
+        try:
+            blobs.append((path, data.decode("utf-8")))
+        except UnicodeDecodeError:
+            continue
+    return blobs
+
+
+def export_findings(root: Path, head: str) -> list[str]:
+    found = []
+    for path, text in tree_blobs(root, head):
+        found.extend(text_findings(path, text))
+    return found
+
+
+def checkout_findings(root: Path) -> list[str]:
+    """Rule 5 on the files as they are on disk: the tracked files of a git checkout, else every file
+    (an exported tree has no .git). Lets the test suite catch what a tree already carries; job output
+    written next to the checkout (untracked) is not part of it."""
+    res = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True)
+    if res.returncode == 0 and (root / ".git").exists():
+        paths = [p.decode() for p in res.stdout.split(b"\0") if p]
+    else:
+        paths = [p.relative_to(root).as_posix() for p in root.rglob("*")
+                 if p.is_file() and "__pycache__" not in p.parts and ".git" not in p.parts]
+    found = []
+    for path in sorted(paths):
+        if not_exported(path):
+            continue
+        try:
+            data = (root / path).read_bytes()
+        except (FileNotFoundError, IsADirectoryError):
+            continue                                     # deleted in the checkout, or a submodule
+        if b"\0" in data:
+            continue
+        try:
+            found.extend(text_findings(path, data.decode("utf-8")))
+        except UnicodeDecodeError:
+            continue
+    return found
+
+
+def export_problem(found: list[str]) -> str | None:
+    if not found:
+        return None
+    shown = "\n      ".join(found[:EXPORT_REPORT_LIMIT])
+    more = f"\n      ... and {len(found) - EXPORT_REPORT_LIMIT} more" if len(found) > EXPORT_REPORT_LIMIT else ""
+    return (
+        f"{len(found)} internal reference(s) in files that reach the public export:\n      {shown}{more}\n"
+        f"    Fix: drop the card id from code, comments, docs and fragment text; the card goes into the "
+        f"fragment's file name ({release.FRAGMENT_DIR}/<card>-<slug>.md), the branch and the merge request. "
+        f"A test fixture uses a stub id ({', '.join('#' + x for x in sorted(STUB_CARD_IDS)[:6])}, ... see "
+        f"STUB_CARD_IDS in ops/check_mr_policy.py). Replace a lane or person name with a neutral role "
+        f"(owner, lead, ops, builder). Paths outside the export: NOT_EXPORTED in the same file ({DOC}).")
 
 
 def check(root: Path, base: str, head: str, branch: str, labels: list[str], description: str) -> list[str]:
@@ -171,6 +296,9 @@ def check(root: Path, base: str, head: str, branch: str, labels: list[str], desc
         if left:
             problems.append(f"release branch: fragments not collected into CHANGELOG.md: {', '.join(left)}; "
                             f"run python3 ops/release.py <version> on the branch head ({DOC})")
+    hygiene = export_problem(export_findings(root, head))
+    if hygiene:
+        problems.append(hygiene)
     return problems
 
 

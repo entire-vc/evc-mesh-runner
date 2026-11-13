@@ -1,10 +1,12 @@
 """Changelog fragments, the release script and the merge request gate (ops/release.py, ops/check_mr_policy.py)."""
+import hashlib
 import importlib.util
 import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -351,6 +353,103 @@ class MergeRequestGate(unittest.TestCase):
             self.assertEqual(policy.main(["--root", str(self.repo.root), "--base", "nope", "--branch", "feat/x"]), 2)
 
 
+# The card id is synthetic; the name corpus is a synthetic deployment fixture.
+REAL_ID = "1a2b" + "3c4d"
+NAME = "Zorblax"
+
+
+class ExportHygiene(unittest.TestCase):
+    """Rule 5: no card id or internal name in a file that reaches the public export."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Repo(Path(self.tmp.name))
+        self.repo.branch("feat/x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def refused(self, rel, text):
+        self.repo.write(rel, text)
+        self.repo.commit("x")
+        return " ".join(self.repo.check("feat/x"))
+
+    def test_a_card_id_in_a_comment_is_refused_with_the_fix(self):
+        problems = self.refused("src/mesh_runner/core.py", f"VALUE = 1  # see #{REAL_ID}\n")
+        self.assertIn(f"src/mesh_runner/core.py:1: card id #{REAL_ID}", problems)
+        self.assertIn("changelog.d/<card>-<slug>.md", problems)          # where the id goes instead
+        self.assertIn("STUB_CARD_IDS", problems)
+
+    def test_a_clean_change_passes(self):                                 # positive control
+        self.assertEqual(self.refused("docs/a.md", "Plain text, #aaaaaaaa is a stub, Billing is a word.\n"), "")
+
+    def test_uppercase_hex_ids_are_refused_but_fixture_stubs_pass(self):
+        upper_id = REAL_ID.upper()
+        problems = self.refused("docs/a.md", f"# see #{upper_id}\n")
+        self.assertIn(f"docs/a.md:1: card id #{upper_id}", problems)
+        self.repo.write("docs/a.md", "Fixture #ABCDEF12 is a stub.\n")
+        self.repo.commit("fixture")
+        self.assertEqual(self.repo.check("feat/x"), [])
+
+    def test_a_card_id_in_fragment_text_is_refused_but_not_in_its_name(self):
+        problems = self.refused(f"changelog.d/{REAL_ID}-x.md", f"- **Change (#{REAL_ID}).** Text.\n")
+        self.assertIn(f"changelog.d/{REAL_ID}-x.md:1: card id #{REAL_ID}", problems)
+        self.repo.write(f"changelog.d/{REAL_ID}-x.md", "- **Change.** Text.\n")
+        self.repo.commit("fixed")
+        self.assertEqual(self.repo.check("feat/x"), [])
+
+    # Fixture configuration: exercise the real scanner with a synthetic deployment name.
+    @mock.patch.object(policy, "PRIVATE_NAME_SHA256",
+                       frozenset({hashlib.sha256(NAME.encode()).hexdigest()[:16]}))
+    def test_an_internal_name_is_refused_whole_words_only(self):
+        problems = self.refused("tests/test_a.py", f"OWNER = '{NAME}'\n")
+        self.assertIn(f"tests/test_a.py:1: internal name '{NAME}'", problems)
+        for word in (NAME.lower(), NAME + "s", "x_" + NAME, "Billing", "Frankly"):
+            self.assertFalse(policy.private_name(word), word)
+
+    def test_paths_outside_the_export_are_not_scanned(self):
+        self.repo.write(".gitlab-ci.yml", f"# #{REAL_ID}\n")
+        self.repo.write("tools/x.py", f"# {NAME}\n")
+        self.repo.write("CHANGELOG.md", CHANGELOG + f"\n- old entry (#{REAL_ID})\n")
+        self.repo.commit("outside")
+        self.assertEqual(self.repo.check("feat/x"), ["CHANGELOG.md is edited outside a release/* branch. Move the "
+                                                     "entry into changelog.d/<card>-<slug>.md (one file per change, "
+                                                     "a list item '- **What changed.** ...'); the release commit "
+                                                     "collects it (docs/release-process.md)."])
+
+    def test_binary_files_are_skipped(self):
+        (self.repo.root / "docs").mkdir(exist_ok=True)
+        (self.repo.root / "docs/a.bin").write_bytes(b"\0" + f"#{REAL_ID}".encode())
+        self.repo.commit("bin")
+        self.assertEqual(self.repo.check("feat/x"), [])
+
+    def test_exported_lookalike_paths_are_scanned(self):
+        paths = ("CHANGELOG.md.bak", ".gitlab-ci.yml-copy", "toolshed/x.py",
+                 "ops/managed-runtime-copy/x.py")
+        for path in paths:
+            self.repo.write(path, f"# see #{REAL_ID}\n")
+        self.repo.commit("lookalike paths")
+        expected = sorted(f"{path}:1: card id #{REAL_ID}" for path in paths)
+        self.assertEqual(sorted(policy.export_findings(self.repo.root, "HEAD")), expected)
+        self.assertEqual(sorted(policy.checkout_findings(self.repo.root)), expected)
+
+    def test_the_checkout_scan_sees_the_same(self):
+        self.repo.write("docs/a.md", f"see #{REAL_ID}\n")
+        self.repo.write("docs/untracked.md", f"see #{REAL_ID}\n")
+        self.repo.git("add", "docs/a.md")
+        self.assertEqual(policy.checkout_findings(self.repo.root), [f"docs/a.md:1: card id #{REAL_ID}"])
+
+    # Fixture configuration: no real deployment names or their hashes are shipped.
+    @mock.patch.object(policy, "PRIVATE_NAME_SHA256",
+                       frozenset({hashlib.sha256(NAME.encode()).hexdigest()[:16]}))
+    def test_the_name_list_is_not_in_this_repository_as_text(self):
+        names = [NAME]
+        source = (ROOT / "ops/check_mr_policy.py").read_text()
+        for n in names:
+            self.assertNotIn(n, source)
+            self.assertTrue(policy.private_name(n))
+
+
 class SequentialMerges(unittest.TestCase):
     """AC1: two merge requests with entries merge one after the other without rebasing the second."""
 
@@ -398,6 +497,10 @@ class SequentialMerges(unittest.TestCase):
 class RepositoryLayout(unittest.TestCase):
     def test_fragments_in_this_checkout_are_valid(self):
         release.collect_fragments(ROOT)                            # raises on a malformed fragment
+
+    def test_exported_files_carry_no_card_ids_or_internal_names(self):
+        found = policy.checkout_findings(ROOT)
+        self.assertEqual(found, [], policy.export_problem(found))
 
     @unittest.skipUnless((ROOT / ".gitlab-ci.yml").is_file(), "the CI configuration is not part of this tree")
     def test_ci_runs_the_gate_on_merge_requests(self):

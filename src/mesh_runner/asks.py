@@ -32,6 +32,10 @@ DEFAULT_HARD_PATTERNS: tuple[str, ...] = (
     r"refund", r"charge\b", r"charged\b", r"subscription", r"money", r"purchase", r"budget",
     r"оплат", r"платн", r"платеж", r"платёж", r"платит", r"счёт", r"счет\b", r"счета\b", r"деньг", r"денежн", r"цена\b",
     r"цены\b", r"цену\b", r"цен[аыу]\b", r"стоимост", r"тариф", r"возврат", r"бюджет", r"купит", r"покупк",
+    # a top-up, a balance or an amount of money is money too (a live gate asked to "top up the
+    # shared balance by $20"); the space before a currency may be a no-break one
+    r"top[- ]?up", r"credits?\b", r"deposit", r"balance", r"пополн", r"баланс", r"перевод(?:ести)? (?:денег|средств)",
+    r"[$€₽£][\s ]?\d", r"\d[\d.,]*[\s ]?(?:usd|eur|руб|₽|\$)",
     # secrets, keys, credentials, access
     r"secret", r"key\b", r"keys\b", r"token", r"password", r"passphrase", r"credential", r"access\b",
     r"permission", r"api[ _-]?key", r"доступ", r"ключ", r"токен", r"парол", r"секрет", r"учётн", r"учетн",
@@ -119,12 +123,20 @@ def gate_class(question: str, labels, default: str | None, patterns=DEFAULT_HARD
     """The class Mesh arms a ``❓ Blocking`` gate with (server ``markerGateClass``): a ``[hard]``
     tag, then a hard rule (over a ``[soft]`` tag), then ``[soft]``; a soft question still stays
     hard without a default its asker stated, since nothing could be applied at the deadline.
-    The tags count on ``marker_line`` (the marker's own line) when given, else anywhere."""
+    The tags count on ``marker_line`` (the marker's own line) when given, else anywhere.
+    The hard rules read the question and the default together: what happens unanswered at the
+    deadline is the default, so "Top up? Default: pay $20" is a money question whatever the
+    question line says (Mesh reads the marker's whole tail, its ``Default:`` line included)."""
     question = question or ""
     tag_text = question if marker_line is None else marker_line
     if _HARD_TAG.search(tag_text):
         return Verdict(True, "tag:hard")
-    verdict = classify(_SOFT_TAG.sub(" ", question), labels, patterns, hard_labels)
+    stated = (default or "").strip()
+    # A missing question stays "unsure" (hard): a default alone is never read as the question.
+    asked = _SOFT_TAG.sub(" ", question).strip()
+    text = question if not asked or not stated or stated == MARKER_FALLBACK_DEFAULT \
+        else f"{question}\n{stated}"
+    verdict = classify(_SOFT_TAG.sub(" ", text), labels, patterns, hard_labels)
     if verdict.hard:
         return verdict
     if _SOFT_TAG.search(tag_text):
@@ -177,8 +189,28 @@ def marker_gate_class(body: str, handle: str, labels, patterns=DEFAULT_HARD_PATT
     if not found:
         return Verdict(True, "unsure: no marker for the handle")
     line, rest = found
+    if not _HARD_TAG.search(line) and not _ASK_WORD.search(_asked_text(rest)):
+        return Verdict(True, "unsure: no question text")
     return gate_class("\n".join(rest), labels, marker_default(body, handle), patterns, hard_labels,
                       marker_line=line)
+
+
+# A letter or a digit: an ask without one asks nothing (":" alone).
+_ASK_WORD = re.compile(r"[^\W_]")
+_ASK_META_LINE = re.compile(r"^[\s>*\-•]*\**\s*(?:deadline|supersedes)\**\s*:", re.IGNORECASE)
+
+
+def _asked_text(rest: list[str]) -> str:
+    """Server ``askedText``: the question of a marker without its default, deadline and
+    supersedes lines and without class tags; '' when the marker asks nothing, so a marker
+    carrying only a default fails closed instead of reading the default as its question."""
+    first = rest[0] if rest else ""
+    m = _INLINE_DEFAULT.search(first)
+    if m:
+        first = first[:m.start()]
+    kept = [first] + [x for x in rest[1:] if not _LINE_DEFAULT.match(x) and not _ASK_META_LINE.match(x)]
+    text = _SOFT_TAG.sub(" ", _HARD_TAG.sub(" ", "\n".join(kept)))
+    return " ".join(text.split())
 
 
 _FENCE = re.compile(r"^(`+|~+)")

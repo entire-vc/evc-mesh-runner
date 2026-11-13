@@ -194,6 +194,51 @@ class DecisionRequestReuse(Bench):
         self.assertEqual(r.effects.answered_repeat(attempt, 'lead', 'approve plan B?',
                                                    mesh.comments(source['id']), r.me), '')
 
+    def test_repeat_of_a_request_closed_as_done_is_sent_back_with_its_reference(self):
+        # the answer lives on the request (its closing comment), not on the source: the repeat is
+        # still sent back, naming the request, and the request is neither moved nor commented on
+        r, mesh, source, attempt, wait = self.setup_question()
+        request = wait['request']['id']
+        mesh.add_comment(request, 'Answer: approved, ship it.', author='agent-lead',
+                         at=now() + dt.timedelta(seconds=1))
+        self.close(r, attempt, wait)
+        with patch.object(mesh, 'move', wraps=mesh.move) as moved, \
+                patch.object(mesh, 'add_comment', wraps=mesh.add_comment) as commented:
+            told = r.effects.answered_repeat(attempt, 'lead', 'approve the plan?', mesh.comments(source['id']), r.me)
+        self.assertIn(f'Answer reference: request #{request[:8]}', told)
+        self.assertIn('approved, ship it.', told)
+        self.assertIn('already_answered', told)
+        self.assertEqual(moved.call_args_list, [])
+        self.assertEqual(commented.call_args_list, [])
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'done')
+
+    def test_repeat_of_an_earlier_answered_question_is_sent_back(self):
+        # not only the last remembered question: A answered, then B asked and answered on the same
+        # request, then A again
+        r, mesh, source, attempt, wait = self.setup_question('approve the plan?')
+        request = wait['request']['id']
+        mesh.add_comment(request, 'Answer: the plan is approved.', author='agent-lead')
+        self.close(r, attempt, wait)
+        second = self.question('approve the revised plan?')
+        r.effects.on_wait(attempt, source, second, r.me)
+        self.assertEqual(second['request']['id'], request)
+        mesh.add_comment(request, 'Answer: the revised plan is rejected.', author='agent-lead',
+                         at=now() + dt.timedelta(seconds=2))
+        self.close(r, attempt, second)
+        told = r.effects.answered_repeat(attempt, 'lead', 'Approve the plan', mesh.comments(source['id']), r.me)
+        self.assertIn(f'Answer reference: request #{request[:8]}', told)
+        self.assertIn('earlier on request', told)
+        # the newest comment answers the later question: never quoted as the earlier one's answer
+        self.assertNotIn('revised plan is rejected', told)
+        self.assertNotIn('«', told)
+        # positive control: a new question is not sent back and reopens the request as before
+        self.assertEqual(r.effects.answered_repeat(attempt, 'lead', 'approve plan C?',
+                                                   mesh.comments(source['id']), r.me), '')
+        third = self.question('approve plan C?')
+        r.effects.on_wait(attempt, source, third, r.me)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'todo')
+        self.assertIn('approve plan C?', self.request_comments(mesh, request)[-1])
+
     def test_verbatim_repeat_without_an_answer_is_reused_not_sent_back(self):
         # the reopen path; with decision_identical_no_reopen (default) the same question is attached
         # to the closed request instead: test_decision_waste

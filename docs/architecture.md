@@ -99,6 +99,19 @@ dir missing, or reused by another worktree after it disappeared) is held with
 `worktree admin link requires operator inspection` and is never leased, snapshotted,
 restored into, cleaned or evicted; the periodic slot pass also checks free slots and logs
 one warning per slot with the admin dir and listing timestamps.
+Every slot's admin entry is locked (`git worktree lock --reason mesh-runner:<agent>`): a
+`git worktree prune` run by a process that cannot see the slot's path (another mount view, a
+sandbox) skips locked entries instead of deleting the admin dir of a live slot. New slots are
+locked when made, existing ones by the periodic slot pass; eviction unlocks before
+`worktree remove` and locks again if removal fails. When an admin dir is removed anyway, the
+slot is recovered without an operator: a held slot whose work nobody resumes (no attempt, or a
+finished one whose task has no open attempt) has its content committed onto a never-pushed
+`refs/mesh-runner/archive/orphan-*` ref through a scratch index in the base clone (git never
+runs in the slot), its directory moved into `<archive>/orphan-admin/<agent>/` on the same
+volume and its row dropped; a leased slot is rebuilt in place during suspend (same content
+laid back on the matched commit, its branch checked out when unambiguous), so its attempt
+checkpoints and resumes. A pool whose starts are held names its held slots and their notes
+in `pool_hold`.
 Legacy `git worktree add` appended a decimal collision counter to the slot basename (`slot-1` -> `slot-11`, `slot-12`); `WorkspacePool.issue` accepts that unprefixed spelling only after the reciprocal `commondir`/`gitdir` proof above, the lease check and the same owner/repo/slot tail. A foreign repo, foreign back-pointer, other owner's tree, shared physical target or a non-numeric suffix is refused. No migration is needed: nothing on disk is renamed, and the runner release carrying this check is the whole recovery (rollback = the previous release).
 
 ## What the runner does not do

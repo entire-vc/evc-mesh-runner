@@ -19,7 +19,10 @@ Safety rules:
 - two open attempts never share a slot; slots belong to one agent's pool;
 - a slot is used only while its ``.git`` file leads to its own admin dir under the base clone's
   ``worktrees/`` (checked before any git command runs in it); new slots get an owner-prefixed admin
-  id, so pools sharing one base clone never hand each other an admin id.
+  id, so pools sharing one base clone never hand each other an admin id;
+- every slot's admin entry is locked (``git worktree lock``), so a ``git worktree prune`` run where the
+  slot's path is not visible keeps it; a slot whose admin dir was removed anyway is recovered: a held one
+  whose work nobody resumes is archived and dropped, a leased one is rebuilt in place from its content.
 """
 from __future__ import annotations
 
@@ -60,6 +63,8 @@ POOL_INDEX_FLAGS_HOLD_NOTE = "index flags require operator inspection"
 POOL_ADMIN_HOLD_NOTE = "worktree admin link requires operator inspection"
 DIRTY_HOLD_NOTE = "uncommitted changes"        # the hold reason archive_and_free can resolve
 ARCHIVE_REF_PREFIX = "refs/mesh-runner/archive"  # outside refs/heads and refs/tags: no default push or fetch rule names it
+# Commits of the base clone tried as the base of an orphaned slot's content (newest first).
+ORPHAN_CANDIDATES = 60
 
 
 def base_lock(base: Path, *, timeout: float = 600) -> "TimedLock":
@@ -514,6 +519,260 @@ class WorkspacePool:
                         held.append(str(path))
         return held
 
+    # -- prevent: lock every slot's admin entry -------------------------------------------------
+    def _lock_reason(self) -> str:
+        return f"mesh-runner:{self.owner}"
+
+    def _lock(self, path: Path, repo: RepoSpec) -> bool:
+        """Lock the slot's admin entry (``git worktree lock``): ``git worktree prune`` skips locked entries.
+
+        A prune run by a process for which the slot's path does not exist (another mount view, a sandbox, a
+        volume not mounted there) otherwise deletes the admin dir of a live slot, and the slot is held from then
+        on. Only a slot whose admin link is sound is locked; True when this call locked it."""
+        why, admin = self._admin_check(path, repo, timeout=30)
+        if why or os.path.lexists(os.path.join(admin, "locked")):
+            return False
+        git(repo.base, "worktree", "lock", "--reason", self._lock_reason(), str(path), env=self.env, timeout=30)
+        return True
+
+    def _unlock(self, path: Path, repo: RepoSpec) -> bool:
+        """Undo ``_lock`` before git removes the worktree (``worktree remove`` and ``move`` refuse a locked
+        one). True when this call unlocked it."""
+        why, admin = self._admin_check(path, repo, timeout=30)
+        if why or not os.path.lexists(os.path.join(admin, "locked")):
+            return False
+        git(repo.base, "worktree", "unlock", str(path), env=self.env, timeout=30)
+        return True
+
+    def _lock_quietly(self, path: Path, repo: RepoSpec) -> None:
+        """``_lock`` whose failure only logs: the periodic ``lock_slots`` pass retries it."""
+        try:
+            self._lock(path, repo)
+        except WorkspaceError as e:
+            log.warning("%s: worktree %s not locked yet: %s", self.owner, path, e)
+
+    def lock_slots(self) -> list[str]:
+        """Periodic pass: lock every slot of this pool (free, leased or held) whose admin link is sound and
+        not locked yet, so slots made before locking existed are protected too. Costs a file check per slot
+        and one git call per slot it locks. Returns the newly locked paths."""
+        locked = []
+        for name, repo in self.repos.items():
+            if not self._rows(name):
+                continue
+            with base_lock(repo.base):
+                for row in self._rows(name):
+                    path = Path(row["path"])
+                    if not os.path.lexists(path / ".git"):
+                        continue
+                    try:
+                        if self._lock(path, repo):
+                            locked.append(str(path))
+                    except WorkspaceError as e:
+                        log.warning("%s: worktree %s not locked: %s", self.owner, path, e)
+        if locked:
+            log.info("%s: locked %d worktree(s) against a foreign prune: %s", self.owner, len(locked),
+                     ", ".join(locked))
+        return locked
+
+    # -- recover: a slot whose admin dir was removed ----------------------------------------------
+    def _orphan_admin(self, path: Path, repo: RepoSpec) -> str:
+        """The admin dir the slot's ``.git`` names when that dir is missing and is the slot's only link fault
+        (directly under the base clone's ``worktrees/``); '' for a sound link or any other fault (a symlinked
+        ``.git``, a foreign or reused admin dir), which stays with the operator."""
+        why, admin = self._admin_check(path, repo, timeout=30)
+        return admin if admin and why == f"admin dir {admin} is missing" else ""
+
+    def _archive_orphan(self, path: Path, repo: RepoSpec, label: str) -> tuple[str, str, str]:
+        """Save the content of a slot whose admin dir is gone, without running git in the slot itself.
+
+        Git cannot run in the slot (its ``.git`` names a missing admin dir), so the base clone's object store
+        is used with a scratch index: the commit whose tree the slot's tracked files match is found among the
+        newest commits of the clone; when none matches exactly, the slot's tracked and untracked (not ignored)
+        content is committed on top of the closest one onto a never-pushed ref under ``ARCHIVE_REF_PREFIX``,
+        read back before the caller may move anything. Ignored files are not committed: they move with the
+        directory. Returns (base commit, archive ref or '', summary)."""
+        real = os.path.realpath(path)
+        common = self._common_dir(repo, timeout=60)
+        name, email = self.identity or ("mesh-runner", "mesh-runner@localhost")
+        base_env = dict(self.env if self.env is not None else os.environ)
+        base_env.update({"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+                         "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email})
+        with tempfile.TemporaryDirectory(prefix="orphan-index-") as scratch:
+            index = os.path.join(scratch, "index")
+            env = {**base_env, "GIT_INDEX_FILE": index}
+
+            def g(*args: str, check: bool = True) -> str:
+                return git(Path(real), f"--git-dir={common}", f"--work-tree={real}", *args, check=check, env=env)
+
+            def measure(commit: str) -> tuple[list[str], list[str], list[str]]:
+                if os.path.exists(index):
+                    os.unlink(index)
+                g("read-tree", commit)
+                g("update-index", "-q", "--refresh", check=False)
+                subs = [line.split("\t", 1)[1] for line in g("ls-tree", "-r", commit).splitlines()
+                        if line.split()[1] == "commit"]
+                excl = [f":!{p}" for p in subs]
+                tracked = [x for x in g("diff-files", "--name-only", "--", ".", *excl).splitlines() if x]
+                untracked = [x for x in g("ls-files", "--others", "--exclude-standard", "--", ".",
+                                          *excl).splitlines() if x]
+                return tracked, untracked, excl
+
+            stamp = int(os.stat(real).st_mtime) + 86400
+            best = None
+            for commit in g("rev-list", f"--before={stamp}", f"--max-count={ORPHAN_CANDIDATES}", "--all").split():
+                tracked, untracked, excl = measure(commit)
+                score = len(tracked) + len(untracked)
+                if best is None or score < best[0]:
+                    best = (score, commit, tracked, untracked, excl)
+                if score == 0:
+                    break
+            if best is None:
+                raise WorkspaceError("orphan archive: no candidate commit in the base clone")
+            score, commit, tracked, untracked, excl = best
+            if not score:
+                return commit, "", f"clean at {commit[:12]}"
+            measure(commit)
+            g("add", "-A", "--", ".", *excl)
+            tree = g("write-tree")
+            new = g("commit-tree", tree, "-p", commit, "-m",
+                    f"mesh-runner archive of an orphaned worktree\n\nslot: {path}\nattempt: {label}")
+            stem = f"{ARCHIVE_REF_PREFIX}/orphan-{label[:8]}-{path.name}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            ref, n = stem, 0
+            while g("rev-parse", "-q", "--verify", ref, check=False):
+                n += 1
+                ref = f"{stem}-{n}"
+            g("update-ref", ref, new, "")
+            if g("rev-parse", f"{ref}^{{tree}}") != tree:
+                raise WorkspaceError(f"orphan archive: ref {ref} does not hold the snapshot")
+        return commit, ref, (f"{len(tracked)} tracked + {len(untracked)} untracked file(s) beside "
+                             f"{commit[:12]} saved as {ref}")
+
+    def _park_orphan(self, path: Path) -> Path:
+        """Move the slot directory, ignored files included, into ``<archive>/orphan-admin/<owner>/`` on the
+        same volume (a rename: nothing is copied or deleted). Returns the new location."""
+        if path.is_symlink():
+            raise WorkspaceError(f"orphan archive: slot path {path} is a symlink")
+        real = Path(os.path.realpath(path))
+        base = self.archive_root if self.archive_root is not None else self.root.parent.parent / "slot-archive"
+        parent = Path(os.path.realpath(base)) / "orphan-admin" / self.owner
+        parent.mkdir(parents=True, exist_ok=True)
+        if os.stat(parent).st_dev != os.stat(real).st_dev:
+            raise WorkspaceError(f"orphan archive: {parent} is not on the volume of {real}; slot left in place")
+        stem = parent / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{path.parent.name}-{path.name}"
+        dest, n = stem, 0
+        while os.path.lexists(dest):
+            n += 1
+            dest = stem.with_name(f"{stem.name}-{n}")
+        os.rename(real, dest)
+        return dest
+
+    def recover_orphans(self, open_attempts: set[str]) -> list[str]:
+        """Periodic pass: return to the pool every held slot whose admin dir was removed (a foreign
+        ``git worktree prune``) and whose work nobody will resume in it.
+
+        Taken: held for the admin link, the admin dir missing (the only fault), and no attempt or a finished
+        one whose task has no open attempt of this agent. Its content is saved (``_archive_orphan``), the
+        directory moved to the orphan archive (``_park_orphan``) and the row dropped; the next lease makes a
+        fresh, locked slot. Anything else stays held. Returns the recovered paths."""
+        recovered = []
+        rows = [dict(r) for r in self.store.db.execute(
+            "SELECT * FROM slots WHERE state='held' AND pool LIKE ?", (f"{self.owner}/%",))]
+        for row in rows:
+            if POOL_ADMIN_HOLD_NOTE not in row["note"]:
+                continue
+            attempt = row["attempt"]
+            if attempt:
+                a = self.store.get(attempt)
+                if attempt in open_attempts or a is None or a.state in OPEN \
+                        or self.store.open_for_task(a.agent, a.task_id):
+                    continue
+            repo = self.repos.get(row["pool"].split("/", 1)[1])
+            if repo is None:
+                continue
+            path = Path(row["path"])
+            try:
+                with base_lock(repo.base):
+                    self._maintenance_guard(attempt, row["path"])
+                    cur = self.store.db.execute("SELECT * FROM slots WHERE path=?", (row["path"],)).fetchone()
+                    if not cur or dict(cur) != row or not self._orphan_admin(path, repo):
+                        continue
+                    _, ref, what = self._archive_orphan(path, repo, attempt or "held")
+                    if not self._claim(row):
+                        continue
+                    try:
+                        dest = self._park_orphan(path)
+                    except (OSError, WorkspaceError):
+                        self._unclaim(row)
+                        raise
+                    self.store.db.execute("DELETE FROM slots WHERE path=? AND state='freeing' AND attempt=?",
+                                          (row["path"], attempt))
+            except (WorkspaceError, OSError, UnicodeError, sqlite3.Error) as e:
+                log.warning("%s: orphaned worktree %s stays held: %s", self.owner, path, e)
+                continue
+            try:
+                self.store.event(attempt or "held", "slot-orphan-recovered", f"{path} -> {dest}; {what}")
+            except sqlite3.Error:
+                pass
+            log.warning("%s: orphaned worktree %s (admin dir removed) recovered: %s; directory moved to %s",
+                        self.owner, path, what, dest)
+            recovered.append(str(path))
+        return recovered
+
+    def _orphan_branch(self, repo: RepoSpec, commit: str) -> str:
+        """The one local branch whose tip is ``commit`` and that no worktree has checked out; '' otherwise.
+        An orphaned slot lost its HEAD with its admin dir: this is the branch it most likely had."""
+        names = [r for r in git(repo.base, "for-each-ref", "--points-at", commit, "--format=%(refname)",
+                                "refs/heads", env=self.env).splitlines()
+                 if r and not r.startswith("refs/heads/runner-keep/")]
+        taken = {ref for _, ref in self._worktree_branches(repo)}
+        names = [r for r in names if r not in taken]
+        return names[0][len("refs/heads/"):] if len(names) == 1 else ""
+
+    def _reseat_orphan(self, path: Path, repo: RepoSpec, attempt_id: str) -> str:
+        """Rebuild, at the same path, a leased slot whose admin dir was removed, so its attempt can be
+        checkpointed and resumed. Caller holds the base lock and the lease.
+
+        The content is saved first (``_archive_orphan``), the old directory moved to the orphan archive, a
+        fresh locked worktree made at the same path on the matched commit, the saved tracked and untracked
+        content laid back on top of it (index at HEAD: edits show as edits) and the branch the commit is the
+        tip of checked out when it is unambiguous. Ignored files stay in the archived directory. Returns a
+        summary for the log."""
+        _, admin_name = self._admin_check(path, repo, timeout=30)
+        commit, ref, what = self._archive_orphan(path, repo, attempt_id)
+        branch = self._orphan_branch(repo, commit)
+        real = Path(os.path.realpath(path))
+        dest = self._park_orphan(path)
+        staging = self._staging_path(path)
+        try:
+            git(repo.base, "worktree", "add", "--quiet", "--detach", str(staging), commit, env=self.env)
+            git(repo.base, "worktree", "move", str(staging), str(path), env=self.env)
+        except WorkspaceError:
+            if not os.path.lexists(path):
+                os.rename(dest, real)          # nothing was made at the path: the original goes back
+            raise
+        if why := self._admin_reason(path, repo):
+            raise WorkspaceError(f"rebuilt worktree {path}: {why}")
+        self._configure(path)
+        self._keep_base_bare(repo)
+        if ref:
+            git(path, "read-tree", "-u", "--reset", ref, env=self.env)
+            git(path, "reset", "--quiet", env=self.env)     # index back to HEAD; the files keep the saved state
+        if branch:
+            try:
+                git(path, "checkout", "--quiet", branch, env=self.env)
+            except WorkspaceError as e:
+                log.warning("%s: rebuilt worktree %s stays detached at %s: %s", self.owner, path, commit[:12], e)
+                branch = ""
+        self._lock_quietly(path, repo)
+        summary = (f"admin dir {os.path.basename(admin_name)} was removed; {what}; old directory moved to {dest}; "
+                   f"rebuilt at {commit[:12]}" + (f" on branch {branch}" if branch else " (detached)"))
+        try:
+            self.store.event(attempt_id, "slot-orphan-reseated", f"{path}: {summary}")
+        except sqlite3.Error:
+            pass
+        log.warning("%s: leased worktree %s (attempt %s) rebuilt: %s", self.owner, path, attempt_id[:8], summary)
+        return summary
+
     def _save_detached_commits(self, path: Path, repo: RepoSpec, attempt_id: str) -> str:
         """Keep commits of a detached HEAD that the remote lacks. Returns the ref or ''."""
         if git(path, "symbolic-ref", "-q", "HEAD", check=False, env=self.env):
@@ -559,7 +818,10 @@ class WorkspacePool:
         no return has spent yet): the paths on which a card that left the lane (to a review, to another
         agent) continues its session if it comes back. A card that was closed (done, cancelled) when it left
         is not expected back and names nothing: on a busy lane those notes cover nearly every slot and the
-        order would say nothing. Unreadable notes and notes older than ``RETURNING_HOURS`` name nothing."""
+        order would say nothing. The exception is the one the return verdict makes too: a decision request
+        closed (done) by its answer is reopened by its asker with the next question and continues in the
+        same session, so its paths are kept. A cancelled request names nothing.
+        Unreadable notes and notes older than ``RETURNING_HOURS`` name nothing."""
         since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=self.RETURNING_HOURS)).isoformat()
         out: set[str] = set()
         try:
@@ -572,7 +834,9 @@ class WorkspacePool:
             try:
                 note = json.loads(value)
                 paths = note.get("workspaces") or []
-                closed = note.get("observed_status") in ("done", "cancelled")
+                status = note.get("observed_status")
+                closed = (status in ("done", "cancelled")
+                          and not (status == "done" and note.get("decision_request") is True))
             except (ValueError, AttributeError):
                 continue
             if not closed:
@@ -617,6 +881,7 @@ class WorkspacePool:
             # Only this pool's free inventory is eligible for config repair. Validate
             # the admin link before writing anything; never follow a foreign HEAD/index.
             if path.is_dir() and not self._admin_reason(path, repo):
+                self._lock_quietly(path, repo)
                 self._configure(path)
             reason = self.unsafe_reason(path, repo)
             if reason:
@@ -647,6 +912,7 @@ class WorkspacePool:
         # leave a known free slot that the next lease repairs and reuses, not an unregistered directory
         # that every later lease skips while failed retries pile up more of them.
         self._set(path, repo_name, "free", note="new; configuration pending")
+        self._lock_quietly(path, repo)
         self._configure(path)
         self._keep_base_bare(repo)       # _configure may have just switched per-worktree config on
         self._set(path, repo_name, "leased", attempt_id)
@@ -800,6 +1066,9 @@ class WorkspacePool:
             with base_lock(repo.base):
                 self._maintenance_guard(attempt_id, slot["path"])
                 # Snapshot, reset and clear below all run git in the slot: never through a foreign admin dir.
+                if self._orphan_admin(path, repo):
+                    # its admin dir was removed under it (a foreign prune): rebuild it in place from its content
+                    self._reseat_orphan(path, repo, attempt_id)
                 if why := self._admin_reason(path, repo):
                     raise WorkspaceError(f"checkpoint: {path}: {POOL_ADMIN_HOLD_NOTE}: {why}; lease retained")
                 journal = next((r for r in self._checkpoint_rows(attempt_id) if r["repo"] == repo_name), None)
@@ -1206,6 +1475,15 @@ class WorkspacePool:
             finally:
                 self._unclaim(dict(row))         # no-op once the slot is free
         return "freed" + (f" (commits saved as {saved})" if saved else "")
+
+    def held_slots(self, repo_names, limit: int = 3) -> list[str]:
+        """``path (note)`` of the held slots of these repositories, at most ``limit`` and a count of the rest:
+        what an operator must look at when held slots fill a pool. Database only."""
+        rows = [r for name in repo_names for r in self._rows(name, "held")]
+        out = [f"{r['path']} ({(r['note'] or 'no note')[:160]})" for r in rows[:limit]]
+        if len(rows) > limit:
+            out.append(f"{len(rows) - limit} more (see `mesh-runner slots`)")
+        return out
 
     def full(self, repo_name: str) -> bool:
         """No slot to lease: none free and the pool at its maximum. No git, no lock: a cheap

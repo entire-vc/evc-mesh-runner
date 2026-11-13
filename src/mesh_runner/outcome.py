@@ -418,7 +418,9 @@ def _typed_card(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
     if cond and cond != "task_done" and cond not in CARD_CONDITIONS:
         return typed_unparsed(row, wait, f"target_condition `{cond}` is unknown here")
     note = _typed_note(row, wait)
-    line = f"⏳ WAIT card:#{target}" + (f" until={cond}" if cond in CARD_CONDITIONS else "") + _tail(note)
+    criterion = " ".join(str(wait.get("criterion") or "").split()) if cond == "artifact_published" else ""
+    line = (f"⏳ WAIT card:#{target}" + (f" until={cond}" if cond in CARD_CONDITIONS else "")
+            + (f" criterion={criterion}" if criterion else "") + _tail(note))
     return Outcome("card", target, note=note, line=line)
 
 
@@ -777,7 +779,8 @@ MANUAL_WAIT_GUIDANCE = (
 DECISION_WAIT_GUIDANCE = """\
 Asking another agent the same open question again with ask_agent (same agent, same words) reuses its open
 request; an unchanged question is no reason for another turn. New comments still wake you; only the addressee's answer
-resolves it. A known external scheduled event may still use wait_for on=time while a question is open.
+resolves it. An answered question is refused (`already_answered`): read its answer; a new question
+says what changed. A known external scheduled event may still use wait_for on=time while a question is open.
 """
 
 
@@ -790,8 +793,9 @@ _CONTRACT_TEMPLATE = """\
 End every turn on this task by calling exactly ONE Mesh turn command (Mesh MCP tool, task_id = this card).
 It records the outcome, writes the comment and keeps or releases your checkout; a refusal writes nothing,
 so fix what it names and call again.
-  wait_for on=card target_task_id=<card> [target_condition=shipped|deployed|accepted]
-      — another card must close (or reach that state)
+  wait_for on=card target_task_id=<card> [target_condition=shipped|deployed|accepted|artifact_published]
+      — another card must close (or reach that state); artifact_published criterion=<named result>: one part
+      it posts, not its closure
   wait_for on=mr project_path=<group>/<project> mr_iid=<iid> until=merged|green|changed [provider=github]
       — a merge request is merged, gets a new successful head pipeline, or a new head pipeline result
   wait_for on=pipeline project_path=<group>/<project> pipeline_id=<id> until=finished|green|changed

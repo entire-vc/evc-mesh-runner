@@ -190,8 +190,12 @@ class FakeMesh:
                 return dict(t)
         raise MeshError(404, "not found")
 
-    def session_report(self, task_id, tokens_in, tokens_out, model, cost):
+    def session_report(self, task_id, tokens_in, tokens_out, model, cost, report_id=""):
         self.reports.append({"task": task_id, "in": tokens_in, "out": tokens_out, "model": model, "cost": cost})
+        self.report_ids = getattr(self, "report_ids", []) + [report_id]
+        if getattr(self, "lose_report_answer", 0):    # applied, but the caller never sees the answer
+            self.lose_report_answer -= 1
+            raise MeshError(0, "timed out")
 
     def mentions(self, workspace_id):
         return [m for m in getattr(self, "mention_rows", []) if not m.get("seen")]
@@ -286,9 +290,10 @@ class FakeMesh:
         self.recorded_turns(tid)
         return list(self.comment_log.get(tid, []))
 
-    def add_comment(self, tid, body, author=AGENT_ID, at=None):
+    def add_comment(self, tid, body, author=AGENT_ID, at=None, key=""):
         c = {"id": str(uuid.uuid4()), "author_id": author, "author_name": author, "body": body,
              "created_at": (at or dt.datetime.now(dt.timezone.utc)).isoformat()}
+        self.comment_keys = getattr(self, "comment_keys", []) + [key]
         self.comment_log.setdefault(tid, []).append(c)
         return c
 

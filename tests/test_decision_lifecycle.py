@@ -251,8 +251,8 @@ class DecisionLifecycle(Bench):
         r, mesh, source, attempt, wait = self.setup_question()
         request = wait['request']['id']
         add = mesh.add_comment
-        def committed_but_response_lost(*args):
-            add(*args)
+        def committed_but_response_lost(*args, **kw):
+            add(*args, **kw)
             raise MeshError(0, 'response lost')
         with patch.object(mesh, 'add_comment', side_effect=committed_but_response_lost) as post:
             r.effects.on_end(attempt, wait, 'answered', close_request=True)

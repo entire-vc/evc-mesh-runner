@@ -209,14 +209,83 @@ class SameQuestionAgain(Bench):
         self.r.effects.on_wait(self.a, self.source, same, self.r.me)
         self.assertEqual(same.get("attached_closed"), first[:8])
         self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "done")
-        # declared again after that re-check handed it back: the asker still needs it, ask once more
+        # declared again after that re-check handed it back: the request answered it (closed as
+        # done), so it is still neither moved nor commented on, and the asker gets the answer reference
         insisted = dict(self.question("approve the plan"), rechecks=1)
-        self.r.effects.on_wait(self.a, self.source, insisted, self.r.me)
+        with mock.patch.object(self.mesh, "move", wraps=self.mesh.move) as moved, \
+                mock.patch.object(self.mesh, "add_comment", wraps=self.mesh.add_comment) as commented:
+            self.r.effects.on_wait(self.a, self.source, insisted, self.r.me)
+        self.assertEqual([c for c in moved.call_args_list if c.args[0] == first], [])
+        self.assertEqual([c for c in commented.call_args_list if c.args[0] == first], [])
         self.assertEqual(insisted["request"]["id"], first)
-        self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "todo")   # reopened now
-        self.assertEqual(len(self.asked(first)), 1)
-        self.assertNotIn("attached_closed", insisted)
+        self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "done")   # still not reopened
+        self.assertEqual(self.asked(first), [])
+        self.assertEqual(insisted.get("attached_closed"), first[:8])
         self.assertEqual(len(self.mesh.created), 1)
+        event = wake_check(self.mesh, self.r.cats, None, self.source, dict(insisted, started=iso()),
+                           self.r.agent_id, [], now() + dt.timedelta(hours=7))
+        self.assertIn(f"Answer reference: request #{first[:8]}", event)
+        self.assertIn("already answered", event)
+
+    def test_an_earlier_answered_question_is_not_reopened_after_a_later_one(self):
+        # A answered, B asked on the same request (reopened) and answered: A again matches the
+        # request's history, not only its last question, and reopens nothing
+        wait = self.setup_question("approve the plan?")
+        first = wait["request"]["id"]
+        self.r.effects.on_end(self.a, wait, "answered", close_request=True)
+        second = self.question("approve the revised plan?")
+        self.r.effects.on_wait(self.a, self.source, second, self.r.me)
+        self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "todo")   # B reopened it
+        self.r.effects.on_end(self.a, second, "answered", close_request=True)
+        self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "done")
+        asked = len(self.asked(first))
+        for insisted in (self.question("Approve the plan"), dict(self.question("approve the plan?"), rechecks=1)):
+            with self.subTest(insisted["note"]):
+                self.r.effects.on_wait(self.a, self.source, insisted, self.r.me)
+                self.assertEqual(insisted["request"]["id"], first)
+                self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "done")
+                self.assertEqual(len(self.asked(first)), asked)
+                self.assertEqual(insisted.get("attached_closed"), first[:8])
+        self.assertEqual(len(self.mesh.created), 1)
+
+    def test_no_answered_question_is_forgotten_however_many_followed(self):
+        # the history is not truncated: the first of 25 answered questions still matches, and a
+        # repeat of it after the re-check neither moves nor comments on the request
+        wait = self.setup_question("question 0?")
+        first = wait["request"]["id"]
+        for n in range(1, 25):
+            self.r.effects.on_end(self.a, wait, "answered", close_request=True)
+            wait = self.question(f"question {n}?")
+            self.r.effects.on_wait(self.a, self.source, wait, self.r.me)
+            self.assertEqual(wait["request"]["id"], first)
+        self.r.effects.on_end(self.a, wait, "answered", close_request=True)
+        remembered = self.r.effects._recent(self.source["id"])["agent-lead"]
+        self.assertEqual(len(remembered["answered"]), 24)                     # 0..23; 24 is the current one
+        asked = len(self.asked(first))
+        for insisted in (self.question("Question 0"), dict(self.question("question 0?"), rechecks=1)):
+            self.r.effects.on_wait(self.a, self.source, insisted, self.r.me)
+            self.assertEqual(insisted.get("attached_closed"), first[:8])
+        self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "done")
+        self.assertEqual(len(self.asked(first)), asked)
+        self.assertEqual(len(self.mesh.created), 1)
+
+    def test_the_same_question_on_a_cancelled_request_is_asked_again_after_the_recheck(self):
+        # positive control: a request closed WITHOUT an answer (cancelled) is reopened when the
+        # asker repeats the question after the re-check
+        wait = self.setup_question()
+        first = wait["request"]["id"]
+        self.r.effects.on_end(self.a, wait, "answered", close_request=True)
+        category = self.r.effects.cats.category
+        same, insisted = self.question("approve the plan"), dict(self.question("approve the plan"), rechecks=1)
+        with mock.patch.object(self.r.effects.cats, "category",
+                               side_effect=lambda t: "cancelled" if t.get("id") == first else category(t)):
+            self.r.effects.on_wait(self.a, self.source, same, self.r.me)
+            self.assertEqual(same.get("attached_closed"), first[:8])         # first repeat: attached
+            self.assertNotIn("attached_answered", same)
+            self.r.effects.on_wait(self.a, self.source, insisted, self.r.me)
+        self.assertEqual(insisted["request"]["id"], first)
+        self.assertEqual(self.mesh.category(self.mesh.tasks[first]), "todo")   # reopened
+        self.assertEqual(len(self.asked(first)), 1)
 
     def test_a_materially_different_question_reopens_as_before(self):
         wait = self.setup_question()
