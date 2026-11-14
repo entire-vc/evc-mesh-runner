@@ -7,7 +7,8 @@ from unittest import mock
 
 from mesh_runner.store import iso
 from mesh_runner.wake import GitLab
-from fakes import AGENT_ID, FakeMesh, task, write_replies, wait_pipeline
+from fakes import (AGENT_ID, FakeMesh, ask_agent, next_turn, task, wait_card, wait_mr, wait_pipeline, wait_time,
+                   write_replies)
 from test_runner import Bench
 
 
@@ -86,21 +87,21 @@ class CIIdleBudget(Bench):
             if index < len(sequence) and sequence[index] == 'S' and index + 1 != last_step:
                 child = task(0xa0000000 + index, assignee_id='other')
                 r.mesh.tasks[child['id']] = child
-                line = f"⏳ WAIT card:#{child['id'][:8]}"
+                line = wait_card(child['id'])
             else:
-                line = f'⏳ WAIT pipeline:g/app#{index}'
+                line = wait_pipeline('g/app', index)
             a = self.turn(r, t, line, first=index == 1)
             self.assert_waiting(r, a)
         self.assertEqual(r.store.outcomes_today('builder', t['id']), {'wait': 9, 'step': 12})
 
     def test_nine_consecutive_idle_waits_after_ci_still_cap(self):
         r, t, gl = self.setup_flow()
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
+        a = self.turn(r, t, wait_pipeline('g/app', 1), first=True)
         self.wake_ci(r, a, gl)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')
+        a = self.turn(r, t, wait_pipeline('g/app', 2))
         for count in range(1, 10):
             self.wake_comment(r, a)
-            a = self.turn(r, t, f'⏳ WAIT pipeline:g/app#{count + 2}')
+            a = self.turn(r, t, wait_pipeline('g/app', count + 2))
             if count <= 8:
                 self.assert_waiting(r, a)
         self.assertEqual((a.state, a.note), ('completed', 'cap: requeued (turn budget)'))
@@ -109,20 +110,20 @@ class CIIdleBudget(Bench):
     def test_repeat_pipeline_result_and_alias_do_not_reset_again(self):
         self.cfg.daily_wait_budget = 1
         r, t, gl = self.setup_flow()
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
+        a = self.turn(r, t, wait_pipeline('g/app', 1), first=True)
         self.wake_ci(r, a, gl)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')  # genuine step: reset
+        a = self.turn(r, t, wait_pipeline('g/app', 2))  # genuine step: reset
         self.wake_comment(r, a)
         gl.mrs['g/app!9'] = {'sha': 'a' * 40, 'state': 'opened', 'head_pipeline': {
             'id': 1, 'sha': 'a' * 40, 'status': 'running'}}
-        a = self.turn(r, t, '⏳ WAIT mr:g/app!9')        # idle 1
+        a = self.turn(r, t, wait_mr('g/app', 9))        # idle 1
         self.assert_waiting(r, a)
         gl.mrs['g/app!9']['head_pipeline']['status'] = 'success'
         r._wake_one(a)                                # same pipeline #1 under its MR alias
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')
+        a = self.turn(r, t, wait_pipeline('g/app', 3))
         self.assert_waiting(r, a)
         self.wake_comment(r, a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#4')  # idle 2: duplicate result cannot reset
+        a = self.turn(r, t, wait_pipeline('g/app', 4))  # idle 2: duplicate result cannot reset
         self.assertEqual((a.state, a.note), ('completed', 'cap: requeued (turn budget)'))
 
     def test_time_and_card_steps_do_not_reset_idle_budget(self):
@@ -136,8 +137,10 @@ class CIIdleBudget(Bench):
                 if kind == 'card':
                     child = task(0xabcdef12, assignee_id='other')
                     r.mesh.tasks[child['id']] = child
-                line = {'time': f'⏳ WAIT {(dt.datetime.now(dt.timezone.utc)+dt.timedelta(hours=2)).isoformat(timespec="seconds")}: external=fixture-window source=card:#abcdef12 soak', 'card': '⏳ WAIT card:#abcdef12',
-                        'decision': '⏳ WAIT decision:@lead'}[kind]
+                line = {'time': wait_time((dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                                          why='soak', event_ref='fixture-window', source='card:#abcdef12'),
+                        'card': wait_card(child['id']) if kind == 'card' else None,
+                        'decision': ask_agent('lead', 'go ahead?')}[kind]
                 a = self.turn(r, t, line, first=True)
                 if kind == 'time':
                     # mock: external boundary — only the deadline clock advances.
@@ -150,50 +153,50 @@ class CIIdleBudget(Bench):
                     r.mesh.set_category(child['id'], 'done')
                     r._wake_one(a)
                 self.assertEqual(a.state, 'ready')
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#20')
+                a = self.turn(r, t, wait_pipeline('g/app', 20))
                 self.assert_waiting(r, a)
                 self.wake_comment(r, a)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#21')
+                a = self.turn(r, t, wait_pipeline('g/app', 21))
                 self.assertEqual(a.state, 'completed')
                 self.assertEqual(r.store.outcomes_today('builder', t['id']), {'wait': 2, 'step': 1})
 
     def test_restart_pending_step_and_new_attempt_keep_streak(self):
         self.cfg.daily_wait_budget = 2
         r, t, gl = self.setup_flow()
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
+        a = self.turn(r, t, wait_pipeline('g/app', 1), first=True)
         self.wake_comment(r, a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')  # 2 old idle waits
+        a = self.turn(r, t, wait_pipeline('g/app', 2))  # 2 old idle waits
         self.wake_ci(r, a, gl)
         r = self.runner(r.mesh, gl)                   # restart before consuming valid wake
         r.refresh_me()
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')  # persisted proof resets old idle waits
+        a = self.turn(r, t, wait_pipeline('g/app', 3))  # persisted proof resets old idle waits
         self.assert_waiting(r, a)
         r._finish(a, 'completed', 'fixture: session replacement')
         r = self.runner(r.mesh, gl)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#4', first=True)
+        a = self.turn(r, t, wait_pipeline('g/app', 4), first=True)
         self.assert_waiting(r, a)                     # new attempt idle 1
         self.wake_comment(r, a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#5')
+        a = self.turn(r, t, wait_pipeline('g/app', 5))
         self.assert_waiting(r, a)                     # idle 2
         self.wake_comment(r, a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#6')
+        a = self.turn(r, t, wait_pipeline('g/app', 6))
         self.assertEqual(a.state, 'completed')        # idle 3, no attempt reset
 
     def test_task_boundary_and_utc_midnight_keep_daily_limits(self):
         self.cfg.daily_wait_budget = 1
         r, t, gl = self.setup_flow()
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
+        a = self.turn(r, t, wait_pipeline('g/app', 1), first=True)
         r._finish(a, 'completed', 'fixture: completed session')
         r.mesh.tasks[t['id']]['assignee_id'] = 'other'
         other = task(2)
         r.mesh.tasks[other['id']] = other
-        a = self.turn(r, other, '⏳ WAIT pipeline:g/app#2', first=True)
+        a = self.turn(r, other, wait_pipeline('g/app', 2), first=True)
         self.assert_waiting(r, a)                     # task 1 does not spend task 2 budget
         r._finish(a, 'completed', 'fixture: completed session')
         tomorrow = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
         # mock: external boundary — UTC day roll-over, no budget/DAO mocks.
         with mock.patch('mesh_runner.store.now', return_value=tomorrow), mock.patch('mesh_runner.runner.now', return_value=tomorrow):
-            a = self.turn(r, other, '⏳ WAIT pipeline:g/app#3', first=True)
+            a = self.turn(r, other, wait_pipeline('g/app', 3), first=True)
             self.assert_waiting(r, a)
             self.assertEqual(r.store.outcomes_today('builder', other['id']), {'wait': 1})
 
@@ -206,19 +209,19 @@ class CIIdleBudget(Bench):
                 r.mesh.tasks = {t['id']: t}
                 gl.rows['g/app#1'] = {'id': 1, 'sha': 'a' * 40,
                                          'status': 'success' if case == 'already-final' else 'running'}
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
+                a = self.turn(r, t, wait_pipeline('g/app', 1), first=True)
                 if case == 'already-final':
                     r._wake_one(a)
-                    next_line = '⏳ WAIT pipeline:g/app#2'
+                    next_line = wait_pipeline('g/app', 2)
                 else:
                     self.wake_ci(r, a, gl)
                     gl.rows['g/app#1']['status'] = 'running'  # a retry of the same pipeline
-                    next_line = '⏳ WAIT pipeline:g/app#1'
+                    next_line = wait_pipeline('g/app', 1)
                 a = self.turn(r, t, next_line)
                 self.assert_waiting(r, a)
                 self.assertEqual(r.store.idle_waits_today('builder', t['id']), 1)
                 self.wake_comment(r, a)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')
+                a = self.turn(r, t, wait_pipeline('g/app', 3))
                 self.assertEqual(a.state, 'completed')
 
     def test_old_head_terminal_result_does_not_reset(self):
@@ -226,20 +229,20 @@ class CIIdleBudget(Bench):
         r, t, gl = self.setup_flow()
         gl.mrs['g/app!9'] = {'sha': 'a' * 40, 'state': 'opened', 'head_pipeline': {
             'id': 1, 'sha': 'b' * 40, 'status': 'running'}}
-        a = self.turn(r, t, '⏳ WAIT mr:g/app!9', first=True)
+        a = self.turn(r, t, wait_mr('g/app', 9), first=True)
         gl.mrs['g/app!9']['head_pipeline']['status'] = 'success'
         r._wake_one(a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')
+        a = self.turn(r, t, wait_pipeline('g/app', 2))
         self.assert_waiting(r, a)
         self.assertEqual(r.store.idle_waits_today('builder', t['id']), 1)
         self.wake_comment(r, a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')
+        a = self.turn(r, t, wait_pipeline('g/app', 3))
         self.assertEqual(a.state, 'completed')
 
     def test_typed_terminal_ci_step_resets_but_unknown_observation_does_not(self):
         self.cfg.daily_wait_budget = 1
         r, t, gl = self.setup_flow()
-        baseline = f'⏳ WAIT pipeline:g/app#1 until=success after={"a" * 40}:1:running'
+        baseline = wait_pipeline('g/app', 1, until='green', after_sha='a' * 40, after_pipeline_id=1, after_status='running')
         a = self.turn(r, t, baseline, first=True)
         gl.rows['g/app#1'] = {}  # external provider returned no usable observation
         for _ in range(3):
@@ -248,11 +251,11 @@ class CIIdleBudget(Bench):
         self.assertEqual(r.store.idle_waits_today('builder', t['id']), 1)
         gl.rows['g/app#1'] = {'sha': 'a' * 40, 'id': 1, 'status': 'success'}
         r._wake_one(a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')
+        a = self.turn(r, t, wait_pipeline('g/app', 2))
         self.assert_waiting(r, a)
         self.assertEqual(r.store.idle_waits_today('builder', t['id']), 0)
         self.wake_comment(r, a)
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')
+        a = self.turn(r, t, wait_pipeline('g/app', 3))
         self.assert_waiting(r, a)
 
     def test_unknown_seed_and_already_final_observation_do_not_reset(self):
@@ -271,17 +274,17 @@ class CIIdleBudget(Bench):
                 rows = gl.rows if kind == 'pipeline' else gl.mrs
                 rows[target] = final if seed == 'error' else ({'state': 'opened'} if kind == 'mr-head' else {})
                 gl.errors = int(seed == 'error')
-                a = self.turn(r, t, f"⏳ WAIT {'pipeline' if kind == 'pipeline' else 'mr'}:{target}", first=True)
+                a = self.turn(r, t, (wait_pipeline('g/app', 1) if kind == 'pipeline' else wait_mr('g/app', 9)), first=True)
                 rows[target] = final
                 r._wake_one(a)
                 self.assertEqual(a.state, 'ready')  # Preserve the legacy diagnostic wake.
                 self.assertNotIn('ci_progress', a.wait)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')
+                a = self.turn(r, t, wait_pipeline('g/app', 2))
                 self.assert_waiting(r, a)
                 self.assertEqual(r.store.idle_waits_today(a.agent, a.task_id), 1)
                 self.assertFalse(any(k == 'ci_progress' for _, k, _ in r.store.events(a.id)))
                 self.wake_comment(r, a)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')
+                a = self.turn(r, t, wait_pipeline('g/app', 3))
                 self.assertEqual(a.state, 'completed')
 
     def test_failed_seed_then_known_pending_then_terminal_can_reset(self):
@@ -297,7 +300,7 @@ class CIIdleBudget(Bench):
                 rows[target] = head if kind == 'pipeline' else {
                     'state': 'opened', 'sha': 'a' * 40, 'head_pipeline': head}
                 gl.errors = 1
-                a = self.turn(r, t, f"⏳ WAIT {'pipeline' if kind == 'pipeline' else 'mr'}:{target}", first=True)
+                a = self.turn(r, t, (wait_pipeline('g/app', 1) if kind == 'pipeline' else wait_mr('g/app', 9)), first=True)
                 r._wake_one(a)  # First successful read establishes a known baseline.
                 self.assert_waiting(r, a)
                 rows[target]['state'] = 'closed' if kind == 'mr-state' else 'opened'
@@ -305,11 +308,11 @@ class CIIdleBudget(Bench):
                 r._wake_one(a)
                 self.assertEqual(a.state, 'ready')
                 self.assertIn('ci_progress', a.wait)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')
+                a = self.turn(r, t, wait_pipeline('g/app', 2))
                 self.assert_waiting(r, a)
                 self.assertEqual(r.store.idle_waits_today(a.agent, a.task_id), 0)
                 self.wake_comment(r, a)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')
+                a = self.turn(r, t, wait_pipeline('g/app', 3))
                 self.assert_waiting(r, a)
 
     def test_action_required_notices_do_not_reset_idle_budget_before_real_success(self):
@@ -319,7 +322,7 @@ class CIIdleBudget(Bench):
                 r, _, gl = self.setup_flow()
                 t = task(index)
                 r.mesh.tasks = {t['id']: t}
-                marker = f'⏳ WAIT pipeline:g/app#1 until=success after={"a" * 40}:1:running'
+                marker = wait_pipeline('g/app', 1, until='green', after_sha='a' * 40, after_pipeline_id=1, after_status='running')
                 gl.rows['g/app#1'] = {'id': 1, 'sha': 'a' * 40, 'status': 'running'}
                 a = self.turn(r, t, marker, first=True)
                 gl.rows['g/app#1']['status'] = status
@@ -328,17 +331,17 @@ class CIIdleBudget(Bench):
                 self.assertIn('action required', a.wake_text)
                 self.assertNotIn('ci_progress', a.wait)
                 self.assertIsNone(r.store.mark(a.agent, a.task_id, 'met_wake'))
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#2')
+                a = self.turn(r, t, wait_pipeline('g/app', 2))
                 self.assert_waiting(r, a)
                 self.assertEqual(r.store.idle_waits_today(a.agent, a.task_id), 2)
                 self.assertFalse(any(kind == 'ci_progress' for _, kind, _ in r.store.events(a.id)))
                 self.wake_ci(r, a, gl)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#3')
+                a = self.turn(r, t, wait_pipeline('g/app', 3))
                 self.assert_waiting(r, a)
                 self.assertEqual(r.store.idle_waits_today(a.agent, a.task_id), 0)
                 self.assertEqual(sum(kind == 'ci_progress' for _, kind, _ in r.store.events(a.id)), 1)
                 self.wake_comment(r, a)
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#4')
+                a = self.turn(r, t, wait_pipeline('g/app', 4))
                 self.assert_waiting(r, a)
 
     def test_default_24_step_and_6_next_caps_survive_ci_progress(self):
@@ -348,11 +351,11 @@ class CIIdleBudget(Bench):
                 r, _, gl = self.setup_flow()
                 t = task(30 if kind == 'step' else 31)
                 r.mesh.tasks = {t['id']: t}
-                a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
+                a = self.turn(r, t, wait_pipeline('g/app', 1), first=True)
                 for index in range(limit + 1):
                     if kind == 'step' or index == 0:
                         self.wake_ci(r, a, gl)
-                    a = self.turn(r, t, f'⏳ WAIT pipeline:g/app#{index + 2}' if kind == 'step' else '↻ NEXT')
+                    a = self.turn(r, t, wait_pipeline('g/app', index + 2) if kind == 'step' else next_turn())
                     if index < limit:
                         self.assertEqual(a.state, 'waiting' if kind == 'step' else 'ready')
                 self.assertEqual(a.state, 'completed')
@@ -360,7 +363,7 @@ class CIIdleBudget(Bench):
 
     def test_outcome_and_progress_receipt_are_atomic_and_replay_does_not_reset_twice(self):
         r, t, gl = self.setup_flow()
-        a = self.turn(r, t, '⏳ WAIT pipeline:g/app#1', first=True)
+        a = self.turn(r, t, wait_pipeline('g/app', 1), first=True)
         self.wake_ci(r, a, gl)
         write_replies(self.replies, {t['id'][:8] + ':resume': wait_pipeline("g/app", 2)})
         self.assertEqual(r.resume_ready(1), 0)

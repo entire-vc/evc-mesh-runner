@@ -45,11 +45,11 @@ _MSG_ID = re.compile(r"[A-Za-z0-9_-]{4,64}")
 _FORBIDDEN_MARKER = set("\"'\\{}()[]:")
 
 WAIT_GUIDANCE = (
-    "invalid gmail wait: `⏳ WAIT gmail:<registration-id>` is accepted only when the Gmail observer "
+    "invalid gmail wait: `wait_for on=registered registration=gmail registration_ref=<gmr_ id>` is accepted only when the Gmail observer "
     "is enabled on this runner and an operator registered it for this card and this lane "
     "(`mesh-runner watch gmail register`). It wakes once on the first new inbound message that "
     "matches the registered predicate, or once with `cancelled`. Time never completes it. "
-    "Declare another condition (card, mr, pipeline, decision) or ask the operator to register it."
+    "Wait on another condition (card, mr, pipeline, ask_agent) or ask the operator to register it."
 )
 
 SCHEMA = """

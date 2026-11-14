@@ -335,14 +335,14 @@ class CrossWorkspaceCardWait(unittest.TestCase):
         self.assertEqual(wait["target_id"], "22223333-full")
         self.assertIn("full task id", out)
 
-    def test_own_next_supersedes_a_wait_whose_target_cannot_be_read(self):
+    def test_own_next_comment_no_longer_supersedes_a_wait_whose_target_cannot_be_read(self):
         wait = self.wait(target_id="22223333-full")
         mine = StatusCategories(Denied())
         own = {"author_id": "me", "body": "go on\n\n↻ NEXT",
                "created_at": (NOW + dt.timedelta(minutes=1)).isoformat()}
         out = check(mine.mesh, mine, None, {}, wait, "me", [own], NOW + dt.timedelta(minutes=2))
-        self.assertIn("superseded", out)
-        self.assertTrue(wait["met"])
+        self.assertNotIn("superseded", out)                  # a typed continue_next does it; the text is ignored
+        self.assertFalse(wait.get("met"))
         foreign = {"author_id": "other", "body": "hello", "author_name": "x",
                    "created_at": (NOW + dt.timedelta(minutes=1)).isoformat()}
         wait2 = self.wait(target_id="22223333-full")

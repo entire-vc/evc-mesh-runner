@@ -4,8 +4,7 @@ import datetime as dt
 from types import SimpleNamespace
 from unittest import mock
 
-from fakes import FakeGitLab, FakeMesh, task, write_replies
-from mesh_runner.outcome import parse_line
+from fakes import FakeGitLab, FakeMesh, task, typed, wait_pipeline, write_replies
 from mesh_runner.store import iso
 from mesh_runner.wake import ci_delivery_key
 from test_runner import Bench
@@ -23,8 +22,8 @@ class ManualAction(Bench):
         r = self.runner(FakeMesh([t]), gl)
         r.refresh_me()
         a = r.store.create(self.agent.name, t["id"], "claude")
-        outcome = parse_line(f"⏳ WAIT pipeline:{TARGET} until=success after={SHA}:5:{baseline}",
-                             dt.datetime.now(dt.timezone.utc))
+        outcome = typed(wait_pipeline("g/app", 5, until="green", after_sha=SHA, after_pipeline_id=5,
+                                      after_status=baseline))
         wait = {"kind": outcome.kind, "target": outcome.target, **outcome.extra,
                 "since": iso(), "started": iso()}
         r.store.update(a, state="waiting", wait=wait)
@@ -254,15 +253,15 @@ class ManualAction(Bench):
         self.assertFalse(a.wait.get("met"))
 
     def test_missing_after_is_not_an_exact_typed_contract(self):
-        for suffix in (" after=:5:failed", " after=abc:5:failed"):
-            with self.subTest(suffix=suffix):
-                parsed = parse_line(f"⏳ WAIT pipeline:{TARGET} until=success{suffix}",
-                                    dt.datetime.now(dt.timezone.utc))
+        for sha in ("", "abc"):
+            with self.subTest(sha=sha):
+                parsed = typed(wait_pipeline("g/app", 5, until="green", after_sha=sha, after_pipeline_id=5,
+                                             after_status="failed"))
                 self.assertEqual(parsed.kind, "unparsed")
                 self.assertNotIn("ci_change", parsed.extra)
 
     def test_missing_after_takes_the_state_at_declaration_as_baseline(self):
-        parsed = parse_line(f"⏳ WAIT pipeline:{TARGET} until=success", dt.datetime.now(dt.timezone.utc))
+        parsed = typed(wait_pipeline("g/app", 5, until="green"))
         self.assertEqual(parsed.kind, "pipeline")
         self.assertNotIn("ci_change", parsed.extra)          # the runner fills the baseline in
         self.assertEqual(parsed.extra["ci_default"], {"predicate": "success"})

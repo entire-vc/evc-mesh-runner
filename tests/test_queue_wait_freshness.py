@@ -13,10 +13,23 @@ from mesh_runner.store import Store, iso
 from mesh_runner.selection import parse_time
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import Runner
-from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT, write_replies, calls, wait_time
+from fakes import AGENT_ID, FakeMesh, task, FUTURE_AT, write_replies, calls, wait_time, wait_registered, turn_rows
 from test_runner import Bench
 
 NOW = 1792500000
+TIME_WAIT = wait_time(until_at=FUTURE_AT, event_ref='published-window', source='comment:00000000-0000-4000-8000-0000000000ab',
+                      why='approved external window')
+
+
+def queue_wait(task8):
+    return wait_registered('queue', task8)
+
+
+def declare(r, a, turn):
+    """Mesh holds the turn's typed outcome and wait, as after a live lane's turn command."""
+    row, wait = turn_rows(turn)
+    r.mesh.outcomes = {a.task_id: [row]}
+    r.mesh.waits = {a.task_id: wait}
 A = str(UUID(int=21))
 P = str(UUID(int=22))
 VALUE = dict(version=1, observed_at=NOW - 600,
@@ -85,7 +98,8 @@ class QueueWait(Bench):
         a = r.store.get(a.id)
         path = self.root/'after-proof.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-            result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s'))+'\n')
+            result='turn done', session_id='s'))+'\n')
+        declare(r, a, TIME_WAIT)
         r.store.update(a, state='running', log_path=str(path), turns=1)
         r.settle(a)
         self.assertEqual(a.wait['kind'], 'time')
@@ -162,7 +176,8 @@ class QueueWait(Bench):
         r,a,t = self.setup_wait()
         path=self.root/'turn.jsonl'
         path.write_text(json.dumps(dict(type='result',subtype='success',is_error=False,
-                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window',session_id='s'))+'\n')
+                                        result='turn done',session_id='s'))+'\n')
+        declare(r, a, TIME_WAIT)
         r.store.update(a,state='running',log_path=str(path),turns=1)
         r.settle(a)
         self.assertEqual(a.state,'waiting')
@@ -819,7 +834,8 @@ class FirstMove(QueueWait):
         r.store.mark(a.agent, a.task_id, a.wait['queue_delivery']['key'], 'delivered')
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
+                                        result='turn done', session_id='s')) + '\n')
+        declare(r, a, TIME_WAIT)
         r.store.update(a, state='running', log_path=str(path), turns=1)
         r.settle(a)
         self.assertEqual((a.state, a.wait['kind']), ('waiting', 'queue'))   # the lead's WAIT is not acceptance
@@ -890,7 +906,8 @@ class FirstMove(QueueWait):
         r, a, t = self.setup_wait()
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
+                                        result='turn done', session_id='s')) + '\n')
+        declare(r, a, TIME_WAIT)
         extra = {} if source_read is None else dict(
             source_read_at=iso(dt.datetime.fromtimestamp(source_read, dt.timezone.utc)))
         r.store.update(a, state='running', log_path=str(path), turns=1,
@@ -1014,7 +1031,8 @@ class FirstMove(QueueWait):
         r, a, t = self.setup_wait(start_after=future)
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
+                                        result='turn done', session_id='s')) + '\n')
+        declare(r, a, TIME_WAIT)
         r.store.update(a, state='running', log_path=str(path), turns=1,
                        turn_started_at=iso(dt.datetime.fromtimestamp(NOW - 3600, dt.timezone.utc)))
         r.settle(a)
@@ -1048,7 +1066,8 @@ class FirstMove(QueueWait):
         self.assertEqual(q.floor(r.store, a.agent, a.task_id), NOW + 1)
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result=f'⏳ WAIT {FUTURE_AT}: external=published-window source=card:#abcdef12 approved external window', session_id='s')) + '\n')
+                                        result='turn done', session_id='s')) + '\n')
+        declare(r, a, TIME_WAIT)
         r.store.update(a, log_path=str(path))
         r.settle(a)
         self.assertNotEqual(a.wait.get('queue_request', {}).get('contract'), old['contract'])
@@ -1073,7 +1092,7 @@ class FirstMove(QueueWait):
 
 
 class ExplicitQueueWait(Bench):
-    """`⏳ WAIT queue:#<card>`: an event wait on the card's own machine source, no timer."""
+    """`wait_for on=registered registration=queue`: an event wait on the card's own machine source, no timer."""
     def setUp(self):
         Bench.setUp(self)
         clock = mock.patch('mesh_runner.runner.time.time', return_value=NOW)
@@ -1086,16 +1105,17 @@ class ExplicitQueueWait(Bench):
 
     def settle_line(self, line, **changes):
         r, a, t = self.setup_wait(**changes)
+        declare(r, a, line)
         r.store.update(a, state='waiting', wait={})
         path = self.root / 'queue-line.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result=line, session_id='s')) + '\n')
+                                        result='turn done', session_id='s')) + '\n')
         r.store.update(a, state='running', log_path=str(path), turns=1)
         r.settle(a)
         return r, r.store.get(a.id), t
 
     def test_declared_queue_wait_becomes_v2_any_request_without_time(self):
-        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8])
+        r, a, t = self.settle_line(queue_wait(task(1)['id'][:8]))
         self.assertEqual((a.state, a.wait['kind'], a.wait['until']), ('waiting', 'queue', ''))
         wire = a.wait['queue_request']['contract']
         self.assertEqual((wire['version'], wire['mode'], wire['observed_at']), (2, 'any', VALUE['observed_at']))
@@ -1108,13 +1128,13 @@ class ExplicitQueueWait(Bench):
         self.assertFalse(r.store.db.execute("SELECT 1 FROM marks WHERE key LIKE 'queue_wait:%'").fetchall())
 
     def test_no_typed_source_is_sent_back(self):
-        self.sent_back('⏳ WAIT queue:#' + task(1)['id'][:8], description='plain')
+        self.sent_back(queue_wait(task(1)['id'][:8]), description='plain')
 
     def test_other_card_id_is_sent_back(self):
-        self.sent_back('⏳ WAIT queue:#abcdef12')
+        self.sent_back(queue_wait('abcdef12'))
 
     def test_served_source_cannot_be_waited_again(self):
-        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8])
+        r, a, t = self.settle_line(queue_wait(task(1)['id'][:8]))
         req = a.wait['queue_request']
         r.store.mark(a.agent, a.task_id, q.consumed_key(r.agent_id, req['contract']), 'withdrawn')
         self.assertTrue(q.served(r.store, a, r.agent_id, req['contract']))
@@ -1124,7 +1144,7 @@ class ExplicitQueueWait(Bench):
         self.assertFalse(q.served(r.store, a, r.agent_id, newer))
 
     def test_v2_proof_for_exact_request_wakes_once(self):
-        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8])
+        r, a, t = self.settle_line(queue_wait(task(1)['id'][:8]))
         self.mark_delivered(r, a)
         q.publish(r.store, self.cfg.state_dir / 'queue-wait-requests.json',
                   self.cfg.state_dir / 'queue-wait-receipts.json')
@@ -1145,7 +1165,7 @@ class ExplicitQueueWait(Bench):
         every = dict(version=2, mode='all', observed_at=VALUE['observed_at'], targets=VALUE['targets'])
         self.assertEqual(q.as_any(every)['mode'], 'any')
         self.assertEqual(q.as_any(VALUE)['mode'], 'any')
-        r, a, t = self.settle_line('⏳ WAIT queue:#' + task(1)['id'][:8], description=description(every))
+        r, a, t = self.settle_line(queue_wait(task(1)['id'][:8]), description=description(every))
         self.assertEqual(a.wait['queue_request']['contract']['mode'], 'any')
 
 
@@ -1160,7 +1180,7 @@ class ResidualQueueWait(ExplicitQueueWait):
 
     def setUp(self):
         super().setUp()
-        self.line = '⏳ WAIT queue:#' + task(1)['id'][:8]
+        self.line = queue_wait(task(1)['id'][:8])
 
     def with_recovered(self, a, recovered, r=None):
         value = proof(a.wait['queue_request'])
@@ -1191,7 +1211,8 @@ class ResidualQueueWait(ExplicitQueueWait):
     def rewait(self, r, a, t):
         path = self.root / 'second-wait.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                                        result=self.line, session_id='s2')) + '\n')
+                                        result='turn done', session_id='s2')) + '\n')
+        declare(r, a, self.line)
         r.store.update(a, state='running', log_path=str(path), turns=2, wait={})
         r.settle(a)
         return r.store.get(a.id)

@@ -7,7 +7,7 @@ from unittest import mock
 
 from mesh_runner import outcome as outcome_mod
 from mesh_runner.mesh import MeshError
-from mesh_runner.outcome import Outcome, from_typed, parse_line
+from mesh_runner.outcome import Outcome, from_typed
 from mesh_runner.runner import Runner
 
 from fakes import AGENT_ID, FakeMesh, calls, task, write_replies
@@ -19,7 +19,6 @@ REQUEST = "6f1c2a90-1b2c-4d5e-8f90-0123456789ab"
 COMMENT = "9a8b7c6d-1234-4abc-8def-0123456789ab"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 HEX64 = "ab" * 32
-FIELDS = ("kind", "target", "until", "jobs", "handle", "note", "line", "extra")
 
 
 def wait_row(note="", **wait):
@@ -32,10 +31,8 @@ class Mapping(unittest.TestCase):
     """Each kind Mesh has today gives the Outcome its marker equivalent parses to, field by field."""
 
     def same(self, typed: Outcome, line: str):
-        marker = parse_line(line, NOW, merge=True)
-        for f in FIELDS:
-            self.assertEqual(getattr(typed, f), getattr(marker, f), f"{f} of {line!r}")
-        self.assertEqual(typed, marker)                 # provenance (``typed``) is left out of equality
+        self.assertNotEqual(typed.kind, "unparsed", typed.note)
+        self.assertEqual(typed.line, line)              # the display spelling of the wait record
         self.assertTrue(typed.typed.get("id"))
 
     def test_continue_next(self):
@@ -60,9 +57,10 @@ class Mapping(unittest.TestCase):
         github = dict(base, provider="github")
         self.same(from_typed(*wait_row(**github, until="merged"), NOW),
                   "⏳ WAIT mr:github:entire-vc/evc-mesh!1801 until=merged")
-        # a GitHub PR has no head pipeline: refused exactly as the marker is
-        self.same(from_typed(*wait_row(**github, until="green"), NOW),
-                  "⏳ WAIT mr:github:entire-vc/evc-mesh!1801 until=success")
+        # a GitHub PR has no head pipeline: refused
+        refused = from_typed(*wait_row(**github, until="green"), NOW)
+        self.assertEqual(refused.kind, "unparsed")
+        self.assertIn("a GitHub pull request carries no head pipeline", refused.note)
 
     def test_pipeline_wait(self):
         base = dict(kind="pipeline", project_path="entire-vc/evc-mesh", pipeline_id=28905)
@@ -97,8 +95,6 @@ class Mapping(unittest.TestCase):
             "event": "store review window", "source": f"comment:{COMMENT}",
             "why": "the store publishes the window then", "at": "2026-11-12T15:00:00.123456+03:00"})
         self.assertEqual(out.note, "the store publishes the window then")
-        # the 0.2.1 route (row -> marker text -> parser) lost exactly this
-        self.assertEqual(parse_line(out.line, NOW).kind, "unparsed")
 
     def test_a_time_wait_refused_on_substance_names_what(self):
         base = dict(kind="time", until_at="2026-11-12T12:00:00Z", event_ref="window", why="the window opens")
@@ -133,8 +129,6 @@ class Mapping(unittest.TestCase):
         self.assertEqual(out.extra, {"merge": {"sha": SHA}})
         # a runner without the merge gate refuses it exactly as it refuses the marker line
         off = from_typed(*wait_row(**base), NOW)
-        marker = parse_line(f"⏳ WAIT merge:entire-vc/evc-mesh!1801 after={SHA}", NOW, merge=False)
-        self.assertEqual(off, marker)
         self.assertEqual(off.kind, "unparsed")
         self.assertEqual(off.note, outcome_mod.MERGE_NOT_ENABLED)
 
@@ -296,7 +290,7 @@ class Settle(TypedTurn):
         self.assertEqual(len(calls(self.calls)), 1)                  # no correction turn was spent
         self.assertEqual(mesh.typed_reads, 2)                        # the outcome row and its wait
         self.assertEqual([json.loads(d) for d in self.events(r, a, "outcome_source")],
-                         [{"source": "typed", "kind": "card", "harness": "claude", "both": False, "disagree": False}])
+                         [{"source": "typed", "kind": "card", "harness": "claude"}])
 
     def test_a_typed_next_continues_in_the_same_session(self):
         t = task(1)
@@ -305,10 +299,10 @@ class Settle(TypedTurn):
         self.typed(mesh, t, "next")
         a = self.finish_turn(r)
         self.assertEqual(a.state, "ready")
-        self.assertIn("NEXT", a.wake_text)
+        self.assertIn("you asked to continue (continue_next)", a.wake_text)
         self.assertEqual(mesh.typed_reads, 1)
 
-    def test_typed_wins_over_a_marker_comment_and_the_disagreement_is_recorded(self):
+    def test_a_marker_comment_does_not_compete_with_the_typed_outcome(self):
         t, other = task(1), task(2)
         mesh = FakeMesh([t, other], max_concurrent=1)
         r = self.run_turn(mesh, t)
@@ -317,13 +311,11 @@ class Settle(TypedTurn):
                          at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=3))
         a = self.finish_turn(r)
         self.assertEqual((a.state, a.wait["kind"], a.wait["target"]), ("waiting", "card", other["id"][:8]))
-        self.assertEqual([json.loads(d) for d in self.events(r, a, "outcome_disagree")],
-                         [{"typed": {"kind": "card", "target": other["id"][:8]},
-                           "marker": {"kind": "next", "target": ""}}])
+        self.assertEqual(self.events(r, a, "outcome_disagree"), [])
         self.assertEqual(json.loads(self.events(r, a, "outcome_source")[0]),
-                         {"source": "typed", "kind": "card", "harness": "claude", "both": True, "disagree": True})
+                         {"source": "typed", "kind": "card", "harness": "claude"})
 
-    def test_a_marker_that_says_the_same_is_no_disagreement(self):
+    def test_a_marker_in_the_final_message_changes_nothing_beside_the_typed_outcome(self):
         t, other = task(1), task(2)
         mesh = FakeMesh([t, other], max_concurrent=1)
         r = self.run_turn(mesh, t, reply=f"Parked.\n⏳ WAIT card:#{other['id'][:8]}: needs its API")
@@ -332,7 +324,7 @@ class Settle(TypedTurn):
         self.assertEqual(a.state, "waiting")
         self.assertEqual(self.events(r, a, "outcome_disagree"), [])
         self.assertEqual(json.loads(self.events(r, a, "outcome_source")[0]),
-                         {"source": "typed", "kind": "card", "harness": "claude", "both": True, "disagree": False})
+                         {"source": "typed", "kind": "card", "harness": "claude"})
 
     def test_a_typed_time_wait_with_a_receipt_source_settles(self):
         t = task(1)
@@ -419,40 +411,30 @@ class Settle(TypedTurn):
 
     def test_ask_human_waits_on_the_gate_mesh_armed_and_raises_nothing(self):
         """Mesh posted the Blocking comment and armed the gate: the runner neither posts nor routes the
-        question again (no `_route_ask`, no comment, no correction), and parks exactly as the marker
-        path parks once Mesh raised the gate from the line."""
-        parked = {}
-        for path in ("typed", "marker"):
-            t = task(1)
-            mesh = FakeMesh([t], max_concurrent=1)
-            line = "❓ Blocking @morgan: ship tonight or wait for the canary?"
-            r = self.run_turn(mesh, t, reply=("Asked through Mesh." if path == "typed" else f"Asking.\n{line}"))
-            mesh.tasks[t["id"]]["human_gate"] = True             # armed with the question, in both paths
-            if path == "typed":
-                self.typed(mesh, t, "wait", {"kind": "human", "addressee": "morgan", "note": "asked @morgan",
-                                             "question": "ship tonight or wait for the canary?",
-                                             "human_gate_ref": f"comment:{COMMENT}"}, note="asked @morgan")
-            posted = len(mesh.comment_log.get(t["id"], []))
-            with mock.patch.object(r, "_route_ask", wraps=r._route_ask) as routed:
-                a = self.finish_turn(r)
-            self.assertEqual((a.state, a.no_outcome), ("waiting", 0), a.wake_text)
-            self.assertEqual(len(mesh.comment_log.get(t["id"], [])), posted, path)   # nothing posted
-            self.assertEqual(routed.call_count, 0 if path == "typed" else 1)
-            parked[path] = {k: a.wait.get(k) for k in ("kind", "handle", "note", "line")}
-            if path == "typed":
-                self.assertEqual(a.wait["human_gate_ref"], f"comment:{COMMENT}")
-                self.assertEqual(json.loads(self.events(r, a, "outcome_source")[0])["kind"], "blocking")
-            # the wake is the marker path's: the gate held is no event, the gate lifted wakes
-            r._wake_budgeted(a)
-            self.assertEqual(r.store.get(a.id).state, "waiting")
-            mesh.tasks[t["id"]]["human_gate"] = False
-            r._wake_budgeted(r.store.get(a.id))
-            woke = r.store.get(a.id)
-            self.assertEqual(woke.state, "ready")
-            self.assertIn("the human gate was lifted", woke.wake_text)
-            self.tearDown()
-            self.setUp()
-        self.assertEqual(parked["typed"], parked["marker"])
+        question again (no `_route_ask`, no comment, no correction), and parks on the gate."""
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.run_turn(mesh, t, reply="Asked through Mesh.")
+        mesh.tasks[t["id"]]["human_gate"] = True                 # armed with the question
+        self.typed(mesh, t, "wait", {"kind": "human", "addressee": "morgan", "note": "asked @morgan",
+                                     "question": "ship tonight or wait for the canary?",
+                                     "human_gate_ref": f"comment:{COMMENT}"}, note="asked @morgan")
+        posted = len(mesh.comment_log.get(t["id"], []))
+        with mock.patch.object(r, "_route_ask", wraps=r._route_ask) as routed:
+            a = self.finish_turn(r)
+        self.assertEqual((a.state, a.no_outcome), ("waiting", 0), a.wake_text)
+        self.assertEqual(len(mesh.comment_log.get(t["id"], [])), posted)   # nothing posted
+        self.assertEqual(routed.call_count, 0)
+        self.assertEqual(a.wait["human_gate_ref"], f"comment:{COMMENT}")
+        self.assertEqual(json.loads(self.events(r, a, "outcome_source")[0])["kind"], "blocking")
+        # the gate held is no event, the gate lifted wakes
+        r._wake_budgeted(a)
+        self.assertEqual(r.store.get(a.id).state, "waiting")
+        mesh.tasks[t["id"]]["human_gate"] = False
+        r._wake_budgeted(r.store.get(a.id))
+        woke = r.store.get(a.id)
+        self.assertEqual(woke.state, "ready")
+        self.assertIn("the human gate was lifted", woke.wake_text)
 
     def test_a_typed_merge_wait_parks_on_the_runners_merge_gate(self):
         t = task(1)
@@ -466,7 +448,7 @@ class Settle(TypedTurn):
         self.assertEqual((a.state, a.wait["kind"], a.wait["target"]), ("waiting", "merge", "g/p!7"), a.wake_text)
         self.assertEqual(a.wait["merge"], {"sha": sha, "runs": 0})
 
-    def test_a_typed_merge_wait_on_a_runner_without_the_gate_is_sent_back_like_the_marker(self):
+    def test_a_typed_merge_wait_on_a_runner_without_the_gate_is_sent_back(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.run_turn(mesh, t)
@@ -474,7 +456,7 @@ class Settle(TypedTurn):
                                      "after_sha": "0123456789abcdef0123456789abcdef01234567"})
         a = self.finish_turn(r)
         self.assertEqual((a.state, a.no_outcome), ("ready", 1))
-        self.assertIn("`merge:` waits are not enabled on this runner", a.wake_text)
+        self.assertIn("`wait_for on=merge` is not enabled on this runner", a.wake_text)
 
     def test_an_unsupported_wait_kind_asks_precisely(self):
         t = task(1)
@@ -545,15 +527,15 @@ class Settle(TypedTurn):
         self.assertEqual(a.state, "running")
         self.assertEqual(len(self.events(r, a, "outcome_read_deferred")), 1)
 
-    def test_a_mesh_without_the_typed_read_settles_on_the_marker(self):
+    def test_a_mesh_without_the_typed_read_ignores_the_marker(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.run_turn(mesh, t, reply="Step done.\n↻ NEXT: the docs")
         mesh.typed_error = MeshError(404, "not found")
         a = self.finish_turn(r)
-        self.assertEqual((a.state, a.no_outcome), ("ready", 0))
+        self.assertEqual((a.state, a.no_outcome), ("ready", 1))       # the marker settles nothing
         self.assertEqual(json.loads(self.events(r, a, "outcome_source")[0]),
-                         {"source": "final_text", "kind": "next", "harness": "claude", "both": False, "disagree": False})
+                         {"source": "none", "kind": "none", "harness": "claude"})
 
     def test_outcome_sources_are_counted_once_per_turn_and_exported(self):
         from mesh_runner.runner import OutcomeRead
@@ -569,10 +551,10 @@ class Settle(TypedTurn):
         codex = r.store.create(self.agent.name, t2["id"], "codex")
         r._count_outcome(codex, OutcomeRead(None, ""), None)
         claude = r.store.create(self.agent.name, t3["id"], "claude")
-        r._count_outcome(claude, OutcomeRead(Outcome("next"), "", "comment"), Outcome("next"))
+        r._count_outcome(claude, OutcomeRead(None, ""), None)
         self.assertEqual(json.loads(self.events(r, codex, "outcome_source")[0]),
-                         {"source": "none", "kind": "none", "harness": "codex", "both": False, "disagree": False})
-        totals = {"typed": {"claude": 1}, "none": {"codex": 1}, "comment": {"claude": 1}}
+                         {"source": "none", "kind": "none", "harness": "codex"})
+        totals = {"typed": {"claude": 1}, "none": {"codex": 1, "claude": 1}}
         self.assertEqual(r.outcome_sources(), totals)
         outer = Runner(self.cfg, lock=False)
         outer.agents = [r, r]                                          # summed over the agents

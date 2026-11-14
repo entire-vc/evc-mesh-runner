@@ -3,7 +3,7 @@ import datetime as dt
 import json
 import unittest
 
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT, next_turn, wait_time
+from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT, next_turn, wait_time, wait_card, ask_agent
 from test_requeue_on_cap import CapBench
 from test_runner import Bench
 
@@ -110,7 +110,7 @@ class LoopBench(Bench):
 
 class RunsOfNothing(LoopBench):
     def test_a_run_of_empty_nexts_is_stopped_at_the_limit(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         self.settle_all(r)
         self.assertEqual(self.turns(), 6)
         banner = self.looped()
@@ -122,7 +122,7 @@ class RunsOfNothing(LoopBench):
     def test_six_bounced_identical_waits_are_stopped(self):
         # the runner sends the wait back each time (here the card-wait bounce, which has no
         # once-a-day limit) and the agent declares it again
-        r = self.start("⏳ WAIT card:#00000002")
+        r = self.start(wait_card("00000002"))
         r._card_wait_told = lambda a, outcome: "that card waits on a timer: wait on the event"
         self.settle_all(r)
         self.assertEqual(self.turns(), 7)                 # the first, then six sent back and declared again
@@ -132,71 +132,71 @@ class RunsOfNothing(LoopBench):
         self.stopped(r)
 
     def test_a_wait_declared_again_in_a_turn_started_by_its_own_next_extends_it(self):
-        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
+        r = self.start(wait_time(why="waiting for the vendor"))
         self.settle_all(r)
         for _ in range(3):
             self.assertEqual(self.looped(), [])
-            self.assertEqual(self.step(r, "↻ NEXT").state, "ready")
-            self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
+            self.assertEqual(self.step(r, next_turn()).state, "ready")
+            self.step(r, wait_time(why="waiting for the vendor"))
         self.assertEqual(self.turns(), 7)
         self.assertIn("started by its own NEXT", self.looped()[0])
 
     def test_the_banner_lists_the_turns(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         self.settle_all(r)
         text = self.looped()[0]
         for n in range(1, 7):
             self.assertIn(f"{n}. NEXT, nothing changed, no new comment", text)
 
     def test_the_streak_starts_again_after_a_hand_up(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         self.settle_all(r)
         self.assertEqual(r.store.mark(self.agent.name, self.t["id"], LOOP_STREAK)[0], "")
 
 
 class AcceptedWaitsAreNeutral(LoopBench):
     def test_ten_rechecks_of_an_accepted_decision_wait_never_hand_up(self):
-        r = self.start("⏳ WAIT decision:@lead: ship the release?")
+        r = self.start(ask_agent("lead", "ship the release?"))
         self.settle_all(r)
         self.assertEqual(self.states(r), {self.t["id"][:8]: "waiting"})
         for _ in range(10):
-            self.assertEqual(self.step(r, "⏳ WAIT decision:@lead: ship the release?", recheck=True).state, "waiting")
+            self.assertEqual(self.step(r, ask_agent("lead", "ship the release?"), recheck=True).state, "waiting")
         self.assertEqual(self.turns(), 11)
         self.assertEqual(self.looped(), [])
 
     def test_the_same_accepted_wait_after_any_wake_is_neutral(self):
-        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
+        r = self.start(wait_time(why="waiting for the vendor"))
         self.settle_all(r)
         for _ in range(12):
-            self.wake(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
+            self.wake(r, wait_time(why="waiting for the vendor"))
         self.assertEqual(self.turns(), 13)
         self.assertEqual(self.looped(), [])
 
     def test_a_neutral_recheck_between_empty_nexts_does_not_reset_the_count(self):
-        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor")
+        r = self.start(wait_time(why="waiting for the vendor"))
         self.settle_all(r)
-        self.assertEqual(self.step(r, "↻ NEXT").state, "ready")                                  # 1
-        self.assertEqual(self.step(r, "↻ NEXT").state, "ready")                                  # 2
-        self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor").state, "waiting")    # 3: its own NEXT
-        self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor", recheck=True).state, "waiting")
+        self.assertEqual(self.step(r, next_turn()).state, "ready")                                  # 1
+        self.assertEqual(self.step(r, next_turn()).state, "ready")                                  # 2
+        self.assertEqual(self.step(r, wait_time(why="waiting for the vendor")).state, "waiting")    # 3: its own NEXT
+        self.assertEqual(self.step(r, wait_time(why="waiting for the vendor"), recheck=True).state, "waiting")
         for _ in range(2):                                                                       # 4, 5
-            self.assertEqual(self.step(r, "↻ NEXT").state, "ready")
+            self.assertEqual(self.step(r, next_turn()).state, "ready")
         self.assertEqual(self.looped(), [])
-        self.assertEqual(self.step(r, "↻ NEXT").state, "completed")                              # 6: handed up
+        self.assertEqual(self.step(r, next_turn()).state, "completed")                              # 6: handed up
         self.assertEqual(len(self.looped()), 1)
 
     def test_a_recheck_that_ends_in_a_different_wait_is_progress(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         for _ in range(4):
             # one turn at a time: the reply file is written before the turn starts, never under a running harness
-            self.assertEqual(self.step(r, "↻ NEXT").state, "ready")
-        self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 waiting for the vendor").state, "waiting")    # a different wait: reset
+            self.assertEqual(self.step(r, next_turn()).state, "ready")
+        self.assertEqual(self.step(r, wait_time(why="waiting for the vendor")).state, "waiting")    # a different wait: reset
         self.assertEqual(json.loads(r.store.mark(self.agent.name, self.t["id"], LOOP_STREAK)[0])["log"], [])
 
 
 class ProgressIsNeverStopped(LoopBench):
     def test_nexts_that_change_the_worktree_are_never_a_loop(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         counter = iter(range(1000))
         r._work_digest = lambda a: str(next(counter))
         self.settle_all(r)                    # only max_turns ends it
@@ -204,26 +204,26 @@ class ProgressIsNeverStopped(LoopBench):
         self.assertEqual(self.looped(), [])
 
     def test_many_waits_on_different_things_are_never_a_loop(self):
-        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak round 0")
+        r = self.start(wait_time(why="soak round 0"))
         self.settle_all(r)
         for i in range(1, 16):
-            self.wake(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak round {i}")
+            self.wake(r, wait_time(why=f"soak round {i}"))
         self.assertEqual(self.turns(), 16)
         self.assertEqual(self.looped(), [])
         self.assertEqual(self.states(r), {self.t["id"][:8]: "waiting"})
 
     def test_the_same_wait_after_a_met_event_is_a_step_not_a_loop(self):
-        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 the release train")
+        r = self.start(wait_time(why="the release train"))
         self.settle_all(r)
         for _ in range(15):
             # the awaited thing happened and woke the session; it waits for the next round of the same
-            self.wake(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 the release train",
+            self.wake(r, wait_time(why="the release train"),
                       lambda a: r.store.mark(self.agent.name, self.t["id"], "met_wake", a.id))
         self.assertEqual(self.turns(), 16)
         self.assertEqual(self.looped(), [])
 
     def test_the_same_wait_with_a_new_comment_each_time_is_not_a_loop(self):
-        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 review of the change")
+        r = self.start(wait_time(why="review of the change"))
         self.settle_all(r)
         write_replies(self.replies, {self.t["id"][:8]: wait_time(why="review of the change")})
         for i in range(12):
@@ -237,7 +237,7 @@ class ProgressIsNeverStopped(LoopBench):
 
 class ResetsTheStreak(LoopBench):
     def test_an_own_comment_resets_it(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         r.tick()
         for turn in range(1, 12):
             if turn == 6:
@@ -249,24 +249,18 @@ class ResetsTheStreak(LoopBench):
         self.assertEqual(len(self.looped()), 1)
 
     def test_the_same_comment_again_does_not_reset_it(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         n = self.next_turns(r, 12, lambda i: self.say("still looking at the failing job, nothing found yet"))
         self.assertEqual(n, 7)                        # the first copy is new, then six repeats
         self.assertEqual(len(self.looped()), 1)
 
-    def test_a_declaration_alone_is_not_a_comment(self):
-        r = self.start("↻ NEXT")
-        n = self.next_turns(r, 12, lambda i: self.say("↻ NEXT: " + str(i)))
-        self.assertEqual(n, 6)
-        self.assertEqual(len(self.looped()), 1)
-
     def test_a_runner_note_is_not_a_comment(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         n = self.next_turns(r, 12, lambda i: self.say(f"[runner] note {i}"))
         self.assertEqual(n, 6)
 
     def test_a_change_in_the_worktree_resets_it(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         r.tick()
         for turn in range(1, 12):
             if turn == 6:
@@ -278,13 +272,13 @@ class ResetsTheStreak(LoopBench):
         self.assertEqual(len(self.looped()), 1)
 
     def test_an_unreadable_digest_is_not_proof_of_idleness(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         r._work_digest = lambda a: ""
         self.settle_all(r)
         self.assertEqual(self.looped(), [])
 
     def test_a_task_without_a_worktree_relies_on_comments(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         r.tick()
         a = r.store.by_state(self.agent.name, ("running",))[0]
         r.store.update(a, workspaces=[])
@@ -296,7 +290,7 @@ class ResetsTheStreak(LoopBench):
         self.assertEqual(n, 6)
 
     def test_a_changed_status_and_a_met_wake_reset_it_directly(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         r.refresh_me()
         a = r.store.create(self.agent.name, self.t["id"], "claude")
         r.store.update(a, turn_started_at=(now() - dt.timedelta(minutes=1)).isoformat())
@@ -317,7 +311,7 @@ class ResetsTheStreak(LoopBench):
 
 class NothingNew(LoopBench):
     def test_comments_that_differ_only_in_numbers_and_times_are_not_news(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         n = self.next_turns(r, 12, lambda i: self.say(
             f"still waiting for the release pipeline to finish (pipeline {21234 + i}, checked 14:{i:02d}, "
             f"sha {i}a3f9c{i:02d}e on 2026-10-{10 + i})"))
@@ -325,13 +319,13 @@ class NothingNew(LoopBench):
         self.assertEqual(len(self.looped()), 1)
 
     def test_a_status_line_too_short_to_carry_news_never_counts(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         n = self.next_turns(r, 12, lambda i: self.say(f"still waiting for pipeline {21234 + i} (checked 14:0{i})"))
         self.assertEqual(n, 6)
         self.assertEqual(len(self.looped()), 1)
 
     def test_a_genuinely_new_finding_resets_it(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         r.tick()
         said = lambda i: f"still waiting for the release pipeline to finish (pipeline {21234 + i}, checked 14:0{i})"
         for turn in range(1, 12):
@@ -342,7 +336,7 @@ class NothingNew(LoopBench):
         self.assertEqual(self.looped(), [])
 
     def test_alternating_between_two_comments_is_still_a_repeat(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         n = self.next_turns(r, 14, lambda i: self.say(FINDINGS[i % 2]))
         self.assertEqual(n, 8)                        # two news, then six repeats
         self.assertEqual(len(self.looped()), 1)
@@ -360,7 +354,7 @@ class NothingNew(LoopBench):
 
 
 class PingPong(LoopBench):
-    A, B = f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak alpha", f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak beta"
+    A, B = wait_time(why="soak alpha"), wait_time(why="soak beta")
 
     def test_alternating_between_two_waits_is_handed_up(self):
         r = self.start(self.A)
@@ -391,7 +385,7 @@ class PingPong(LoopBench):
     def test_progress_by_a_next_clears_the_window_too(self):
         r = self.start(self.A)
         self.settle_all(r)
-        self.assertEqual(self.step(r, "↻ NEXT", during=lambda: self.digest.__setitem__(0, "work done")).state,
+        self.assertEqual(self.step(r, next_turn(), during=lambda: self.digest.__setitem__(0, "work done")).state,
                          "ready")                                          # progress
         self.assertEqual(self.step(r, self.B).state, "waiting")
         self.assertEqual(self.step(r, self.A).state, "waiting")
@@ -399,10 +393,10 @@ class PingPong(LoopBench):
         self.assertEqual(state["log"], [])
 
     def test_all_new_waits_are_never_a_loop(self):
-        r = self.start(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak a")
+        r = self.start(wait_time(why="soak a"))
         self.settle_all(r)
         for name in "bcdefghijkl":
-            self.assertEqual(self.step(r, f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak {name}").state, "waiting")
+            self.assertEqual(self.step(r, wait_time(why=f"soak {name}")).state, "waiting")
         self.assertEqual(self.turns(), 12)
         self.assertEqual(self.looped(), [])
 
@@ -416,7 +410,7 @@ class PingPong(LoopBench):
         self.assertEqual(self.looped(), [])
 
     def test_the_window_is_forgotten_after_a_status_change_directly(self):
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         r.refresh_me()
         a = r.store.create(self.agent.name, self.t["id"], "claude")
         r.store.update(a, turn_started_at=(now() - dt.timedelta(minutes=1)).isoformat())
@@ -433,7 +427,7 @@ class Off(LoopBench):
     def test_limit_zero_disables_the_guard(self):
         self.cfg.loop_streak_limit = 0
         self.cfg.max_turns = 20
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         self.settle_all(r)
         self.assertEqual(self.turns(), 20)
         self.assertEqual(self.looped(), [])
@@ -442,7 +436,7 @@ class Off(LoopBench):
     def test_the_daily_counters_still_work_as_a_backstop(self):
         self.cfg.loop_streak_limit = 0
         self.cfg.daily_next_budget = 2
-        r = self.start("↻ NEXT")
+        r = self.start(next_turn())
         self.settle_all(r)
         self.assertTrue(any("TURN CAP" in b for b in self.bodies()))
 

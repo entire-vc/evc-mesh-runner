@@ -3,10 +3,9 @@ import datetime as dt
 from types import SimpleNamespace
 from unittest import mock
 
-from mesh_runner.outcome import parse_line
 from mesh_runner.store import iso
 from mesh_runner.wake import typed_event
-from fakes import FakeGitLab, FakeMesh, task, write_replies
+from fakes import FakeGitLab, FakeMesh, task, write_replies, wait_mr, typed
 from test_runner import Bench
 
 NOW = dt.datetime.now(dt.timezone.utc)
@@ -15,8 +14,8 @@ TARGET = 'g/app!56'
 KEY = 'mr-state:' + TARGET
 
 
-def marker():
-    return f'⏳ WAIT mr:{TARGET} until=merged after={SHA}:opened'
+def marker(**override):
+    return wait_mr('g/app', 56, until='merged', after_sha=SHA, after_status='opened', **override)
 
 
 def row(state='opened', at=None):
@@ -35,18 +34,19 @@ class MRStateWait(Bench):
         r = self.runner(FakeMesh([t]), gl)
         r.refresh_me()
         a = r.store.create(self.agent.name, t['id'], 'claude')
-        o = parse_line(marker(), NOW)
+        o = typed(marker(), now=NOW)
         r.store.update(a, state='waiting', wait={'kind': o.kind, 'target': o.target,
                        **o.extra, 'since': iso(), 'started': iso()})
         return r, a, t, gl
 
-    def test_strict_parser_does_not_fall_back_to_legacy(self):
-        self.assertEqual(parse_line(marker(), NOW).extra['mr_state']['state'], 'opened')
-        for text in (marker().replace(SHA, 'abc'), marker().replace(':opened', ':closed'),
-                     marker().replace('until=merged', 'until=merge'),
-                     marker().replace('mr:', 'pipeline:'), marker().replace(' after=', ' after =')):
-            with self.subTest(text=text):
-                self.assertEqual(parse_line(text, NOW).kind, 'unparsed')
+    def test_strict_typed_baseline_does_not_fall_back_to_legacy(self):
+        self.assertEqual(typed(marker(), now=NOW).extra['mr_state']['state'], 'opened')
+        for bad in (dict(after_sha='abc'), dict(after_status='closed'), dict(until='merge'),
+                    dict(after_status='')):
+            with self.subTest(bad=bad):
+                turn = marker()
+                turn.update(bad)
+                self.assertEqual(typed(turn, now=NOW).kind, 'unparsed')
 
     def test_settle_skips_terminal_ci_seed_and_new_heads_do_not_wake(self):
         t = task(1)
@@ -81,7 +81,7 @@ class MRStateWait(Bench):
                 r2 = self.runner(r.mesh, gl)
                 r2.refresh_me()
                 b = r2.store.create(self.agent.name, t['id'], 'claude')
-                o = parse_line(marker(), NOW)
+                o = typed(marker(), now=NOW)
                 r2.store.update(b, state='waiting', wait={'kind': o.kind, 'target': o.target,
                     **o.extra, 'since': iso(), 'started': iso()})
                 r2._wake_one(b)
@@ -157,9 +157,9 @@ class MRStateWait(Bench):
     def test_review_uses_same_terminal_predicate_without_ack_before_spawn(self):
         r, a, t, gl = self.setup_wait()
         old = NOW - dt.timedelta(days=3)
-        last = {'body': marker(), 'created_at': iso(old), 'author_id': r.agent_id}
+        last = typed(marker(), now=NOW)
         self.assertEqual(r._review_event(t, old, last, []), '')
-        self.assertTrue(r._own_wait_pending(t, last, old))
+        self.assertTrue(r._own_wait_pending(last, old))
         gl.mr_rows[TARGET] = row('closed', iso(NOW))
         self.assertIn('closed without merge', r._review_event(t, old, last, []))
         delivery = r._review_ci_delivery[t['id']]

@@ -375,9 +375,9 @@ class OtherCaps(CapBench):
         self.assertEqual(len(calls(self.calls)), before)              # nothing new: nothing starts
 
     def test_turn_cap_on_an_ask_agent_wait_requeues_and_files_no_second_request(self):
-        # ask_agent: Mesh opened the request and addressed the agent before the cap ran; the runner
-        # requeues the card and files nothing itself (its own filing is the marker path's, see
-        # test_outcome_marker_scenarios.MarkerCaps). The addressee's answer is the new input.
+        # ask_agent: Mesh recorded the request, but its comment wakes nobody; the runner files the one
+        # request card that starts the addressee before the cap requeues the source card, and no
+        # second one after. The addressee's answer is the new input.
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         self.cfg.daily_next_budget = 2
@@ -387,7 +387,7 @@ class OtherCaps(CapBench):
         r = self.runner(mesh)
         r.tick()
         self.finish_turn(r)
-        self.assertEqual(mesh.created, [])
+        self.assertEqual([c["assignee_id"] for c in mesh.created], ["agent-lead"])
         self.assertIn("cap: requeued (turn budget)", self.notes(r, t))
         self.assertEqual(mesh.category(mesh.tasks[t["id"]]), "todo")
         mesh.add_comment(t["id"], "approved", author="agent-lead")

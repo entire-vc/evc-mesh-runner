@@ -42,11 +42,11 @@ _BOT = re.compile(r"[\w.:-]{1,64}")
 _CHAT = re.compile(r"-?[0-9]{1,20}")
 
 WAIT_GUIDANCE = (
-    "invalid receipt wait: `⏳ WAIT receipt:#<this-card-8hex>` is accepted only when the receipt "
+    "invalid receipt wait: `wait_for on=registered registration=receipt` is accepted only when the receipt "
     "observer is enabled on this runner and an operator armed a live registration for this card "
     "and this owner (`mesh-runner receipt-wait arm`). It wakes once on the first new accepted "
-    "correlated provider text receipt after that registration. Nothing is armed here: declare "
-    "another condition (card, mr, pipeline, decision) or ask the operator to arm it."
+    "correlated provider text receipt after that registration. Nothing is armed here: wait on "
+    "another condition (card, mr, pipeline, ask_agent) or ask the operator to arm it."
 )
 
 

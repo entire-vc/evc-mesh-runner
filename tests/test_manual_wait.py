@@ -1,16 +1,16 @@
-"""`wait_for on=manual` (marker `⏳ WAIT manual:#<this-card>`): a lead-decided passive wait on a card
+"""`wait_for on=manual`: a lead-decided passive wait on a card
 labelled `wake:manual`.
 
 No observer exists for it, so it has no timer and no age re-check: only a comment by someone
-else (or the owner's own NEXT) resumes the session. Without the label, or naming another card,
+else (or the owner's own typed continue_next) resumes the session. Without the label, or naming another card,
 it is refused like any unreadable outcome, so it never becomes a silent park."""
 import datetime as dt
 import unittest
 
-from fakes import FakeMesh, calls, task, wait_manual, write_replies
+from fakes import FakeMesh, calls, task, typed, wait_manual, write_replies
 from test_runner import Bench
 
-from mesh_runner.outcome import MANUAL_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, from_typed, parse_outcome
+from mesh_runner.outcome import MANUAL_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, from_typed
 from mesh_runner.wake import check
 
 NOW = dt.datetime(2026, 11, 10, 18, 0, tzinfo=dt.timezone.utc)
@@ -28,15 +28,9 @@ def comment(author, body, minute=1):
 
 
 class Parse(unittest.TestCase):
-    def test_the_line_is_a_manual_wait_on_the_named_card(self):
-        o = parse_outcome("⏳ WAIT manual:#abcdef12 — вход: новый attachment-артефакт на этой карточке", NOW)
+    def test_the_command_is_a_manual_wait_on_this_card(self):
+        o = typed(wait_manual("вход: новый attachment-артефакт на этой карточке"), task8="abcdef12", now=NOW)
         self.assertEqual((o.kind, o.target, o.is_wait), ("manual", "abcdef12", True))
-
-    def test_a_malformed_manual_line_gets_its_own_guidance_not_the_time_one(self):
-        for line in ("⏳ WAIT manual: someday", "⏳ WAIT manual:#xyz", "⏳ WAIT manual:abcdef12"):
-            o = parse_outcome(line, NOW)
-            self.assertEqual((o.kind, o.note), ("unparsed", MANUAL_WAIT_GUIDANCE), line)
-            self.assertNotEqual(o.note, TIME_WAIT_GUIDANCE, line)
 
 
 class Typed(unittest.TestCase):
@@ -78,10 +72,12 @@ class Wake(unittest.TestCase):
     def test_a_comment_by_someone_else_resumes_it(self):
         self.assertIn("commented", self.woken(wait(), [comment("lead", "артефакт: bridge v1 готов")]))
 
-    def test_the_owners_own_next_supersedes_it(self):
+    def test_a_next_marker_in_the_owners_comment_is_ignored(self):
+        """Only a typed continue_next ends the wait now; marker text in a comment says nothing."""
         w = wait()
-        self.assertIn("superseded", self.woken(w, [comment("me", "нашёл вход сам\n↻ NEXT")]))
-        self.assertTrue(w.get("met"))
+        self.assertEqual(self.woken(w, [comment("me", "нашёл вход сам\n↻ NEXT")]), "")
+        self.assertFalse(w.get("met"))
+        self.assertFalse(w.get("superseded"))
 
     def test_the_owners_own_note_does_not_wake_it(self):
         self.assertEqual(self.woken(wait(), [comment("me", "проверка: входа нет")]), "")

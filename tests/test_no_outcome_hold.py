@@ -5,18 +5,21 @@ never twice for the same run of misses."""
 import datetime as dt
 from unittest import mock
 
-from fakes import AGENT_ID, FakeGitLab, FakeMesh, calls, task, write_replies, wait_pipeline
+from fakes import (AGENT_ID, FakeGitLab, FakeMesh, calls, next_turn, task, typed, wait_card, wait_mr, wait_pipeline,
+                   wait_time, write_replies)
 from test_requeue_on_cap import CapBench
 from test_runner import Bench
 
-from mesh_runner.outcome import TIME_WAIT_GUIDANCE, parse_outcome
+from mesh_runner.outcome import TIME_WAIT_GUIDANCE
 
 SHA = "a" * 40
+U = {"success": "green", "change": "changed", "merged": "merged"}
 NOW = dt.datetime(2026, 10, 28, 12, 0, tzinfo=dt.timezone.utc)
 
 
-def p(text):
-    return parse_outcome(text, NOW)
+def p(turn):
+    """The Outcome the runner reads for an agent's Mesh turn command (``now`` fixed at NOW)."""
+    return typed(turn, now=NOW)
 
 
 def row(pid=7, status="running", sha=SHA, state="opened"):
@@ -24,49 +27,66 @@ def row(pid=7, status="running", sha=SHA, state="opened"):
 
 
 class UnsourcedTimeWait(Bench):
-    """1. A time WAIT without a sourced external timestamp is unreadable: a relative interval, a
-    reason naming an event, `poll:`, a bare date and a moment already past are all refused with
-    the same guidance (which names the event forms), never scheduled and never turned into NEXT."""
+    """1. A time wait without a sourced external timestamp is unreadable: a relative interval, a
+    reason naming an event, `poll:`, a bare date and a missing source are all refused with the guidance
+    (which names the event forms), never scheduled and never turned into a continuation. A deadline that
+    has already passed stays a time wait: it is due, not invalid."""
 
-    LINE = "⏳ WAIT 20m: идёт независимое ревью PR77, закончится вердиктом SHIP"
+    BAD = wait_time("20m", why="идёт независимое ревью PR77, закончится вердиктом SHIP")
 
-    def test_every_unsourced_form_is_refused_with_the_guidance(self):
-        for line in (self.LINE, "⏳ WAIT 6h: soak window", "⏳ WAIT 6h: poll: Telegram inbox for the reply",
-                     "⏳ WAIT 2026-10-30T06:00Z: decision from the lead", "⏳ WAIT 2026-10-28: today, date only",
-                     "⏳ WAIT 2026-10-28T07:05Z: external=night-run source=card:#abcdef12 already past",
-                     "⏳ WAIT 2026-10-28T12:00Z: external=night-run source=card:#abcdef12 exactly now",
-                     "⏳ WAIT tomorrow", "⏳ WAIT in 2 hours: the export", "⏳ WAIT until the vendor replies"):
-            o = p(line)
-            self.assertEqual((o.kind, o.until, o.note), ("unparsed", None, TIME_WAIT_GUIDANCE), line)
-        for form in ("⏳ WAIT card:#<8hex>", "⏳ WAIT decision:@<agent>", "⏳ WAIT mr:<group>/<project>!<iid>",
-                     "⏳ WAIT pipeline:<group>/<project>#<id>"):
+    def test_every_unsourced_form_is_refused(self):
+        src = "card:#abcdef12"
+        for turn in (self.BAD,
+                     wait_time("6h", why="soak window"),
+                     wait_time("2026-10-30T06:00Z", why="poll: Telegram inbox for the reply", source=src),
+                     wait_time("2026-10-30T06:00Z", event_ref="decision:@lead", why="decision from the lead", source=src),
+                     wait_time("2026-10-28", why="today, date only", source=src),
+                     wait_time("tomorrow", why="later", source=src),
+                     wait_time("2026-10-30T06:00Z", event_ref="night-run", why="the export", source=""),
+                     wait_time("2026-10-30T06:00Z", event_ref="", why="the export", source=src),
+                     wait_time("2026-10-30T06:00Z", event_ref="night-run", why="", source=src)):
+            o = p(turn)
+            self.assertEqual((o.kind, o.until), ("unparsed", None), turn)
+            self.assertIn("recorded, but this runner cannot act on it", o.note)
+        for form in ("wait_for on=time", "wait_for on=card", "wait_for on=mr", "wait_for on=pipeline", "ask_agent"):
             self.assertIn(form, TIME_WAIT_GUIDANCE)
+        # a poll or a dependency named as the event carries the full guidance
+        for turn in (wait_time("2026-10-30T06:00Z", why="poll: Telegram inbox for the reply", source=src),
+                     wait_time("2026-10-30T06:00Z", event_ref="decision:@lead", why="decision from the lead", source=src)):
+            self.assertIn(TIME_WAIT_GUIDANCE, p(turn).note)
 
     def test_a_malformed_event_wait_keeps_its_own_reading(self):
-        for line in ("⏳ WAIT card:xyz", "⏳ WAIT decision: someone", "⏳ WAIT mr: soon"):
-            self.assertNotEqual(p(line).note, TIME_WAIT_GUIDANCE, line)
+        for turn in (wait_card("xyz"), wait_mr("", 0)):
+            o = p(turn)
+            self.assertEqual(o.kind, "unparsed", turn)
+            self.assertNotIn(TIME_WAIT_GUIDANCE, o.note, turn)
 
     def test_a_sourced_moment_just_ahead_is_kept_exactly(self):
-        o = p("⏳ WAIT 2026-10-28T12:02Z: external=night-run source=card:#abcdef12 the export starts")
+        o = p(wait_time("2026-10-28T12:02Z", event_ref="night-run", source="card:#abcdef12", why="the export starts"))
         self.assertEqual((o.kind, o.until), ("time", NOW + dt.timedelta(minutes=2)))
+
+    def test_a_sourced_moment_already_past_is_a_due_time_wait(self):
+        for at in ("2026-10-28T07:05Z", "2026-10-28T12:00Z"):
+            o = p(wait_time(at, event_ref="night-run", source="card:#abcdef12", why="already past"))
+            self.assertEqual(o.kind, "time", at)
 
     def test_the_first_is_corrected_in_the_same_session_and_schedules_nothing(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: self.LINE})
+        write_replies(self.replies, {t["id"][:8]: self.BAD})
         r = self.runner(mesh)
         r.tick()
         a = self.finish_turn(r)
         self.assertEqual((a.state, a.no_outcome), ("ready", 1))
-        self.assertIn("external=<stable-reference>", a.wake_text)
+        self.assertIn("until_at `20m` is not a time with a timezone", a.wake_text)
         self.assertEqual(a.wait, {})
         self.assertFalse(mesh.tasks[t["id"]].get("start_after"))
 
     def test_repeating_it_after_the_correction_is_a_correction_hold(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        line = "⏳ WAIT tomorrow: later"
-        write_replies(self.replies, {t["id"][:8]: line, t["id"][:8] + ":resume": line})
+        bad = wait_time("tomorrow", why="later")
+        write_replies(self.replies, {t["id"][:8]: bad, t["id"][:8] + ":resume": bad})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -80,25 +100,34 @@ class UnsourcedTimeWait(Bench):
 class CiWaitWithoutBaseline(Bench):
     """3. `until=` without `after=` takes the state at the moment of declaring as its baseline."""
 
-    def test_parser_marks_the_default(self):
-        o = p("⏳ WAIT pipeline:g/app#18827 until=success")
+    @staticmethod
+    def parse(r, turn):
+        """What the runner settles on for a typed wait: the Outcome, with the declared-state baseline filled in."""
+        out = p(turn)
+        if out.extra.get("ci_default") or out.extra.get("mr_default"):
+            out = r._default_baseline(out)
+        return out
+
+    def test_typed_wait_marks_the_default(self):
+        o = p(wait_pipeline("g/app", 18827, until="green"))
         self.assertEqual((o.kind, o.target, o.extra), ("pipeline", "g/app#18827", {"ci_default": {"predicate": "success"}}))
-        o = p("⏳ WAIT pipeline:g/app#18827 until=change: CI")
+        o = p(wait_pipeline("g/app", 18827, until="changed", note="CI"))
         self.assertEqual((o.kind, o.extra["ci_default"]["predicate"], o.note), ("pipeline", "change", "CI"))
-        o = p("⏳ WAIT mr:g/app!9 until=success")
+        o = p(wait_mr("g/app", 9, until="green"))
         self.assertEqual((o.kind, o.target, o.extra), ("mr", "g/app!9", {"ci_default": {"predicate": "success"}}))
-        o = p("⏳ WAIT mr:g/app!9 until=merged")
+        o = p(wait_mr("g/app", 9, until="merged"))
         self.assertEqual((o.kind, o.extra), ("mr", {"mr_default": {"predicate": "merged"}}))
 
     def test_malformed_typed_waits_are_still_refused(self):
-        for line in ("⏳ WAIT pipeline:g/app#1 until=success after=nonsense",
-                     "⏳ WAIT pipeline:g/app#1 until=whenever",
-                     "⏳ WAIT mr:g/app#9 until=success",
-                     "⏳ WAIT pipeline:g/app#1 after=" + SHA + ":1:running"):
-            self.assertEqual(p(line).kind, "unparsed", line)
+        for turn in (wait_pipeline("g/app", 1, until="green", after_sha="nonsense", after_pipeline_id=1,
+                                   after_status="running"),
+                     wait_pipeline("g/app", 1, until="whenever"),
+                     wait_mr("g/app", 0, until="green"),
+                     wait_pipeline("g/app", 1, after_sha=SHA, after_pipeline_id=1, after_status="running")):
+            self.assertEqual(p(turn).kind, "unparsed", turn)
 
     def test_full_form_is_unchanged(self):
-        o = p(f"⏳ WAIT pipeline:g/app#7 until=success after={SHA}:7:running")
+        o = p(wait_pipeline("g/app", 7, until="green", after_sha=SHA, after_pipeline_id=7, after_status="running"))
         self.assertEqual(o.extra["ci_change"]["status"], "running")
         self.assertNotIn("ci_default", o.extra)
 
@@ -106,26 +135,26 @@ class CiWaitWithoutBaseline(Bench):
         gl = FakeGitLab()
         gl.pipeline_rows["g/app#7"] = {"sha": SHA, "id": 7, "status": "running"}
         r = self.runner(FakeMesh([task(1)], max_concurrent=1), gl)
-        o = r._parse("⏳ WAIT pipeline:g/app#7 until=success", NOW)
+        o = self.parse(r, wait_pipeline("g/app", 7, until="green"))
         self.assertEqual(o.extra, {"ci_change": {"predicate": "success", "sha": SHA, "pipeline": 7,
                                                   "status": "running"}})
-        o = r._parse("⏳ WAIT pipeline:g/app#7 until=change", NOW)
+        o = self.parse(r, wait_pipeline("g/app", 7, until="changed"))
         self.assertEqual(o.extra["ci_change"]["predicate"], "change")
 
     def test_mr_baseline_is_the_head_pipeline_now(self):
         gl = FakeGitLab()
         gl.mr_rows["g/app!9"] = row(pid=11, status="pending")
         r = self.runner(FakeMesh([task(1)], max_concurrent=1), gl)
-        o = r._parse("⏳ WAIT mr:g/app!9 until=success", NOW)
+        o = self.parse(r, wait_mr("g/app", 9, until="green"))
         self.assertEqual(o.extra["ci_change"], {"predicate": "success", "sha": SHA, "pipeline": 11, "status": "pending"})
-        o = r._parse("⏳ WAIT mr:g/app!9 until=merged", NOW)
+        o = self.parse(r, wait_mr("g/app", 9, until="merged"))
         self.assertEqual(o.extra["mr_state"], {"predicate": "merged", "sha": SHA, "state": "opened"})
 
     def test_a_result_that_already_satisfies_success_is_the_plain_wait(self):
         gl = FakeGitLab()
         gl.pipeline_rows["g/app#7"] = {"sha": SHA, "id": 7, "status": "success"}
         r = self.runner(FakeMesh([task(1)], max_concurrent=1), gl)
-        o = r._parse("⏳ WAIT pipeline:g/app#7 until=success", NOW)
+        o = self.parse(r, wait_pipeline("g/app", 7, until="green"))
         self.assertEqual((o.kind, o.target, o.extra), ("pipeline", "g/app#7", {}))
 
     def test_a_pipeline_already_in_any_final_state_is_the_plain_wait(self):
@@ -135,7 +164,7 @@ class CiWaitWithoutBaseline(Bench):
                     gl = FakeGitLab()
                     gl.pipeline_rows["g/app#7"] = {"sha": SHA, "id": 7, "status": status}
                     r = self.runner(FakeMesh([task(1)], max_concurrent=1), gl)
-                    o = r._parse(f"⏳ WAIT pipeline:g/app#7 until={predicate}", NOW)
+                    o = self.parse(r, wait_pipeline("g/app", 7, until=U[predicate]))
                     self.assertEqual((o.kind, o.target, o.extra), ("pipeline", "g/app#7", {}))
 
     def test_a_non_final_pipeline_keeps_the_typed_baseline(self):
@@ -144,7 +173,7 @@ class CiWaitWithoutBaseline(Bench):
                 gl = FakeGitLab()
                 gl.pipeline_rows["g/app#7"] = {"sha": SHA, "id": 7, "status": status}
                 r = self.runner(FakeMesh([task(1)], max_concurrent=1), gl)
-                o = r._parse("⏳ WAIT pipeline:g/app#7 until=change", NOW)
+                o = self.parse(r, wait_pipeline("g/app", 7, until="changed"))
                 self.assertEqual(o.extra["ci_change"]["status"], status)
 
     def test_an_mr_whose_head_pipeline_is_final_is_the_plain_wait(self):
@@ -154,7 +183,7 @@ class CiWaitWithoutBaseline(Bench):
                     gl = FakeGitLab()
                     gl.mr_rows["g/app!9"] = row(pid=11, status=status)
                     r = self.runner(FakeMesh([task(1)], max_concurrent=1), gl)
-                    o = r._parse(f"⏳ WAIT mr:g/app!9 until={predicate}", NOW)
+                    o = self.parse(r, wait_mr("g/app", 9, until=U[predicate]))
                     self.assertEqual((o.kind, o.target, o.extra), ("mr", "g/app!9", {}))
 
     def test_an_mr_already_merged_or_closed_is_the_plain_wait(self):
@@ -164,18 +193,18 @@ class CiWaitWithoutBaseline(Bench):
                     gl = FakeGitLab()
                     gl.mr_rows["g/app!9"] = row(pid=11, status="running", state=state)
                     r = self.runner(FakeMesh([task(1)], max_concurrent=1), gl)
-                    o = r._parse(f"⏳ WAIT mr:g/app!9 {line}", NOW)
+                    o = self.parse(r, wait_mr("g/app", 9, until=U[line.removeprefix("until=")]))
                     self.assertEqual((o.kind, o.target, o.extra), ("mr", "g/app!9", {}))
 
     def test_unreadable_target_or_no_gitlab_falls_back_to_the_plain_wait(self):
         r = self.runner(FakeMesh([task(1)], max_concurrent=1), FakeGitLab())      # nothing known about the target
-        for line, kind in (("⏳ WAIT pipeline:g/app#7 until=success", "pipeline"),
-                           ("⏳ WAIT mr:g/app!9 until=success", "mr"),
-                           ("⏳ WAIT mr:g/app!9 until=merged", "mr")):
-            o = r._parse(line, NOW)
-            self.assertEqual((o.kind, o.extra), (kind, {}), line)
+        for turn, kind in ((wait_pipeline("g/app", 7, until="green"), "pipeline"),
+                           (wait_mr("g/app", 9, until="green"), "mr"),
+                           (wait_mr("g/app", 9, until="merged"), "mr")):
+            o = self.parse(r, turn)
+            self.assertEqual((o.kind, o.extra), (kind, {}), turn)
         r = self.runner(FakeMesh([task(1)], max_concurrent=1))                    # no GitLab at all
-        self.assertEqual(r._parse("⏳ WAIT pipeline:g/app#7 until=success", NOW).extra, {})
+        self.assertEqual(self.parse(r, wait_pipeline("g/app", 7, until="green")).extra, {})
 
     def test_the_session_waits_on_the_pipeline(self):
         t = task(1)
@@ -263,7 +292,7 @@ class NoOutcomeRun(CapBench):
         r.tick()
         self.assertEqual(self.finish_turn(r).state, "ready")          # miss
         for _ in range(3):
-            self.silent(t, "↻ NEXT: did a piece")
+            self.silent(t, next_turn("did a piece"))
             r.tick()
             self.assertEqual(self.finish_turn(r).state, "ready")      # readable outcome resets the run
             self.silent(t)

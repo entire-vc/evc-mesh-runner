@@ -13,7 +13,7 @@ from pathlib import Path
 from mesh_runner.mesh import MeshError
 from mesh_runner.outcome import Outcome
 import fakes
-from fakes import AGENT_ID, FAKE_AGENT, HarnessGate, FakeAdapter, FakeProfileAdapter, FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT, ask_agent, ask_human, finish, hand_off, next_turn, wait_card, wait_mr, wait_pipeline, wait_time, slow
+from fakes import AGENT_ID, FAKE_AGENT, HarnessGate, FakeAdapter, FakeProfileAdapter, FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT, turn_rows, ask_agent, ask_human, finish, hand_off, next_turn, wait_card, wait_mr, wait_pipeline, wait_time, slow
 from test_workspace import make_repo
 
 from mesh_runner.adapters.base import group_alive, proc_stamp
@@ -474,9 +474,9 @@ class Loop(Bench):
         r.tick()                                   # not retried while nobody wrote on the task
         self.assertEqual(r.store.by_state("builder", ("running", "starting")), [])
         self.cfg.failed_cooldown_hours = 0          # time alone must not retry NO OUTCOME
-        mesh.add_comment(t["id"], "↻ NEXT: retry the same work", author=AGENT_ID)
+        mesh.add_comment(t["id"], "↻ NEXT: retry the same work", author=AGENT_ID)   # text: ignored
         r.store.db.close()
-        r = self.runner(mesh)                      # the hold survives restart and our own NEXT
+        r = self.runner(mesh)                      # the hold survives restart and our own text line
         for _ in range(3):
             r.tick()
             self.assertEqual(r.store.by_state("builder", ("running", "starting")), [])
@@ -1091,7 +1091,32 @@ class TypedTurnCommands(Bench):
     """The fake agent ends its turns with Mesh turn commands, as live lanes do: Mesh records the outcome,
     opens the request or arms the gate and writes the command's comment; the runner only settles on it."""
 
-    def test_ask_agent_waits_on_the_request_mesh_opened_and_files_none_itself(self):
+    def test_only_a_typed_continue_next_with_a_note_after_the_hold_lifts_a_wait_correction(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.me = mesh.me()                                  # as the first tick reads it
+        failed_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
+        later = (failed_at + dt.timedelta(minutes=5)).isoformat()
+        earlier = (failed_at - dt.timedelta(minutes=5)).isoformat()
+
+        def rows(*turns):
+            mesh.outcomes = {t["id"]: [turn_rows(turn, at=at)[0] | extra for turn, at, extra in turns]}
+            return r._correction_rearmed(t["id"], failed_at)
+
+        self.assertFalse(rows())                                                    # nothing after the hold
+        self.assertTrue(rows((next_turn("fixed the baseline"), later, {})))         # own NEXT with a reason
+        self.assertFalse(rows((next_turn(""), later, {})))                          # no repair reason
+        self.assertFalse(rows((next_turn("fixed the baseline"), earlier, {})))      # before the hold
+        self.assertFalse(rows((wait_pipeline("g/app", 5), later, {})))              # the same wait again
+        self.assertFalse(rows((next_turn("not mine"), later, {"agent_id": "someone-else"})))
+        mesh.outcomes = {}
+        mesh.add_comment(t["id"], "↻ NEXT: fixed the baseline", author=AGENT_ID)   # text is not an outcome
+        self.assertFalse(r._correction_rearmed(t["id"], failed_at))
+        mesh.add_comment(t["id"], "use pipeline 6 instead", author="lead")          # a foreign correction
+        self.assertTrue(r._correction_rearmed(t["id"], failed_at))
+
+    def test_ask_agent_waits_on_the_request_mesh_opened_and_files_the_one_card_that_starts_the_addressee(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "approve the plan?")})
@@ -1100,12 +1125,18 @@ class TypedTurnCommands(Bench):
         self.settle_all(r)
         a = r.store.by_state("builder", ("waiting",))[0]
         self.assertEqual(a.wait["kind"], "decision")
-        self.assertEqual(mesh.created, [])                           # Mesh opened it, not the runner
+        self.assertTrue(a.wait.get("decision_request_id"))
+        # Mesh records the request, but its comment wakes nobody: the request card is what starts the
+        # addressee (effects.on_wait), one card, quoting the question Mesh wrote
+        self.assertEqual([(c["assignee_id"], c["title"]) for c in mesh.created],
+                         [("agent-lead", f"[decision] approve the plan? (#{t['id'][:8]})")])
+        self.assertTrue(a.wait.get("ask_filed"))
         self.assertFalse(mesh.tasks[t["id"]].get("human_gate"))
         self.assertFalse(any("❓" in c["body"] or "⏳" in c["body"] for c in mesh.comments_all(t["id"])))
         for _ in range(3):
             r.tick()
         self.assertEqual(len(calls(self.calls)), 1)
+        self.assertEqual(len(mesh.created), 1)                       # no second card on later passes
 
     def test_continue_next_runs_the_next_turn_in_the_same_session(self):
         t = task(1)
@@ -1699,7 +1730,7 @@ class FastWaits(Bench):
         self.settle_all(r)
         woken = calls(self.calls)[1]["prompt"]            # (a third turn: the fake Mesh knows no @executor)
         self.assertIn("wait cycle", woken)
-        self.assertIn("decision:@executor", woken)
+        self.assertIn("ask_agent to=Executor", woken)
 
 
 
@@ -2655,10 +2686,14 @@ class OwnWorkInReview(Bench):
     not seen happens: then the next step is the author's and it is fed with the event."""
 
     def own_work(self, mesh, r, t, during=None, closing="done; sent to review",
-                 reply="SLEEP:1:done"):
+                 reply="SLEEP:1:done", declared=None):
+        """``declared``: a typed wait command (fakes.wait_*, ask_human) the agent still holds in Mesh."""
         write_replies(self.replies, {t["id"][:8]: reply})
         r.tick()                                                   # the work turn starts
         mesh.add_comment(t["id"], closing, author=AGENT_ID)
+        if declared:
+            mesh.waits = getattr(mesh, "waits", {})
+            mesh.waits[t["id"]] = turn_rows(declared)[1]
         if during:
             during()
         mesh.set_category(t["id"], "review")                       # the agent sent it to review
@@ -2679,13 +2714,30 @@ class OwnWorkInReview(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
-        # a merge webhook writes as another agent while the turn is still winding down
-        self.own_work(mesh, r, t, during=lambda: mesh.add_comment(
-            t["id"], "MR !7 merged", author="agent-reviewer",
-            at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(milliseconds=300)),
-            # The automatic review must end with an outcome. Plain "done" retries
-            # no-outcome turns and makes this event/prompt test depend on CI speed.
-            reply="SLEEP:1:⏳ WAIT decision:@lead")
+        gate = HarnessGate(self.root / "work-background")
+        self.agent.inline_env["FAKE_BG_GATE"] = str(gate.path)
+        write_replies(self.replies, {t["id"][:8]: slow("BG:GATE:", finish("review"))})
+        r.tick()
+        work = r.store.by_state("builder", ("running",))[0]
+        try:
+            # finish_task has written the author's last word, but its process group stays alive.
+            self.assertEqual(r.procs[work.id].wait(timeout=10), 0)
+            turns = mesh.recorded_turns(t["id"])
+            self.assertEqual([row["kind"] for row, _ in turns], ["review"])
+            closing = mesh.comment_log[t["id"]][-1]
+            self.assertEqual(closing["author_id"], AGENT_ID)
+            self.assertTrue(group_alive(work.pid, work.stamp))
+            webhook = mesh.add_comment(t["id"], "MR !7 merged", author="agent-reviewer")
+            self.assertLess(closing["created_at"], webhook["created_at"])
+            self.assertEqual(r.store.get(work.id).state, "running")
+            # The automatic review must end with an outcome; the work turn has exited.
+            write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?")})
+        finally:
+            gate.release()
+        self.settle_all(r)
+        ended = r.store.get(work.id)
+        self.assertEqual(ended.state, "completed")
+        self.assertLess(webhook["created_at"], ended.updated_at)
         review = [a for a in r.store.by_state("builder", ("waiting",)) if a.mode == "review"]
         self.assertEqual(len(review), 1)
         self.assertEqual(review[0].no_outcome, 0)
@@ -2771,7 +2823,7 @@ class OwnWorkInReview(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         gl = FakeGitLab()
         r = self.runner(mesh, gitlab=gl)
-        self.own_work(mesh, r, t, closing="merge after CI\n⏳ WAIT mr:g/app!9")
+        self.own_work(mesh, r, t, closing="merge after CI", declared=wait_mr("g/app", 9, until="merged"))
         gl.mr_rows["g/app!9"] = {"state": "opened", "sha": "1234"}
         self.assertIn("own work", self.review_hold(r, t))
         gl.mr_rows["g/app!9"] = {"state": "merged", "merged_at": self.later(30), "sha": "1234"}
@@ -2785,7 +2837,7 @@ class OwnWorkInReview(Bench):
         t = task(1)
         mesh = FakeMesh([t, other], max_concurrent=1)
         r = self.runner(mesh)
-        self.own_work(mesh, r, t, closing=f"⏳ WAIT card:#{other['id'][:8]}")
+        self.own_work(mesh, r, t, declared=wait_card(other["id"]))
         self.assertIn("own work", self.review_hold(r, t))
         mesh.set_category(other["id"], "done")
         self.assertEqual(self.review_hold(r, t), "")
@@ -2859,7 +2911,7 @@ class OwnWorkInReview(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
-        self.own_work(mesh, r, t, closing="❓ Blocking @owner: which database?")
+        self.own_work(mesh, r, t, closing="which database?", declared=ask_human("owner", "which database?"))
         self.assertIn("own work", self.review_hold(r, t))           # no gate set on this path: still asked
         mesh.tasks[t["id"]]["human_gate"] = True
         self.assertEqual(self.review_hold(r, t), "waiting for a human decision")
@@ -2871,7 +2923,7 @@ class OwnWorkInReview(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
-        self.own_work(mesh, r, t, closing="❓ Blocking @owner: which database?")
+        self.own_work(mesh, r, t, closing="which database?", declared=ask_human("owner", "which database?"))
         mesh.links = {t["id"]: [{"link_type": "commit", "title": "x", "created_at": self.later(600)}]}
         self.assertIn("own work", self.review_hold(r, t))           # code news do not answer a question
         mesh.add_comment(t["id"], "use postgres", author="owner",
@@ -2907,7 +2959,8 @@ class OwnWorkInReview(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
         until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=40)).strftime("%Y-%m-%dT%H:%MZ")
-        a = self.own_work(mesh, r, t, closing=f"merged, watching the window\n\n⏳ WAIT {until}: external=fixture-window source=card:#abcdef12 48h window")
+        a = self.own_work(mesh, r, t, closing="merged, watching the window",
+                        declared=wait_time(until, why="48h window", source="card:#abcdef12"))
         old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=5)).isoformat()
         r.store.db.execute("UPDATE attempts SET created_at=?, updated_at=? WHERE id=?", (old, old, a.id))
         for c in mesh.comment_log[t["id"]]:
@@ -2918,7 +2971,7 @@ class OwnWorkInReview(Bench):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
-        a = self.own_work(mesh, r, t, closing="merged\n\n⏳ WAIT pipeline:grp/proj#123")
+        a = self.own_work(mesh, r, t, closing="merged", declared=wait_pipeline("grp/proj", 123))
         ago = lambda h: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=h)).isoformat()  # noqa: E731
         set_age = lambda h: ([r.store.db.execute("UPDATE attempts SET created_at=?, updated_at=? WHERE id=?", (ago(h), ago(h), a.id))]  # noqa: E731
                              + [c.update(created_at=ago(h)) for c in mesh.comment_log[t["id"]]])
@@ -3527,8 +3580,9 @@ class ParkedCard(Bench):
 class ParkedReview(Bench):
     """Review uses the same park boundary as work, with its session kept in a real Store."""
 
-    def start_review(self, reply='↻ NEXT'):
+    def start_review(self, reply=None):
         t = task(95, cat='review')
+        reply = reply or next_turn('review started')
         write_replies(self.replies, {t['id'][:8]: reply,
                                      t['id'][:8] + ':resume': next_turn("continued review")})
         r = self.runner(FakeMesh([t]))
@@ -3957,7 +4011,7 @@ class CappedEventObservation(Bench):
         self.r.check_wakes()
         self.assertEqual(self.r.store.get(a.id).wait["cap_override"]["comment_id"], c["id"])
 
-    def cap(self, status="running", reply="⏳ WAIT pipeline:g/app#5"):
+    def cap(self, status="running", reply=None):
         from mesh_runner.wake import GitLab
         self.cfg.daily_wait_budget = 0
         self.cfg.daily_next_budget = 0
@@ -3967,7 +4021,7 @@ class CappedEventObservation(Bench):
         self.gl.pipelines["g/app#5"] = status
         self.gl.seed = lambda kind, target, now: GitLab.seed(self.gl, kind, target, now)
         self.gl.pipeline_event = lambda target, last: GitLab.pipeline_event(self.gl, target, last)
-        write_replies(self.replies, {self.t["id"][:8]: reply})
+        write_replies(self.replies, {self.t["id"][:8]: reply or wait_pipeline("g/app", 5)})
         self.r = self.runner(self.mesh, self.gl)
         self.r.tick()
         self.settle_all(self.r)
@@ -4015,7 +4069,7 @@ class CappedEventObservation(Bench):
             self.assertEqual(reason, "daily turn budget spent; waits for tomorrow (UTC) or a new comment")
 
     def test_cap_next_has_no_event_escape(self):
-        self.cap(reply="↻ NEXT")
+        self.cap(reply=next_turn("more work"))
         self.gl.pipelines["g/app#5"] = "success"
         for _ in range(3):
             self.r.tick()
@@ -4114,7 +4168,7 @@ class CappedEventObservation(Bench):
 
     def test_mr_merge_event_is_observed_once_under_cap(self):
         from mesh_runner.wake import GitLab
-        self.cap(reply="⏳ WAIT mr:g/app!5")
+        self.cap(reply=wait_mr("g/app", 5))
         self.gl.mr_event = lambda target, last, now=None: GitLab.mr_event(self.gl, target, last, now)
         self.gl.mr_rows["g/app!5"] = {"state": "merged"}
         self.r.tick()

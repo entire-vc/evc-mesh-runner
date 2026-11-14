@@ -1,6 +1,6 @@
 """A wait cycle is told once per signature, and a question is not converted into one.
 
-Observed shape: agent A asked ``⏳ WAIT decision:@b: ... #<B's card>``; the runner converted it into
+Observed shape: agent A asked ``ask_agent to=b`` about ``#<B's card>``; the runner converted it into
 a card wait on B's live card, which itself waited ``decision:@a``. The cycle notice told A to ask
 with ``decision:@b`` instead, which was converted again: a cycle wake and a resumed turn every two
 minutes, dozens of times, until the turn cap handed the card up. Two rules end it:
@@ -16,7 +16,7 @@ Names are spelled out instead of imported so this file runs against the old code
 """
 import json
 
-from fakes import FakeMesh, calls, task, write_replies, wait_card
+from fakes import FakeMesh, ask_agent, calls, task, write_replies, wait_card
 from mesh_runner.config import AgentConfig
 from mesh_runner.runner import TASK_WIDE, AgentRunner
 from mesh_runner.store import Store
@@ -248,6 +248,7 @@ class MutualCardCycle(Bench):
 class DecisionAboutALiveTaskThatWaitsOnTheAsker(Bench):
     """The observed shape: the question names the addressee's live task, and that task waits on the asker."""
 
+
     def declare(self, their_wait):
         self.source = task(1)
         self.live = task(2, cat="in_progress", assignee_id="agent-lead")
@@ -258,28 +259,17 @@ class DecisionAboutALiveTaskThatWaitsOnTheAsker(Bench):
             theirs = self.r.store.create("lead", self.live["id"], "claude", "fixture")
             self.r.store.update(theirs, state="waiting", wait=their_wait)
         write_replies(self.replies, {self.source["id"][:8]:
-                                     f"⏳ WAIT decision:@lead: run A5 on prod from #{self.live['id'][:8]}"})
+                                     ask_agent("lead", f"run A5 on prod from #{self.live['id'][:8]}")})
         self.r.tick()
         return self.finish_turn(self.r)
 
-    def test_it_is_filed_as_a_request_not_converted_into_a_cycle(self):
-        a = self.declare({"kind": "decision", "handle": "builder",
-                          "line": f"⏳ WAIT decision:@builder: run A5 on prod from #{MINE8}"})
-        self.assertEqual(a.state, "waiting")
-        self.assertEqual(a.wait["kind"], "decision")              # not card:#<live>
-        self.assertNotIn("converted_from", a.wait)
-        self.assertEqual(len(self.mesh.created), 1)               # one addressed request
-        self.assertEqual(self.mesh.created[0]["assignee_id"], "agent-lead")
-        self.assertIn("decision_to_card_wait_skipped", events(self.r, a.id))
-        self.assertNotIn("decision_to_card_wait", events(self.r, a.id))
-
-    def test_the_live_task_waiting_on_this_card_closing_is_a_cycle_too(self):
-        a = self.declare({"kind": "card", "target": MINE8, "line": f"⏳ WAIT card:#{MINE8}"})
-        self.assertEqual(a.wait["kind"], "decision")
-        self.assertIn("decision_to_card_wait_skipped", events(self.r, a.id))
-
-    def test_without_a_cycle_the_question_still_becomes_a_card_wait(self):
-        for label, their_wait in (("no attempt", None),
+    def test_a_question_already_filed_in_mesh_is_never_converted_into_a_card_wait(self):
+        """ask_agent is recorded by Mesh as a decision request before the runner reads it: the runner
+        converts nothing, so a question naming the addressee's live task stays a decision wait
+        whatever that task waits on (no cycle can form from a conversion that does not happen)."""
+        for label, their_wait in (("waits on this card", {"kind": "card", "target": MINE8,
+                                                          "line": f"⏳ WAIT card:#{MINE8}"}),
+                                  ("no attempt", None),
                                   ("waits on a pipeline", {"kind": "pipeline", "target": "g/p#1",
                                                            "line": "⏳ WAIT pipeline:g/p#1"}),
                                   ("asks someone else", {"kind": "decision", "handle": "reviewer",
@@ -287,7 +277,10 @@ class DecisionAboutALiveTaskThatWaitsOnTheAsker(Bench):
             with self.subTest(label):
                 self.setUp()
                 a = self.declare(their_wait)
-                self.assertEqual((a.wait["kind"], a.wait["target"]), ("card", self.live["id"][:8]))
-                self.assertEqual(self.mesh.created, [])
-                self.assertIn("decision_to_card_wait", events(self.r, a.id))
+                self.assertEqual(a.state, "waiting")
+                self.assertEqual(a.wait["kind"], "decision")
+                self.assertNotIn("converted_from", a.wait)
+                kinds = events(self.r, a.id)
+                self.assertNotIn("decision_to_card_wait", kinds)
+                self.assertNotIn("decision_to_card_wait_skipped", kinds)
                 self.tearDown()

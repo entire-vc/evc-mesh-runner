@@ -44,11 +44,11 @@ SOURCES = ("startup", "resume", "compact")  # clear is recorded by the hook but 
 _PROFILE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 WAIT_GUIDANCE = (
-    "invalid lifecycle wait: `⏳ WAIT lifecycle:#<this-card-8hex>` is accepted only when the lifecycle "
+    "invalid lifecycle wait: `wait_for on=registered registration=lifecycle` is accepted only when the lifecycle "
     "observer is enabled on this runner and an operator armed a live registration for this card and "
     "this owner (`mesh-runner lifecycle-wait arm`). It wakes once on the first new correlated "
     "startup/resume/compact SessionStart candidate or recorded hook failure after that registration. "
-    "Nothing is armed here: declare another condition (card, mr, pipeline, decision) or ask the "
+    "Nothing is armed here: wait on another condition (card, mr, pipeline, ask_agent) or ask the "
     "operator to arm it."
 )
 

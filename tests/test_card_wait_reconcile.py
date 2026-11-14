@@ -1,15 +1,13 @@
-"""Owner ticks repair stale card intent without waking or modifying Mesh.
+"""A card WAIT whose formal dependency disagrees with the target it observes is held, never woken on the old target.
 
-FakeMesh is the external Mesh service boundary; Runner, parser and SQLite are real.
+Comment text is not owner intent: a newer wait replaces this one only through Mesh (a typed wait_for read
+when the turn settles), so no comment, marker or prose, retargets or releases it.
+FakeMesh is the external Mesh service boundary; Runner and SQLite are real.
 """
 import copy
 import datetime as dt
-import json
-import subprocess
-import sys
 
-from fakes import AGENT_ID, FakeMesh, task
-from mesh_runner.effects import runtime_state
+from fakes import FakeMesh, task
 from mesh_runner.mesh import MeshError
 from mesh_runner.runner import AgentRunner
 from mesh_runner.store import Store
@@ -17,25 +15,6 @@ from test_runner import Bench
 
 
 class CardWaitReconcile(Bench):
-    def test_tied_newest_prose_and_wait_hold_before_ordinary_observer(self):
-        for prose_first in (True, False):
-            for empty_edges in (True, False):
-                with self.subTest(prose_first=prose_first, empty_edges=empty_edges):
-                    r, a, t, _, edge, c = self.flow()
-                    prose = dict(c, id='tied-prose', body='Owner progress update.')
-                    r.mesh.comment_log[t['id']] = [prose, c] if prose_first else [c, prose]
-                    edge.update(depends_on_task_id=task(2)['id'], condition_satisfied=True)
-                    r.mesh.deps[t['id']] = [] if empty_edges else [edge]
-                    self.unchanged(r, a)
-
-    def test_tied_prose_only_keeps_ordinary_valid_wait_observation(self):
-        r, a, t, _, edge, c = self.flow()
-        c['body'] = 'Owner progress update.'
-        r.mesh.comment_log[t['id']] = [c, dict(c, id='other-prose', body='Another update.')]
-        edge.update(depends_on_task_id=task(2)['id'], condition_satisfied=True)
-        r._wake_one(a)
-        self.assertEqual(r.store.get(a.id).state, 'ready')
-
     def flow(self):
         t, old, target = task(1), task(2, cat='done'), task(3)
         mesh = FakeMesh([t, old, target])
@@ -55,7 +34,7 @@ class CardWaitReconcile(Bench):
         edge = {'id': 'new-edge', 'task_id': t['id'], 'depends_on_task_id': target['id'],
                 'dependency_type': 'blocks', 'condition': 'task_done', 'condition_satisfied': False}
         mesh.deps[t['id']] = [edge]
-        c = mesh.add_comment(t['id'], 'Corroborated handoff.\n\n⏳ WAIT card:#' + target['id'][:8],
+        c = mesh.add_comment(t['id'], 'Corroborated handoff.',
                              at=dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc))
         return r, a, t, target, edge, c
 
@@ -66,77 +45,43 @@ class CardWaitReconcile(Bench):
         self.assertEqual(saved.state, 'waiting')
         self.assertFalse(r.store.mark(a.agent, a.task_id, 'card_wait_reconcile:' + a.id))
 
-    def test_owner_tick_retargets_without_waking_or_claiming_edge(self):
-        r, a, t, target, edge, c = self.flow()
-        before = copy.deepcopy(edge)
-        r.check_wakes()
-        saved = r.store.get(a.id)
-        self.assertEqual((saved.state, saved.wait['target']), ('waiting', target['id'][:8]))
-        self.assertEqual((saved.session_id, saved.workspaces, saved.turns, saved.wake_text),
-                         ('native-session', ['/leased/wt'], 0, ''))
-        self.assertNotIn('edge', saved.wait)
-        self.assertNotIn('errors', saved.wait)
-        self.assertEqual(saved.wait['since'], c['created_at'])
-        receipt = json.loads(r.store.mark(a.agent, a.task_id, 'card_wait_reconcile:' + a.id)[0])
-        self.assertEqual(receipt, saved.wait['card_reconcile'])
-        self.assertEqual((receipt['old_target'], receipt['comment_id'], receipt['dependency_id']),
-                         ('00000002', c['id'], edge['id']))
-        self.assertEqual(r.mesh.deps[t['id']], [before])
-        self.assertEqual(len(r.mesh.comment_log[t['id']]), 1)
-        self.assertFalse(self.calls.exists())
-        desired = runtime_state(saved, 'test')
-        self.assertEqual((desired['kind'], desired['ref']), ('waiting', 'card:#' + target['id'][:8]))
-
-    def test_synthetic_stale_installed_wait_shape(self):
-        # Whitelisted fields from the synthetic receipt shape.
-        # The installed registry retained 22222222 while the own marker and
-        # sole task_done dependency both already named 11111111.
-        r, a, t, _, edge, c = self.flow()
-        source = '00000000-0000-4000-8000-000000000011'
-        destination = '11111111-1111-4111-8111-111111111111'
-        t['id'] = source
-        r.mesh.tasks[source] = t
-        c.update(id='00000000-0000-4000-8000-000000000033',
-                 created_at='2026-10-04T00:00:00Z', body='Owner correction.\n⏳ WAIT card:#11111111')
-        edge.update(id='00000000-0000-4000-8000-000000000044', task_id=source,
-                    depends_on_task_id=destination)
-        r.mesh.deps[source] = [edge]
-        r.mesh.comment_log[source] = [c]
-        wait = dict(self.oldwait, target='22222222', since='2026-10-03T00:00:00Z')
-        r.store.update(a, task_id=source, wait=wait)
-        r._wake_one(a)
-        saved = r.store.get(a.id)
-        self.assertEqual((saved.state, saved.wait['target']), ('waiting', '11111111'))
-        receipt = saved.wait['card_reconcile']
-        self.assertEqual((receipt['old_target'], receipt['comment_id'], receipt['dependency_id']),
-                         ('22222222', c['id'], edge['id']))
-        self.assertEqual(runtime_state(saved, 'agent-a')['ref'], 'card:#11111111')
-        self.assertEqual(r.mesh.deps[source], [edge])
-        self.assertFalse(self.calls.exists())
-
-    def test_settled_pid_is_retained_but_live_process_group_blocks_repair(self):
-        r, a, _, target, _, _ = self.flow()
-        r.store.update(a, pid=999999999)
-        r._wake_one(a)
-        self.assertEqual(r.store.get(a.id).wait['target'], target['id'][:8])
-        r, a, _, _, _, _ = self.flow()
-        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)
-        try:
-            r.store.update(a, pid=proc.pid)
-            self.unchanged(r, a)
-        finally:
-            proc.terminate()
-            proc.wait(timeout=5)
-
     def test_unknown_or_ambiguous_dependency_never_wakes_old_done_target(self):
-        for change in ({'condition_satisfied': None}, {'condition_satisfied': True},
-                       {'condition_satisfied': 0}, {'condition': 'accepted'},
-                       {'dependency_type': 'relates_to'}, {'task_id': 'foreign'},
-                       {'depends_on_task_id': task(4)['id']}, {'id': ''}):
+        for change in ({'condition_satisfied': None}, {'condition_satisfied': 0}, {'condition': 'accepted'},
+                       {'task_id': 'foreign'}, {'depends_on_task_id': task(4)['id']}, {'id': ''}):
             with self.subTest(change=change):
                 r, a, _, _, edge, _ = self.flow()
                 edge.update(change)
                 self.unchanged(r, a)
+
+    def test_known_released_or_informational_edges_let_the_ordinary_observer_wake_the_old_done_target(self):
+        # the same flow, but Mesh's verdict is explicit: the satisfied block / the relates_to link
+        # does not constrain observation, so the done target wakes the attempt
+        for change in ({'condition_satisfied': True}, {'dependency_type': 'relates_to'}):
+            with self.subTest(change=change):
+                r, a, _, _, edge, _ = self.flow()
+                edge.update(change)
+                r._wake_one(a)
+                self.assertEqual(r.store.get(a.id).state, 'ready')
+
+    def test_a_block_on_the_waited_target_corroborates_the_wait(self):
+        # positive control for the hold: the unsatisfied block names the target the wait observes
+        r, a, t, _, edge, _ = self.flow()
+        edge.update(depends_on_task_id=task(2)['id'])
+        r._wake_one(a)
+        self.assertEqual(r.store.get(a.id).state, 'ready')
+
+    def test_comment_text_never_retargets_or_releases_the_wait(self):
+        # a marker line, a fenced or doubled one, or prose in the owner's own comments is not intent:
+        # the wait stays on its old target, held by the disagreeing dependency, and nothing is written
+        for body in ('\u23f3 WAIT card:#00000003', '\u21bb NEXT', '\u23f3 WAIT card:#00000003\n\u23f3 WAIT card:#00000004',
+                     '```\n\u23f3 WAIT card:#00000003\n```', 'Owner status update without a declaration.'):
+            with self.subTest(body=body):
+                r, a, t, _, edge, _ = self.flow()
+                before = copy.deepcopy(edge)
+                r.mesh.add_comment(t['id'], body, at=dt.datetime(2026, 10, 3, tzinfo=dt.timezone.utc))
+                self.unchanged(r, a)
+                self.assertEqual(r.mesh.deps[t['id']], [before])
+                self.assertFalse(self.calls.exists())
 
     def test_multiple_edges_are_ambiguous_even_if_one_satisfied(self):
         r, a, t, _, edge, _ = self.flow()
@@ -153,73 +98,6 @@ class CardWaitReconcile(Bench):
             r._wake_one(a)
         self.assertEqual(r.store.get(a.id).wait, self.oldwait)
 
-    def test_wrong_checkout_or_foreign_writer_cannot_retarget(self):
-        for changes in ({'checkout_session_id': None}, {'checkout_session_id': 'other'},
-                        {'checked_out_by': 'other-agent'}):
-            with self.subTest(changes=changes):
-                r, a, t, _, _, _ = self.flow()
-                t.update(changes)
-                self.unchanged(r, a)
-
-    def test_ambiguous_marker_is_not_authority(self):
-        for body in ('⏳ WAIT card:#00000003\n⏳ WAIT card:#00000004',
-                     '```\n⏳ WAIT card:#00000003\n```',
-                     '⏳ WAIT card:#00000003\nExplanatory footer',
-                     '⏳ WAIT card:#00000003-0000-4000-8000-000000000003'):
-            with self.subTest(body=body):
-                r, a, _, _, _, c = self.flow()
-                c['body'] = body
-                self.unchanged(r, a)
-
-    def test_old_and_foreign_comments_do_not_retarget(self):
-        for foreign in (False, True):
-            r, a, _, _, _, c = self.flow()
-            if foreign:
-                c['author_id'] = 'other-agent'
-            else:
-                c['created_at'] = self.oldwait['since']
-            # Old/foreign text cannot authorize retargeting. The mismatched
-            # pending dependency still forbids observing the old DONE target.
-            self.unchanged(r, a)
-            self.assertEqual(r.store.get(a.id).wait, self.oldwait)
-
-    def test_same_instant_markers_and_newest_own_nonmarker_are_not_reused(self):
-        r, a, t, _, _, c = self.flow()
-        r.mesh.add_comment(t['id'], '⏳ WAIT card:#00000004',
-                           at=dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc))
-        self.unchanged(r, a)
-        r, a, t, _, _, c = self.flow()
-        r.mesh.add_comment(t['id'], 'A newer owner update without a declaration.',
-                           at=dt.datetime(2026, 10, 3, tzinfo=dt.timezone.utc))
-        self.unchanged(r, a)
-
-    def test_missing_old_wait_timestamp_and_scheduled_effect_are_not_repaired(self):
-        for change in ({'since': ''}, {'scheduled': '2026-10-04T00:00:00Z'}):
-            r, a, _, _, _, _ = self.flow()
-            self.oldwait.update(change)
-            r.store.update(a, wait=copy.deepcopy(self.oldwait))
-            self.unchanged(r, a)
-
-    def test_prose_after_wait_never_retargets_from_history_or_wakes_old_done(self):
-        for prose in ('[runner] completed in 2m', 'Owner status update without a declaration.'):
-            with self.subTest(prose=prose):
-                r, a, t, _, _, _ = self.flow()
-                r.mesh.add_comment(t['id'], prose,
-                                   at=dt.datetime(2026, 10, 3, tzinfo=dt.timezone.utc))
-                self.unchanged(r, a)  # full _wake_one; old target is DONE
-                self.assertEqual(r.store.get(a.id).wait['target'], '00000002')
-                self.assertFalse(self.calls.exists())
-
-    def test_real_top_level_session_has_no_nested_fallback(self):
-        r, a, t, target, _, _ = self.flow()
-        self.assertNotIn('metadata', t)
-        r._wake_one(a)
-        self.assertEqual(r.store.get(a.id).wait['target'], target['id'][:8])
-        r, a, t, _, _, _ = self.flow()
-        t.pop('checkout_session_id')  # released/absent session provenance
-        t['metadata'] = {'checkout_session_id': a.id}  # unsupported field cannot authorize
-        self.unchanged(r, a)
-
     def test_prose_with_unknown_edges_holds_but_matching_edge_uses_normal_observer(self):
         r, a, t, _, edge, _ = self.flow()
         r.mesh.add_comment(t['id'], '[runner] completed in 2m',
@@ -229,44 +107,3 @@ class CardWaitReconcile(Bench):
         edge.update(condition_satisfied=True, depends_on_task_id=task(2)['id'])
         r._wake_one(a)
         self.assertEqual(r.store.get(a.id).state, 'ready')
-
-    def test_future_or_missing_timestamp_fails_closed(self):
-        for created in ('', 'not-a-date', '2999-01-01T00:00:00Z'):
-            r, a, _, _, _, c = self.flow()
-            c['created_at'] = created
-            self.unchanged(r, a)
-
-    def test_state_and_wait_cas_preserve_concurrent_owner_change(self):
-        for state, wait in (('ready', {'kind': 'card', 'target': 'concurrent'}),
-                            ('waiting', {'kind': 'card', 'target': 'deadbeef', 'since': '2026-10-03T00:00:00Z'})):
-            with self.subTest(state=state):
-                r, stale, _, _, _, _ = self.flow()
-                # A second genuine SQLite connection commits between snapshot and CAS.
-                other = Store(self.db_path)
-                live = other.get(stale.id)
-                other.update(live, state=state, wait=wait)
-                other.db.close()
-                r._wake_one(stale)
-                saved = r.store.get(stale.id)
-                self.assertEqual((saved.state, saved.wait), (state, wait))
-                self.assertFalse(r.store.mark(stale.agent, stale.task_id, 'card_wait_reconcile:' + stale.id))
-
-    def test_identity_cas_rejects_changed_agent_even_with_same_wait(self):
-        r, stale, _, _, _, _ = self.flow()
-        other = Store(self.db_path)
-        other.db.execute('UPDATE attempts SET agent=? WHERE id=?', ('other', stale.id))
-        other.db.close()
-        r._wake_one(stale)
-        saved = r.store.get(stale.id)
-        self.assertEqual((saved.agent, saved.state, saved.wait), ('other', 'waiting', self.oldwait))
-        self.assertFalse(r.store.mark(stale.agent, stale.task_id, 'card_wait_reconcile:' + stale.id))
-
-    def test_removed_old_edge_never_becomes_owned_new_edge_on_later_tick(self):
-        r, a, t, target, edge, _ = self.flow()
-        r._wake_one(a)
-        # Once target closes the ordinary observer wakes, but on_end must leave
-        # the independently supplied dependency alone.
-        target['status_id'] = 's-done'
-        r._wake_one(a)
-        self.assertEqual(r.store.get(a.id).state, 'ready')
-        self.assertEqual(r.mesh.deps[t['id']], [edge])

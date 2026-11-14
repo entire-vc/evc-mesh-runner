@@ -1461,6 +1461,9 @@ class Driver:
                 model = model or str(msg.get("model") or "")
                 if msg.get("id"):
                     usage[msg["id"]] = msg.get("usage") or {}
+                else:
+                    # Without a message id its usage cannot be deduplicated reliably.
+                    usage[None] = {}
                 if e.get("isApiErrorMessage"):
                     error = " ".join(str(b.get("text") or "") for b in msg.get("content") or []
                                      if isinstance(b, dict)).strip() or "API error"
@@ -1473,8 +1476,11 @@ class Driver:
                 self.emit({**rec, "session_id": sid})
         total = {}
         for u in usage.values():
-            for k, v in u.items():
-                if isinstance(v, (int, float)):
+            for k in set(u) | {"input_tokens", "output_tokens"}:
+                v = u.get(k)
+                if not isinstance(v, (int, float)) or (k in total and total[k] is None):
+                    total[k] = None
+                else:
                     total[k] = total.get(k, 0) + v
         # Preserve the CLI hook's typed failure, independently of transcript prose.
         # A task or assistant quoting the same words must never quarantine a profile.
@@ -1514,8 +1520,13 @@ class Driver:
         thread = self.rollout_thread() or str(ev.get("thread-id") or self.meta.get("session_id") or self.sid)
         self.meta["session_id"] = thread
         after = self.codex_totals()
-        usage = {k: max(0, int(after.get(k) or 0) - int(before.get(k) or 0))
-                 for k in ("input_tokens", "cached_input_tokens", "output_tokens")} if after else {}
+        usage = {}
+        for k in ("input_tokens", "cached_input_tokens", "output_tokens"):
+            # Only a new session has a known zero baseline without a token record.
+            previous = before.get(k, 0 if self.mode == "start" and not before else None)
+            current = after.get(k)
+            usage[k] = (max(0, int(current) - int(previous))
+                        if current is not None and previous is not None else None)
         self.codex_thread_started(thread)
         final = str(ev.get("last-assistant-message") or "")
         # The final message was streamed only when the rollout was read to the task's end and the last

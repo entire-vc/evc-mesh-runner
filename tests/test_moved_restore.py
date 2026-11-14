@@ -15,10 +15,10 @@ from mesh_runner import interactive, path_guard
 from mesh_runner import prompt as prompts
 from mesh_runner.adapters.codex import CodexAdapter
 from mesh_runner.runner import AgentRunner
-from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, calls, task, write_replies, wait_time
 from test_runner import Bench
 
-WAIT = f'⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 external work'
+WAIT = wait_time(why='external work')
 BLOCK = "[runner] Your working copies moved while the task waited:"
 
 

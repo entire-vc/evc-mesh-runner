@@ -2,7 +2,7 @@
 import unittest
 
 from mesh_runner.wake import ci_delivery_key
-from fakes import FakeGitLab, FakeMesh, task, write_replies
+from fakes import FakeGitLab, FakeMesh, task, wait_mr, wait_pipeline, write_replies
 from test_runner import Bench
 
 SHA = 'a' * 40
@@ -20,15 +20,15 @@ def mr_row(status='success', labels=(), sha=SHA, pid=14845, state='opened'):
 
 
 def pipeline_line(status, baseline='running'):
-    return f'⏳ WAIT pipeline:{PIPELINE} until=success after={SHA}:14845:{baseline}'
+    return wait_pipeline('g/app', 14845, until='green', after_sha=SHA, after_pipeline_id=14845, after_status=baseline)
 
 
 def merged_line():
-    return f'⏳ WAIT mr:{MR} until=merged after={SHA}:opened'
+    return wait_mr('g/app', 56, until='merged', after_sha=SHA, after_status='opened')
 
 
 def change_line(status, pid=14845):
-    return f'⏳ WAIT mr:{MR} until=change after={SHA}:{pid}:{status}'
+    return wait_mr('g/app', 56, until='changed', after_sha=SHA, after_pipeline_id=pid, after_status=status)
 
 
 class UnattendedWait(Bench):
@@ -203,17 +203,19 @@ class UnattendedWait(Bench):
         return {'id': 14900, 'sha': self.NEWER_SHA, 'status': status, 'ref': 'refs/merge-requests/56/head'}
 
     def test_canceled_target_is_sent_back_once_with_the_newer_pipeline(self):
-        for until, status in (('success', 'canceled'), ('change', 'canceled'), ('change', 'cancelled'),
-                              ('change', 'skipped')):
+        for until, status in (('green', 'canceled'), ('changed', 'canceled'), ('changed', 'cancelled'),
+                              ('changed', 'skipped')):
             with self.subTest(until=until, status=status):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(status)
                 gl.newer[PIPELINE] = self.newer_row()
-                line = f'⏳ WAIT pipeline:{PIPELINE} until={until} after={SHA}:14845:{status}'
+                line = wait_pipeline('g/app', 14845, until=until, after_sha=SHA, after_pipeline_id=14845,
+                                     after_status=status)
                 a = self.turn(r, t, line)
                 self.assert_bounced(a, r, t, f'pipeline 14845 is {status}; nothing will change it',
                                     'Retry it, push, or wait on the newer pipeline 14900',
-                                    f'⏳ WAIT pipeline:g/app#14900 until=change after={self.NEWER_SHA}:14900:running')
+                                    f'wait_for on=pipeline project_path=g/app pipeline_id=14900 until=changed after_sha={self.NEWER_SHA} '
+                                    'after_pipeline_id=14900 after_status=running')
                 self.assertIsNotNone(r.store.mark(self.agent.name, t['id'], f'canceled_bounce:{PIPELINE}:{status}'))
                 r.store.db.close()
 
@@ -232,7 +234,8 @@ class UnattendedWait(Bench):
 
     def test_canceled_dead_wait_declared_again_is_kept_and_marked(self):
         r, t, gl = self.flow('canceled')
-        line = f'⏳ WAIT pipeline:{PIPELINE} until=change after={SHA}:14845:canceled'
+        line = wait_pipeline('g/app', 14845, until='changed', after_sha=SHA, after_pipeline_id=14845,
+                             after_status='canceled')
         a = self.turn(r, t, line)
         self.assertEqual(a.state, 'ready')
         a = self.turn(r, t, line, first=False)
@@ -246,12 +249,14 @@ class UnattendedWait(Bench):
     def test_bounce_history_is_not_truncated(self):
         self.cfg.daily_wait_budget = 1000
         r, t, gl = self.flow('canceled')
-        first = f'⏳ WAIT pipeline:{PIPELINE} until=change after={SHA}:14845:canceled'
+        first = wait_pipeline('g/app', 14845, until='changed', after_sha=SHA, after_pipeline_id=14845,
+                              after_status='canceled')
         self.assertEqual(self.turn(r, t, first).state, 'ready')
         for i in range(25):
             other = f'g/app#{20000 + i}'
             gl.pipeline_rows[other] = {'sha': SHA, 'id': 20000 + i, 'status': 'canceled'}
-            line = f'⏳ WAIT pipeline:{other} until=change after={SHA}:{20000 + i}:canceled'
+            line = wait_pipeline('g/app', 20000 + i, until='changed', after_sha=SHA, after_pipeline_id=20000 + i,
+                                 after_status='canceled')
             self.assertEqual(self.turn(r, t, line, first=False).state, 'ready')
         a = self.turn(r, t, first, first=False)
         self.assertEqual(a.state, 'waiting')
@@ -269,7 +274,8 @@ class UnattendedWait(Bench):
             with self.subTest(status=status):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(status)
-                line = f'⏳ WAIT pipeline:{PIPELINE} until=change after={SHA}:14845:{status}'
+                line = wait_pipeline('g/app', 14845, until='changed', after_sha=SHA, after_pipeline_id=14845,
+                                     after_status=status)
                 a = self.turn(r, t, line)
                 self.assertNotIn('nothing will change it', a.wake_text or '')
                 self.assertIsNone(r.store.mark(self.agent.name, t['id'], f'canceled_bounce:{PIPELINE}:canceled'))

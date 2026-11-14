@@ -147,9 +147,9 @@ REVIEW_PROTOCOL = """This task is in REVIEW and assigned to you. Decide it in th
   - accept: everything the task asks for is done and proven (merged, deployed, evidence on the task)
     → move it to done with a short comment naming the evidence;
   - return: something is missing → move it back to todo for its author with a comment saying what;
-  - a human must decide → a comment starting with "❓ Blocking @<human>: <question>".
+  - a human must decide → the Mesh turn command `ask_human to=<human> question=<question>`.
 Leaving it in review without one of these is wrong: it comes back to you only when someone writes on it.
-If the decision itself needs time (CI, a deploy), end with the usual outcome line: ⏳ WAIT … or ↻ NEXT.
+If the decision itself needs time (CI, a deploy), end with the usual turn command: wait_for … or continue_next.
 """
 
 
@@ -160,10 +160,9 @@ Do one of these in this turn:
     in progress and fix it;
   - hand it to whoever reviews or accepts this kind of work (assign it, or ask them by name in a comment);
   - if nobody fits, hand it to your lead with a comment saying it waits for a review;
-  - if the review itself waits on something real (CI, a deploy), end with ⏳ WAIT … for it;
-  - if your last comment is a ❓ Blocking question to a person, keep waiting for the answer:
-    end with that same line (❓ Blocking @<person>: <question>); a question to an agent waits
-    with ⏳ WAIT decision:@<agent>.
+  - if the review itself waits on something real (CI, a deploy), end with `wait_for` on it;
+  - if you asked a person (ask_human) and the answer has not come, keep waiting: `ask_human` with the same
+    question reuses the open one; a question to an agent waits with `ask_agent`.
 """
 
 
@@ -209,8 +208,8 @@ What changed: {event}
 
 The new comments by others are listed below when there are any; read older ones only for a concrete gap
 ({FETCH_HINT}). Continue from where you stopped, and end the turn with one Mesh
-turn command (wait_for, continue_next, ask_agent, ask_human, finish_task or hand_off; the marker line only if
-the command fails).
+turn command (wait_for, continue_next, ask_agent, ask_human, finish_task or hand_off). A line of text is not
+an outcome.
 
 {DECISION_WAIT_GUIDANCE}{delivery_note(task)}"""
 
@@ -259,8 +258,8 @@ def no_outcome_prompt(task: dict, line: str = "", why: str = "", merge: bool = F
     else:
         head = f"[runner] Your last turn on task #{task['id'][:8]} ended without an outcome.\n"
     return head + f"""End the turn now with ONE Mesh turn command (wait_for, continue_next, ask_agent, ask_human,
-finish_task or hand_off): call it, do not write it as a line. A marker line is read only after Mesh refused
-that command; then quote the command and the error in the same comment.
+finish_task or hand_off): call it, do not write it as a line. Text is never read as an outcome; if Mesh
+refused the command, fix what it names and call again.
 {contract(merge)}{delivery_note(task)}"""
 
 
@@ -272,15 +271,14 @@ def ask_not_raised_prompt(task: dict, handle: str, refusal: str = "") -> str:
 {refusal.strip()[:600]}
 
 Work from that answer. A new question needs a different subject and
-`ask_human ... supersedes=<what the earlier answer does not cover>` (marker fallback: a line
-`supersedes: <...>` in the same comment). Do not raise the gate any other way. End the turn with one Mesh
+`ask_human ... supersedes=<what the earlier answer does not cover>`. Do not raise the gate any other way. End the turn with one Mesh
 turn command.
 """
     return head + f"""A person is asked with the Mesh turn command
   ask_human to={handle} question=<one question, with your recommended default>
-Mesh posts it as a Blocking question, arms the human gate and checks that it was not answered before. Only if
-the command fails, post a comment whose last line is `❓ Blocking @{handle}: <question>`.
-`ask_agent` (`⏳ WAIT decision:@<handle>`) is for agents. If the decision is yours to make, make it and continue.
+Mesh posts it as a Blocking question, arms the human gate and checks that it was not answered before. A
+`❓ Blocking` line you write yourself is not a question to anyone: text is not an outcome.
+`ask_agent` is for agents. If the decision is yours to make, make it and continue.
 """
 
 

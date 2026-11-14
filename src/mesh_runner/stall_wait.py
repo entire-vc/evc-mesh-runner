@@ -37,11 +37,11 @@ _FENCE = re.compile(r"```json\n(?P<body>.*?)\n```", re.S)
 _LAST = re.compile(r"↻\s*NEXT")
 
 WAIT_GUIDANCE = (
-    "invalid stall wait: `⏳ WAIT stall:#<this-card-8hex>` is accepted only when the stall observer "
+    "invalid stall wait: `wait_for on=registered registration=stall` is accepted only when the stall observer "
     "is enabled on this runner and an operator armed a live registration for this card and this "
     "owner (`mesh-runner stall-wait arm`). It wakes once on the first NEW own-author "
-    "[mesh-stall-control:<uuid>] result comment on this card. Nothing is armed here: declare "
-    "another condition (card, mr, pipeline, decision) or ask the operator to arm it."
+    "[mesh-stall-control:<uuid>] result comment on this card. Nothing is armed here: wait on "
+    "another condition (card, mr, pipeline, ask_agent) or ask the operator to arm it."
 )
 
 

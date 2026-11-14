@@ -2,8 +2,7 @@
 observed state changes (including a retried pipeline that fails again) wakes on the next tick."""
 import datetime as dt
 
-from fakes import FakeGitLab, FakeMesh, task, write_replies
-from mesh_runner.outcome import parse_line
+from fakes import FakeGitLab, FakeMesh, task, typed, wait_card, wait_mr, wait_pipeline, write_replies
 from mesh_runner.store import iso
 from mesh_runner.wake import ci_delivery_key, ci_observation, typed_event
 from test_runner import Bench
@@ -22,8 +21,10 @@ def mr_row(status='failed', sha=SHA, pid=16447, labels=(), **extra):
 
 
 def change(kind, status, pid=16447, sha=SHA):
-    target = MR if kind == 'mr' else PIPELINE
-    return f'⏳ WAIT {kind}:{target} until=change after={sha}:{pid}:{status}'
+    baseline = dict(after_sha=sha, after_pipeline_id=pid, after_status=status)
+    if kind == 'mr':
+        return wait_mr('g/app', 224, until='changed', **baseline)
+    return wait_pipeline('g/app', 16355, until='changed', **baseline)
 
 
 class DeadWaits(Bench):
@@ -79,7 +80,7 @@ class DeadWaits(Bench):
         r, t, gl = self.flow(mr=mr_row('failed'), linked=False)
         a = self.turn(r, t, change('mr', 'failed'))
         self.assert_bounced(a, f'MR {MR}', 'pipeline 16447', 'already finished: failed',
-                            'nothing changes without a push or a retry', 'WAIT card:')
+                            'nothing changes without a push or a retry', 'wait_for on=card')
         self.assertEqual(r.store.idle_waits_today(self.agent.name, t['id']), 1)
 
     def test_canceled_or_skipped_head_is_sent_back_like_failed(self):
@@ -148,7 +149,7 @@ class DeadWaits(Bench):
     # -- c: until=merged on the task's own MR that was never linked --------------------------
 
     def merged(self):
-        return f'⏳ WAIT mr:{MR} until=merged after={SHA}:opened'
+        return wait_mr('g/app', 224, until='merged', after_sha=SHA, after_status='opened')
 
     def test_unlinked_mr_naming_the_task_in_its_description_is_the_tasks_own(self):
         r, t, gl = self.flow(mr=mr_row('success', pid=16467,
@@ -195,7 +196,7 @@ class DeadWaits(Bench):
     def test_typed_event_fires_on_each_transition_away_from_the_baseline(self):
         gl = FakeGitLab()
         for kind, target, pid in (('mr', MR, 16447), ('pipeline', PIPELINE, 16355)):
-            wait = parse_line(change(kind, 'running', pid=pid), dt.datetime.now(dt.timezone.utc)).extra
+            wait = typed(change(kind, 'running', pid=pid)).extra
             for status in ('failed', 'success', 'manual'):
                 gl.mr_rows[MR] = mr_row(status)
                 gl.pipeline_rows[PIPELINE] = {'sha': SHA, 'id': 16355, 'status': status}
@@ -282,7 +283,7 @@ class DeadWaits(Bench):
                                                   'since': iso(), 'started': iso()})
         key = ci_delivery_key(MR, 16447)
         r.store.mark(self.agent.name, t['id'], key, f'{SHA}:16447:failed')
-        a = self.turn(r, t, f"⏳ WAIT card:#{x['id'][:8]}")
+        a = self.turn(r, t, wait_card(x['id']))
         self.assertEqual(a.state, 'ready')
         self.assertIn('does not hold development', a.wake_text)
         self.assertEqual(r.store.mark(self.agent.name, t['id'], key)[0], f'{SHA}:16447:failed')

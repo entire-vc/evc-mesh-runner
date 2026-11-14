@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from mesh_runner import config as config_mod
-from fakes import AGENT_ID, FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time
+from fakes import AGENT_ID, FakeMesh, calls, next_turn, task, turn_rows, write_replies, wait_time
 from test_runner import Bench
 
 
@@ -28,8 +28,16 @@ class TurnCapBench(Bench):
         r._resume_one(r.store.get(a.id))
         return r.store.get(a.id)
 
-    def last_turn(self, r, t, outcomes, text):
-        """The capped turn itself settles through the production path, declaring ``text``."""
+    def declare(self, mesh, t, turn):
+        """Mesh holds the turn command ``turn`` as the capped turn's typed outcome (and its wait)."""
+        row, wait = turn_rows(turn)
+        mesh.outcomes = {t["id"]: [row]}
+        mesh.waits = {t["id"]: wait} if wait else {}
+
+    def last_turn(self, r, t, outcomes, turn):
+        """The capped turn itself settles through the production path, declaring ``turn``."""
+        self.declare(r.mesh, t, turn)
+        text = "done for now"
         r.refresh_me()
         a = r.store.create(self.agent.name, t["id"], "claude")
         for kind in outcomes:
@@ -70,7 +78,7 @@ class Continue(TurnCapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         write_replies(self.replies, {t["id"][:8]: wait_time(why="soak")})
         r = self.runner(mesh)
-        a = self.last_turn(r, t, ["step", "next", "step"], f"done for now\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak")
+        a = self.last_turn(r, t, ["step", "next", "step"], wait_time(why="soak"))
         self.assertEqual(a.state, "waiting")                       # the wait is recorded, not lost to the cap
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
         self.assertEqual(self.bodies(mesh, t), [])
@@ -87,7 +95,7 @@ class Continue(TurnCapBench):
         t = task(1, cat="in_progress")
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
-        a = self.last_turn(r, t, ["wait"] * 5, f"idle\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak")
+        a = self.last_turn(r, t, ["wait"] * 5, wait_time(why="soak"))
         self.assertEqual(a.state, "waiting")
         self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
         r.store.update(a, state="ready", wake_text="the wait is over")
@@ -101,7 +109,7 @@ class Continue(TurnCapBench):
         t = task(1, cat="in_progress")
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
-        a = self.last_turn(r, t, ["step", "step"], "more to do\n↻ NEXT")
+        a = self.last_turn(r, t, ["step", "step"], next_turn("more to do"))
         self.assertEqual(a.state, "ready")                         # the NEXT is recorded and counted
         self.assertEqual(r.store.recent_outcomes(a.id, 1), ["next"])
         r._resume_one(a)
@@ -115,10 +123,11 @@ class Continue(TurnCapBench):
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
         r.refresh_me()
+        self.declare(mesh, t, wait_time(why="soak"))
         a = r.store.create(self.agent.name, t["id"], "claude", mode="review")
         path = self.root / f"{a.id}.jsonl"
         path.write_text(json.dumps({"type": "result", "subtype": "success", "is_error": False,
-                                    "result": f"idle\n⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak",
+                                    "result": "idle",
                                     "session_id": "s-cap"}) + "\n")
         r.store.update(a, state="running", turns=self.cfg.max_turns, log_path=str(path))
         r.settle(a)

@@ -22,7 +22,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from . import outcome
 
 # English and Russian. A stem over-matches on purpose (an extra hard question only costs
 # the owner one look); the short, ambiguous words are anchored to the whole word.
@@ -34,8 +33,12 @@ DEFAULT_HARD_PATTERNS: tuple[str, ...] = (
     r"цены\b", r"цену\b", r"цен[аыу]\b", r"стоимост", r"тариф", r"возврат", r"бюджет", r"купит", r"покупк",
     # a top-up, a balance or an amount of money is money too (a live gate asked to "top up the
     # shared balance by $20"); the space before a currency may be a no-break one
-    r"top[- ]?up", r"credits?\b", r"deposit", r"balance", r"пополн", r"баланс", r"перевод(?:ести)? (?:денег|средств)",
+    r"top[- ]?up", r"credits?\b", r"deposit", r"balance", r"пополн", r"баланс", r"перев(?:од|ест|ед|ож)[а-яё]*\s+(?:денег|деньги|средств[а-яё]*)",
     r"[$€₽£][\s ]?\d", r"\d[\d.,]*[\s ]?(?:usd|eur|руб|₽|\$)",
+    # a currency or an amount spelled as a word ("20 долларов", "50 евро", "5к"), and a "drop/throw"
+    # verb with an amount a few words on ("скинуть 20 на OpenRouter"); "евро" only as a whole word
+    r"доллар", r"евро\b", r"dollar", r"euros?\b", r"бакс", r"\d[\d.,]*[\s ]?(?:k|к|тыс)\b",
+    r"(?:за|с)кин[уь][а-яё]*(?:[\s ]+[^\s ]+){0,3}?[\s ]+\d",
     # secrets, keys, credentials, access
     r"secret", r"key\b", r"keys\b", r"token", r"password", r"passphrase", r"credential", r"access\b",
     r"permission", r"api[ _-]?key", r"доступ", r"ключ", r"токен", r"парол", r"секрет", r"учётн", r"учетн",
@@ -146,6 +149,12 @@ def gate_class(question: str, labels, default: str | None, patterns=DEFAULT_HARD
     return verdict
 
 
+# The question line of the comment Mesh posts for an ``ask_human`` turn command (evc-mesh
+# internal/service/typed_ask_human.go askHumanBody: ``❓ Blocking @<person>: <question>``). It locates the
+# question and its default in that comment; it is not an outcome: a turn's outcome is the typed row.
+_ASK_LINE = re.compile(r"^\s*❓\s+(?:\*\*)?Blocking\s+@(?P<handle>[\w.\-]+)(?:\*\*)?\s*:?\s*(?P<note>.*)$")
+
+
 _LINE_DEFAULT = re.compile(
     r"^[\s>*\-•]*\**\s*(?:recommended[ _-]?default|default(?:\s+if\s+no\s+answer)?|"
     r"по\s+умолчанию|рекомендую\s+по\s+умолчанию|дефолт)\**\s*[:—-]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
@@ -158,7 +167,7 @@ def _ask_lines(body: str, handle: str) -> tuple[str, list[str]] | None:
     code stripped; None when no marker names it."""
     lines = strip_quoted_spans(body or "").split("\n")
     for i, line in enumerate(lines):
-        m = outcome._BLOCKING.match(line)
+        m = _ASK_LINE.match(line)
         if m and m.group("handle").lower() == (handle or "").lower():
             return line, [m.group("note"), *lines[i + 1:]]
     return None
@@ -273,7 +282,7 @@ def blocking_ask(comments: list[dict]) -> tuple[str, str]:
     for c in reversed(comments):
         body = c.get("body") or ""
         for line in strip_quoted_spans(body).split("\n"):
-            m = outcome._BLOCKING.match(line)
+            m = _ASK_LINE.match(line)
             if m:
                 return m.group("handle"), body
     return "", ""
@@ -288,7 +297,7 @@ def blocking_question(comments: list[dict]) -> tuple[str, str]:
         return "", ""
     lines = strip_quoted_spans(body).split("\n")
     for i, line in enumerate(lines):
-        m = outcome._BLOCKING.match(line)
+        m = _ASK_LINE.match(line)
         if m and m.group("handle") == handle:
             rest = [m.group("note").strip(), *[x.strip() for x in lines[i + 1:]]]
             return handle, " ".join(x for x in rest if x)

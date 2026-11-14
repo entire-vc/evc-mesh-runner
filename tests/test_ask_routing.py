@@ -427,6 +427,15 @@ class GateClass(unittest.TestCase):
              "этот канал отключённым?")
         self.assertEqual(asks.gate_class(q, [], "да"), asks.Verdict(True, "keyword:пополн"))
         self.assertEqual(asks.gate_class(q, [], "да, пополнить"), asks.Verdict(True, "keyword:пополн"))
+        # An amount spelled with a currency word is money too, while a time window is not.
+        self.assertEqual(asks.gate_class("Закинуть 20 долларов на OpenRouter?", [], "да"),
+                         asks.Verdict(True, "keyword:закинуть 2"))
+        self.assertEqual(asks.gate_class("Потратить 50 евро на домен?", [], "да"),
+                         asks.Verdict(True, "keyword:евро"))
+        self.assertEqual(asks.gate_class("Оставить окно 24 часа для мягких вопросов?", [], "да"),
+                         asks.Verdict(False, "no hard rule matched"))
+        self.assertEqual(asks.gate_class("Перенести сервер в европейский регион?", [], "да"),
+                         asks.Verdict(False, "no hard rule matched"))
         # A missing question fails closed even with a stated default that would read soft.
         for missing in ("", "   ", None, "[soft]"):
             self.assertEqual(asks.gate_class(missing, [], "да, включить"),

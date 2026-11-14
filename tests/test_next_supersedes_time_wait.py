@@ -1,4 +1,5 @@
-"""A fresh ``↻ NEXT`` from the agent supersedes an older time WAIT."""
+"""A ``↻ NEXT`` text in the agent's own comment no longer supersedes a time or merge wait: the runner reads no
+marker lines (only a typed continue_next ends a wait)."""
 import datetime as dt
 import unittest
 
@@ -22,31 +23,17 @@ def woken(w, comments):
     return check(None, None, None, {}, w, "me", comments, NOW)
 
 
-class NextSupersedesTimeWait(unittest.TestCase):
-    def test_later_next_wakes_the_wait(self):
+class MarkerNextIgnoredOnTimeWait(unittest.TestCase):
+    def test_own_next_marker_comment_does_not_wake_the_wait(self):
         w = wait()
-        self.assertIn("superseded", woken(w, [own("did a thing\n↻ NEXT", 5)]))
-        self.assertTrue(w["met"])
-
-    def test_a_blocking_ask_to_a_person_is_not_superseded(self):
-        w = {**wait(), "kind": "blocking", "handle": "morgan"}
-        event = check(None, None, None, {"human_gate": True}, w, "me", [own("↻ NEXT", 5)], NOW)
-        self.assertEqual(event, "")
+        self.assertEqual(woken(w, [own("did a thing\n↻ NEXT", 5)]), "")
         self.assertFalse(w.get("met"))
 
-    def test_a_later_wait_after_the_next_stands(self):
-        self.assertEqual(woken(wait(), [own("↻ NEXT", 5), own("⏳ WAIT 24h: poll", 9)]), "")
-
-    def test_a_next_older_than_the_wait_is_ignored(self):
-        old = own("↻ NEXT", 5)
-        old["created_at"] = "2026-10-25T12:00:00+00:00"
-        self.assertEqual(woken(wait(), [old]), "")
-
-    def test_runner_notes_and_plain_comments_do_not_count(self):
-        self.assertEqual(woken(wait(), [own("[runner] ↻ NEXT", 5), own("just a note", 6)]), "")
+    def test_plain_comment_does_not_wake_it_either(self):
+        self.assertEqual(woken(wait(), [own("just a note", 6)]), "")
 
 
-class NextSupersedesMergeWait(unittest.TestCase):
+class MarkerNextIgnoredOnMergeWait(unittest.TestCase):
     def event(self, comments):
         from types import SimpleNamespace
         from mesh_runner import runner
@@ -55,10 +42,10 @@ class NextSupersedesMergeWait(unittest.TestCase):
         a = SimpleNamespace(task_id="t", id="x")
         return runner.AgentRunner._merge_event(me, a, w), w
 
-    def test_next_wakes_a_merge_wait(self):
+    def test_next_marker_comment_does_not_wake_a_merge_wait(self):
         event, w = self.event([own("↻ NEXT", 5)])
-        self.assertIn("superseded", event)
-        self.assertTrue(w["met"])
+        self.assertEqual(event, "")
+        self.assertFalse(w.get("met"))
 
     def test_without_next_the_merge_wait_stands(self):
         self.assertEqual(self.event([own("note", 5)])[0], "")

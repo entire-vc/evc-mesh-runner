@@ -85,12 +85,12 @@ def metadata_instructions(sandboxed: bool = True) -> str:
                 "and permissions; use task metadata and existing diagnostic evidence. "
                 "Do not modify source, configuration, running services, a shared repository or another "
                 "attempt's checkout. If diagnosis requires repair or code work, add the "
-                "runner:workspace-required label and end with ↻ NEXT before making those changes. "
+                "runner:workspace-required label and end the turn with `continue_next` before making those changes. "
                 "The next turn must pass normal workspace admission and obtain its leased checkouts. "
                 "This admission scope is not a tool sandbox.\n")
     return ("\n\n[runner] This typed decision request explicitly opts into metadata-only work. "
             "No Git worktrees are leased to this attempt and the harness runs it read-only: file "
             "edits and shell commands are refused. Decide using task metadata and existing "
             "evidence through the Mesh tools. If this task requires "
-            "code work, add the runner:workspace-required label and end with ↻ NEXT. "
+            "code work, add the runner:workspace-required label and end the turn with `continue_next`. "
             "The next turn must pass normal workspace admission before editing code.\n")

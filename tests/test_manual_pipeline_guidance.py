@@ -6,7 +6,7 @@ measured, agents copied such a hint literally and re-armed the same dead wait.
 """
 import unittest
 
-from fakes import FakeGitLab, FakeMesh, task, write_replies
+from fakes import FakeGitLab, FakeMesh, task, wait_pipeline, write_replies
 from mesh_runner.wake import (ci_change_event, ci_delivery_key, manual_next_step, pipeline_merge_request,
                               typed_event)
 from test_runner import Bench
@@ -46,7 +46,7 @@ class WakeText(unittest.TestCase):
         self.assertIn('will not reach success by itself', text)
         self.assertIn('Do not run jobs or skip a project gate automatically', text)
         self.assertIn(f'obtain the review verdict on head {SHA}', text)
-        self.assertIn(f'`⏳ WAIT merge:g/app!56 after={SHA}`', text)
+        self.assertIn(f'`wait_for on=merge project_path=g/app mr_iid=56 after_sha={SHA}`', text)
         self.assertNotIn('until=success on this pipeline', text)
         self.assertNotIn('until=success', text)
         self.assertNotIn('<iid>', text)
@@ -56,9 +56,9 @@ class WakeText(unittest.TestCase):
         self.assertIn('blocked on manual jobs', text)
         self.assertIn('arrange the required review or authorized manual action', text)
         self.assertIn('Do not run jobs or skip a project gate automatically', text)
-        self.assertNotIn('WAIT merge:', text)
+        self.assertNotIn('on=merge', text)
         self.assertNotIn('until=success', text)
-        self.assertIn(f'`⏳ WAIT mr:g/app!56 until=merged after={SHA}:opened`', text)
+        self.assertIn(f'`wait_for on=mr project_path=g/app mr_iid=56 until=merged after_sha={SHA} after_status=opened`', text)
 
     def test_finished_non_success_notice_uses_the_reworded_hint(self):
         text = notice(gitlab(status='failed'), merge_gate=False)
@@ -69,29 +69,29 @@ class WakeText(unittest.TestCase):
     def test_notice_through_the_shared_evaluator_carries_the_flag(self):
         wait = {'ci_change': contract()}
         text = typed_event(gitlab(), 'pipeline', PIPELINE, wait, allow_action_required=True, merge_gate=True)
-        self.assertIn('WAIT merge:g/app!56', text)
+        self.assertIn('wait_for on=merge project_path=g/app mr_iid=56', text)
         self.assertNotIn('until=success', text)
 
     def test_unknown_merge_request_uses_placeholders_the_agent_fills(self):
         cases = {
-            'branch': ('main', 'g/app!<iid>', f'after={SHA}'),
-            'no_ref': (None, 'g/app!<iid>', 'after=<full-head-sha>'),
-            'merged_results': ('refs/merge-requests/56/merge', 'g/app!56', 'after=<full-head-sha>'),
+            'branch': ('main', '<iid>', SHA),
+            'no_ref': (None, '<iid>', '<full-head-sha>'),
+            'merged_results': ('refs/merge-requests/56/merge', '56', '<full-head-sha>'),
         }
-        for name, (ref, target, after) in cases.items():
+        for name, (ref, iid, after) in cases.items():
             with self.subTest(name=name):
                 sha = MERGE_SHA if name == 'merged_results' else SHA
                 gl = gitlab(ref=ref, sha=sha)
                 text = ci_change_event(gl, 'pipeline', PIPELINE,
                                        {**contract(), 'sha': sha}, allow_action_required=True, merge_gate=True)
-                self.assertIn(f'WAIT merge:{target} {after}', text)
+                self.assertIn(f'wait_for on=merge project_path=g/app mr_iid={iid} after_sha={after}', text)
                 self.assertNotIn(MERGE_SHA, text.split('Next step:', 1)[1])
                 self.assertNotIn('until=success', text)
 
     def test_mr_notice_with_a_merge_gate_names_the_mr_and_its_head(self):
         text = notice(gitlab(), merge_gate=True, kind='mr')
         self.assertIn(f'MR {MR} head {SHA[:8]} pipeline 14845 is blocked on manual jobs', text)
-        self.assertIn(f'`⏳ WAIT merge:{MR} after={SHA}`', text)
+        self.assertIn(f'`wait_for on=merge project_path=g/app mr_iid=56 after_sha={SHA}`', text)
         self.assertNotIn('until=success', text)
 
     def test_merge_request_of_a_pipeline_row(self):
@@ -140,13 +140,18 @@ class SendBack(Bench):
         self.assertIn('Do not run jobs or skip a project gate automatically', a.wake_text)
         self.assertNotIn('until=success', a.wake_text)
         if merge_gate:
-            self.assertIn(f'`⏳ WAIT merge:g/app!56 after={SHA}`', a.wake_text)
+            self.assertIn(f'`wait_for on=merge project_path=g/app mr_iid=56 after_sha={SHA}`', a.wake_text)
         else:
-            self.assertNotIn('WAIT merge:', a.wake_text)
+            self.assertNotIn('on=merge', a.wake_text)
             self.assertIn('arrange the required review or authorized manual action', a.wake_text)
 
-    success_line = f'⏳ WAIT pipeline:{PIPELINE} until=success after={SHA}:14845:running'
-    plain_line = f'⏳ WAIT pipeline:{PIPELINE}'
+    @staticmethod
+    def success_wait(baseline):
+        return wait_pipeline('g/app', 14845, until='green', after_sha=SHA, after_pipeline_id=14845,
+                             after_status=baseline)
+
+    success_line = success_wait.__func__('running')
+    plain_line = wait_pipeline('g/app', 14845)
 
     def notice_delivered(self, r, t, merge_gate=True):
         """until=success on a running pipeline, the pipeline stops at its manual stage, the owner
@@ -156,7 +161,7 @@ class SendBack(Bench):
         self.set_status(r.gitlab, 'manual')
         a = self.wake(r, a)
         self.assertIn('action required', a.wake_text)
-        self.assertEqual('WAIT merge:g/app!56' in a.wake_text, merge_gate)
+        self.assertEqual('wait_for on=merge project_path=g/app mr_iid=56' in a.wake_text, merge_gate)
         self.assertNotIn('until=success', a.wake_text)
         return a
 
@@ -167,7 +172,7 @@ class SendBack(Bench):
                 r, t, gl = self.flow(merge_gate=merge_gate)
                 self.notice_delivered(r, t, merge_gate)
                 for baseline in ('running', 'manual'):
-                    a = self.turn(r, t, f'⏳ WAIT pipeline:{PIPELINE} until=success after={SHA}:14845:{baseline}',
+                    a = self.turn(r, t, self.success_wait(baseline),
                                   first=False)
                     self.assert_sent_back(a, merge_gate)
 
@@ -202,8 +207,8 @@ class SendBack(Bench):
 
     def test_running_or_pending_pipeline_is_not_sent_back(self):
         for status in ('running', 'pending'):
-            for line in (f'⏳ WAIT pipeline:{PIPELINE} until=success after={SHA}:14845:{status}', self.plain_line):
-                with self.subTest(status=status, line=line):
+            for line in (self.success_wait(status), self.plain_line):
+                with self.subTest(status=status, line=line['until'] if 'until' in line else ''):
                     self.tearDown(), self.setUp()
                     r, t, gl = self.flow(status)
                     a = self.turn(r, t, line)
@@ -212,8 +217,8 @@ class SendBack(Bench):
     def test_started_manual_stage_is_not_sent_back(self):
         # the manual state was delivered, then someone started the post-review stage
         for status in ('running', 'pending'):
-            for line in (f'⏳ WAIT pipeline:{PIPELINE} until=success after={SHA}:14845:{status}', self.plain_line):
-                with self.subTest(status=status, line=line):
+            for line in (self.success_wait(status), self.plain_line):
+                with self.subTest(status=status, line=line['until'] if 'until' in line else ''):
                     self.tearDown(), self.setUp()
                     r, t, gl = self.flow()
                     self.notice_delivered(r, t)

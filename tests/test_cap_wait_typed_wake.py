@@ -2,15 +2,17 @@
 change of the linked merge request or pipeline."""
 import datetime as dt
 
-from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time
+from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time, wait_pipeline, wait_mr, typed
 from test_requeue_on_cap import CapBench
 
-from mesh_runner.outcome import parse_line
 from mesh_runner.store import iso
 
 SHA = "a" * 40
 NEXT_SHA = "b" * 40
 NOW = dt.datetime.now(dt.timezone.utc)
+PLAIN = wait_pipeline("g/app", 18827)
+CHANGE = wait_pipeline("g/app", 18827, until="changed", after_sha=SHA, after_pipeline_id=18827, after_status="pending")
+MERGED = wait_mr("g/app", 9, until="merged", after_sha=SHA, after_status="opened")
 
 
 def link(pipeline="running", status="open", head=SHA):
@@ -24,7 +26,7 @@ def row(pid=7, status="running", sha=SHA, state="opened", **extra):
 
 class TypedCapWake(CapBench):
     def capped(self, wait_line=None, wait=None, links=None):
-        """A task whose turn budget ran out right after the session declared ``wait_line``."""
+        """A task whose turn budget ran out right after the session declared the ``wait_line`` turn."""
         t = task(1, cat="in_progress")
         mesh = FakeMesh([t], max_concurrent=1)
         mesh.links = {t["id"]: links if links is not None else [link()]}
@@ -37,7 +39,7 @@ class TypedCapWake(CapBench):
         r.refresh_me()
         a = r.store.create("builder", t["id"], "claude")
         if wait_line:
-            o = parse_line(wait_line, NOW)
+            o = typed(wait_line, now=NOW)
             wait = {"kind": o.kind, "target": o.target, "handle": o.handle, "line": o.line, **o.extra,
                     "since": iso(), "started": iso()}
             if not o.extra:
@@ -56,7 +58,7 @@ class TypedCapWake(CapBench):
 
     # --- plain pipeline wait: wait for the pipeline to finish
     def test_intermediate_pipeline_change_does_not_wake_a_pipeline_wait(self):
-        r, mesh, gl, t, rec = self.capped("⏳ WAIT pipeline:g/app#18827")
+        r, mesh, gl, t, rec = self.capped(PLAIN)
         self.assertEqual(rec["wait"]["kind"], "pipeline")
         self.assertFalse(self.woke(r, mesh, t, rec))
         mesh.links[t["id"]] = [link(pipeline="pending")]       # a job started: a link change, no result
@@ -64,7 +66,7 @@ class TypedCapWake(CapBench):
         self.assertNotIn(t["id"], r._cap_wake_reasons)
 
     def test_terminal_pipeline_wakes_a_pipeline_wait(self):
-        r, mesh, gl, t, rec = self.capped("⏳ WAIT pipeline:g/app#18827")
+        r, mesh, gl, t, rec = self.capped(PLAIN)
         gl.pipelines["g/app#18827"] = "success"
         mesh.links[t["id"]] = [link(pipeline="success")]
         self.assertTrue(self.woke(r, mesh, t, rec))
@@ -72,7 +74,7 @@ class TypedCapWake(CapBench):
 
     # --- typed pipeline wait: until=change
     def test_queue_hop_does_not_wake_a_typed_pipeline_change_wait(self):
-        r, mesh, gl, t, rec = self.capped(f"⏳ WAIT pipeline:g/app#18827 until=change after={SHA}:18827:pending")
+        r, mesh, gl, t, rec = self.capped(CHANGE)
         gl.pipeline_rows["g/app#18827"] = {"sha": SHA, "id": 18827, "status": "running"}
         mesh.links[t["id"]] = [link(pipeline="running")]
         self.assertFalse(self.woke(r, mesh, t, rec))
@@ -82,7 +84,7 @@ class TypedCapWake(CapBench):
 
     # --- typed MR wait: until=merged
     def test_post_review_pipeline_restart_does_not_wake_an_until_merged_wait(self):
-        r, mesh, gl, t, rec = self.capped(f"⏳ WAIT mr:g/app!9 until=merged after={SHA}:opened",
+        r, mesh, gl, t, rec = self.capped(MERGED,
                                           links=[link(pipeline="success")])
         self.assertEqual(rec["wait"]["mr_state"]["predicate"], "merged")
         gl.mr_rows["g/app!9"] = row(pid=8, status="running")    # the post-review stage started
@@ -93,7 +95,7 @@ class TypedCapWake(CapBench):
         self.assertFalse(self.woke(r, mesh, t, rec))
 
     def test_merge_wakes_an_until_merged_wait(self):
-        r, mesh, gl, t, rec = self.capped(f"⏳ WAIT mr:g/app!9 until=merged after={SHA}:opened",
+        r, mesh, gl, t, rec = self.capped(MERGED,
                                           links=[link(pipeline="success")])
         gl.mr_rows["g/app!9"] = row(state="merged", merged_at="2026-10-25T12:00:00Z")
         mesh.links[t["id"]] = [link(pipeline="success", status="merged")]
@@ -102,14 +104,14 @@ class TypedCapWake(CapBench):
 
     # --- the other inputs still wake as before
     def test_foreign_comment_wakes_whatever_the_declared_wait(self):
-        r, mesh, gl, t, rec = self.capped(f"⏳ WAIT mr:g/app!9 until=merged after={SHA}:opened")
+        r, mesh, gl, t, rec = self.capped(MERGED)
         self.assertFalse(self.woke(r, mesh, t, rec))
         mesh.add_comment(t["id"], "please look", author="assembler")
         self.assertTrue(self.woke(r, mesh, t, rec))
         self.assertIn("comment from someone else", r._cap_wake_reasons[t["id"]])
 
     def test_new_assignee_wakes_whatever_the_declared_wait(self):
-        r, mesh, gl, t, rec = self.capped("⏳ WAIT pipeline:g/app#18827")
+        r, mesh, gl, t, rec = self.capped(PLAIN)
         mesh.tasks[t["id"]].update(assignee_id="agent-reviewer")
         self.assertTrue(self.woke(r, mesh, t, rec))
         self.assertEqual(r._cap_wake_reasons[t["id"]], "new assignee")
@@ -160,13 +162,13 @@ class TypedCapWake(CapBench):
         self.assertNotIn("wait", r._cap_wait(t["id"]))
 
     def test_an_unreadable_declared_wait_is_not_news(self):
-        r, mesh, gl, t, rec = self.capped(f"⏳ WAIT mr:g/app!9 until=merged after={SHA}:opened")
+        r, mesh, gl, t, rec = self.capped(MERGED)
         gl.mr_rows["g/app!9"] = {}                                # the provider answers nothing usable
         mesh.links[t["id"]] = [link(pipeline="pending")]
         self.assertFalse(self.woke(r, mesh, t, rec))
 
     def test_without_a_gitlab_client_a_declared_wait_is_not_satisfied(self):
-        r, mesh, gl, t, rec = self.capped("⏳ WAIT pipeline:g/app#18827")
+        r, mesh, gl, t, rec = self.capped(PLAIN)
         r.gitlab = None                                           # nothing can evaluate the declared wait
         mesh.links[t["id"]] = [link(pipeline="pending")]
         self.assertFalse(self.woke(r, mesh, t, rec))
@@ -174,7 +176,7 @@ class TypedCapWake(CapBench):
         self.assertTrue(self.woke(r, mesh, t, rec))
 
     def test_a_provider_failure_is_not_a_satisfied_wait(self):
-        r, mesh, gl, t, rec = self.capped(f"⏳ WAIT pipeline:g/app#18827 until=change after={SHA}:18827:pending")
+        r, mesh, gl, t, rec = self.capped(CHANGE)
         rec["wait"]["errors"] = 4                                 # an old error count must not carry over
         mesh.links[t["id"]] = [link(pipeline="pending")]
 
