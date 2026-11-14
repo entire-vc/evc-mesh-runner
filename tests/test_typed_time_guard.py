@@ -1,54 +1,57 @@
 """External timestamps are evidence contracts, never guesses for dependency retries."""
 import datetime as dt
 import unittest
-from unittest import mock
 
-from mesh_runner.outcome import parse_outcome, contract
+from mesh_runner.outcome import TIME_WAIT_GUIDANCE, contract
 from mesh_runner.wake import check
-from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, wait_mr
+from fakes import FakeGitLab, FakeMesh, calls, task, write_replies, wait_mr, wait_time, next_turn, turn_rows, typed
 from test_runner import Bench
 
 NOW = dt.datetime(2026, 10, 28, 12, tzinfo=dt.timezone.utc)
 
 def external(at='2026-10-29T12:30:00+03:00', event='backup-20261029', source='https://provider.example/schedule', why='published backup available'):
-    return f'⏳ WAIT {at}: external={event} source={source} {why}'
+    """The wait_for on=time turn of a fake agent (the typed replacement for the marker line)."""
+    return wait_time(until_at=at, event_ref=event, source=source, why=why)
 
 class ExternalTimeGrammar(unittest.TestCase):
     def test_absolute_timestamp_and_evidence_are_preserved_without_clamping(self):
-        o = parse_outcome(external(), NOW)
+        o = typed(external(), now=NOW)
         self.assertEqual(o.kind, 'time')
         self.assertEqual(o.until, dt.datetime(2026, 10, 29, 9, 30, tzinfo=dt.timezone.utc))
         self.assertEqual(o.extra['external_time'], {'event':'backup-20261029', 'source':'https://provider.example/schedule', 'why':'published backup available', 'at':'2026-10-29T12:30:00+03:00'})
-        o = parse_outcome(external(at='2026-10-28T12:00:01Z', source='card:#abcdef12', event='export-window'), NOW)
+        o = typed(external(at='2026-10-28T12:00:01Z', source='card:#abcdef12', event='export-window'), now=NOW)
         self.assertEqual(o.until - NOW, dt.timedelta(seconds=1))
 
     def test_relative_bare_poll_and_missing_evidence_cannot_schedule(self):
-        invalid = ['⏳ WAIT 6h: retry dependency', '⏳ WAIT 24h', '⏳ WAIT 2026-10-29',
-                   '⏳ WAIT 2026-10-29T12:30Z: measurement window',
-                   '⏳ WAIT 6h: poll: Telegram answer', '⏳ WAIT poll: inbox',
-                   external(at='2026-10-29T12:30'), external(at='2026-10-27T12:30Z'),
+        # (the marker's "no seconds" and "already past" refusals do not exist for typed waits:
+        # a time that passed while the settle waited is a due time wait, not an invalid one)
+        invalid = [external(at='6h'), external(at='24h'), external(at='2026-10-29'),
+                   external(at='2026-10-29T12:30'),
+                   external(why='poll: Telegram answer'),
                    external(source='https://['), external(source='https://example.test:bad/'), external(source='file:///local'), external(source='https://'),
                    external(source='https://user:password@example.test/'),
                    external(event='mr:group/app!7'), external(event='poll:inbox'),
-                   external(why='poll: inbox'), external(why='')]
-        for line in invalid:
-            with self.subTest(line=line):
-                o = parse_outcome(line, NOW)
+                   external(why='poll: inbox'), external(why=''), external(source='')]
+        for turn in invalid:
+            with self.subTest(turn=turn):
+                o = typed(turn, now=NOW)
                 self.assertEqual(o.kind, 'unparsed')
                 self.assertIsNone(o.until)
-                self.assertIn('source=', o.note)
-                self.assertIn('WAIT card:', o.note)
+                self.assertIn('cannot act on it', o.note)
+        for turn in (external(event='mr:group/app!7'), external(event='poll:inbox'), external(why='poll: inbox')):
+            self.assertIn(TIME_WAIT_GUIDANCE, typed(turn, now=NOW).note)
 
     def test_explicit_external_reference_does_not_depend_on_natural_language(self):
         # A cited source may mention a card or person; prose is never the validator.
-        self.assertEqual(parse_outcome(external(why='approved by @Morgan on #abcdef12'), NOW).kind, 'time')
+        self.assertEqual(typed(external(why='approved by @Morgan on #abcdef12'), now=NOW).kind, 'time')
         for kind in ('backup', 'export', 'scheduled-job', 'measurement'):
-            self.assertEqual(parse_outcome(external(event=kind), NOW).kind, 'time')
+            self.assertEqual(typed(external(event=kind), now=NOW).kind, 'time')
 
     def test_contract_has_one_schema_and_no_poll_escape(self):
         for merge in (True, False):
             text = contract(merge)
-            self.assertIn('external=<stable-reference> source=<https-url|card:#8hex>', text)
+            self.assertIn('wait_for on=time until_at=<RFC3339 with Z or offset> event_ref=<stable reference>', text)
+            self.assertIn('source=<https-url|comment:<uuid>|artifact:<uuid>>', text)
             self.assertNotIn('WAIT 2h:', text)
             self.assertIn('Internal retry/backoff never writes', text)
 
@@ -71,28 +74,31 @@ class TypedTimeSettlement(Bench):
         a=r.store.create(self.agent.name,t['id'],'claude')
         r._correction_hold(a,t,'invalid external time wait; cite the schedule')
         at=dt.datetime.fromisoformat(a.updated_at)
-        mesh.add_comment(t['id'],'↻ NEXT: old correction',author=r.agent_id,at=at-dt.timedelta(seconds=1))
+        def nxt(note, secs):
+            row, _ = turn_rows(next_turn(note), at=(at+dt.timedelta(seconds=secs)).isoformat())
+            mesh.outcomes.setdefault(t['id'], []).append(row)
+        mesh.outcomes = {}
+        nxt('old correction', -1)
         mesh.add_comment(t['id'],'ordinary own update',author=r.agent_id,at=at+dt.timedelta(seconds=1))
         mesh.add_comment(t['id'],'[runner] ↻ NEXT: auto notice',author=r.agent_id,at=at+dt.timedelta(seconds=2))
+        # marker text in the owner's own comment is not a continue_next
+        mesh.add_comment(t['id'],'↻ NEXT: replaced polling with a cited external schedule',author=r.agent_id,at=at+dt.timedelta(seconds=2))
         self.assertFalse(r._correction_rearmed(t['id'],at))
         restarted=self.runner(mesh);restarted.refresh_me()
         self.assertIn('wait correction required',restarted._hold_reason(t,'work'))
-        mesh.add_comment(t['id'],'↻ NEXT',author=r.agent_id,at=at+dt.timedelta(seconds=3))
+        nxt('', 3)                                    # a continue_next without a note repairs nothing
         self.assertFalse(restarted._correction_rearmed(t['id'],at))
-        mesh.add_comment(t['id'],'↻ NEXT: replaced polling with a cited external schedule',author=r.agent_id,at=at+dt.timedelta(seconds=4))
+        nxt('replaced polling with a cited external schedule', 4)
         self.assertTrue(restarted._correction_rearmed(t['id'],at))
         self.assertNotIn('wait correction required',restarted._hold_reason(t,'work'))
 
-    def test_programmatic_time_outcome_cannot_bypass_the_schema_or_queue_contract(self):
-        from mesh_runner.outcome import Outcome
-        from mesh_runner.runner import OutcomeRead
+    def test_a_typed_poll_time_wait_cannot_bypass_the_schema_or_queue_contract(self):
+        # (replaces the forged-programmatic-outcome test: the runner no longer re-parses a non-typed
+        # outcome at settle, since none can exist; the schema is checked where the typed outcome is built)
         t=task(1); mesh=FakeMesh([t],max_concurrent=1)
-        write_replies(self.replies,{t['id'][:8]:'ignored'})
+        write_replies(self.replies,{t['id'][:8]:external(event='poll:queue', why='poll: queue')})
         r=self.runner(mesh)
-        forged=Outcome('time', until=dt.datetime.now(dt.timezone.utc)+dt.timedelta(hours=6),
-                       line='⏳ WAIT 6h: poll: queue', extra={'external_time': {'event':'fake'}})
-        with mock.patch.object(r,'_read_outcome',return_value=OutcomeRead(forged,'','comment')):
-            r.tick(); self.settle_all(r)
+        r.tick(); self.settle_all(r)
         self.assertFalse(r.store.by_state(self.agent.name,('waiting',)))
         self.assertFalse(mesh.tasks[t['id']].get('start_after'))
 

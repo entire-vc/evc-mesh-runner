@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fakes import FakeMesh, calls, task, write_replies
+from fakes import FakeMesh, ask_agent, calls, task, write_replies
 from mesh_runner.adapters.claude import ClaudeAdapter
 from test_runner import Loop
 
@@ -37,7 +37,7 @@ class AccountChange(Loop):
     def wake_after_wait(self, known):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "\u23f3 WAIT decision:@lead"})
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "approve the plan?")})
         r = self.runner(mesh)
         r.tick()
         self.settle_all(r)
@@ -72,7 +72,7 @@ class AccountChange(Loop):
     def test_no_conversation_on_resume_still_restarts_without_a_failure(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
-        write_replies(self.replies, {t["id"][:8]: "\u23f3 WAIT decision:@lead",
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "approve the plan?"),
                                      t["id"][:8] + ":resume": "ERROR:No conversation found with session ID: x"})
         r = self.runner(mesh)
         r.tick()

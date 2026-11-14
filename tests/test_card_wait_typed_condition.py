@@ -1,10 +1,9 @@
-"""``⏳ WAIT card:#X until=<typed condition>``: the edge this WAIT creates carries that condition
+"""``wait_for on=card target_condition=<typed condition>``: the edge this wait creates carries that condition
 instead of the broad task_done. The plain form keeps creating task_done (unchanged)."""
 import datetime as dt
 import unittest
 
-from fakes import FakeMesh, task
-from mesh_runner import outcome
+from fakes import FakeMesh, task, typed, wait_card
 from mesh_runner.runner import AgentRunner
 from mesh_runner.store import Store
 from test_runner import Bench
@@ -12,26 +11,29 @@ from test_runner import Bench
 NOW = dt.datetime(2026, 11, 9, tzinfo=dt.timezone.utc)
 
 
-def declared(line):
-    return outcome.parse_line(line, NOW)
+def declared(condition=""):
+    return typed(wait_card("deadbeef", condition=condition), now=NOW)
 
 
 class Grammar(unittest.TestCase):
-    def test_typed_card_wait_parses_with_its_condition(self):
+    def test_typed_card_wait_carries_its_condition(self):
         for cond in ("access_ready", "contract_ready", "artifact_published", "shipped", "deployed", "accepted"):
-            o = declared(f"⏳ WAIT card:#deadbeef until={cond}")
+            o = declared(cond)
             self.assertEqual((o.kind, o.target), ("card", "deadbeef"), cond)
-            self.assertEqual(outcome.card_condition(o.line), cond)
+            self.assertEqual(o.extra.get("card_condition"), cond)
 
     def test_plain_card_wait_is_unchanged(self):
-        o = declared("⏳ WAIT card:#deadbeef")
-        self.assertEqual((o.kind, o.target, outcome.card_condition(o.line)), ("card", "deadbeef", ""))
-        o = declared("⏳ WAIT card:#deadbeef: explanation")
-        self.assertEqual((o.kind, outcome.card_condition(o.line)), ("card", ""))
+        o = declared()
+        self.assertEqual((o.kind, o.target, o.extra.get("card_condition", "")), ("card", "deadbeef", ""))
 
     def test_unknown_condition_is_not_a_wait(self):
-        for bad in ("until=done", "until=task_done", "until=", "until=deployed,accepted", "until=DEPLOYED x"):
-            self.assertEqual(declared(f"⏳ WAIT card:#deadbeef {bad}").kind, "unparsed", bad)
+        for bad in ("done", "deployed,accepted", "DEPLOYED x"):
+            self.assertEqual(declared(bad).kind, "unparsed", bad)
+
+
+    def test_task_done_condition_is_the_plain_wait(self):
+        o = declared("task_done")
+        self.assertEqual((o.kind, o.extra.get("card_condition", "")), ("card", ""))
 
 
 class Edge(Bench):
@@ -45,13 +47,13 @@ class Edge(Bench):
         a = r.store.create(self.agent.name, t["id"], "claude")
         return r, a, t, target
 
-    def wait(self, target, line):
-        return {"kind": "card", "target": target["id"][:8], "line": line, "since": "2026-11-09T00:00:00Z",
+    def wait(self, target, condition=""):
+        return {"kind": "card", "target": target["id"][:8], "card_condition": condition, "since": "2026-11-09T00:00:00Z",
                 "started": "2026-11-09T00:00:00Z", "fx": True}
 
     def test_typed_wait_creates_the_typed_edge_not_task_done(self):
         r, a, t, g = self.flow()
-        w = self.wait(g, f"⏳ WAIT card:#{g['id'][:8]} until=deployed")
+        w = self.wait(g, "deployed")
         r.effects._add_edge(a, w)
         rows = r.mesh.dependencies(t["id"])["outgoing"]
         self.assertEqual([e["condition"] for e in rows], ["deployed"])
@@ -59,14 +61,14 @@ class Edge(Bench):
 
     def test_plain_wait_still_creates_task_done(self):
         r, a, t, g = self.flow()
-        w = self.wait(g, f"⏳ WAIT card:#{g['id'][:8]}")
+        w = self.wait(g, )
         r.effects._add_edge(a, w)
         self.assertEqual([e["condition"] for e in r.mesh.dependencies(t["id"])["outgoing"]], ["task_done"])
         self.assertNotIn("edge_condition", w)
 
     def test_cleanup_removes_its_own_typed_edge_but_not_a_changed_one(self):
         r, a, t, g = self.flow()
-        w = self.wait(g, f"⏳ WAIT card:#{g['id'][:8]} until=deployed")
+        w = self.wait(g, "deployed")
         r.effects._add_edge(a, w)
         self.assertTrue(r.effects._edge_still_ours(a, w))                 # still the shape it was created with
         r.mesh.edges[t["id"]][0]["condition"] = "accepted"               # an owner retyped it

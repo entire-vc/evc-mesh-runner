@@ -27,21 +27,24 @@ raise SystemExit(76)
 '''
 
 
-SPAN_MINUTES = 215                     # the last clock step of public_case is at 214 min
+WINDOW = dt.timedelta(minutes=220)  # the scenario advances the clock up to +214 min
 
 
 class Clock:
-    def __init__(self):
+    def __init__(self, real_now=None):
         self.elapsed = 0
         # Three hours back, not a fixed hour: the fake harness stamps its typed outcome with the real
         # clock, and the runner reads only outcomes newer than the turn start (origin + ~152 min).
-        self.origin = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).replace(second=0, microsecond=0)
-        # The scenario spans ~215 min and the runner's notice is once per UTC day: a window that crosses
-        # midnight posts a second notice. Then it ends before that midnight instead; its turn start
-        # (origin + ~152 min) stays in the real past, since the real clock is at most 35 min short of it.
-        boundary = (self.origin + dt.timedelta(days=1)).replace(hour=0, minute=0)
-        if self.origin + dt.timedelta(minutes=SPAN_MINUTES) >= boundary:
-            self.origin = boundary - dt.timedelta(minutes=SPAN_MINUTES + 5)
+        real_now = real_now or dt.datetime.now(dt.timezone.utc)
+        origin = (real_now - dt.timedelta(hours=3)).replace(second=0, microsecond=0)
+        # The runner tells "no reviewer could be started" at most once per UTC day; a window across
+        # midnight legally sends a second notice. Shift back so the whole window [origin, origin+WINDOW]
+        # ends before midnight; the new origin is never later, so the outcome-newer-than-turn-start
+        # condition still holds.
+        end = origin + WINDOW
+        if end.date() != origin.date():
+            origin = dt.datetime.combine(end.date(), dt.time(), dt.timezone.utc) - WINDOW - dt.timedelta(minutes=1)
+        self.origin = origin
 
     def now(self):
         return self.origin + dt.timedelta(seconds=self.elapsed)
@@ -161,6 +164,14 @@ class SiblingEvidenceRetry(Bench):
                         proc.terminate()
                         proc.wait(timeout=5)
                 r.store.db.close()
+
+    def test_clock_window_stays_inside_one_utc_day(self):
+        day = dt.datetime(2026, 11, 13, tzinfo=dt.timezone.utc)
+        for hh, mm in ((0, 0), (0, 31), (0, 40), (0, 41), (1, 30), (3, 0), (3, 39), (10, 0), (21, 30), (23, 0), (23, 59)):
+            real_now = day.replace(hour=hh, minute=mm, second=17)
+            origin = Clock(real_now).origin
+            self.assertEqual(origin.date(), (origin + WINDOW).date(), real_now)
+            self.assertLessEqual(origin, real_now - dt.timedelta(hours=3), real_now)
 
     def test_only_exact_sibling_unknown_tag_is_added(self):
         for prefix in ('', 'route: '):

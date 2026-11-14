@@ -66,7 +66,6 @@ DECISION_MARK = "decision_request"
 DECISION_RECENT_MARK = "decision_recent"   # store mark: requests filed per source, by recipient, for reuse
 CLOSE_BLOCKED_MARK = "close_blocked_human"  # store mark on a request: its close was refused by a human gate
 CLOSE_BLOCKED_RETRY = dt.timedelta(hours=6)  # a gate-refused close is retried this often unless the card changes
-ANSWER_QUOTE = 300                      # chars of the addressee's answer quoted in a repeat send-back
 SKIP_MARK = "skip_state"                # store mark: the skip state this agent published on a task
 SKIP_SEED_DAYS = 30                     # first run with a store: tasks of this age may carry stale states
 SKIP_CLEARS_PER_TICK = 10               # clears take at most this share of a pass's writes
@@ -987,8 +986,8 @@ class Effects:
             if self.store is not None and self.store.mark(self.lane, a.task_id, f"{EDGE_REMOVED_MARK}:{wait.get('target')}"):
                 log.info("%s: edge #%s → #%s was removed by a user; not restored", self.lane, a.task8, wait.get("target"))
                 return
-            # `WAIT card:#X until=<typed>` names the condition it waits for; the plain form stays task_done
-            condition = outcome.card_condition(wait.get("line") or "")
+            # a card wait with a typed target_condition names what it waits for; the plain form stays task_done
+            condition = str(wait.get("card_condition") or "")
             edge = (self.mesh.add_dependency(a.task_id, target_id, condition) if condition
                     else self.mesh.add_dependency(a.task_id, target_id))
             edge_id = edge.get("id") or (edge.get("dependency") or {}).get("id")
@@ -1187,76 +1186,6 @@ class Effects:
             return entry if self._fresh(entry) else None
         entry = self._recent(task_id).get(recipient)
         return dict(entry) if entry and (entry.get("request") or {}).get("id") and self._fresh(entry) else None
-
-    def answered_repeat(self, a: Attempt, handle: str, note: str, comments: list[dict], me: dict) -> str:
-        """Send-back text when ``WAIT decision:@handle: note`` repeats, verbatim, the last
-        question this source put to that agent and the agent has commented on the source since
-        it was asked: asking again gets the same answer. '' = file or reuse as usual."""
-        if not self.enabled or self.reuse_window is None or self.store is None:
-            return ""
-        question = self._question_text({"note": note})
-        if not question or not handle:
-            return ""
-        try:
-            addressee = self._resolve_agent(handle, me)
-        except MeshError:
-            return ""
-        if not addressee or addressee.get("id") in (me.get("id"), None):
-            return ""                       # a person or ourselves: never handled here
-        entry = self._reusable(a.task_id, addressee["id"], self._decision(a.task_id))
-        asked = parse_time((entry or {}).get("asked_at"))
-        if not entry or asked is None or not self._asked_on(a.task_id, entry, note):
-            return ""
-        name = str(addressee.get("name") or handle)
-        req8 = str(entry["request"]["id"])[:8]
-
-        def by_addressee(c: dict) -> bool:
-            author = c.get("author_id") or (c.get("author") or {}).get("id")
-            who = str(c.get("author_name") or (c.get("author") or {}).get("name") or "").casefold()
-            return author == addressee["id"] or (bool(who) and who == name.casefold())
-        try:
-            # the answer is a comment on the source task; with decision_wake = "answer" it may
-            # also be one on the request itself
-            on_request = self.mesh.comments(entry["request"]["id"])
-        except MeshError:
-            on_request = []
-        if self._same_question(a.task_id, entry.get("question"), note):
-            # the request's current question: its answer is what the addressee wrote after it was asked
-            answers = [c for c in list(comments) + list(on_request) if by_addressee(c)
-                       and (c.get("body") or "").strip() and (parse_time(c.get("created_at")) or asked) > asked]
-            if not answers:
-                return ""
-            last = max(answers, key=lambda c: parse_time(c.get("created_at")) or asked)
-            quote = " ".join(last["body"].split())
-            if len(quote) > ANSWER_QUOTE:
-                quote = quote[:ANSWER_QUOTE - 1].rstrip() + "…"
-            said = f"after you asked it: «{quote}»"
-        else:
-            # an earlier question answered on this request before a later one was put on it: the
-            # newest comment there may answer the later question, so nothing is quoted as its answer
-            said = (f"earlier on request #{req8}, before a later question was put on it; read that request's "
-                    "thread for its answer")
-        return (f"@{name} already answered this exact question {said}. Answer reference: request "
-                f"#{req8}. Mesh refuses this repeat (`already_answered`): read that answer; a new question "
-                "must say what changed. "
-                "The same question will get the same answer, so this decision wait was sent back and "
-                f"nothing was asked again. Wait for the event that changes the answer "
-                "(`⏳ WAIT card:#<8hex>`, `⏳ WAIT mr:<group>/<project>!<iid>`, "
-                "`⏳ WAIT pipeline:<group>/<project>#<id>`, or a time with its reason), "
-                f"or ask @{name} a different question.")
-
-    def _request_answered(self, request_id: str) -> str:
-        """The status name of a request card closed as done (answered), '' otherwise or unreadable."""
-        try:
-            card = self.mesh.task(request_id)
-        except MeshError:
-            return ""
-        card = card.get("task", card) if isinstance(card, dict) else {}
-        if self.cats.category(card) != "done":
-            return ""
-        status = card.get("status")
-        name = status.get("name") if isinstance(status, dict) else status
-        return str(name or card.get("status_slug") or "done")
 
     def _end_decision(self, task_id: str, record: dict, why: str) -> bool:
         if record.get("state") == "closed":
@@ -1632,6 +1561,47 @@ class Effects:
                  a.task8, addressee.get("name"), source[:8], target)
         return True
 
+    def _retire_decision_wait(self, request_id: str, source_id: str, recipient_id: str) -> None:
+        """Before reopening a request, retire only its previous typed wait on this source.
+
+        The addressee may run on another host: Mesh's durable receipt is the
+        authority, never the local store or just a matching pair of cards.
+        """
+        edges = card_wait_reconcile.readable_outgoing(self.mesh.dependencies(request_id), request_id)
+        if edges is None:
+            log.warning("decision request #%s: preserve dependencies: unreadable edge set", request_id[:8])
+            return
+        for edge in edges:
+            if edge["depends_on_task_id"] != source_id or edge["dependency_type"] != "blocks":
+                continue
+            owner = edge.get("owner_wait_id")
+            if not owner or edge.get("owner_agent_id") != recipient_id:
+                log.info("decision request #%s: preserve edge %s: no matching wait owner", request_id[:8],
+                         edge["id"])
+                continue
+            try:
+                receipt = self.mesh.wait_receipt(request_id, owner)
+            except MeshError as e:
+                if e.status not in (404, 410):
+                    raise
+                log.warning("decision request #%s: preserve edge %s: wait receipt unavailable",
+                            request_id[:8], edge["id"])
+                continue
+            owned = card_wait_reconcile.owned_decision_wait(edge, receipt, request_id, source_id, recipient_id)
+            if owned is None:
+                log.info("decision request #%s: preserve edge %s: receipt does not prove ownership",
+                         request_id[:8], edge["id"])
+                continue
+            try:
+                self.mesh.delete_wait_dependency(request_id, *owned)
+            except MeshError as e:
+                if e.status not in (404, 409, 410):
+                    raise
+                log.info("decision request #%s: preserve changed/absent edge %s: HTTP %s",
+                         request_id[:8], edge["id"], e.status)
+                continue
+            log.info("decision request #%s: retired previous wait edge %s", request_id[:8], edge["id"])
+
     def _reuse_decision(self, a: Attempt, task: dict, wait: dict, addressee: dict, key: str,
                         reuse: dict, ask: bool = False) -> bool:
         """Ask a question on the request this source already filed for ``addressee``: reopen it
@@ -1661,6 +1631,7 @@ class Effects:
                             None)
                 if not todo:
                     return False
+                self._retire_decision_wait(req["id"], a.task_id, addressee["id"])
                 self.mesh.move(req["id"], todo)     # idempotent: a retry after a failed comment repeats it
             asking = iso()
             posted = self.mesh.add_comment(req["id"], self._decision_ask(a, task, wait, addressee, again=True),

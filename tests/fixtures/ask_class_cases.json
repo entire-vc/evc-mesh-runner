@@ -43,9 +43,16 @@
   "balance",
   "пополн",
   "баланс",
-  "перевод(?:ести)? (?:денег|средств)",
+  "перев(?:од|ест|ед|ож)[а-яё]*\\s+(?:денег|деньги|средств[а-яё]*)",
   "[$€₽£][\\s ]?\\d",
   "\\d[\\d.,]*[\\s ]?(?:usd|eur|руб|₽|\\$)",
+  "доллар",
+  "евро\\b",
+  "dollar",
+  "euros?\\b",
+  "бакс",
+  "\\d[\\d.,]*[\\s ]?(?:k|к|тыс)\\b",
+  "(?:за|с)кин[уь][а-яё]*(?:[\\s ]+[^\\s ]+){0,3}?[\\s ]+\\d",
   "secret",
   "key\\b",
   "keys\\b",
@@ -588,6 +595,159 @@
    "slug": "morgan",
    "labels": [],
    "default": "левый",
+   "class": "soft",
+   "rule": "no hard rule matched"
+  },
+  {
+   "name": "money transfer, infinitive",
+   "body": "❓ Blocking @morgan: Перевести средства исполнителю?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:перевести средства"
+  },
+  {
+   "name": "money transfer, first person",
+   "body": "❓ Blocking @morgan: Переведу деньги подрядчику сегодня?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:переведу деньги"
+  },
+  {
+   "name": "money transfer, noun",
+   "body": "❓ Blocking @morgan: Нужен перевод средств партнёру?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:перевод средств"
+  },
+  {
+   "name": "a transfer of a task, not money, stays soft",
+   "body": "❓ Blocking @morgan: Перевести задачу в другой проект?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "soft",
+   "rule": "no hard rule matched"
+  },
+  {
+   "name": "amount in dollars spelled out, default yes",
+   "body": "❓ Blocking @morgan: Закинуть 20 долларов на OpenRouter?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:закинуть 2"
+  },
+  {
+   "name": "amount in euros spelled out, default yes",
+   "body": "❓ Blocking @morgan: Потратить 50 евро на домен?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:евро"
+  },
+  {
+   "name": "amount in dollars in English, default yes",
+   "body": "❓ Blocking @morgan: Spend 30 dollars on the domain?\nDefault: yes",
+   "slug": "morgan",
+   "labels": [],
+   "default": "yes",
+   "class": "hard",
+   "rule": "keyword:dollar"
+  },
+  {
+   "name": "amount in euros in English, default yes",
+   "body": "❓ Blocking @morgan: Spend 30 euros on the domain?\nDefault: yes",
+   "slug": "morgan",
+   "labels": [],
+   "default": "yes",
+   "class": "hard",
+   "rule": "keyword:30 eur"
+  },
+  {
+   "name": "amount in bucks, default yes",
+   "body": "❓ Blocking @morgan: Отдать 15 баксов за подписку на сервис?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:бакс"
+  },
+  {
+   "name": "amount in thousands, default yes",
+   "body": "❓ Blocking @morgan: Выделить 5к на рекламу?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:5к"
+  },
+  {
+   "name": "amount in thousands spelled tys, default yes",
+   "body": "❓ Blocking @morgan: Выделить 10 тыс на рекламу?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:10 тыс"
+  },
+  {
+   "name": "amount in k, default yes",
+   "body": "❓ Blocking @morgan: Allocate 2k for the ads?\nDefault: yes",
+   "slug": "morgan",
+   "labels": [],
+   "default": "yes",
+   "class": "hard",
+   "rule": "keyword:2k"
+  },
+  {
+   "name": "transfer verb with a bare amount, default yes",
+   "body": "❓ Blocking @morgan: Скинуть 20 на OpenRouter?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:скинуть 2"
+  },
+  {
+   "name": "transfer verb with the amount a word later, default yes",
+   "body": "❓ Blocking @morgan: Закинуть на OpenRouter 20, чтобы бот ожил?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "hard",
+   "rule": "keyword:закинуть на openrouter 2"
+  },
+  {
+   "name": "a time window is not money, default yes",
+   "body": "❓ Blocking @morgan: Оставить окно 24 часа для мягких вопросов?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "soft",
+   "rule": "no hard rule matched"
+  },
+  {
+   "name": "euro inside another word is not money, default yes",
+   "body": "❓ Blocking @morgan: Перенести сервер в европейский регион?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
+   "class": "soft",
+   "rule": "no hard rule matched"
+  },
+  {
+   "name": "transfer verb without an amount is not money, default yes",
+   "body": "❓ Blocking @morgan: Скинуть ссылку на макет в канал?\nDefault: да",
+   "slug": "morgan",
+   "labels": [],
+   "default": "да",
    "class": "soft",
    "rule": "no hard rule matched"
   }

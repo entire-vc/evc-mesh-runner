@@ -1,7 +1,7 @@
-"""A ``WAIT card:#X`` is sent back when X itself waits on a timer, a person or a human gate."""
+"""A ``wait_for on=card`` on X is sent back when X itself waits on a timer, a person or a human gate."""
 import datetime as dt
 
-from fakes import FakeMesh, task, write_replies, wait_card
+from fakes import FakeMesh, task, write_replies, wait_card, wait_time
 from mesh_runner.store import iso
 from test_runner import Bench
 
@@ -19,7 +19,7 @@ class CardWaitOnIdleTarget(Bench):
         return r, t, x
 
     def turn(self, r, t, x, first=True):
-        line = f"⏳ WAIT card:#{x['id'][:8]}"
+        line = wait_card(x['id'])
         write_replies(self.replies, {t['id'][:8]: line, t['id'][:8] + ':resume': line})
         r.start_new(1) if first else r.resume_ready(1)
         return self.finish_turn(r)
@@ -128,7 +128,7 @@ class CardWaitOnIdleTarget(Bench):
 
     def condition_on_time_target(self, cond):
         r, t, x = self.flow(x_wait={'kind': 'time', 'target': '', 'until': iso()})
-        a = self.turn_line(r, t, x, f"⏳ WAIT card:#{x['id'][:8]} until={cond}")
+        a = self.turn_line(r, t, x, wait_card(x['id'], condition=cond))
         self.assertEqual(a.state, 'waiting', a.wake_text)
 
     def test_accepted_condition_on_time_target_is_accepted(self):
@@ -142,7 +142,7 @@ class CardWaitOnIdleTarget(Bench):
 
     def test_acceptance_condition_on_decision_target_is_accepted(self):
         r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead'})
-        a = self.turn_line(r, t, x, f"⏳ WAIT card:#{x['id'][:8]} until=accepted")
+        a = self.turn_line(r, t, x, wait_card(x['id'], condition='accepted'))
         self.assertEqual(a.state, 'waiting', a.wake_text)
 
     def test_target_waiting_for_published_external_event_is_accepted(self):
@@ -150,13 +150,14 @@ class CardWaitOnIdleTarget(Bench):
         self.assertEqual(self.turn(r, t, x).state, 'waiting')
 
     def test_target_time_wait_keeps_its_event_and_source(self):
-        # the target's own `on=time` declaration is stored with event_ref and source
+        # the target's own `wait_for on=time` is stored with event_ref and source
         x = task(2)
         r = self.runner(FakeMesh([x], max_concurrent=1))
         self.addCleanup(r.store.db.close)
         r.refresh_me()
         when = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).strftime('%Y-%m-%dT04:20:00Z')
-        line = f"⏳ WAIT {when}: external=pbs-gc-0400 source=https://example.org/gc GC frees the datastore"
+        line = wait_time(until_at=when, event_ref='pbs-gc-0400', source='https://example.org/gc',
+                         why='GC frees the datastore')
         write_replies(self.replies, {x['id'][:8]: line})
         r.start_new(1)
         a = self.finish_turn(r)

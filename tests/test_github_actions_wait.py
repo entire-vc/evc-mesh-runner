@@ -5,7 +5,7 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from fakes import FakeGitLab, FakeMesh, task, write_replies
+from fakes import FakeGitLab, FakeMesh, task, wait_pipeline, write_replies
 from test_runner import Bench
 
 from mesh_runner import config as config_mod
@@ -181,7 +181,7 @@ class MissingPipeline(Bench):
 
     def test_404_is_sent_back_with_the_reason(self):
         r, t = self.flow(http_error(404))
-        a = self.turn(r, t, "⏳ WAIT pipeline:g/app#999")
+        a = self.turn(r, t, wait_pipeline("g/app", 999))
         self.assertEqual(a.state, "ready")
         self.assertIn("pipeline g/app#999 not found on git.example", a.wake_text)
         self.assertIn("give a GitLab pipeline id or a GitHub Actions run of a GitHub-hosted repo", a.wake_text)
@@ -189,7 +189,7 @@ class MissingPipeline(Bench):
 
     def test_typed_wait_on_a_missing_pipeline_is_sent_back_too(self):
         r, t = self.flow(http_error(404))
-        a = self.turn(r, t, f"⏳ WAIT pipeline:g/app#999 until=success after={SHA}:999:running")
+        a = self.turn(r, t, wait_pipeline("g/app", 999, until="green", after_sha=SHA, after_pipeline_id=999, after_status="running"))
         self.assertEqual(a.state, "ready")
         self.assertIn("not found on git.example", a.wake_text)
 
@@ -198,7 +198,7 @@ class MissingPipeline(Bench):
             with self.subTest(error=repr(error)):
                 self.tearDown(), self.setUp()
                 r, t = self.flow(error)
-                a = self.turn(r, t, "⏳ WAIT pipeline:g/app#999")
+                a = self.turn(r, t, wait_pipeline("g/app", 999))
                 self.assertEqual(a.state, "waiting")
                 self.assertEqual(a.wait["target"], "g/app#999")
                 r.store.db.close()
@@ -207,7 +207,7 @@ class MissingPipeline(Bench):
         r, t = self.flow(http_error(404))
         r.gitlab.pipeline_rows["g/app#5"] = {"sha": SHA, "id": 5, "status": "running"}
         r.gitlab.pipelines["g/app#5"] = "running"
-        a = self.turn(r, t, "⏳ WAIT pipeline:g/app#5")
+        a = self.turn(r, t, wait_pipeline("g/app", 5))
         self.assertEqual(a.state, "waiting")
 
 

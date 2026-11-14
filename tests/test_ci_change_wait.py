@@ -3,10 +3,9 @@ import datetime as dt
 import unittest
 from unittest import mock
 
-from mesh_runner.outcome import parse_line
 from mesh_runner.store import Store, iso
 from mesh_runner.wake import check, ci_change_event, ci_delivery_key
-from fakes import FakeGitLab, FakeMesh, task, write_replies, calls, wait_pipeline
+from fakes import FakeGitLab, FakeMesh, task, write_replies, calls, wait_pipeline, wait_mr, typed, turn_rows
 from test_runner import Bench
 
 NOW = dt.datetime.now(dt.timezone.utc)
@@ -14,8 +13,16 @@ SHA = 'a' * 40
 OTHER = 'b' * 40
 
 
-def marker(target='mr:g/app!56', predicate='change', status='failed'):
-    return f'⏳ WAIT {target} until={predicate} after={SHA}:14845:{status}'
+def marker(target='mr:g/app!56', predicate='change', status='failed', jobs=(), sha=SHA, pid=14845):
+    """The typed wait command (wait_for on=mr / on=pipeline) with an explicit CI baseline."""
+    until = {'change': 'changed', 'success': 'green'}[predicate]
+    kind, rest = target.split(':')
+    base = dict(after_sha=sha, after_pipeline_id=pid, after_status=status)
+    if kind == 'mr':
+        project, iid = rest.split('!')
+        return wait_mr(project, int(iid), until=until, jobs=jobs, **base)
+    project, number = rest.split('#')
+    return wait_pipeline(project, int(number), until=until, jobs=jobs, **base)
 
 
 def row(pid=14845, status='failed', sha=SHA):
@@ -23,7 +30,7 @@ def row(pid=14845, status='failed', sha=SHA):
 
 
 class TypedCI(Bench):
-    def setup_wait(self, text=None):
+    def setup_wait(self, turn=None):
         t = task(1)
         mesh, gl = FakeMesh([t]), FakeGitLab()
         gl.mr_rows['g/app!56'] = row()
@@ -31,18 +38,20 @@ class TypedCI(Bench):
         r = self.runner(mesh, gl)
         r.refresh_me()
         a = r.store.create(self.agent.name, t['id'], 'claude')
-        o = parse_line(text or marker(), NOW)
+        o = typed(turn or marker())
         r.store.update(a, state='waiting', wait={'kind': o.kind, 'target': o.target,
                        **o.extra, 'since': iso(), 'started': iso()})
         return r, a, t, gl
 
     def test_strict_parser_and_pipeline_identity(self):
-        self.assertEqual(parse_line(marker(), NOW).extra['ci_change']['pipeline'], 14845)
-        for text in (marker().replace(SHA, 'abc'), marker().replace('until=change', 'until=anything'),
-                     marker('pipeline:g/app#9'), marker().replace('failed', 'unknown')):
-            with self.subTest(text=text):
-                self.assertEqual(parse_line(text, NOW).kind, 'unparsed')
-        self.assertFalse(parse_line('⏳ WAIT mr:g/app!56: wait for new success', NOW).extra)
+        self.assertEqual(typed(marker()).extra['ci_change']['pipeline'], 14845)
+        for name, turn in (('short sha', marker(sha='abc')),
+                           ('unknown until', {**marker(), 'until': 'anything'}),
+                           ('pipeline id differs from the awaited one', marker('pipeline:g/app#9')),
+                           ('unknown status', marker(status='unknown'))):
+            with self.subTest(name=name):
+                self.assertEqual(typed(turn).kind, 'unparsed')
+        self.assertFalse(typed(wait_mr('g/app', 56, note='wait for new success')).extra)
 
     def test_known_failed_baseline_does_not_wake_in_either_spelling(self):
         for target in ('pipeline:g/app#14845', 'mr:g/app!56'):
@@ -61,7 +70,7 @@ class TypedCI(Bench):
         r.store.update(a, state='completed')
         r2 = self.runner(r.mesh, gl)  # separate SQLite connection, same durable database
         b = r2.store.create(self.agent.name, t['id'], 'claude')
-        o = parse_line(marker(status='running'), NOW)
+        o = typed(marker(status='running'))
         r2.refresh_me()
         r2.store.update(b, state='waiting', wait={'kind':o.kind, 'target':o.target, **o.extra,
                                                 'since':iso(), 'started':iso()})
@@ -106,7 +115,7 @@ class TypedCI(Bench):
 
     def test_review_uses_same_predicate_ignores_foreign_pipeline_and_does_not_ack(self):
         r, a, t, gl = self.setup_wait(marker(predicate='success'))
-        last={'body':marker(predicate='success'),'created_at':iso(NOW),'author_id':r.agent_id}
+        last = typed(marker(predicate='success'))     # the wait this agent still holds in Mesh
         r.mesh.vcs_links = lambda tid: [{'url':'https://git.example/g/other/-/pipelines/999',
                                         'status':'failed','updated_at':iso(NOW+dt.timedelta(minutes=1))}]
         self.assertEqual(r._review_event(t,NOW,last,[]),'')
@@ -117,7 +126,7 @@ class TypedCI(Bench):
         delivery=r._review_ci_delivery[t['id']]
         r.store.update_with_marks(a,{key:delivery['value']},expect='waiting',state='ready')
         self.assertEqual(r._review_event(t,NOW,last,[]),'')
-        self.assertTrue(r._own_wait_pending(t,last,NOW-dt.timedelta(days=3)))
+        self.assertTrue(r._own_wait_pending(last,NOW-dt.timedelta(days=3)))
 
     def test_old_head_is_unknown_and_ordinary_failed_wake_is_preserved(self):
         r,a,t,gl=self.setup_wait()
@@ -140,7 +149,7 @@ class TypedCI(Bench):
         r,a,t,gl=self.setup_wait(marker('pipeline:g/app#14845',status='running'))
         r._wake_one(a)
         self.assertEqual(a.state,'ready')
-        o=parse_line(marker(status='running'),NOW)
+        o=typed(marker(status='running'))
         r.store.update(a,state='waiting',wait={'kind':o.kind,'target':o.target,**o.extra,
                                              'since':iso(),'started':iso()})
         r._wake_one(a)
@@ -189,7 +198,7 @@ class TypedCI(Bench):
         r,a,t,gl=self.setup_wait(marker(status='running'))
         r._wake_one(a)
         r.store.mark(self.agent.name,t['id'],ci_delivery_key('g/app#999',999),'different')
-        o=parse_line(marker('pipeline:g/app#14845',status='running'),NOW)
+        o=typed(marker('pipeline:g/app#14845',status='running'))
         r.store.update(a,state='waiting',wait={'kind':o.kind,'target':o.target,**o.extra,
                                              'since':iso(),'started':iso()})
         r._wake_one(a)
@@ -198,7 +207,8 @@ class TypedCI(Bench):
     def test_review_refeed_age_cannot_bypass_baseline_after_prior_feed(self):
         r,a,t,gl=self.setup_wait()
         old=NOW-dt.timedelta(days=3)
-        last={'body':marker(),'created_at':iso(old),'author_id':r.agent_id}
+        last={'body':'worked on it','created_at':iso(old),'author_id':r.agent_id}
+        r.mesh.waits={t['id']:turn_rows(marker())[1]}
         t['updated_at']=iso(old)
         r.store.mark(self.agent.name,t['id'],'review_fed','previous')
         with mock.patch.object(r,'_own_work',return_value=(a,old,last)), \
@@ -252,7 +262,7 @@ class TypedCI(Bench):
         self.addCleanup(r.store.db.close)
         r.refresh_me()
         r.store.mark(self.agent.name, t['id'], ci_delivery_key('g/app!56', 14845), f'{SHA}:14845:{status}')
-        return r, t, gl, f'⏳ WAIT {target} until={predicate} after={SHA}:14845:running'
+        return r, t, gl, marker(target, predicate, 'running')
 
     def _turn(self, r, t, line, first=False):
         write_replies(self.replies, {t['id'][:8]: line, t['id'][:8] + ':resume': line})
@@ -285,7 +295,7 @@ class TypedCI(Bench):
         r, t, gl, line = self._stale_flow(predicate='success')
         probe = r.store.create(self.agent.name, t['id'], 'claude')
         self.assertEqual(r._stale_ci_baseline(
-            probe, {'kind': 'mr', 'target': 'g/app!56', 'ci_change': parse_line(line, NOW).extra['ci_change']}), '')
+            probe, {'kind': 'mr', 'target': 'g/app!56', 'ci_change': typed(line).extra['ci_change']}), '')
         r.store.update(probe, state='completed')
         a = self._turn(r, t, line, first=True)
         self.assertEqual(a.state, 'waiting')
@@ -311,14 +321,14 @@ class TypedCI(Bench):
                 r, t, gl, line = self._stale_flow(target=target)
                 mutate(gl)
                 a = r.store.create(self.agent.name, t['id'], 'claude')
-                o = parse_line(line, NOW)
+                o = typed(line)
                 self.assertEqual(r._stale_ci_baseline(a, {'kind': o.kind, 'target': o.target, **o.extra}), '')
                 r.store.update(a, state='completed')
 
     def test_stale_check_failure_is_logged_and_baseline_retained(self):
         r, t, gl, line = self._stale_flow()
         a = r.store.create(self.agent.name, t['id'], 'claude')
-        o = parse_line(line, NOW)
+        o = typed(line)
         gl.mr_rows['g/app!56'] = row(sha='nothex')
         with self.assertLogs('mesh_runner', level='WARNING') as logs:
             self.assertEqual(r._stale_ci_baseline(a, {'kind': o.kind, 'target': o.target, **o.extra}), '')
@@ -341,7 +351,8 @@ class TypedCI(Bench):
     def test_review_already_delivered_comment_does_not_bypass_typed_hold(self):
         r,a,t,gl=self.setup_wait()
         old=NOW-dt.timedelta(days=3)
-        last={'body':marker(),'created_at':iso(old),'author_id':r.agent_id}
+        last={'body':'worked on it','created_at':iso(old),'author_id':r.agent_id}
+        r.mesh.waits={t['id']:turn_rows(marker())[1]}
         noise={'body':'earlier answer','created_at':iso(old+dt.timedelta(hours=1)),
                'author_id':'someone-else'}
         t['updated_at']=iso(old)
@@ -359,7 +370,7 @@ class TypedCI(Bench):
         gl.mr_rows['g/app!56']={'sha':sha,'state':'opened',
             'head_pipeline':{'id':14845,'sha':sha,'status':'failed'}}
         write_replies(self.replies,{t['id'][:8]:wait_pipeline("g/app", 14845),
-            t['id'][:8]+':resume':f'⏳ WAIT mr:g/app!56 until=change after={sha}:14845:failed'})
+            t['id'][:8]+':resume':wait_mr('g/app', 56, until='changed', after_sha=sha, after_pipeline_id=14845, after_status='failed')})
         r=self.runner(FakeMesh([t]),gl)
         r.tick()
         # Settle each real child separately: tick() can settle the legacy wait,
@@ -466,19 +477,20 @@ class OwnPlay(TypedCI):
 class ExplicitWaitDiagnosisTests(unittest.TestCase):
     SHA = 'a' * 40
 
-    def note(self, tail):
-        o = parse_line(f'⏳ WAIT mr:g/app!5 {tail}', NOW)
+    def note(self, **baseline):
+        o = typed(wait_mr('g/app', 5, until='changed', **baseline))
         self.assertEqual(o.kind, 'unparsed')
         return o.note
 
     def test_none_baseline_is_named(self):
-        self.assertIn('no pipeline yet', self.note(f'until=change after={self.SHA}:none:none'))
+        self.assertIn('after_pipeline_id', self.note(after_sha=self.SHA, after_status='none'))
 
     def test_opened_baseline_with_change_is_named(self):
-        self.assertIn('until=merged', self.note(f'until=change after={self.SHA}:opened'))
+        self.assertIn('after_status `opened` is not a pipeline status',
+                      self.note(after_sha=self.SHA, after_pipeline_id=14845, after_status='opened'))
 
-    def test_other_malformation_gets_the_forms(self):
-        self.assertIn('expected', self.note('until=change after=nonsense'))
+    def test_other_malformation_names_the_field(self):
+        self.assertIn('after_sha `nonsense` is not a full', self.note(after_sha='nonsense'))
 
 
 def _manual_pipeline():
@@ -502,8 +514,9 @@ class TargetJobs(Bench):
         r = self.runner(FakeMesh([t]), gl)
         r.refresh_me()
         a = r.store.create(self.agent.name, t['id'], 'claude')
-        o = parse_line(f'⏳ WAIT pipeline:{self.TARGET} until={predicate} '
-                       f'after={self.sha}:9001:{baseline} jobs=[{jobs}]', NOW)
+        o = typed(wait_pipeline('example/project', 9001, until={'success': 'green', 'change': 'changed'}[predicate],
+                                jobs=jobs.split(','), after_sha=self.sha, after_pipeline_id=9001,
+                                after_status=baseline))
         r.store.update(a, state='waiting', wait={'kind': o.kind, 'target': o.target, **o.extra,
                                                  'since': iso(), 'started': iso()})
         return r, a, t, gl, o
@@ -564,68 +577,60 @@ class TargetJobs(Bench):
 
     def test_default_baseline_keeps_jobs_on_a_manual_pipeline(self):
         r, a, t, gl, o = self.setup_wait()
-        out = r._parse(f'⏳ WAIT pipeline:{self.TARGET} until=success jobs=[browser-tests]', NOW)
+        out = r._default_baseline(typed(wait_pipeline('example/project', 9001, until='green', jobs=['browser-tests'])))
         self.assertEqual(out.extra['ci_change']['jobs'], ['browser-tests'])
         self.assertEqual(out.extra['ci_change']['status'], 'manual')
-        legacy = r._parse(f'⏳ WAIT pipeline:{self.TARGET} jobs=[browser-tests]', NOW)
+        legacy = r._default_baseline(typed(wait_pipeline('example/project', 9001, jobs=['browser-tests'])))
         self.assertEqual(legacy.extra['ci_change'], {'predicate': 'change', 'sha': self.sha,
                                                      'pipeline': 9001, 'status': 'manual',
                                                      'jobs': ['browser-tests']})
 
     def test_default_baseline_jobs_wait_without_a_baseline_is_sent_back(self):
         r, a, t, gl, o = self.setup_wait()
-        line = f'⏳ WAIT pipeline:{self.TARGET} until=success jobs=[browser-tests]'
+        declared = typed(wait_pipeline('example/project', 9001, until='green', jobs=['browser-tests']))
         with mock.patch.object(gl, 'get_pipeline', side_effect=RuntimeError('502')):
-            out = r._parse(line, NOW)
+            out = r._default_baseline(declared)
         self.assertEqual(out.kind, 'unparsed')
         self.assertIn('could not be read', out.note)
-        plain = r._parse(f'⏳ WAIT pipeline:{self.TARGET} until=success', NOW)
+        plain = r._default_baseline(typed(wait_pipeline('example/project', 9001, until='green')))
         self.assertEqual(plain.kind, 'pipeline')                 # without jobs the plain wait still stands
         r.gitlab = None
-        out = r._parse(line, NOW)
+        out = r._default_baseline(declared)
         self.assertEqual(out.kind, 'unparsed')
         self.assertIn('no GitLab', out.note)
 
     def test_default_baseline_jobs_wait_on_a_closed_mr_is_sent_back(self):
         r, a, t, gl, o = self.setup_wait()
         gl.mr_rows['g/app!56'] = dict(row(pid=14846), state='merged')
-        out = r._parse('⏳ WAIT mr:g/app!56 until=success jobs=[e2e]', NOW)
+        out = r._default_baseline(typed(wait_mr('g/app', 56, until='green', jobs=['e2e'])))
         self.assertEqual(out.kind, 'unparsed')
         self.assertIn('not open', out.note)
-        plain = r._parse('⏳ WAIT mr:g/app!56 until=success', NOW)
+        plain = r._default_baseline(typed(wait_mr('g/app', 56, until='green')))
         self.assertEqual(plain.kind, 'mr')
 
 
 class JobsParsing(unittest.TestCase):
     def test_jobs_field_in_typed_and_default_forms(self):
-        o = parse_line(f'⏳ WAIT pipeline:g/app#14845 until=success after={SHA}:14845:manual '
-                       'jobs=[browser-tests, lint]: post-review gate', NOW)
+        o = typed(wait_pipeline('g/app', 14845, until='green', jobs=['browser-tests', 'lint'],
+                                note='post-review gate', after_sha=SHA, after_pipeline_id=14845,
+                                after_status='manual'))
         self.assertEqual(o.kind, 'pipeline')
         self.assertEqual(o.extra['ci_change']['jobs'], ['browser-tests', 'lint'])
         self.assertEqual(o.jobs, ('browser-tests', 'lint'))
         self.assertEqual(o.note, 'post-review gate')
-        first = parse_line(f'⏳ WAIT pipeline:g/app#14845 jobs=[browser-tests] until=change '
-                           f'after={SHA}:14845:manual', NOW)
+        first = typed(wait_pipeline('g/app', 14845, until='changed', jobs=['browser-tests'],
+                                    after_sha=SHA, after_pipeline_id=14845, after_status='manual'))
         self.assertEqual(first.extra['ci_change']['jobs'], ['browser-tests'])
-        d = parse_line('⏳ WAIT mr:g/app!56 until=success jobs=[e2e]', NOW)
+        d = typed(wait_mr('g/app', 56, until='green', jobs=['e2e']))
         self.assertEqual(d.extra['ci_default'], {'predicate': 'success', 'jobs': ['e2e']})
 
     def test_no_jobs_field_keeps_the_old_contract(self):
-        self.assertNotIn('jobs', parse_line(marker(), NOW).extra['ci_change'])
+        self.assertNotIn('jobs', typed(marker()).extra['ci_change'])
 
-    def test_empty_jobs_list_is_refused_not_ignored(self):
-        for text in (f'{marker()} jobs=[]', '⏳ WAIT pipeline:g/app#5 jobs=[ ]',
-                     '⏳ WAIT pipeline:g/app#5 until=success jobs=[]'):
-            with self.subTest(text=text):
-                o = parse_line(text, NOW)
-                self.assertEqual(o.kind, 'unparsed')
-                self.assertIn('names no job', o.note)
-
-    def test_legacy_jobs_form_is_read_as_a_typed_jobs_wait(self):
-        o = parse_line('⏳ WAIT pipeline:g/app#5 jobs=[a,b]', NOW)
+    def test_finished_pipeline_wait_with_jobs_is_a_typed_jobs_wait(self):
+        o = typed(wait_pipeline('g/app', 5, jobs=['a', 'b']))
         self.assertEqual(o.extra['ci_default'], {'predicate': 'change', 'jobs': ['a', 'b']})
 
     def test_contract_names_the_jobs_field(self):
         from mesh_runner.outcome import CONTRACT
         self.assertIn('required_jobs=[<job>,<job>]', CONTRACT)
-        self.assertIn('then optionally jobs=[<job>,<job>]', CONTRACT)      # the marker fallback

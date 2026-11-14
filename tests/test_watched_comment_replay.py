@@ -7,7 +7,7 @@ FakeMesh is the external Mesh HTTP boundary. These controls run only in CI.
 import datetime as dt
 import json
 
-from fakes import task, write_replies
+from fakes import task, wait_card, write_replies
 from mesh_runner.selection import parse_time
 from mesh_runner.store import Store
 from mesh_runner.wake import check as wake_check
@@ -18,19 +18,30 @@ from test_runner import calls
 class WatchedCommentReplay(DeclaredBench):
     def start(self):
         self.live = task(2, cat="in_progress", assignee_id="agent-lead")
-        self.line = f"⏳ WAIT decision:@lead: pass the handback from #{self.live['id'][:8]} when ready"
+        self.line = wait_card(self.live['id'], "pass the handback when ready")
         a = self.declare(self.line, self.live)
+        # A typed ask_agent is already a Mesh request, so the runner no longer converts a question about the
+        # addressee's live task into a watched card wait; the watched wait is put on the settled card wait.
+        self.watch(a)
+        a = self.r.store.get(a.id)
         write_replies(self.replies, {self.source['id'][:8]: self.line,
                                     self.source['id'][:8]+':resume': self.line})
         self.at = parse_time(a.wait['since']) + dt.timedelta(seconds=5)
         return a
+
+    def watch(self, a):
+        """What the conversion put on the settled wait, again for every redeclaration."""
+        a = self.r.store.get(a.id)
+        if a.state == 'waiting' and 'watch_comments_by' not in a.wait:
+            self.r.store.update(a, wait={**a.wait, 'watch_comments_by': {'id': 'agent-lead', 'name': 'lead'},
+                                         'converted_from': 'decision:@lead'})
 
     def ticks(self, count=1):
         for _ in range(count):
             self.r._last_wake_check.clear()
             self.r.tick()
             if self.r.store.by_state(self.r.agent.name, ('running',)):
-                self.finish_turn(self.r)
+                self.watch(self.finish_turn(self.r))
 
     def comment(self, body, author="agent-lead", at=None):
         return self.mesh.add_comment(self.live['id'], body, author=author, at=at or self.at)

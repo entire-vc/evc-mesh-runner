@@ -4,10 +4,10 @@ import datetime as dt
 import unittest
 from unittest import mock
 
-from fakes import FakeGitLab, FakeMesh, calls, task, wait_mr, write_replies
+from fakes import (FakeGitLab, FakeMesh, calls, mesh_turn, task, typed, wait_merge, wait_mr, wait_pipeline,
+                   write_replies)
 from test_runner import Bench
 
-from mesh_runner.outcome import parse_outcome
 from mesh_runner.wake import (GitHub, GitLab, ProviderUnavailable, ci_delivery_key, ci_observation,
                               split_provider, target_jobs_state)
 
@@ -20,50 +20,56 @@ RUN = {"id": 41664214493, "head_sha": SHA, "head_branch": "main", "status": "com
 GL_MR = {"state": "opened", "sha": SHA, "head_pipeline": {"id": 7, "status": "success", "sha": SHA}}
 
 
-def parse(text, merge=False):
-    return parse_outcome(text, NOW, merge=merge)
+def parse(turn, merge=False):
+    return typed(turn, now=NOW, merge=merge)
 
 
 class Parse(unittest.TestCase):
     def test_bare_keeps_semantics(self):
-        o = parse("⏳ WAIT mr:entire-vc/evc-mesh!814")
+        o = parse(wait_mr("entire-vc/evc-mesh", 814))
         self.assertEqual((o.kind, o.target), ("mr", "entire-vc/evc-mesh!814"))
 
     def test_explicit_providers_parse_on_every_predicate(self):
         for prov in ("github", "gitlab"):
-            o = parse(f"⏳ WAIT mr:{prov}:entire-vc/evc-mesh!814")
-            self.assertEqual((o.kind, o.target), ("mr", f"{prov}:entire-vc/evc-mesh!814"))
-            o = parse(f"⏳ WAIT pipeline:{prov}:entire-vc/evc-mesh#5")
-            self.assertEqual((o.kind, o.target), ("pipeline", f"{prov}:entire-vc/evc-mesh#5"))
-            o = parse(f"⏳ WAIT mr:{prov}:o/r!3 until=merged after={SHA}:opened")
+            pre = "github:" if prov == "github" else ""     # a GitLab target stays bare, GitHub is always named
+            o = parse(wait_mr("entire-vc/evc-mesh", 814, provider=prov))
+            self.assertEqual((o.kind, o.target), ("mr", f"{pre}entire-vc/evc-mesh!814"))
+            o = parse(wait_pipeline("entire-vc/evc-mesh", 5, provider=prov))
+            self.assertEqual((o.kind, o.target), ("pipeline", f"{pre}entire-vc/evc-mesh#5"))
+            o = parse(wait_mr("o/r", 3, until="merged", provider=prov, after_sha=SHA, after_status="opened"))
             self.assertEqual(o.extra["mr_state"]["sha"], SHA)
-            self.assertEqual(o.target, f"{prov}:o/r!3")
-            o = parse(f"⏳ WAIT mr:{prov}:o/r!3 until=merged")
+            self.assertEqual(o.target, f"{pre}o/r!3")
+            o = parse(wait_mr("o/r", 3, until="merged", provider=prov))
             self.assertEqual(o.extra["mr_default"], {"predicate": "merged"})
             if prov == "gitlab":
-                o = parse(f"⏳ WAIT mr:{prov}:o/r!3 until=change after={SHA}:9:running")
+                o = parse(wait_mr("o/r", 3, until="changed", provider=prov, after_sha=SHA,
+                                  after_pipeline_id=9, after_status="running"))
                 self.assertEqual(o.extra["ci_change"]["pipeline"], 9)
-                o = parse(f"⏳ WAIT mr:{prov}:o/r!3 until=success")
-                self.assertEqual((o.target, o.extra["ci_default"]["predicate"]), (f"{prov}:o/r!3", "success"))
-            o = parse(f"⏳ WAIT pipeline:{prov}:o/r#9 until=change after={SHA}:9:failed jobs=[a,b]")
-            self.assertEqual((o.target, o.jobs), (f"{prov}:o/r#9", ("a", "b")))
+                o = parse(wait_mr("o/r", 3, until="green", provider=prov))
+                self.assertEqual((o.target, o.extra["ci_default"]["predicate"]), (f"{pre}o/r!3", "success"))
+            o = parse(wait_pipeline("o/r", 9, until="changed", jobs=["a", "b"], provider=prov, after_sha=SHA,
+                                    after_pipeline_id=9, after_status="failed"))
+            self.assertEqual((o.target, o.jobs), (f"{pre}o/r#9", ("a", "b")))
 
     def test_github_mr_ci_predicates_are_refused_with_the_run_spelling(self):
-        for line in (f"⏳ WAIT mr:github:o/r!3 until=change after={SHA}:9:running", "⏳ WAIT mr:github:o/r!3 until=success",
-                     "⏳ WAIT mr:github:o/r!3 until=change jobs=[a]"):
-            o = parse(line)
-            self.assertEqual(o.kind, "unparsed", line)
-            self.assertIn("pipeline:github:", o.note)
-        self.assertEqual(parse("⏳ WAIT mr:github:o/r!3").kind, "mr")
+        for turn in (wait_mr("o/r", 3, until="changed", provider="github", after_sha=SHA,
+                             after_pipeline_id=9, after_status="running"),
+                     wait_mr("o/r", 3, until="green", provider="github"),
+                     wait_mr("o/r", 3, until="changed", provider="github", jobs=["a"])):
+            o = parse(turn)
+            self.assertEqual(o.kind, "unparsed", turn)
+            self.assertIn("pipeline", o.note)
+        self.assertEqual(parse(wait_mr("o/r", 3, provider="github")).kind, "mr")
 
     def test_unknown_provider_is_not_a_wait_target(self):
-        self.assertEqual(parse("⏳ WAIT mr:bitbucket:o/r!3").kind, "unparsed")
+        self.assertEqual(parse(wait_mr("o/r", 3, provider="bitbucket")).kind, "unparsed")
 
     def test_qualified_merge_is_rejected_not_sent_to_the_gate(self):
-        o = parse(f"⏳ WAIT merge:github:o/r!3 after={SHA}", merge=True)
+        o = parse(mesh_turn("wait", on="merge", project_path="o/r", mr_iid=3, after_sha=SHA, provider="github"),
+                  merge=True)
         self.assertEqual(o.kind, "unparsed")
-        self.assertIn("no provider-qualified form", o.note)
-        self.assertEqual(parse(f"⏳ WAIT merge:o/r!3 after={SHA}", merge=True).kind, "merge")
+        self.assertIn("GitLab only", o.note)
+        self.assertEqual(parse(wait_merge("o/r", 3, SHA), merge=True).kind, "merge")
 
 
 class Transport(unittest.TestCase):

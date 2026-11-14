@@ -13,9 +13,8 @@ from unittest import mock
 from uuid import UUID
 
 from mesh_runner import gmail_watch as gw
-from mesh_runner.outcome import parse_line
 from mesh_runner.store import Store
-from fakes import FakeMesh, task
+from fakes import FakeMesh, task, typed, turn_rows, wait_registered
 from test_runner import Bench
 
 MAILBOX = 'box@example.org'
@@ -388,11 +387,11 @@ class Delivery(Base):
 class Waits(unittest.TestCase):
     def test_F14_parse(self):
         now = dt.datetime.now(dt.timezone.utc)
-        o = parse_line('⏳ WAIT gmail:gmr_3f9a1c07d2be', now)
+        o = typed(wait_registered('gmail', 'gmr_3f9a1c07d2be'), now=now)
         self.assertEqual((o.kind, o.target, o.is_wait), ('gmail', 'gmr_3f9a1c07d2be', True))
-        self.assertEqual(parse_line('⏳ WAIT gmail:gmr_3f9a1c07d2be: why', now).note.strip(': '), 'why')
-        for bad in ('⏳ WAIT gmail:3f9a1c07d2be', '⏳ WAIT gmail:gmr_zz', '⏳ WAIT gmail:gmr_3f9a1c07d2bez', '⏳ WAIT gmail:'):
-            o = parse_line(bad, now)
+        self.assertEqual(typed(wait_registered('gmail', 'gmr_3f9a1c07d2be', note='why'), now=now).note.strip(': '), 'why')
+        for bad in ('3f9a1c07d2be', 'gmr_zz', 'gmr_3f9a1c07d2bez', ''):
+            o = typed(wait_registered('gmail', bad), now=now)
             self.assertEqual(o.kind, 'unparsed', bad)
             self.assertNotIn('absolute', o.note)                        # never routed to the time guidance
 
@@ -420,7 +419,11 @@ class RunnerGmail(Bench):
     def declare(self, reg_id):
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
-                        result=f'⏳ WAIT gmail:{reg_id}', session_id='s')) + '\n')
+                        result='Recorded the outcome through Mesh.', session_id='s')) + '\n')
+        at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=5)).isoformat()
+        row, wait = turn_rows(wait_registered('gmail', reg_id), at=at)
+        self.r.mesh.outcomes = {self.obs: [row]}
+        self.r.mesh.waits = {self.obs: wait}
         self.r.store.update(self.a, state='running', log_path=str(path))
         self.r.settle(self.a)
 
@@ -454,7 +457,7 @@ class RunnerGmail(Bench):
         reg = self.reg()
         gw.cancel(self.r.store, reg)
         self.r.store.update(self.a, state='running')
-        parsed = parse_line(f'⏳ WAIT gmail:{reg}', dt.datetime.now(dt.timezone.utc))
+        parsed = typed(wait_registered('gmail', reg))
         self.assertIsNone(self.r._gmail_registration(self.a, parsed))
 
     def test_flag_off_declaration_is_refused_and_nothing_is_scanned(self):

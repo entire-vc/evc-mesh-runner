@@ -6,9 +6,8 @@ import unittest
 from unittest import mock
 
 from mesh_runner.store import iso
-from mesh_runner.outcome import parse_line
 from mesh_runner.wake import blocked_mr_next_step, ci_delivery_key, mr_merge_blocker, typed_event
-from fakes import FakeGitLab, FakeMesh, task, write_replies
+from fakes import FakeGitLab, FakeMesh, task, typed, wait_mr, write_replies
 from test_runner import Bench
 
 SHA = 'a' * 40
@@ -26,7 +25,7 @@ def mr_row(status='success', labels=REVIEWED, sha=SHA, pid=14845, **extra):
 
 
 def merged_line(sha=SHA):
-    return f'⏳ WAIT mr:{MR} until=merged after={sha}:opened'
+    return wait_mr('g/app', 56, until='merged', after_sha=sha, after_status='opened')
 
 
 class MergeWaitOnBlockedMR(Bench):
@@ -144,7 +143,7 @@ class MergeWaitOnBlockedMR(Bench):
 
     def test_change_wait_on_a_conflicting_mr_keeps_its_own_rules(self):
         r, t, gl = self.flow(mr_row('running', has_conflicts=True))
-        a = self.turn(r, t, f'⏳ WAIT mr:{MR} until=change after={SHA}:14845:running')
+        a = self.turn(r, t, wait_mr('g/app', 56, until='changed', after_sha=SHA, after_pipeline_id=14845, after_status='running'))
         self.assertEqual(a.state, 'waiting')
 
     # -- next step ------------------------------------------------------------------------
@@ -159,17 +158,17 @@ class MergeWaitOnBlockedMR(Bench):
                 if delivered:
                     r.store.mark(self.agent.name, t['id'], ci_delivery_key(MR, 14845), f'{SHA}:14845:failed')
                 a = self.turn(r, t, merged_line())
-                self.assert_sent_back(a, f'`⏳ WAIT merge:{MR} after=<full-new-head-sha>`', 'once it is SHIP')
+                self.assert_sent_back(a, '`wait_for on=merge project_path=g/app mr_iid=56 after_sha=<full-new-head-sha>`', 'once it is SHIP')
                 r.store.db.close()
 
     def test_send_back_without_a_merge_gate_names_no_merge_wait(self):
         r, t, gl = self.flow(mr_row('success', has_conflicts=True))
         a = self.turn(r, t, merged_line())
         self.assert_sent_back(a, "project's merge tool")
-        self.assertNotIn('WAIT merge:', a.wake_text)
+        self.assertNotIn('on=merge', a.wake_text)
 
 
-    # -- behind only, merge gate (merge-and-release rule 2) ------------------------------------
+    # -- behind only, merge gate ------------------------------------
 
     def test_behind_mr_behind_a_merge_gate_is_accepted(self):
         # the gate syncs a branch that is only behind right before merging: the wait is not sent back
@@ -194,7 +193,7 @@ class MergeWaitOnBlockedMR(Bench):
         self.assertNotIn('merge the target branch', text)
         self.assertNotIn('Do not wait for this MR to merge again', text)
         self.assertIn('leave the branch as it is', text)
-        self.assertIn(f'`⏳ WAIT merge:{MR} after={SHA}`', text)     # the current head, not a new one
+        self.assertIn(f'`wait_for on=merge project_path=g/app mr_iid=56 after_sha={SHA}`', text)     # the current head, not a new one
         self.assertNotIn('new-head', text)
         self.assertIn('<full-head-sha>', blocked_mr_next_step(MR, 'need_rebase', True))
         # without a gate, or for a conflict, the author still makes the new head
@@ -208,12 +207,12 @@ class MergeWaitOnBlockedMR(Bench):
                       blocked_mr_next_step('github:o/r!5', 'need_rebase', True, SHA))
 
 
-def success_line(sha=SHA, status='failed'):
-    return f'⏳ WAIT mr:{MR} until=success after={sha}:14845:{status}'
+def success_line(sha=SHA, status='failed', pid=14845):
+    return wait_mr('g/app', 56, until='green', after_sha=sha, after_pipeline_id=pid, after_status=status)
 
 
 class SuccessWaitOnRedMR(MergeWaitOnBlockedMR):
-    """``until=success`` on an MR whose red head was already told: no new head pipeline comes by
+    """``until=green`` on an MR whose red head was already told: no new head pipeline comes by
     itself, so it is sent back like ``until=merged``; told once first by the owner notice."""
 
     def test_redeclared_success_wait_after_the_red_notice_is_sent_back(self):
@@ -236,7 +235,7 @@ class SuccessWaitOnRedMR(MergeWaitOnBlockedMR):
 
     def test_success_wait_on_a_running_or_new_red_head_is_accepted(self):
         for mr, line in ((mr_row('running'), success_line(status='running')),
-                         (mr_row('failed', sha=SHA2, pid=14900), f'⏳ WAIT mr:{MR} until=success after={SHA2}:14900:failed')):
+                         (mr_row('failed', sha=SHA2, pid=14900), success_line(SHA2, 'failed', 14900))):
             with self.subTest(line=line):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(mr_row('failed'))
@@ -259,7 +258,7 @@ class StandingWaitOnRedMR(MergeWaitOnBlockedMR):
         self.assertIn('action required', a.wake_text)
         told = a.wait['ci_action_delivery']              # acknowledged by the turn that carried it
         r.store.mark(self.agent.name, t['id'], told['key'], told['value'])
-        o = parse_line(line, dt.datetime.now(dt.timezone.utc))
+        o = typed(line)
         r.store.update(a, state='waiting', wake_text='',
                        wait={'kind': o.kind, 'target': o.target, **o.extra, 'since': iso(), 'started': iso()})
         return r, t, gl, r.store.get(a.id)
@@ -311,7 +310,7 @@ class StandingWaitOnRedMR(MergeWaitOnBlockedMR):
         cases = (
             ('green', mr_row('success', labels=[]), merged_line()),          # a reviewer may still label it
             ('running', mr_row('running'), success_line(status='running')),
-            ('change', mr_row('failed'), f'⏳ WAIT mr:{MR} until=change after={SHA}:14845:failed'),
+            ('change', mr_row('failed'), wait_mr('g/app', 56, until='changed', after_sha=SHA, after_pipeline_id=14845, after_status='failed')),
         )
         for name, mr, line in cases:
             with self.subTest(name=name):
@@ -328,7 +327,7 @@ class StandingWaitOnRedMR(MergeWaitOnBlockedMR):
         gl.mr_rows[MR] = mr_row('manual')
         for line in (success_line(status='manual'), merged_line()):
             with self.subTest(line=line):
-                o = parse_line(line, dt.datetime.now(dt.timezone.utc))
+                o = typed(line)
                 self.assertEqual(r._dead_wait_text(a, 'mr', MR, o.extra.get('ci_change'), o.extra.get('mr_state'),
                                                    parked=True), '')
 
@@ -344,7 +343,7 @@ class ConflictOwnerNotice(unittest.TestCase):
         event = typed_event(gl, 'mr', MR, self.wait(), '', first, allow_action_required=True, merge_gate=True)
         self.assertIn('action required', event)
         self.assertIn('has a merge conflict with its target branch', event)
-        self.assertIn(f'WAIT merge:{MR} after=', event)
+        self.assertIn('wait_for on=merge project_path=g/app mr_iid=56 after_sha=', event)
         self.assertNotIn('until=merged', event)
         self.assertTrue(first['action_required'])
         self.assertEqual(typed_event(gl, 'mr', MR, self.wait(), lambda key: first['value'], {},

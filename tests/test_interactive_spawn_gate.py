@@ -74,7 +74,7 @@ class InteractiveSpawnGate(Bench):
                              (shlex.quote(TMUX), shlex.quote(self.socket)))
         self.tmux.chmod(0o700)
         self.cfg.tmux_binary = str(self.tmux)
-        self.agent.env.update(HOME=str(self.root), CLAUDE_CONFIG_DIR=str(self.root / 'claude-config'), FAKE_ROOT=str(self.root), FAKE_KIND='claude', FAKE_REPLY='↻ NEXT', FAKE_SLOW='0.3')
+        self.agent.env.update(HOME=str(self.root), CLAUDE_CONFIG_DIR=str(self.root / 'claude-config'), FAKE_ROOT=str(self.root), FAKE_KIND='claude', FAKE_REPLY='turn done', FAKE_SLOW='0.3')
         self.agent.inline_env = dict(self.agent.env)
         self.agent.declared_env = dict(self.agent.env)
         self.adapter = BoundaryInteractiveAdapter(ClaudeAdapter(str(self.native)), 'builder', self.cfg.state_dir,

@@ -1,10 +1,11 @@
 """The contract agents see names the Mesh turn commands first, with the tool names, parameters and values the
-Mesh MCP server exposes (evc-mesh-mcp internal/mcp/turn_outcomes.go), and keeps the marker lines as the fallback."""
+Mesh MCP server exposes (evc-mesh-mcp internal/mcp/turn_outcomes.go); there is no marker fallback section."""
 import re
 import unittest
 
 from mesh_runner import prompt as prompts
-from mesh_runner.outcome import CONTRACT, DECISION_WAIT_GUIDANCE, MERGE_MARKER_GUIDANCE, MERGE_WAIT_GUIDANCE, contract, parse_line
+from mesh_runner import outcome as outcome_mod
+from mesh_runner.outcome import CONTRACT, DECISION_WAIT_GUIDANCE, MERGE_WAIT_GUIDANCE, contract
 
 from fakes import task
 
@@ -57,46 +58,28 @@ class TurnContract(unittest.TestCase):
                      "after_status=opened", "required_jobs=", "provider=github", "event_ref=", "source=", "why="):
             self.assertIn(form, text)
         self.assertNotIn("on=merge", CONTRACT)              # only where the merge gate runs
-        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, "").replace(MERGE_MARKER_GUIDANCE, ""),
-                         CONTRACT)
+        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, ""), CONTRACT)
 
-    def test_the_command_comes_first_and_the_marker_is_the_fallback(self):
-        first_command = CONTRACT.index("wait_for on=card")
-        fallback = CONTRACT.index("Only if the Mesh command is unavailable or fails")
-        self.assertLess(first_command, fallback)
-        self.assertNotIn("⏳ WAIT", CONTRACT[:fallback])
-        for line in ("⏳ WAIT card:#<8hex>", "⏳ WAIT decision:@<agent>: <question>", "↻ NEXT: <note>",
-                     "❓ Blocking @<person>: <question>", "until=merged after=<full-head-sha>:opened",
-                     "external=<stable-reference> source=<https-url|card:#8hex>"):
-            self.assertIn(line, CONTRACT[fallback:])
-
-    def test_retired_ops_review_wait_is_not_advertised_or_accepted(self):
-        self.assertNotIn("ops-review", contract(True))
-        for ref in ("a" * 64, "bad", ""):
-            out = parse_line("⏳ WAIT ops-review:" + ref, None)
-            self.assertEqual(out.kind, "unparsed")
-            self.assertIn("finish_task to=review", out.note)
-
-    def test_a_marker_is_offered_only_after_a_refused_command(self):
-        # Lanes wrote the marker in place of a command they never called ("habit"); the contract
-        # must not present it as an equal path: no marker beside a command, the fallback names the refusal
+    def test_there_is_no_marker_fallback_section(self):
         for merge in (False, True):
             text = contract(merge)
-            fallback = text.index("Only if the Mesh command is unavailable or fails")
-            self.assertNotIn("Marker:", text)
-            self.assertNotIn("WAIT merge:", text[:fallback])
-            tail = " ".join(text[fallback:].split())
-            self.assertIn("a marker line never replaces a call", tail)
-            self.assertIn("quoting the command and its error", tail)
+            for marker in ("⏳ WAIT", "↻ NEXT", "❓ Blocking", "Only if the Mesh command is unavailable",
+                           "Marker:", "external=<stable-reference>", "until=merged after="):
+                self.assertNotIn(marker, text)
+            self.assertIn("Text is not an outcome", text)
+        for name in ("parse_line", "MERGE_MARKER_GUIDANCE", "JOBS_EMPTY"):
+            self.assertFalse(hasattr(outcome_mod, name), name)
+
+    def test_retired_ops_review_wait_is_not_advertised(self):
+        self.assertNotIn("ops-review", contract(True))
+
+    def test_the_prompts_name_the_command_and_never_ask_for_a_line(self):
         t = task(1)
         for text in (prompts.no_outcome_prompt(t), prompts.no_outcome_prompt(t, "⏳ WAIT 2h", "relative", merge=True)):
             head = " ".join(text[:text.index("End every turn")].split())
             self.assertIn("call it, do not write it as a line", head)
-            self.assertIn("read only after Mesh refused that command", head)
-
-    def test_the_marker_grammar_is_unchanged(self):
-        self.assertEqual(parse_line("↻ NEXT: the docs", None).kind, "next")
-        self.assertEqual(parse_line("❓ Blocking @morgan: ship?", None).kind, "blocking")
+            self.assertIn("Text is never read as an outcome", head)
+            self.assertNotIn("marker", head)
 
     def test_a_named_result_wait_and_the_answered_refusal_are_offered(self):
         # a result another card produces in parts is waited on as that result, not as the card's
@@ -118,9 +101,9 @@ class TurnContract(unittest.TestCase):
         t = task(1)
         for text in (prompts.no_outcome_prompt(t), prompts.no_outcome_prompt(t, "⏳ WAIT 2h", "relative")):
             self.assertIn("End the turn now with ONE Mesh turn command", text)
-            self.assertLess(text.index("Mesh turn command"), text.index("marker"))
         asked = prompts.ask_not_raised_prompt(t, "owner")
-        self.assertLess(asked.index("ask_human to=owner"), asked.index("❓ Blocking @owner:"))
+        self.assertIn("ask_human to=owner", asked)
+        self.assertIn("text is not an outcome", asked)
         self.assertIn("supersedes=", prompts.ask_not_raised_prompt(t, "owner", "answered on 10.11"))
         self.assertIn("one Mesh\nturn command", prompts.wake_prompt(t, "resumed"))
 

@@ -9,14 +9,13 @@ import datetime as dt
 import json
 from uuid import uuid4
 
-from fakes import FakeMesh, task
+from fakes import FakeMesh, task, typed, wait_registered
 from test_runner import Bench
 from mesh_runner import native_result_resume as resume
 from mesh_runner import native_result_wait as wait_adapter
 from mesh_runner import native_result_rebind as rebind
 from mesh_runner.native_result_ledger import Ledger, Refused, identity
 from mesh_runner.native_result_source import ACK_MARKER
-from mesh_runner.outcome import parse_line
 from mesh_runner.store import Store
 
 
@@ -127,10 +126,10 @@ class NativeController(Bench):
 
     def test_strict_parser_and_existing_receipt_contract(self):
         now = dt.datetime.now(dt.timezone.utc)
-        self.assertEqual(parse_line("⏳ WAIT native:" + "a" * 64, now).kind, "native")
+        self.assertEqual(typed(wait_registered("native", "a" * 64), now=now).kind, "native")
         for value in ("A" * 64, "a" * 63, "../ledger", "a" * 64 + " until=success"):
-            self.assertEqual(parse_line("⏳ WAIT native:" + value, now).kind, "unparsed")
-        self.assertEqual(parse_line("⏳ WAIT receipt:#1234abcd", now).kind, "receipt")
+            self.assertEqual(typed(wait_registered("native", value), now=now).kind, "unparsed")
+        self.assertEqual(typed(wait_registered("receipt", "1234abcd"), now=now).kind, "receipt")
 
     def test_ready_prompt_mark_are_durable_but_cursor_is_not_consumed(self):
         r, a, card, ledger, rid, value, receiver = self.context()
@@ -167,7 +166,7 @@ class NativeController(Bench):
 
     def test_own_comments_and_empty_outbox_cannot_wake_native_wait(self):
         r, a, card, ledger, rid, value, receiver = self.context(publish=False)
-        r.mesh.add_comment(card["id"], "↻ NEXT", author=r.agent_id)
+        r.mesh.add_comment(card["id"], "progress note", author=r.agent_id)
         r._wake_one(a)
         self.assertEqual(a.state, "waiting")
         self.assertIsNone(r.store.mark(self.agent.name, card["id"], "native_delivery:" + rid))

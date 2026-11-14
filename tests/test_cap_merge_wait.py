@@ -1,10 +1,9 @@
-"""A declared ``WAIT merge:`` survives a cap: the capped task wakes on the merge request, not on
+"""A declared ``wait_for on=merge`` survives a cap: the capped task wakes on the merge request, not on
 "new input" that nothing will send (the merge gate runs only from a waiting session)."""
 import datetime as dt
 import sys
 
-from fakes import AGENT_ID, CAT_TO_STATUS, FakeGitLab, FakeMesh, task
-from test_merge_wait import GATE
+from fakes import AGENT_ID, CAT_TO_STATUS, FakeGitLab, FakeMesh, task, wait_card, wait_merge, turn_rows
 from test_requeue_on_cap import CapBench
 
 from mesh_runner.runner import HANDBACK_WAIT
@@ -13,7 +12,21 @@ from mesh_runner.store import iso
 SHA = "a" * 40
 OTHER = "b" * 40
 TARGET = "g/app!56"
-LINE = f"⏳ WAIT merge:{TARGET} after={SHA}"
+MERGE = wait_merge("g/app", 56, SHA)
+
+GATE = """\
+import os, sys, pathlib
+here = pathlib.Path(__file__).parent
+with open(here / "runs.log", "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\\n")
+with open(here / "seen.log", "a") as f:
+    f.write(f"{os.getcwd()}|{os.environ.get('LANE_ID', '')}|{os.environ.get('RUNNER_SECRET', '')}\\n")
+out = here / "out.txt"
+print(out.read_text() if out.exists() else "", end="")
+rc = here / "rc.txt"
+sys.exit(int(rc.read_text()) if rc.exists() else 0)
+"""
+
 LINK = [{"url": "https://git.example/g/app/-/merge_requests/56", "status": "open",
          "pipeline_status": "manual", "head_sha": SHA}]
 
@@ -47,10 +60,10 @@ class MergeCapBench(CapBench):
 
 class CappedMergeWait(MergeCapBench):
     def capped(self):
-        """A task capped right after its session declared ``WAIT merge:``."""
+        """A task capped right after its session declared ``wait_for on=merge``."""
         r, mesh, gl, t = self.bench()
         a = r.store.create("builder", t["id"], "claude")
-        r.store.update(a, state="running", wait={"kind": "merge", "target": TARGET, "line": LINE,
+        r.store.update(a, state="running", wait={"kind": "merge", "target": TARGET, "line": f"⏳ WAIT merge:{TARGET} after={SHA}",
                                                  "merge": {"sha": SHA, "runs": 0},
                                                  "since": iso(), "started": iso()})
         r.store.mark("builder", t["id"], "cap_observation", a.id)
@@ -99,14 +112,17 @@ class CappedMergeWait(MergeCapBench):
 
 
 class ReviewHandback(MergeCapBench):
-    """A review session moves the card back to todo for itself and ends with ``WAIT merge:``."""
-    def handed_back(self, cat="todo", assignee=AGENT_ID, line=LINE):
+    """A review session moves the card back to todo for itself and ends with ``wait_for on=merge``."""
+    def handed_back(self, cat="todo", assignee=AGENT_ID, turn=MERGE):
         r, mesh, gl, t = self.bench(cat="review")
         a = r.store.create("builder", t["id"], "claude", "t", mode="review")
         started = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)
         r.store.update(a, state="running", turns=1, turn_started_at=iso(started))
         mesh.tasks[t["id"]].update(status_id=CAT_TO_STATUS[cat], assignee_id=assignee)
-        mesh.add_comment(t["id"], f"Back in todo: delivery to main is not finished.\n\n{line}")
+        mesh.add_comment(t["id"], "Back in todo: delivery to main is not finished.")
+        row, wait = turn_rows(turn)                              # the review's wait_for, recorded in Mesh
+        mesh.outcomes = {t["id"]: [row]}
+        mesh.waits = {t["id"]: wait}
         r.settle(r.store.get(a.id))
         return r, mesh, gl, t, r.store.get(a.id)
 
@@ -142,7 +158,7 @@ class ReviewHandback(MergeCapBench):
         self.assertEqual((kept["kind"], kept["target"], kept["merge"]["sha"]), ("merge", TARGET, SHA))
 
     def test_a_non_vcs_wait_is_not_kept(self):
-        r, mesh, gl, t, a = self.handed_back(line="⏳ WAIT card:#abcdef12")
+        r, mesh, gl, t, a = self.handed_back(turn=wait_card("abcdef12"))
         self.assertIsNone(r._handback_wait(t["id"]))
 
     def test_a_later_work_start_supersedes_the_kept_wait(self):

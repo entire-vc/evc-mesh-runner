@@ -1,68 +1,42 @@
-"""Conservative owner intent reconciliation; no remote effects or wake decisions."""
+"""Card-wait edge checks: the formal dependency a card WAIT observes; no remote effects or wake decisions."""
 from __future__ import annotations
 
-import datetime as dt
 import re
-from dataclasses import dataclass
-
-from .outcome import declaration_lines, parse_line
-from .selection import parse_time
 
 
 _DEPENDENCY_CONDITIONS = ("task_done", "access_ready", "contract_ready",
                           "artifact_published", "shipped", "deployed", "accepted")
 
 
-@dataclass(frozen=True)
-class Intent:
-    target: str
-    comment_id: str
-    created_at: str
-    line: str
-    note: str
+def owned_decision_wait(edge: dict, receipt: dict, request_id: str, source_id: str,
+                        recipient_id: str) -> tuple[str, int, str] | None:
+    """Exact compare-delete arguments for a previous request's typed card wait.
 
-
-def latest_intent(wait: dict, comments: list[dict], agent_id: str,
-                  task_id: str, now: dt.datetime) -> tuple[bool, Intent | None]:
-    """(handled, intent). A newer ambiguous card declaration holds the old wait.
-
-    Only the newest own comment can supersede a wait. Historical examples,
-    edited old comments, multiple declarations and fenced snippets are not intent.
-    A bounded newest-comments window need not contain every historical comment.
+    Pair identity alone grants no authority. A manual edge, an operator edit,
+    another agent's wait, or a legacy receipt without provenance is preserved.
+    The server must still compare both generation and owner at deletion time.
     """
-    own = [c for c in comments if (c.get('author_id') or (c.get('author') or {}).get('id')) == agent_id]
-    if not own:
-        return False, None
-    times = [parse_time(c.get('created_at')) for c in own]
-    if any(t is None for t in times):
-        return True, None
-    latest = max(own, key=lambda c: parse_time(c['created_at']))
-    since, created = parse_time(wait.get('since')), parse_time(latest.get('created_at'))
-    newest = [c for c, timestamp in zip(own, times) if timestamp == created]
-    # A prose comment must not hide a simultaneous newer card declaration.
-    # Tied prose alone leaves the ordinary observer unchanged.
-    if (len(newest) > 1 and (since is None or created > since)
-            and any(re.match(r'^\s*⏳\s*WAIT\s+card:', line)
-                    for c in newest for line in declaration_lines(c.get('body') or ''))):
-        return True, None
-    body = latest.get('body') or ''
-    lines = declaration_lines(body)
-    if not any(re.match(r'^\s*⏳\s*WAIT\s+card:', line) for line in lines):
-        return False, None
-    if since is None or created is None:
-        return True, None
-    if created <= since:
-        return False, None
-    if (created > now or not latest.get('id') or len(lines) != 1 or '```' in body or '~~~' in body
-            or len([t for t in times if t == created]) != 1
-            or body.rstrip().splitlines()[-1].strip() != lines[0].strip()):
-        return True, None
-    outcome = parse_line(lines[0], now, task_id[:8])
-    if outcome.kind != 'card':
-        return True, None
-    if outcome.target == wait.get('target'):
-        return False, None
-    return True, Intent(outcome.target, latest['id'], latest['created_at'], outcome.line, outcome.note)
+    if not isinstance(edge, dict) or not isinstance(receipt, dict):
+        return None
+    generation = edge.get("generation")
+    edge_id, wait_id = edge.get("id"), edge.get("owner_wait_id")
+    if (not isinstance(edge_id, str) or not edge_id
+            or not isinstance(wait_id, str) or not wait_id
+            or type(generation) is not int or generation < 0
+            or edge.get("task_id") != request_id or edge.get("depends_on_task_id") != source_id
+            or edge.get("dependency_type") != "blocks"
+            or edge.get("condition") not in _DEPENDENCY_CONDITIONS
+            or edge.get("owner_agent_id") != recipient_id
+            or receipt.get("id") != wait_id or receipt.get("task_id") != request_id
+            or receipt.get("agent_id") != recipient_id or receipt.get("kind") != "card"
+            or receipt.get("target_task_id") != source_id
+            or (receipt.get("target_condition") or "task_done") != edge["condition"]
+            or receipt.get("dependency_owned") is not True
+            or receipt.get("dependency_id") != edge_id
+            or type(receipt.get("dependency_generation")) is not int
+            or receipt["dependency_generation"] != generation):
+        return None
+    return edge_id, generation, wait_id
 
 
 def sole_dependency(rows: dict, task_id: str, target: str, *, allow_satisfied: bool = False) -> dict | None:

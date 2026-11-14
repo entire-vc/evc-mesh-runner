@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.40 — 2026-11-13
+
+- **An amount with a currency word is a money question.** "20 долларов", "50 евро", "30
+  dollars", "15 баксов", "5к" or "10 тыс", and "закинуть"/"скинуть" with an amount a few words
+  on, now make an ask hard, so a spending question with a default "yes" is never applied
+  unanswered. "Евро" counts only as a whole word: "европейский регион" stays soft.
+- Before reopening a decision request for a new question, remove its previous card-wait dependency on the source only when Mesh's durable receipt proves ownership. Compare both the recorded generation and owner wait when deleting; preserve manual, changed and legacy dependencies. Repeated answered questions still attach without reopening.
+- **A money transfer asked with a verb is hard too.** The transfer stem only matched the noun
+  ("перевод средств"); "перевести средства", "переведу деньги" and other verb forms now make an
+  ask hard, while moving a task or a document stays soft.
+- **Breaking: a turn ends only through a Mesh turn command; text marker lines are no longer read.** From
+  this release the runner settles a turn only from the typed outcome Mesh recorded for it (`wait_for`,
+  `continue_next`, `ask_agent`, `ask_human`, `finish_task`, `hand_off`). A `⏳ WAIT …`, `↻ NEXT` or
+  `❓ Blocking @…` line written in a comment or in the final message is prose: a turn that recorded no
+  command ends without an outcome and gets the usual correction prompt. The same goes for the places that
+  used to read the agent's comments: a review card follows the wait the author still holds in Mesh, a
+  correction hold is lifted by the agent's own `continue_next` with a note, and a newer card wait replaces
+  an older one only through `wait_for`. The prompts no longer offer marker lines as a fallback, and the
+  `outcome_source` event counts only `typed` and `none`. Lanes need a Mesh MCP with the turn commands
+  (evc-mesh-mcp with all six commands, including `ask_human` and `wait_for on=registered|manual|merge`); a
+  lane without them gets "no outcome" on every turn. Three shortcuts that worked only on a marker-declared
+  question to an agent are removed with the parser: turning a question about the addressee's own live task
+  into a card wait, proceeding on a question that carried the asker's proposed default, and sending back a
+  marker-line repeat of an answered question (a typed `ask_agent` arrives with the request Mesh already
+  opened, and Mesh refuses an answered one as `already_answered`); an answered request is still never
+  reopened for the same question. A typed `ask_agent` that hits the turn cap
+  now still gets its request card filed, and a time wait refused again after its correction is a
+  correction hold, as the marker form was.
+- Session reports mark missing token counts and cost as unknown instead of zero, including turns without usage. Observed zero remains known. Interactive transcript aggregation preserves missing counters; Codex and interactive Claude costs remain unknown when their harness provides no price.
+
 ## 0.2.39 — 2026-11-13
 
 - **A decision request that answered a question is no longer reopened when the same question comes

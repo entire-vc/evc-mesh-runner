@@ -113,6 +113,46 @@ def finish(to: str = "done", evidence: str = "criteria met", text: str = "") -> 
 
 def hand_off(to: str, why: str = "", text: str = "") -> dict:
     return mesh_turn("handoff", text, to=to, why=why)
+
+
+def turn_rows(turn: dict, at: str = "") -> tuple[dict, dict | None]:
+    """The (turn-outcome row, task-wait row) Mesh records for a ``mesh_turn`` command, the same shapes the
+    fake agent writes to FAKE_OUTCOMES: what a test hands ``from_typed`` or sets in ``mesh.outcomes`` /
+    ``mesh.waits`` directly."""
+    cmd = {k: v for k, v in turn.items() if k not in ("mesh_turn", "text", "pre")}
+    command = turn["mesh_turn"]
+    oid, wid = str(uuid.uuid4()), str(uuid.uuid4())
+    row = {"id": oid, "agent_id": AGENT_ID, "note": cmd.get("note", ""),
+           "created_at": at or dt.datetime.now(dt.timezone.utc).isoformat()}
+    wait = None
+    if command == "next":
+        row["kind"] = "next"
+    elif command == "wait":
+        row["kind"] = "wait"
+        wait = dict({k: v for k, v in cmd.items() if k != "on"}, kind=cmd["on"], id=wid)
+    elif command == "ask_agent":
+        row.update(kind="wait", note="asked " + cmd["to"])
+        wait = {"id": wid, "kind": "decision", "decision_request_id": str(uuid.uuid4()),
+                "note": "asked " + cmd["to"], "question": cmd["question"]}
+    elif command == "ask_human":
+        row.update(kind="wait", note=cmd["question"])
+        wait = {"id": wid, "kind": "human", "addressee": cmd["to"], "question": cmd["question"],
+                "human_gate_ref": "gate-" + oid[:8]}
+    elif command == "finish":
+        row.update(kind="review" if cmd.get("to") == "review" else "done", note=cmd.get("evidence", ""))
+    else:
+        row.update(kind="handoff", note=cmd.get("why", ""))
+    if wait is not None:
+        row["wait_id"] = wid
+    return row, wait
+
+
+def typed(turn: dict, task8: str = "", now: dt.datetime | None = None, merge: bool = False):
+    """The Outcome the runner reads for a ``mesh_turn`` command (``from_typed`` over its Mesh rows): the
+    typed replacement for building an Outcome from a marker line, which no longer exists."""
+    from mesh_runner.outcome import from_typed
+    row, wait = turn_rows(turn)
+    return from_typed(row, wait, now or dt.datetime.now(dt.timezone.utc), task8, merge=merge)
 STATUSES = [
     {"id": "s-todo", "category": "todo"}, {"id": "s-prog", "category": "in_progress"},
     {"id": "s-rev", "category": "review"}, {"id": "s-done", "category": "done"},
@@ -353,6 +393,9 @@ class FakeMesh:
                 "handoff": f"Handed over to {rec.get('to')}.\n\n" + note}.get(row["kind"], note)
         c = {"id": str(uuid.uuid4()), "author_id": AGENT_ID, "author_name": AGENT_ID, "body": body,
              "created_at": row["created_at"]}
+        if wait.get("kind") == "decision":             # as evc-mesh typed_outcome_commands.go writes it
+            c["metadata"] = {"command": "ask_agent", "decision_request_id": wait.get("decision_request_id"),
+                             "wakes": False}
         log = self.comment_log.setdefault(tid, [])
         at = next((i for i, o in enumerate(log) if (o.get("created_at") or "") > c["created_at"]), len(log))
         log.insert(at, c)

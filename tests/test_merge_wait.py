@@ -7,10 +7,10 @@ from pathlib import Path
 
 from mesh_runner import config
 from mesh_runner.effects import runtime_state
-from mesh_runner.outcome import CONTRACT, MERGE_MARKER_GUIDANCE, MERGE_WAIT_GUIDANCE, contract, parse_line
+from mesh_runner.outcome import CONTRACT, MERGE_WAIT_GUIDANCE, contract
 from mesh_runner.prompt import no_outcome_prompt, start_prompt
 from mesh_runner.store import iso
-from fakes import FakeGitLab, FakeMesh, task, write_replies, FUTURE_AT, wait_time
+from fakes import FakeGitLab, FakeMesh, task, write_replies, FUTURE_AT, wait_time, wait_merge, wait_pipeline, typed
 from test_runner import Bench
 
 NOW = dt.datetime.now(dt.timezone.utc)      # parser tests only
@@ -23,7 +23,7 @@ OTHER = "b" * 40
 PROJECT = "g/app"
 TARGET = f"{PROJECT}!56"
 QUEUE = "g/app#77"
-LINE = f"⏳ WAIT merge:{TARGET} after={SHA}"
+LINE = wait_merge(PROJECT, 56, SHA)
 
 GATE = """\
 import os, sys, pathlib
@@ -86,40 +86,40 @@ class MergeBench(Bench):
 
 class Parser(MergeBench):
     def test_accepts_the_declaration_only_when_enabled(self):
-        o = parse_line(LINE + ": SHIP on this head", NOW, merge=True)
+        o = typed(wait_merge(PROJECT, 56, SHA, note="SHIP on this head"), merge=True)
         self.assertEqual((o.kind, o.target, o.extra), ("merge", TARGET, {"merge": {"sha": SHA}}))
         self.assertEqual(o.note, "SHIP on this head")
         self.assertTrue(o.is_wait)
-        off = parse_line(LINE, NOW)
+        off = typed(LINE)
         self.assertEqual(off.kind, "unparsed")
         self.assertIn("not enabled", off.note)
 
     def test_rejects_malformed_declarations_with_a_reason(self):
-        for text in (f"⏳ WAIT merge:{TARGET}", f"⏳ WAIT merge:{TARGET} after=abc",
-                     f"⏳ WAIT merge:{TARGET} until=merged after={SHA}",
-                     f"⏳ WAIT merge:g/app after={SHA}", f"⏳ WAIT merge:g/app!0 after={SHA}",
-                     f"⏳ WAIT merge:app!56 after={SHA}", f"⏳ WAIT merge:-x/app!56 after={SHA}",
-                     f"⏳ WAIT merge:{TARGET} after={SHA.upper()}"):
-            with self.subTest(text=text):
-                o = parse_line(text, NOW, merge=True)
+        bad = (wait_merge(PROJECT, 56, "abc"),
+               wait_merge(PROJECT, 56, SHA.upper()),
+               wait_merge(PROJECT, 56, ""),
+               {**wait_merge(PROJECT, 56, SHA), "until": "merged"},
+               wait_merge("g", 56, SHA), wait_merge(PROJECT, 0, SHA),
+               wait_merge("app", 56, SHA), wait_merge("-x/app", 56, SHA))
+        for turn in bad:
+            with self.subTest(turn=turn):
+                o = typed(turn, merge=True)
                 self.assertEqual(o.kind, "unparsed")
-                self.assertIn("merge:<group>/<project>!<iid> after=<full-head-sha>", o.note)
+                self.assertTrue(o.note)
 
     def test_contract_names_the_wait_only_when_enabled(self):
-        guidance = "⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>"
+        guidance = "wait_for on=merge project_path=<group>/<project> mr_iid=<iid> after_sha=<full head sha>"
         self.assertIn(guidance, contract(True))
         self.assertIn("Do not re-run the merge gate in a loop yourself", contract(True))
-        self.assertIn("wait_for on=merge project_path=<group>/<project> mr_iid=<iid> after_sha=", contract(True))
         for text in (CONTRACT, contract(), contract(False)):
             self.assertNotIn("WAIT merge:", text)
             self.assertNotIn("on=merge", text)
-        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, "").replace(MERGE_MARKER_GUIDANCE, ""),
-                         CONTRACT)
+        self.assertEqual(contract(True).replace(MERGE_WAIT_GUIDANCE, ""), CONTRACT)
         t = task(1)
         for merge in (True, False):
             for text in (start_prompt(t, "builder", [], [], merge=merge),
                          no_outcome_prompt(t, "x", merge=merge)):
-                self.assertEqual(guidance in text, merge)
+                self.assertEqual("on=merge" in text, merge)
 
 
 class RenderedPrompts(MergeBench):
@@ -130,7 +130,7 @@ class RenderedPrompts(MergeBench):
             with self.subTest(command=bool(command), gitlab=bool(gitlab)):
                 self.cfg.merge_command = command
                 r = self.runner(FakeMesh([t]), gitlab)
-                self.assertEqual("WAIT merge:" in r._first_prompt(t, "work", []), r.merge_enabled)
+                self.assertEqual("on=merge" in r._first_prompt(t, "work", []), r.merge_enabled)
 
 
 class Config(MergeBench):
@@ -202,7 +202,7 @@ class Declaration(MergeBench):
                 self.cfg.merge_command = command
                 r = self.runner(FakeMesh([task(1)]), gitlab)
                 self.assertFalse(r.merge_enabled)
-                o = r._parse(LINE, NOW)
+                o = typed(LINE, merge=r.merge_enabled)
                 self.assertEqual(o.kind, "unparsed")
                 self.assertIn("not enabled", o.note)
 
@@ -395,7 +395,7 @@ class Gate(MergeBench):
         a = self.check(r, a)
         self.assertEqual((len(self.runs()), a.state), (1, "ready"))
         self.assertIn("still queued after 2 h", a.wake_text)
-        self.assertIn("⏳ WAIT merge:", a.wake_text)
+        self.assertIn("wait_for on=merge", a.wake_text)
         self.assertIn("exit 3: ⏳ WAIT pipeline:g/app#77", a.wake_text)
 
     def test_a_head_that_cannot_be_read_wakes_without_running_the_gate(self):
@@ -709,12 +709,12 @@ class IdleBudget(MergeBench):
         self.assertEqual(r.store.idle_waits_today(self.agent.name, t["id"]), 4)    # 3 earlier + this one
 
     def test_time_wait_over_the_idle_budget_is_still_capped(self):
-        r, t = self.run_turn(f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window")
+        r, t = self.run_turn(wait_time(until_at=FUTURE_AT, event_ref="fixture-window", why="soak window"))
         self.assertTrue(self.capped(r, t))
         self.assertEqual(r.store.by_state(self.agent.name, ("waiting",)), [])
 
     def test_pipeline_wait_over_the_idle_budget_is_still_capped(self):
-        r, t = self.run_turn("⏳ WAIT pipeline:g/app#77: build")
+        r, t = self.run_turn(wait_pipeline(PROJECT, 77, note="build"))
         self.assertTrue(self.capped(r, t))
         self.assertEqual(r.store.by_state(self.agent.name, ("waiting",)), [])
 

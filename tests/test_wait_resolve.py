@@ -54,14 +54,14 @@ class Resolve(TypedTurn):
         self.assertIn("commented: xxxxxxxx", cause)
         self.assertEqual(len(cause), 200)                              # the wake text, cut to 200
 
-    def test_a_wait_superseded_by_the_agents_own_next_is_cancelled(self):
+    def test_a_next_marker_in_the_agents_own_comment_does_not_supersede_the_wait(self):
+        """Only a typed continue_next ends a wait now; marker text in a comment is ignored."""
         r, mesh, t, a = self.parked()
         mesh.add_comment(t["id"], "Picked it up again.\n↻ NEXT: continue", author=r.agent_id,
                          at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30))
         r._wake_budgeted(a)
-        self.assertEqual(r.store.get(a.id).state, "ready")
-        self.assertEqual([x[2] for x in mesh.resolved], ["cancelled"])
-        self.assertIn("the wait is superseded", mesh.resolved[0][3])
+        self.assertEqual(r.store.get(a.id).state, "waiting")
+        self.assertEqual(getattr(mesh, "resolved", []), [])
 
     def test_the_card_leaving_the_lane_cancels_it(self):
         r, mesh, t, a = self.parked()
@@ -70,16 +70,12 @@ class Resolve(TypedTurn):
         self.assertEqual(r.store.get(a.id).state, "completed")
         self.assertEqual(mesh.resolved, [(t["id"], "w-1", "cancelled", "task left the agent while waiting")])
 
-    def test_a_marker_wait_has_no_mesh_wait_to_resolve(self):
+    def test_a_marker_in_the_final_message_is_no_outcome_and_resolves_nothing(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.run_turn(mesh, t, reply="Parked.\n❓ Blocking @morgan: ship tonight?")
-        mesh.tasks[t["id"]]["human_gate"] = True
         a = self.finish_turn(r)
-        self.assertNotIn("mesh_wait_id", a.wait)
-        mesh.tasks[t["id"]]["human_gate"] = False
-        r._wake_budgeted(a)
-        self.assertEqual(r.store.get(a.id).state, "ready")
+        self.assertEqual((a.state, a.no_outcome, a.wait), ("ready", 1, {}))
         self.assertEqual(getattr(mesh, "resolved", []), [])
 
     def test_the_wait_id_survives_a_restart(self):

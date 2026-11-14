@@ -415,7 +415,7 @@ class MeshClient:
             body["expected_status_id"] = expected_status_id
         return self.request("POST", f"/tasks/{task_id}/move", body)
 
-    def session_report(self, task_id: str, tokens_in: int, tokens_out: int, model: str, cost: float,
+    def session_report(self, task_id: str, tokens_in: int | None, tokens_out: int | None, model: str, cost: float | None,
                        report_id: str = "") -> None:
         """Spend of one turn on the agent's Mesh record (POST /agents/me/sessions/report).
 
@@ -423,8 +423,18 @@ class MeshClient:
         ``Idempotency-Key``: a repeat of the same report sends the same key, so a Mesh that honours
         it applies the report once; another report gets another key. A Mesh that does not know the
         header ignores it."""
-        body = {"tokens_in": int(tokens_in), "tokens_out": int(tokens_out), "model": model or "",
-                "estimated_cost": round(float(cost), 4)}
+        # None is missing evidence, while an observed zero is a known value. Mesh's
+        # unknown-measures contract keeps that distinction in its totals.
+        # Keep the existing complete-report wire order for retries spanning an upgrade.
+        body = {"tokens_in": int(tokens_in) if tokens_in is not None else None,
+                "tokens_out": int(tokens_out) if tokens_out is not None else None,
+                "model": model or "",
+                "estimated_cost": round(float(cost), 4) if cost is not None else None}
+        unknown = [name for name in ("tokens_in", "tokens_out", "estimated_cost") if body[name] is None]
+        for name in unknown:
+            del body[name]
+        if unknown:
+            body["unknown"] = unknown
         if task_id:
             body["task_id"] = task_id
         self.request("POST", "/agents/me/sessions/report", body,
@@ -461,6 +471,17 @@ class MeshClient:
         except MeshError as e:
             if e.status not in (404, 410):
                 raise
+
+    def delete_wait_dependency(self, task_id: str, edge_id: str, generation: int, wait_id: str) -> None:
+        """Compare-delete a typed wait's exact edge; 409 preserves a changed owner/version.
+
+        Keep this separate from legacy deletion so no caller can accidentally
+        drop either ownership predicate while retiring a decision request wait.
+        """
+        if type(generation) is not int or generation < 0 or not wait_id:
+            raise ValueError("a wait dependency requires its generation and owner wait")
+        self.request("DELETE", f"/tasks/{task_id}/dependencies/{edge_id}",
+                     query={"expected_generation": generation, "expected_owner_wait_id": wait_id})
 
     def task_by_short(self, short: str) -> dict:
         t = self.request("GET", f"/tasks/by-short-id/{short}")

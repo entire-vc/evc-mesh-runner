@@ -1,27 +1,13 @@
-"""End-of-turn outcome markers.
+"""End-of-turn outcomes.
 
-An agent ends a turn on a task by posting a comment whose declaration line says
-what happens next. The runner reads the assignee's newest comment written after
-the attempt started and takes the last declaration line in it:
+An agent ends a turn on a task through one of Mesh's turn commands (``wait_for``, ``continue_next``,
+``ask_agent``, ``ask_human``, ``finish_task``, ``hand_off``). Mesh validates it and stores a turn-outcomes
+row and, for a wait, a task-wait row; ``from_typed`` builds the runner's ``Outcome`` from those rows.
 
-    ⏳ WAIT pipeline:<group>/<project>#<id>[ jobs=[a,b]]   CI pipeline settles
-    ⏳ WAIT mr:<group>/<project>!<iid>                     merge request changes
-    ⏳ WAIT merge:<group>/<project>!<iid> after=<sha>      the runner runs the merge gate (opt-in)
-    ⏳ WAIT card:#<8hex>                                   another task closes
-    ⏳ WAIT decision:@<agent>                              another agent answers
-    ⏳ WAIT gmail:gmr_<12hex>                              a registered Gmail observation fires (docs/gmail-watch.md)
-    ⏳ WAIT <absoluteISO>: external=<reference> source=<https-url|card:#8hex> <why>
-    ⏳ WAIT pipeline:<proj>#<id> until=success|change     a changed/successful pipeline (``after=`` optional)
-    ⏳ WAIT pipeline:<proj>#<id> until=... jobs=[a,b]     the same, read from the named jobs only
-    ↻ NEXT[: note]                                         continue right away
-    ❓ Blocking @<person>: <question>                      a person must decide (Mesh raises the gate)
-
-Anything after the target (": why", " — why", " | why") is an explanation and is
-kept. ``mr:`` / ``pipeline:`` targets may carry an explicit provider, ``mr:github:org/repo!N``,
-``mr:gitlab:group/project!N``, ``pipeline:github:org/repo#N``; the explicit selector always wins over the
-configured GitHub allowlist and is never read from the other provider. A bare target keeps the allowlist
-inference. ``merge:`` has no qualified form. ``pipeline:<project>!<iid>`` (a merge request number under the pipeline
-kind) is read as the MR wait it names.
+Text is never read as an outcome: a ``⏳ WAIT`` / ``↻ NEXT`` / ``❓ Blocking`` line that an
+agent writes in a comment or in its final message is prose, and a turn that recorded no turn command has
+no outcome. ``Outcome.line`` is only a rendering of the typed outcome in the old marker spelling, kept
+for the attempt's wait record and the prompts that show it; it is never parsed back.
 """
 from __future__ import annotations
 
@@ -30,73 +16,21 @@ import datetime as dt
 import re
 from dataclasses import dataclass, field
 
-DECLARATION = re.compile(r"^\s*(⏳\s*WAIT\b|↻\s*NEXT(?:\s*:|\s*$)|❓\s+(?:\*\*)?Blocking\b)")
-_EXPLANATION = r"(?P<note>(?:\s*:.*|\s*[—–].*|\s*\|.*|\s+-(?:\s.*)?)?)$"
-_WAIT_HEAD = r"^\s*⏳\s*WAIT\s+"
-
-_JOBS = r"(?:\s+jobs=\[(?P<jobs>[^\]]*)\])?"
-# ``jobs=[...]`` written between the target and ``until=`` is moved behind the baseline.
-_JOBS_FIRST = re.compile(r"^(\s*⏳\s*WAIT\s+(?:mr|pipeline):\S+)(\s+jobs=\[[^\]]*\])(\s+until=\S+(?:\s+after=\S+)?)")
-_PIPELINE = re.compile(
-    _WAIT_HEAD + r"pipeline:(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)#(?P<id>\d+)(?:\s+jobs=\[(?P<jobs>[^\]]*)\])?" + _EXPLANATION)
-_MR = re.compile(_WAIT_HEAD + r"(?:mr|pipeline):(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)!(?P<id>\d+)" + _EXPLANATION)
-_CI_CHANGE = re.compile(
-    _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
-    r"\s+until=(?P<predicate>change|success)\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64}):"
-    r"(?P<pipeline>[1-9]\d{0,11}):(?P<status>created|waiting_for_resource|preparing|pending|running|success|failed|canceled|cancelled|skipped|manual|scheduled)"
-    + _JOBS + _EXPLANATION)
-# ``until=`` without ``after=``: the baseline is the state at the moment the wait is declared. The
-# parser cannot read GitLab, so it only marks the wait (``extra["ci_default"]`` / ``["mr_default"]``)
-# and the runner fills the baseline in (or falls back to the plain wait when it cannot read it).
-_CI_DEFAULT = re.compile(
-    _WAIT_HEAD + r"(?P<kind>mr|pipeline):(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)(?P<sep>[!#])(?P<id>[1-9]\d{0,11})"
-    r"\s+until=(?P<predicate>change|success)" + _JOBS + _EXPLANATION)
-_MR_MERGED_DEFAULT = re.compile(
-    _WAIT_HEAD + r"mr:(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)!(?P<id>[1-9]\d{0,11})\s+until=merged" + _EXPLANATION)
-_MR_STATE = re.compile(
-    _WAIT_HEAD + r"mr:(?P<project>(?:(?:github|gitlab):)?[\w.\-/]+)!(?P<id>[1-9]\d{0,11})"
-    r"\s+until=merged\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64}):opened" + _EXPLANATION)
-_MERGE = re.compile(
-    _WAIT_HEAD + r"merge:(?P<project>\w[\w.\-]*(?:/[\w.\-]+)+)!(?P<id>[1-9]\d{0,11})"
-    r"\s+after=(?P<sha>[0-9a-f]{40}|[0-9a-f]{64})" + _EXPLANATION)
-_MERGE_HEAD = re.compile(_WAIT_HEAD + r"merge:")
-_RECEIPT = re.compile(_WAIT_HEAD + r"receipt:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
-_LIFECYCLE = re.compile(_WAIT_HEAD + r"lifecycle:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
-_STALL = re.compile(_WAIT_HEAD + r"stall:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
-# A lead-decided passive wait (card labelled `wake:manual`): no observer, no timer; only a
-# comment by someone else (or the owner's own NEXT) resumes it.
-_MANUAL = re.compile(_WAIT_HEAD + r"manual:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
-_RECOVERY = re.compile(_WAIT_HEAD + r"recovery:#(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
-_GMAIL = re.compile(_WAIT_HEAD + r"gmail:(?P<id>gmr_[0-9a-f]{12})\b" + _EXPLANATION)
-_NATIVE = re.compile(_WAIT_HEAD + r"native:(?P<id>[0-9a-f]{64})" + _EXPLANATION)
-# ``until=<typed condition>`` names what the edge of this WAIT waits for (instead of the broad task_done).
+# The typed conditions a card wait may name (Mesh ``target_condition``) instead of the broad task_done.
 CARD_CONDITIONS = ("access_ready", "contract_ready", "artifact_published", "shipped", "deployed", "accepted")
-_CARD_UNTIL = r"(?:\s+until=(?P<condition>" + "|".join(CARD_CONDITIONS) + r"))?"
-_CARD = re.compile(_WAIT_HEAD + r"card:#?(?P<id>[0-9a-f]{8})\b" + _CARD_UNTIL + _EXPLANATION)
-_QUEUE = re.compile(_WAIT_HEAD + r"queue:#?(?P<id>[0-9a-f]{8})\b" + _EXPLANATION)
-_DECISION = re.compile(_WAIT_HEAD + r"decision:@(?P<handle>[\w.\-]+)" + _EXPLANATION)
-# Time is a structured assertion about a specific external schedule, not a retry interval.
-# Any other WAIT is a time wait: `2h`, `tomorrow`, `in 2 hours`, `poll:` all get the time guidance.
-_TIME_HEAD = re.compile(_WAIT_HEAD + r"(?!(?:pipeline|mr|merge|card|decision|receipt|lifecycle|recovery|stall|gmail|manual)\s*:)\S", re.IGNORECASE)
-_EXTERNAL_TIME = re.compile(
-    _WAIT_HEAD + r"(?P<when>\d{4}-\d\d-\d\dT\d\d:\d\d(?::\d\d)?(?:Z|[+-]\d\d:\d\d)):"
-    r"\s+external=(?P<external>[A-Za-z0-9][A-Za-z0-9._:/@#%+!?=~-]{0,255})"
-    r"\s+source=(?P<source>https://[^\s]+|card:#[0-9a-f]{8})\s+(?P<why>\S.*)$")
-_NEXT = re.compile(r"^\s*↻\s*NEXT(?:\s*:\s*(?P<note>.*))?\s*$")
-_BLOCKING = re.compile(r"^\s*❓\s+(?:\*\*)?Blocking\s+@(?P<handle>[\w.\-]+)(?:\*\*)?\s*:?\s*(?P<note>.*)$")
+
 
 MAX_ABSOLUTE = dt.timedelta(days=400)
 
 TIME_WAIT_GUIDANCE = (
-    "invalid external time wait: use `⏳ WAIT <absoluteISO-with-timezone>: "
-    "external=<stable-reference> source=<https-url|card:#8hex> <why>`. "
+    "invalid external time wait: use `wait_for on=time until_at=<RFC3339 with Z or offset> "
+    "event_ref=<stable reference> source=<https-url|comment:<uuid>|artifact:<uuid>> why=<what happens then>`. "
     "The future timestamp must come from the cited external event/window, scheduled job, "
     "or measurement endpoint. Describe cancellation in the comment. "
-    "Provider quota, account resets and Retry-After belong to account routing, never a task WAIT. "
+    "Provider quota, account resets and Retry-After belong to account routing, never a task wait. "
     "Relative intervals, bare dates, `poll:` and invented retries are not time events. "
-    "MR/CI/card/answer dependencies use `⏳ WAIT mr:<group>/<project>!<iid>`, "
-    "`⏳ WAIT pipeline:<group>/<project>#<id>`, `⏳ WAIT card:#<8hex>`, "
-    "`⏳ WAIT decision:@<agent>` or `❓ Blocking @<person>: <question>`. "
+    "MR/CI/card/answer dependencies use `wait_for on=mr`, `wait_for on=pipeline`, `wait_for on=card`, "
+    "`ask_agent` or `ask_human`. "
     "If an observer is missing, report the integration blocker; do not replace the event with a timer."
 )
 
@@ -142,7 +76,7 @@ class Outcome:
     line: str = ""
     extra: dict = field(default_factory=dict)
     # Where a typed outcome came from (Mesh turn-outcome row id, wait id and kind, decision request).
-    # Provenance only: left out of equality, so a typed outcome equals the one its marker line parses to.
+    # Provenance only: left out of equality, so two reads of the same declaration compare equal.
     typed: dict = field(default_factory=dict, compare=False)
 
     @property
@@ -150,192 +84,26 @@ class Outcome:
         return self.kind in {"pipeline", "mr", "merge", "card", "decision", "time", "queue", "receipt", "lifecycle", "recovery", "stall", "native", "gmail", "manual"}
 
 
-def _explicit_wait_problem(line: str) -> str:
-    """Name what is wrong with a malformed typed VCS wait, so the agent can fix the line
-    instead of repeating it (a bare "invalid" note led to the same line twice and a give-up)."""
-    if re.search(r"until=change\b.*\bafter=[0-9a-f]{40,64}:opened\b", line):
-        return ("invalid explicit VCS wait: the baseline `<sha>:opened` belongs to `until=merged`; "
-                "`until=change`/`until=success` need `after=<sha>:<pipeline-id>:<status>`")
-    if re.search(r"\bafter=[0-9a-f]{40,64}:(?:none|null|unknown|-)?(?::(?:none|null|unknown|-)?)?(?:\s|$)", line):
-        return ("invalid explicit VCS wait: the baseline needs a real pipeline id and status, "
-                "`after=<sha>:<pipeline-id>:<status>`; the head has no pipeline yet, so wait without "
-                "until/after (`⏳ WAIT mr:<group>/<project>!<iid>`) or wait for the merge with "
-                "`until=merged after=<sha>:opened`")
-    return ("invalid explicit VCS wait: expected `until=change|success after=<full-sha>:<pipeline-id>:<status>` "
-            "(optionally followed by `jobs=[<job>,<job>]`) or `until=merged after=<full-sha>:opened`")
-
-
-def _jobs(m: re.Match) -> tuple[str, ...] | None:
-    """The job names of a ``jobs=[...]`` field: () without the field, None when it names none."""
-    if m.group("jobs") is None:
-        return ()
-    names = tuple(dict.fromkeys(j.strip() for j in m.group("jobs").split(",") if j.strip()))
-    return names or None
-
-
-JOBS_EMPTY = ("invalid explicit VCS wait: `jobs=[]` names no job; list the job names "
-              "(`jobs=[browser-tests,lint]`) or drop the field to wait on the whole pipeline")
-
-
 GITHUB_MR_CI_UNSUPPORTED = (
-    "invalid explicit VCS wait: a GitHub pull request carries no head pipeline, so `mr:github:… until=change|success` "
-    "has nothing to observe; wait on the Actions run itself with `⏳ WAIT pipeline:github:<org>/<repo>#<run-id> "
-    "until=change|success after=<full-sha>:<run-id>:<status>`, or on the merge with "
-    "`⏳ WAIT mr:github:<org>/<repo>!<n> until=merged after=<full-head-sha>:opened`")
+    "invalid VCS wait: a GitHub pull request carries no head pipeline, so `wait_for on=mr provider=github "
+    "until=green|changed` has nothing to observe; wait on the Actions run itself with `wait_for on=pipeline "
+    "provider=github project_path=<org>/<repo> pipeline_id=<run-id> until=green|changed`, or on the merge with "
+    "`wait_for on=mr provider=github project_path=<org>/<repo> mr_iid=<n> until=merged after_sha=<full-head-sha> "
+    "after_status=opened`")
 
 
 MERGE_NOT_ENABLED = (
-    "invalid explicit VCS wait: `merge:` waits are not enabled on this runner; run the merge "
-    "gate yourself and, to await the merge, use "
-    "`⏳ WAIT mr:<group>/<project>!<iid> until=merged after=<full-head-sha>:opened`")
-
-
-def declaration_lines(text: str) -> list[str]:
-    return [line for line in (text or "").splitlines() if DECLARATION.match(line)]
-
-
-def parse_line(line: str, now: dt.datetime, self_task8: str = "", merge: bool = False) -> Outcome:
-    """``merge``: the runner is configured to run a merge gate for ``merge:`` waits."""
-    note = lambda m: (m.group("note") or "").strip(" :—–-|")  # noqa: E731
-    line = _JOBS_FIRST.sub(r"\1\3\2", line, count=1)
-    if _MERGE_HEAD.match(line):
-        if not merge:
-            return Outcome("unparsed", note=MERGE_NOT_ENABLED, line=line)
-        if re.match(_WAIT_HEAD + r"merge:(?:github|gitlab):", line):
-            return Outcome("unparsed", note=(
-                "invalid explicit VCS wait: `merge:` has no provider-qualified form; the merge gate reads the "
-                "configured GitLab only. Use `⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>` for "
-                "GitLab, or `⏳ WAIT mr:github:<org>/<repo>!<n> until=merged after=<full-head-sha>:opened` to "
-                "observe a GitHub pull request"), line=line)
-        if m := _MERGE.match(line):
-            return Outcome("merge", f"{m['project']}!{m['id']}", note=note(m), line=line,
-                           extra={"merge": {"sha": m["sha"]}})
-        return Outcome("unparsed", note=(
-            "invalid explicit VCS wait: expected `⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>` "
-            "(the full 40 or 64 hex-digit SHA of the reviewed head)"), line=line)
-    if m := re.match(_WAIT_HEAD + r"mr:github:\S+\s+until=(?:change|success)\b", line):
-        return Outcome("unparsed", note=GITHUB_MR_CI_UNSUPPORTED, line=line)
-    if m := _MR_STATE.match(line):
-        return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line,
-                       extra={"mr_state": {"predicate": "merged", "sha": m["sha"], "state": "opened"}})
-    if m := _CI_CHANGE.match(line):
-        kind = "mr" if m["sep"] == "!" else "pipeline"
-        if (m["kind"] == "mr" and kind != "mr") or (kind == "pipeline" and m["pipeline"] != m["id"]):
-            return Outcome("unparsed", note="CI baseline does not match target", line=line)
-        jobs = _jobs(m)
-        if jobs is None:
-            return Outcome("unparsed", note=JOBS_EMPTY, line=line)
-        contract = {"predicate": m["predicate"], "sha": m["sha"],
-                    "pipeline": int(m["pipeline"]), "status": m["status"]}
-        if jobs:
-            contract["jobs"] = list(jobs)
-        return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", jobs=jobs, note=note(m), line=line,
-                       extra={"ci_change": contract})
-    if m := _MR_MERGED_DEFAULT.match(line):
-        return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line,
-                       extra={"mr_default": {"predicate": "merged"}})
-    if m := _CI_DEFAULT.match(line):
-        kind = "mr" if m["sep"] == "!" else "pipeline"
-        if m["kind"] == "mr" and kind != "mr":
-            return Outcome("unparsed", note="CI baseline does not match target", line=line)
-        jobs = _jobs(m)
-        if jobs is None:
-            return Outcome("unparsed", note=JOBS_EMPTY, line=line)
-        default = {"predicate": m["predicate"], **({"jobs": list(jobs)} if jobs else {})}
-        return Outcome(kind, f"{m['project']}{m['sep']}{m['id']}", jobs=jobs, note=note(m), line=line,
-                       extra={"ci_default": default})
-    # Explicit fields are a contract, including when malformed; never seed a
-    # legacy already-terminal wait from an invalid typed declaration.
-    if re.match(_WAIT_HEAD + r"(?:mr|pipeline):[^\s]+\s+(?:until|after)\b", line):
-        return Outcome("unparsed", note=_explicit_wait_problem(line), line=line)
-    if m := _PIPELINE.match(line):
-        jobs = _jobs(m)
-        if jobs is None:
-            return Outcome("unparsed", note=JOBS_EMPTY, line=line)
-        if jobs:
-            # the older spelling: read as `until=change jobs=[...]` with the baseline of the moment
-            return Outcome("pipeline", f"{m['project']}#{m['id']}", jobs=jobs, note=note(m), line=line,
-                           extra={"ci_default": {"predicate": "change", "jobs": list(jobs)}})
-        return Outcome("pipeline", f"{m['project']}#{m['id']}", note=note(m), line=line)
-    if m := _MR.match(line):
-        return Outcome("mr", f"{m['project']}!{m['id']}", note=note(m), line=line)
-    if re.match(_WAIT_HEAD + r"ops-review:", line):
-        return Outcome("unparsed", note="ops-review WAIT is retired; submit the source task with finish_task to=review", line=line)
-    if m := _NATIVE.match(line):
-        return Outcome("native", m["id"], note=note(m), line=line)
-    if re.match(_WAIT_HEAD + r"native:", line):
-        return Outcome("unparsed", note="native WAIT requires an exact 64-hex registration", line=line)
-    if m := _CARD.match(line):
-        if self_task8 and m["id"] == self_task8:
-            return Outcome("unparsed", note="a task cannot wait for itself", line=line)
-        return Outcome("card", m["id"], note=note(m), line=line)
-    if m := _RECEIPT.match(line):
-        # Event wait on this card's own armed receipt registration; runner validates it.
-        return Outcome("receipt", m["id"], note=note(m), line=line)
-    if m := _GMAIL.match(line):
-        # Event wait on an operator-registered Gmail observation; runner validates it.
-        return Outcome("gmail", m["id"], note=note(m), line=line)
-    if re.match(_WAIT_HEAD + r"gmail:", line):
-        return Outcome("unparsed", note="gmail WAIT requires an exact registration id gmr_<12 hex>", line=line)
-    if m := _STALL.match(line):
-        # Event wait on this card's own armed stall registration; runner validates it.
-        return Outcome("stall", m["id"], note=note(m), line=line)
-    if m := _RECOVERY.match(line):
-        # Event wait on this card's own armed recovery registration; runner validates it.
-        return Outcome("recovery", m["id"], note=note(m), line=line)
-    if m := _LIFECYCLE.match(line):
-        # Event wait on this card's own armed lifecycle registration; runner validates it.
-        return Outcome("lifecycle", m["id"], note=note(m), line=line)
-    if m := _MANUAL.match(line):
-        # Passive wait on this card itself; runner validates the target and the `wake:manual` label.
-        return Outcome("manual", m["id"], note=note(m), line=line)
-    if re.match(_WAIT_HEAD + r"manual:", line):
-        return Outcome("unparsed", note=MANUAL_WAIT_GUIDANCE, line=line)
-    if m := _QUEUE.match(line):
-        # Event wait on this card's own machine queue request; runner validates the source.
-        return Outcome("queue", m["id"], note=note(m), line=line)
-    if m := _DECISION.match(line):
-        return Outcome("decision", handle=m["handle"], note=note(m), line=line)
-    if _TIME_HEAD.match(line) and quota_time_wait({"kind": "time", "line": line}):
-        return Outcome("unparsed", note=QUOTA_TIME_WAIT_GUIDANCE, line=line)
-    if m := _EXTERNAL_TIME.match(line):
-        until = _parse_when(m["when"])
-        # Never move a past event to now+5m, clamp a deadline, or invent a timezone.
-        if until is None or until <= now or until > now + MAX_ABSOLUTE:
-            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
-        from urllib.parse import urlsplit
-        source = m["source"]
-        try:
-            url = urlsplit(source)
-            _ = url.port  # Reject malformed ports as well as bracketed hosts.
-        except ValueError:
-            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
-        if (source.startswith("https://") and (not url.hostname or url.username or url.password)
-                or m["external"].lower().startswith(("mr:", "pipeline:", "card:", "decision:", "poll:"))):
-            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
-        why = m["why"].strip()
-        if not why or why.lower().startswith("poll:"):
-            return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
-        external = {"event": m["external"], "source": source, "why": why, "at": until.isoformat()}
-        return Outcome("time", until=until, note=why, line=line, extra={"external_time": external})
-    if _TIME_HEAD.match(line):
-        return Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=line)
-    if m := _NEXT.match(line):
-        return Outcome("next", note=(m["note"] or "").strip(), line=line)
-    if m := _BLOCKING.match(line):
-        return Outcome("blocking", handle=m["handle"], note=m["note"].strip(), line=line)
-    return Outcome("unparsed", line=line)
+    "invalid VCS wait: `wait_for on=merge` is not enabled on this runner; run the merge gate yourself and, "
+    "to await the merge, use `wait_for on=mr project_path=<group>/<project> mr_iid=<iid> until=merged "
+    "after_sha=<full-head-sha> after_status=opened`")
 
 
 # ----------------------------------------------------------------------------- typed outcomes
-# An agent may end its turn through Mesh's turn commands (`wait_for`, `continue_next`, `ask_agent`, `ask_human`)
-# instead of a marker line. Mesh has then validated the target and stored a turn-outcomes row and, for a
-# wait, a task-wait row (evc-mesh internal/domain/typed_outcome.go: TurnOutcome, TaskWait). ``from_typed``
-# builds the Outcome straight from those rows, with the same fields the marker parser gives for the
-# equivalent line: the row is never turned into text and parsed back, so what the line grammar cannot
-# spell (a ``comment:<uuid>`` source, an event_ref with spaces, fractional seconds) is not lost.
-# ``line`` is still filled in: it is what the attempt's wait records and shows, and what a few readers of
-# a stored wait look at (a card wait's ``until=`` condition, a time wait's https source).
+# An agent ends its turn through Mesh's turn commands (`wait_for`, `continue_next`, `ask_agent`, `ask_human`).
+# Mesh has then validated the target and stored a turn-outcomes row and, for a wait, a task-wait row
+# (evc-mesh internal/domain/typed_outcome.go: TurnOutcome, TaskWait). ``from_typed`` builds the Outcome
+# straight from those rows. ``line`` is a rendering for the attempt's wait record and the prompts that show
+# it; nothing reads it back (a card wait's condition is ``extra["card_condition"]``).
 
 # Mesh's until states in this grammar's words.
 _TYPED_UNTIL = {"merged": "merged", "green": "success", "changed": "change"}
@@ -390,8 +158,7 @@ def typed_unparsed(row: dict, wait: dict | None, problem: str) -> Outcome:
     name = _typed_name(row, wait)
     return Outcome("unparsed", line=name, typed=_provenance(row, wait), note=(
         f"{name} was recorded, but this runner cannot act on it: {problem}. Mesh may hold the wait; "
-        "end the turn again with an outcome this runner reads (a supported turn command or the "
-        "equivalent marker line)"))
+        "end the turn again with a turn command this runner supports"))
 
 
 def _typed_next(row: dict, wait: dict | None, now: dt.datetime, task8: str) -> Outcome:
@@ -418,10 +185,12 @@ def _typed_card(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
     if cond and cond != "task_done" and cond not in CARD_CONDITIONS:
         return typed_unparsed(row, wait, f"target_condition `{cond}` is unknown here")
     note = _typed_note(row, wait)
+    typed_cond = cond if cond in CARD_CONDITIONS else ""
     criterion = " ".join(str(wait.get("criterion") or "").split()) if cond == "artifact_published" else ""
-    line = (f"⏳ WAIT card:#{target}" + (f" until={cond}" if cond in CARD_CONDITIONS else "")
+    line = (f"⏳ WAIT card:#{target}" + (f" until={typed_cond}" if typed_cond else "")
             + (f" criterion={criterion}" if criterion else "") + _tail(note))
-    return Outcome("card", target, note=note, line=line)
+    return Outcome("card", target, note=note, line=line,
+                   extra={"card_condition": typed_cond} if typed_cond else {})
 
 
 def _typed_project(row: dict, wait: dict, number_field: str) -> tuple[str, int] | Outcome:
@@ -475,7 +244,7 @@ def _typed_baseline(row: dict, wait: dict, until: str, number: int) -> dict | Ou
 
 def _typed_ci(kind: str, target: str, until: str, baseline: dict | None, jobs: tuple[str, ...],
               note: str) -> Outcome:
-    """An mr/pipeline wait with an ``until=``: the Outcome the marker line with the same fields parses to.
+    """An mr/pipeline wait with an ``until=``.
     ``baseline`` was checked by ``_typed_baseline``; the plain ``finished`` wait is not built here."""
     if until == "merged":
         line = f"⏳ WAIT mr:{target} until=merged" + (f" after={baseline['sha']}:opened" if baseline else "")
@@ -590,8 +359,7 @@ _REGISTRATIONS = {
 
 def _typed_registered(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
     """A wait on one of the runner's own registrations (``⏳ WAIT native:``, ``gmail:``, ``receipt:#``,
-    ...). The Outcome is the marker's: the runner validates the registration itself when it settles, as
-    it does for the marker line."""
+    ...). The runner validates the registration itself when it settles."""
     reg = str(wait.get("registration") or "")
     if reg not in _REGISTRATIONS:
         return typed_unparsed(row, wait, f"registration `{reg or 'missing'}` is unknown here")
@@ -668,8 +436,8 @@ def _typed_decision(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outc
 
 def _typed_manual(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
     """A lead-decided passive wait (``wait_for on=manual``): Mesh records it on this card itself, with no
-    target and no timer, and only on a card labelled ``wake:manual``. The Outcome is the
-    ``⏳ WAIT manual:#<this card>`` marker's, so the runner checks the label again when it settles."""
+    target and no timer, and only on a card labelled ``wake:manual``; the runner checks the label again
+    when it settles."""
     own = (task8 or str(wait.get("task_id") or row.get("task_id") or "")[:8]).lower()
     if not re.fullmatch(r"[0-9a-f]{8}", own):
         return typed_unparsed(row, wait, "the manual wait names no card")
@@ -720,7 +488,7 @@ def from_typed(row: dict, wait: dict | None, now: dt.datetime, self_task8: str =
     """The Outcome a Mesh turn-outcomes ``row`` declares; ``wait`` is the task-wait row it points at
     (None for a continuation). Every row gives an Outcome: one this runner cannot act on is an
     ``unparsed`` whose note names the row and the part that was not understood. ``merge``: this runner
-    runs the merge gate; without it a merge wait is refused exactly as its marker line is."""
+    runs the merge gate; without it a merge wait is refused (MERGE_NOT_ENABLED)."""
     build = TYPED_OUTCOMES.get(str(row.get("kind") or ""))
     if build is None:
         return typed_unparsed(row, wait, f"outcome kind `{row.get('kind') or 'missing'}` does not settle a "
@@ -729,20 +497,6 @@ def from_typed(row: dict, wait: dict | None, now: dt.datetime, self_task8: str =
     if out.kind == "merge" and not merge:
         out = Outcome("unparsed", note=MERGE_NOT_ENABLED, line=out.line)
     return out if out.typed else dataclasses.replace(out, typed=_provenance(row, wait))
-
-
-def card_condition(line: str) -> str:
-    """The typed condition a ``WAIT card:#X until=<condition>`` line names, '' for the plain form."""
-    m = _CARD.match(line or "")
-    return (m["condition"] or "") if m else ""
-
-
-def parse_outcome(text: str, now: dt.datetime, self_task8: str = "", merge: bool = False) -> Outcome | None:
-    """Last declaration line of ``text``; None when the text declares nothing."""
-    lines = declaration_lines(text)
-    if not lines:
-        return None
-    return parse_line(lines[-1], now, self_task8, merge)
 
 
 def _parse_when(value: str) -> dt.datetime | None:
@@ -759,7 +513,7 @@ def _parse_when(value: str) -> dt.datetime | None:
 
 
 QUEUE_WAIT_GUIDANCE = (
-    "invalid queue wait: `⏳ WAIT queue:#<this-card-8hex>` is accepted only on a card whose thread holds a "
+    "invalid queue wait: `wait_for on=registered registration=queue` is accepted only on a card whose thread holds a "
     "current, not yet served `[fleet queue-request:...]` machine source, with the queue flag on. It wakes you "
     "once when ANY independent unit becomes ready for the listed targets after that source; it is not "
     "availability and grants no access. An unchanged or already served source has no event to wait for: "
@@ -785,10 +539,8 @@ says what changed. A known external scheduled event may still use wait_for on=ti
 
 
 # What every agent sees at the end of a turn's prompt. The turn commands are the evc-mesh MCP tools
-# (internal/mcp/turn_outcomes.go): their names, parameters and values are copied from there. The marker
-# lines stay as the fallback the parser still reads, until the outcome_source counter shows nobody uses them;
-# they are offered only after a refused command (a lane that writes them instead of calling is the "habit"
-# cause seen in practice), never as an equal path.
+# (internal/mcp/turn_outcomes.go): their names, parameters and values are copied from there. There is no text
+# fallback: the runner reads no marker line, so a refused command is reported, not replaced.
 _CONTRACT_TEMPLATE = """\
 End every turn on this task by calling exactly ONE Mesh turn command (Mesh MCP tool, task_id = this card).
 It records the outcome, writes the comment and keeps or releases your checkout; a refusal writes nothing,
@@ -824,31 +576,22 @@ Waits sleep until their event: CI waits never wake because time passes. No relat
 invented 6h/24h retries; a missing observer is an integration blocker. Internal retry/backoff never writes a
 task's start_after. Provider quotas, account resets and Retry-After are account routing, never a task wait.
 Your session is kept: when the condition is met you are resumed in this same conversation.
-Only if the Mesh command is unavailable or fails: call it first, a marker line never replaces a call. When
-Mesh refused or errored for a reason you cannot fix, post ONE comment quoting the command and its error,
-ending with the same outcome:
-  ⏳ WAIT card:#<8hex> | mr:<group>/<project>!<iid> | pipeline:<group>/<project>#<id> (mr:github:<org>/<repo>!<n>)
-      CI baseline: until=change|success after=<full-head-sha>:<pipeline-id>:<status>, or for mr
-      until=merged after=<full-head-sha>:opened; then optionally jobs=[<job>,<job>]
-@@MERGE_MARKER@@  ⏳ WAIT decision:@<agent>: <question> | queue:#<this-card-8hex>
-  ⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
-  ↻ NEXT: <note>      ❓ Blocking @<person>: <question>
+Text is not an outcome: a line in a comment or in your final message ends nothing, whatever it says.
+When Mesh refused or errored for a reason you cannot fix, post ONE comment quoting the command and its
+error; the turn then ends without an outcome and the runner hands the card on.
 """ + DECISION_WAIT_GUIDANCE
 
 
-# Only for a runner that has the merge gate configured: elsewhere the parser rejects the wait.
+# Only for a runner that has the merge gate configured: elsewhere a merge wait is refused (MERGE_NOT_ENABLED).
 MERGE_WAIT_GUIDANCE = (
     "  wait_for on=merge project_path=<group>/<project> mr_iid=<iid> after_sha=<full head sha>  — after a SHIP\n"
     "      verdict on the current head: the runner runs the merge gate itself and wakes you when merged or\n"
     "      blocked. Do not re-run the merge gate in a loop yourself.\n")
-# Its marker sits with the other fallback lines, never next to the command as an equal path.
-MERGE_MARKER_GUIDANCE = "  ⏳ WAIT merge:<group>/<project>!<iid> after=<full-head-sha>\n"
 
 
 def contract(merge: bool = False) -> str:
-    """The outcome contract text; ``merge``: include the merge wait and its fallback line."""
-    return (_CONTRACT_TEMPLATE.replace("@@MERGE_WAIT@@", MERGE_WAIT_GUIDANCE if merge else "")
-            .replace("@@MERGE_MARKER@@", MERGE_MARKER_GUIDANCE if merge else ""))
+    """The outcome contract text; ``merge``: include the merge wait."""
+    return _CONTRACT_TEMPLATE.replace("@@MERGE_WAIT@@", MERGE_WAIT_GUIDANCE if merge else "")
 
 
 CONTRACT = contract()

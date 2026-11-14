@@ -17,7 +17,6 @@ from dataclasses import dataclass
 
 from .mesh import MeshClient, MeshError
 from . import observation_budget as budget
-from .outcome import declaration_lines
 from .selection import AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, parse_time, satisfied
 
 log = logging.getLogger("mesh_runner")
@@ -428,23 +427,6 @@ def foreign_comments(comments: list[dict], agent_id: str, since: dt.datetime) ->
     return out[::-1]
 
 
-def own_next_after(comments: list[dict], agent_id: str, since: dt.datetime) -> dict | None:
-    """The agent's own newest declaring comment after ``since`` when it ends in ``↻ NEXT``: a later
-    word than the wait it sits on. None when the newest declaration is a WAIT or an ask."""
-    for c in reversed(comments):
-        at = parse_time(c.get("created_at"))
-        if at is None or at <= since:
-            break
-        author = c.get("author_id") or (c.get("author") or {}).get("id")
-        body = c.get("body") or ""
-        if author != agent_id or body.startswith("[runner"):
-            continue
-        lines = declaration_lines(body)
-        if lines:
-            return c if re.match(r"^\s*↻\s*NEXT", lines[-1]) else None
-    return None
-
-
 def foreign_comment(comments: list[dict], agent_id: str, since: dt.datetime) -> dict | None:
     """Newest comment after ``since`` written by anyone but the agent itself."""
     found = foreign_comments(comments, agent_id, since)
@@ -768,14 +750,15 @@ def manual_next_step(kind: str, target: str, sha: str, row: dict | None, merge_g
     iid_s, head_s = iid or "<iid>", head or "<full-head-sha>"
     if merge_gate:
         text = (f"Next step: obtain the review verdict on head {head_s}; once it is SHIP, end with "
-                f"`⏳ WAIT merge:{project}!{iid_s} after={head_s}` and the merge gate starts the "
+                f"`wait_for on=merge project_path={project} mr_iid={iid_s} after_sha={head_s}` and the merge gate starts the "
                 "post-review jobs and merges.")
         if not iid:
             text += (" Fill in the merge request number and its full head SHA. If this pipeline belongs "
                      "to no merge request, arrange the required review or authorized manual action instead.")
         return text
     return ("Next step: arrange the required review or authorized manual action. To await the merge "
-            f"after that, end with `⏳ WAIT mr:{project}!{iid_s} until=merged after={head_s}:opened`"
+            f"after that, end with `wait_for on=mr project_path={project} mr_iid={iid_s} until=merged "
+            f"after_sha={head_s} after_status=opened`"
             + (" (fill in the merge request number and its full head SHA)." if not (iid and head) else "."))
 
 
@@ -820,7 +803,8 @@ def blocked_mr_next_step(target: str, cause: str, merge_gate: bool, sha: str = "
         return ("Next step: leave the branch as it is and do not sync it yourself (no catch-up merge, "
                 "no rebase, no push). The merge gate syncs a branch that is only behind, right before merging, "
                 f"and carries the review over. Obtain the review verdict on the current head {head}; once "
-                f"it is SHIP, end with `⏳ WAIT merge:{project}!{iid or '<iid>'} after={head}` (not mr:, "
+                f"it is SHIP, end with `wait_for on=merge project_path={project} mr_iid={iid or '<iid>'} "
+                f"after_sha={head}` (not on=mr, "
                 "which never runs the gate). If the gate refuses the sync, its refusal wakes you with "
                 "the next step.")
     if cause == "red":
@@ -835,7 +819,8 @@ def blocked_mr_next_step(target: str, cause: str, merge_gate: bool, sha: str = "
                "pushed branch), then have the review cover the merge delta and give its verdict on the new "
                "head")
     if merge_gate:
-        then = (f"once it is SHIP, end with `⏳ WAIT merge:{project}!{iid or '<iid>'} after=<full-new-head-sha>` "
+        then = (f"once it is SHIP, end with `wait_for on=merge project_path={project} mr_iid={iid or '<iid>'} "
+                "after_sha=<full-new-head-sha>` "
                 "and the merge gate merges it.")
     else:
         then = "once it is SHIP, arrange the merge of the new head with the project's merge tool."
@@ -1183,13 +1168,6 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
         return str(wait["settled"])          # the awaited result was final when the wait began
     since = parse_time(wait.get("since")) or now
     kind = wait.get("kind")
-    if kind in ("time", "card", "decision", "pipeline", "mr", "manual") and (c := own_next_after(comments, agent_id, since)):
-        # (a blocking ask is left out on purpose: a person's gate is lifted by the person, not by a NEXT)
-        # the agent's newest word after the wait was declared is "continue now": the old WAIT line
-        # (and its until) no longer stands. "met" counts the next declaration as a step of the work;
-        # "superseded" tells the runner the awaited event itself did not arrive (a Mesh wait is cancelled)
-        wait["met"] = wait["superseded"] = True
-        return f"you declared ↻ NEXT after this wait ({(c.get('created_at') or '')[:16]}): the wait is superseded"
     foreign = foreign_comments(comments, agent_id, since)
     if comment_wake == "addressed":
         foreign = [x for x in foreign if wakes_on_comment(x, wait, agent_name, comment_wake_always_from)]
@@ -1239,7 +1217,7 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
             wait["recheck_due"] = True
             return (f"re-check: decision wait @{wait.get('handle') or ''} has lasted {_hours(now - started)} "
                     "and no human gate or agent request stands behind it; the question may be gone. "
-                    "Continue the work, or ask again with `❓ Blocking @person` if an answer is still needed")
+                    "Continue the work, or ask again with `ask_human` if an answer is still needed")
         return ""
     if kind == "decision" and wait.get("attached_closed"):
         # the same question again, attached to its closed request without reopening it: only a

@@ -2,7 +2,7 @@
 import sys
 import unittest
 
-from fakes import FakeMesh, FakeProfileAdapter, calls, task, write_replies, FUTURE_AT
+from fakes import FakeMesh, FakeProfileAdapter, calls, task, write_replies, FUTURE_AT, wait_time
 from test_runner import Bench
 
 HOME_ROUTE = [sys.executable, "-c", "print('X=1')"]
@@ -54,8 +54,7 @@ class TaskRoute(Bench):
             "sys.exit(75 if required and not ready else 0)"]
         write_replies(self.replies, {
             t["id"][:8]: "ERROR:usage limit reached",
-            t["id"][:8] + ":resume":
-                f"⏳ WAIT {FUTURE_AT}: external=fixture-window source=card:#abcdef12 soak window",
+            t["id"][:8] + ":resume": wait_time(until_at=FUTURE_AT, event_ref="fixture-window", why="soak window"),
         })
         r = self.runner(mesh)
         # External provider CLI: native Codex protocol, real child process and ACK.

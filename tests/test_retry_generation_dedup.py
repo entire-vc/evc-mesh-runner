@@ -3,8 +3,7 @@ import datetime as dt
 import hashlib
 import unittest
 
-from fakes import FakeGitLab, FakeMesh, task, write_replies
-from mesh_runner.outcome import parse_line
+from fakes import FakeGitLab, FakeMesh, task, write_replies, wait_pipeline, typed
 from mesh_runner.store import iso
 from mesh_runner.wake import ci_change_event
 from test_runner import Bench
@@ -140,8 +139,8 @@ class RunnerWake(Bench):
         r = self.runner(FakeMesh([t]), gl)
         r.refresh_me()
         a = r.store.create(self.agent.name, t["id"], "claude")
-        marker = f"⏳ WAIT pipeline:{TARGET} until=success after={SHA}:5:failed"
-        outcome = parse_line(marker, dt.datetime.now(dt.timezone.utc))
+        marker = wait_pipeline("g/app", 5, until="green", after_sha=SHA, after_pipeline_id=5, after_status="failed")
+        outcome = typed(marker)
         wait = {"kind": outcome.kind, "target": outcome.target, **outcome.extra,
                 "since": iso(), "started": iso()}
         r.store.update(a, state="waiting", wait=wait, session_id="existing-session")

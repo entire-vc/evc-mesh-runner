@@ -2,15 +2,19 @@
 import datetime as dt
 import unittest
 
-from mesh_runner.outcome import parse_outcome
-from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT
+from mesh_runner.outcome import quota_time_wait
+from fakes import FakeMesh, calls, task, write_replies, FUTURE_AT, wait_time, typed
 from test_runner import Bench
 
 NOW = dt.datetime(2026, 11, 4, 11, tzinfo=dt.timezone.utc)
 
 
 def declaration(event='codex/test/7d-reset', why='provider reset_at verified codex_session_log'):
-    return f'⏳ WAIT {FUTURE_AT}: external={event} source=card:#abcdef12 {why}'
+    return wait_time(event_ref=event, why=why, source='card:#abcdef12')
+
+
+def is_quota(outcome):
+    return quota_time_wait({'kind': 'time', 'line': outcome.line, **outcome.extra})
 
 
 class QuotaWaitGrammar(unittest.TestCase):
@@ -21,22 +25,17 @@ class QuotaWaitGrammar(unittest.TestCase):
                            ('capacity', 'weekly usage limit resets'),
                            ('capacity', 'лимит аккаунта, сброс квоты')]:
             with self.subTest(event=event, why=why):
-                outcome = parse_outcome(declaration(event, why), NOW)
-                self.assertEqual(outcome.kind, 'unparsed')
-                self.assertIsNone(outcome.until)
-                self.assertIn('account', outcome.note)
-
-    def test_malformed_quota_timer_does_not_become_an_ordinary_correction_hold(self):
-        for line in ('⏳ WAIT 24h: quota reset', '⏳ WAIT tomorrow: provider Retry-After'):
-            outcome = parse_outcome(line, NOW)
-            self.assertEqual(outcome.kind, 'unparsed')
-            self.assertIn('account', outcome.note)
+                outcome = typed(declaration(event, why), now=NOW)
+                self.assertEqual(outcome.kind, 'time')
+                self.assertTrue(is_quota(outcome))
 
     def test_nonquota_resource_reset_and_scheduled_event_remain_valid(self):
         for event, why in [('backup-window', 'published backup becomes available'),
                            ('database-reset', 'maintenance completes at the published time')]:
             with self.subTest(event=event):
-                self.assertEqual(parse_outcome(declaration(event, why), NOW).kind, 'time')
+                outcome = typed(declaration(event, why), now=NOW)
+                self.assertEqual(outcome.kind, 'time')
+                self.assertFalse(is_quota(outcome))
 
 
 class QuotaWaitSettlement(Bench):
@@ -78,7 +77,7 @@ class QuotaWaitSettlement(Bench):
         r = self.runner(mesh)
         r.refresh_me()
         a = r.store.create(self.agent.name, t['id'], 'claude')
-        wait = {'kind': 'time', 'until': FUTURE_AT, 'line': declaration(),
+        wait = {'kind': 'time', 'until': FUTURE_AT, 'line': typed(declaration(), now=NOW).line,
                 'since': NOW.isoformat(), 'started': NOW.isoformat(), 'scheduled': FUTURE_AT,
                 'external_time': {'event': 'codex/test/7d-reset', 'why': 'provider reset_at', 'at': FUTURE_AT}}
         mesh.tasks[t['id']]['start_after'] = FUTURE_AT
@@ -103,7 +102,7 @@ class QuotaWaitSettlement(Bench):
         r = self.runner(mesh)
         r.refresh_me()
         a = r.store.create(self.agent.name, t['id'], 'claude')
-        wait = {'kind': 'time', 'until': FUTURE_AT, 'line': declaration(), 'scheduled': FUTURE_AT}
+        wait = {'kind': 'time', 'until': FUTURE_AT, 'line': typed(declaration(), now=NOW).line, 'scheduled': FUTURE_AT}
         foreign = (dt.datetime.fromisoformat(FUTURE_AT) + dt.timedelta(hours=1)).isoformat()
         mesh.tasks[t['id']]['start_after'] = foreign
         r.store.update(a, state='waiting', wait=wait)

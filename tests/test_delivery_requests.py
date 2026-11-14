@@ -52,7 +52,7 @@ class DeliveryRecheck(Bench):
     def completed_native(self):
         self.journal('native-exited')
         Path(self.intent['log_path']).write_text(json.dumps({'type': 'result', 'subtype': 'success',
-                        'result': '↻ NEXT', 'session_id': self.intent['session_id']}) + '\n')
+                        'result': 'turn complete', 'session_id': self.intent['session_id']}) + '\n')
 
     def observed(self):
         return requests.snapshot(self.cfg.state_dir, 'builder', self.a.id)

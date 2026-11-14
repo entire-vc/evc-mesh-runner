@@ -62,7 +62,8 @@ class Request(MergeBench):
         card = mesh.tasks[out["card"]]
         self.assertEqual(card["assignee_id"], "agent-rc")
         self.assertIn(rm.LABEL, card["labels"])
-        self.assertIn(f"⏳ WAIT merge:{TARGET} after={SHA}", card["description"])
+        self.assertIn(f"wait_for on=merge project_path={PROJECT} mr_iid={IID} after_sha={SHA}", card["description"])
+        self.assertNotIn("⏳ WAIT", card["description"])
         self.assertEqual(rm.parse_request(card["description"])["sha"], SHA)
         self.assertEqual(mesh.tasks[s["id"]], before)           # assignee, status, labels: untouched
 

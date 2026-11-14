@@ -47,6 +47,23 @@ the same key, and Mesh counts it once. This relies on Mesh honouring the key on 
 version is installed only where the Mesh instance answers the spend report idempotently. With keys off the
 report is marked before it is sent, as before: a lost report is better than a double count.
 
+## Unknown usage
+
+Session reports send `unknown` with any missing `tokens_in`, `tokens_out` or `estimated_cost`
+measure. They omit that measure's numeric value; an observed zero is sent as zero. A turn with
+no usage still sends a report with all three measures unknown, using the same turn key and
+restart handling as a complete report. Deploy this client after the server supports the
+unknown-measures contract on `/agents/me/sessions/report`.
+
+Codex reports tokens but no price in either launch mode, so its cost is unknown. Interactive
+Claude reads tokens from its transcript without a price, so its cost is also unknown. Headless
+Claude uses the terminal result's `total_cost_usd` when present. Either harness may lack one or
+both token counters after an incomplete stream; those measures remain unknown independently.
+Claude's cache buckets add to its input count; Codex's cached input is already part of its
+input count. Missing optional Claude cache buckets mean zero; an explicitly unknown bucket
+makes the input count unknown. A message with missing usage makes an interactive aggregate
+incomplete rather than silently dropping that message's unknown contribution.
+
 ## Rollback
 
 `[runner] idempotency_keys = false` sends no key, does not repeat a write whose answer was lost and does

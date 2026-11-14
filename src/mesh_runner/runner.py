@@ -90,14 +90,14 @@ from .effects import (BACKLOG_BLOCKER, EDGE_REMOVED_MARK, DECISION_REQUEST_LABEL
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
-from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, QUEUE_WAIT_GUIDANCE, MANUAL_WAIT_GUIDANCE, TIME_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, DECLARATION, Outcome, card_condition, declaration_lines, from_typed, parse_line, typed_unparsed
+from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, QUEUE_WAIT_GUIDANCE, MANUAL_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, Outcome, from_typed, typed_unparsed
 from . import gate_owner
 from . import card_wait
 from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, blocking_edges, blocking_tasks, order,
                         parse_time, static_skip_reason)
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from . import observation_budget
-from .wake import (_read_pinned, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, own_next_after, foreign_comment, foreign_comments, wakes_on_comment,
+from .wake import (_read_pinned, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, foreign_comment, foreign_comments, wakes_on_comment,
                    gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign, split_provider, target_jobs_state, UnknownJobs)
@@ -135,12 +135,6 @@ CYCLE_TOLD = "cycle_told"            # store mark: JSON list of the wait-cycle s
 CYCLE_TOLD_KEEP = 64                 # told signatures kept per card (oldest dropped first)
 CAP_REASSIGNED = "cap_reassigned"    # store mark: the UTC day a cap moved this task to this agent
 WAITING_FOR_INPUT = "waiting for new input after "      # hold reason of a capped task
-# a task named in a decision question: a full uuid, or #<8hex>
-TASK_REF = re.compile(r"(?<![\w-])(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![\w-])"
-                      r"|#(?P<short>[0-9a-f]{8})(?![\w-])", re.IGNORECASE)
-# a question that carries the asker's own proposed default (decision_default_proceeds)
-DEFAULT_MARKER = re.compile(r"(?<!\w)(?:default\s*:|дефолт\s*:|по\s+умолчанию\s*:|proposed\s*:|предлагаю"
-                            r"|рекомендую|if\s+no\s+objections?)", re.IGNORECASE)
 DEAD_SLOT_RECHECK = 3600            # seconds between looks at the same held slot
 DEAD_SLOT_PER_TICK = 3              # held slots examined per maintenance pass
 FINISHED_ATTEMPT = ("completed", "failed", "aborted")
@@ -245,15 +239,12 @@ class AlreadyRunning(Exception):
 class OutcomeRead:
     """How a turn ended, as ``_read_outcome`` found it.
 
-    ``source`` is where the outcome came from: ``typed`` (a Mesh turn command), ``comment`` or
-    ``final_text`` (a marker line), ``none``. ``both``: a typed outcome and a marker line were both
-    written in the turn; ``disagree``: the marker says something else (the typed one stands).
+    ``source`` is where the outcome came from: ``typed`` (a Mesh turn command) or ``none``; text in a
+    comment or in the final message is never an outcome.
     ``deferred``: Mesh could not be read, so the turn cannot be settled yet (retried on the next tick)."""
     outcome: Outcome | None
     at: str
     source: str = "none"
-    both: bool = False
-    disagree: bool = False
     deferred: bool = False
 
 
@@ -283,6 +274,9 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 TASK_HOLD_SECONDS = 600                # a hold of one task (gate exit 76): re-asked when the task changes
 MENTION_POLL_SECONDS = 120
 MENTION_LOOKBACK = dt.timedelta(hours=6)   # on a fresh start: older unseen mentions are history
+# `pin-assignee` keeps a request card with its addressee while it is being worked on. It
+# does not exempt the card from review: when the addressee delivers through a merge
+# request, the review step still assigns an independent reviewer to it.
 MENTION_LABELS = ["mention-request", "pin-assignee", "owner-locked"]
 MENTION_CARDS_PER_POLL = 5
 MENTION_MAX_FAILS = 5
@@ -1403,7 +1397,7 @@ class AgentRunner:
     def _report_spend(self, a: Attempt, r: TurnResult) -> None:
         """The turn's tokens and cost on the agent's Mesh record, as the queue feeder reported
         them for its lanes (Mesh cost views read these). Never fails a settle."""
-        if not self.cfg.session_reports or not (r.usage or r.cost_usd):
+        if not self.cfg.session_reports:
             return
         turn = f"{a.id}:{a.turns}"
         done = self.store.mark(self.agent.name, a.task_id, "spend")
@@ -1414,11 +1408,15 @@ class AgentRunner:
             # no key: marked BEFORE the post, a lost report is better than a double count
             self.store.mark(self.agent.name, a.task_id, "spend", turn)
         u = r.usage or {}
-        tokens_in = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0) \
-            + int(u.get("cache_creation_input_tokens") or 0)
+        # Claude's cache buckets are additional input; Codex's cached_input_tokens
+        # is already included in input_tokens. Missing primary counters stay unknown.
+        inputs = [u.get("input_tokens"), u.get("cache_read_input_tokens", 0),
+                  u.get("cache_creation_input_tokens", 0)]
+        tokens_in = sum(int(v) for v in inputs) if all(v is not None for v in inputs) else None
+        tokens_out = int(u["output_tokens"]) if u.get("output_tokens") is not None else None
         try:
-            self.mesh.session_report(a.task_id, tokens_in, int(u.get("output_tokens") or 0),
-                                     r.model or a.harness, float(r.cost_usd or 0.0), report_id=turn)
+            self.mesh.session_report(a.task_id, tokens_in, tokens_out,
+                                     r.model or a.harness, r.cost_usd, report_id=turn)
         except MeshError as e:
             log.warning("%s: session report #%s: %s", self.agent.name, a.task8, e)
             if keyed and (e.status in (0, 429) or e.status >= 500):
@@ -2031,12 +2029,6 @@ class AgentRunner:
         """``WAIT merge:`` needs the configured gate command and a GitLab to read the merge request from."""
         return bool(self.cfg.merge_command) and self.gitlab is not None
 
-    def _parse(self, line: str, at: dt.datetime, task8: str = "") -> Outcome:
-        out = parse_line(line, at, task8, merge=self.merge_enabled)
-        if out.extra.get("ci_default") or out.extra.get("mr_default"):
-            out = self._default_baseline(out)
-        return out
-
     def _default_baseline(self, out: Outcome) -> Outcome:
         """``until=`` without ``after=``: the baseline is the CI/MR state at the moment the wait is
         declared. A target that is already final (a pipeline in any terminal status, a merge request
@@ -2083,45 +2075,19 @@ class AgentRunner:
             "named jobs from; declare it again, or with an explicit `after=<sha>:<pipeline-id>:<status>`"))
 
     def _read_outcome(self, a: Attempt, result: TurnResult, comments: list[dict]) -> OutcomeRead:
-        """How the turn ended. A typed outcome the agent recorded through Mesh's turn commands in this
-        turn comes first: Mesh has validated it and already holds its wait (and released the checkout),
-        so settling on anything else would leave that state unreconciled. Without one, the agent's
-        newest marker line written after the turn started (Mesh clock), else the final message's.
-
-        A marker line next to a typed outcome is only compared: when it says something else, an
-        ``outcome_disagree`` event records both and the typed one stands. The typed read costs one Mesh
-        read per settled turn (two when the outcome is a wait: the row names only the wait's id).
-        When Mesh cannot be read the result is ``deferred``: the turn is not settled as "no outcome"."""
-        started = parse_time(a.turn_started_at)
-        marker = self._marker_line(a, result, comments)
-        typed = self._typed_outcome(a, started)
+        """How the turn ended: the typed outcome the agent recorded through Mesh's turn commands in this
+        turn. Mesh has validated it and already holds its wait (and released the checkout). Text is not
+        read: a ``⏳ WAIT`` / ``↻ NEXT`` line in a comment or in the final message is prose, and a turn
+        without a typed outcome has none. The read costs one Mesh read per settled turn (two when the
+        outcome is a wait: the row names only the wait's id). When Mesh cannot be read the result is
+        ``deferred``: the turn is not settled as "no outcome"."""
+        typed = self._typed_outcome(a, parse_time(a.turn_started_at))
         if typed is TYPED_UNREADABLE:
             return OutcomeRead(None, "", deferred=True)
         if typed is not None:
             outcome, at = typed
-            disagree = marker is not None and self._outcome_disagrees(a, outcome, marker[0])
-            return OutcomeRead(outcome, at, "typed", both=marker is not None, disagree=disagree)
-        if marker is not None:
-            line, at, source = marker
-            return OutcomeRead(self._parse(line, now(), a.task8), at, source)
+            return OutcomeRead(outcome, at, "typed")
         return OutcomeRead(None, self._anchor(comments))
-
-    def _marker_line(self, a: Attempt, result: TurnResult, comments: list[dict]) -> tuple[str, str, str] | None:
-        """(declaration line, its created_at, source) of the turn's marker: the last declaration line of
-        the agent's newest comment written after the turn started, else of the final message."""
-        started = parse_time(a.turn_started_at)
-        for c in reversed(comments):
-            at = parse_time(c.get("created_at"))
-            if at is None or (started is not None and at <= started):
-                break
-            author = c.get("author_id") or (c.get("author") or {}).get("id")
-            lines = declaration_lines(c.get("body") or "")
-            if author == self.agent_id and lines:
-                return lines[-1], c.get("created_at") or "", "comment"
-        lines = declaration_lines(result.final_text)
-        if lines:
-            return lines[-1], self._anchor(comments), "final_text"
-        return None
 
     def _typed_outcome(self, a: Attempt, started: dt.datetime | None):
         """(Outcome, its created_at) of the newest turn outcome this agent recorded through Mesh's turn
@@ -2166,27 +2132,6 @@ class AgentRunner:
             self.store.event(a.id, "typed_outcome", f"{row.get('kind')}:{row.get('id') or ''}")
             return outcome, row.get("created_at") or ""
         return None
-
-    @staticmethod
-    def _outcome_key(o: Outcome) -> tuple[str, str]:
-        """What an outcome declares, for comparing two forms of it: kind and target (a GitLab target
-        with or without its explicit provider is the same target)."""
-        target = (o.target or o.handle.casefold()
-                  or (o.until.astimezone(dt.timezone.utc).isoformat() if o.until else ""))
-        return o.kind, target.removeprefix("gitlab:")
-
-    def _outcome_disagrees(self, a: Attempt, typed: Outcome, line: str) -> bool:
-        """True (and an ``outcome_disagree`` event) when the turn's marker line declares another
-        kind or target than its typed outcome. Parsed without reading GitLab: only compared."""
-        marker = parse_line(line, now(), a.task8, merge=self.merge_enabled)
-        if self._outcome_key(marker) == self._outcome_key(typed):
-            return False
-        (tk, tt), (mk, mt) = self._outcome_key(typed), self._outcome_key(marker)
-        detail = {"typed": {"kind": tk, "target": tt}, "marker": {"kind": mk, "target": mt}}
-        self.store.event(a.id, "outcome_disagree", json.dumps(detail, ensure_ascii=False))
-        self.emit("outcome_disagree", a, **detail)
-        log.info("%s: #%s typed outcome %s %s stands over the marker %s %s", self.agent.name, a.task8, tk, tt, mk, mt)
-        return True
 
     def _turn_over(self, a: Attempt) -> bool:
         """True when the turn's whole process group is gone. Enforces the turn
@@ -2436,15 +2381,10 @@ class AgentRunner:
         outcome, at = read.outcome, read.at
         self._forget_lease_mesh_released(a, outcome)
         if outcome is not None and outcome.kind == "time":
-            # Settlement is the admission boundary, including programmatic outcomes. A typed time wait
-            # was built from Mesh's own fields (outcome.from_typed checks them); its line is only a
-            # rendering and is not parsed back.
+            # Settlement is the admission boundary. A typed time wait was built from Mesh's own fields
+            # (outcome.from_typed checks them); its line is only a rendering and is not parsed back.
             if quota_time_wait({"kind": "time", "line": outcome.line, **outcome.extra}):
                 outcome = Outcome("unparsed", note=QUOTA_TIME_WAIT_GUIDANCE, line=outcome.line)
-            elif not outcome.typed:
-                outcome = self._parse(outcome.line, now(), a.task8)
-            if outcome.kind != "time" and outcome.note != QUOTA_TIME_WAIT_GUIDANCE:
-                outcome = Outcome("unparsed", note=TIME_WAIT_GUIDANCE, line=outcome.line)
         self._count_outcome(a, read, outcome)
         # Mesh already asked: the agent through a decision request (`ask_agent`), or the person through
         # the `❓ Blocking` comment and the human gate it armed (`ask_human`). The runner posts nothing,
@@ -2623,33 +2563,6 @@ class AgentRunner:
             log.info("%s: #%s card wait on #%s sent back: it waits on a timer or a person",
                      self.agent.name, a.task8, outcome.target)
             return
-        repeat = "" if mesh_ask else self._repeated_decision_told(a, task, outcome, comments)
-        if repeat:
-            if sent_back():
-                return
-            # the same budget as the other sent-back waits: asking the same question again and
-            # again still reaches the wait budget
-            self.store.outcome(a, "wait")
-            if self._over_budget(a, task):
-                return
-            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, repeat))
-            log.info("%s: #%s decision wait to @%s sent back: the same question was already answered",
-                     self.agent.name, a.task8, outcome.handle)
-            return
-        proceed = "" if mesh_ask else self._default_proceeds(a, task, outcome)
-        if proceed:
-            if sent_back():
-                return
-            # the asker stated its own default: it continues now, the addressee may object. Counted
-            # like a NEXT, so a session that keeps doing this still reaches the NEXT budget.
-            self.store.outcome(a, "next")
-            self.store.mark(self.agent.name, a.task_id, "cap_observation", "")
-            if self._over_budget(a, task):
-                return
-            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, proceed))
-            return
-        if not mesh_ask and outcome.typed.get("server_observed") is not True:
-            outcome = self._live_task_card_wait(a, task, outcome)
         # the wait is accepted from here on: only now may it retire a delivery receipt
         self._forget_spent_ci_delivery(a, outcome)
         if self._loop_guard(a, task, outcome, comments, end_digest):
@@ -2691,7 +2604,7 @@ class AgentRunner:
             if self._over_budget(a, task):
                 return
             self.life.to_ready(a, no_outcome=0,
-                               wake_text=prompts.wake_prompt(task, "you asked to continue (↻ NEXT)")
+                               wake_text=prompts.wake_prompt(task, "you asked to continue (continue_next)")
                                + ("\n" + outcome.extra["hint"] if outcome.extra.get("hint") else ""))
             return
         wait = {"kind": outcome.kind, "target": outcome.target, "handle": outcome.handle,
@@ -2724,7 +2637,7 @@ class AgentRunner:
             wait["lifecycle_reg"] = lifecycle_reg["reg_id"]
         if stall_reg:
             wait["stall_reg"] = stall_reg["reg_id"]
-        for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time"):
+        for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time", "card_condition"):
             if outcome.extra.get(key):
                 wait[key] = outcome.extra[key]
         if outcome.kind == "merge":
@@ -2784,9 +2697,10 @@ class AgentRunner:
         if observable:
             self.store.update(a, wait=wait)
         self.store.mark(self.agent.name, a.task_id, "cap_observation", a.id if observable else "")
-        if outcome.kind == "decision" and outcome.handle and not mesh_ask and self._budget_spent(a):
+        if outcome.kind == "decision" and outcome.handle and self._budget_spent(a):
             # A cap requeues the task to wait for new input; the question to an agent must already
-            # be filed by then, or nobody is asked and no input can ever arrive.
+            # be filed by then, or nobody is asked and no input can ever arrive. An ``ask_agent``
+            # request Mesh opened wakes nobody either: its request card is filed here the same way.
             # Only a plain agent addressee: person asks, unanswerable or invalid asks keep their
             # path (they raise gates and comments that a cap must not trigger).
             try:
@@ -2798,8 +2712,11 @@ class AgentRunner:
             only = next(iter(matches.values())) if len(matches) == 1 else {}
             if (addressee and only.get("kind") == "agent" and only.get("id") == addressee.get("id")
                     and addressee.get("id") != self.agent_id
-                    and not self._unavailable(str(addressee.get("name") or outcome.handle))):
+                    and not self._unavailable(str(addressee.get("name") or outcome.handle))
+                    and (not wait.get("decision_request_id") or self.effects._typed_question(a, wait))):
                 self.effects._file_decision(a, task, wait, self.me)
+                if wait.get("decision_request_id"):
+                    wait["ask_filed"] = True
         # An accepted ``merge`` wait hands the next step to the runner's own gate, which runs only
         # from the waiting attempt. A cap here would requeue the task to wait for new input
         # instead, and nothing could ever arrive: the merge request's remaining jobs are started
@@ -2862,12 +2779,12 @@ class AgentRunner:
         """How the turn ended, counted once per attempt turn (a settle that runs again for the same
         turn is not counted again): an ``outcome_source`` event and the in-process totals per
         (source, harness) that ``status.json`` shows. They measure the move from marker lines to the
-        typed turn commands: the marker can go once nothing ends a turn with it."""
+        typed turn commands; the only sources are ``typed`` and ``none``."""
         if not self.store.claim(self.agent.name, a.task_id, "outcome_source", f"{a.id}:{a.turns}"):
             return
         source = read.source if outcome is not None else "none"
         detail = {"source": source, "kind": outcome.kind if outcome is not None else "none",
-                  "harness": a.harness, "both": read.both, "disagree": read.disagree}
+                  "harness": a.harness}
         self.store.event(a.id, "outcome_source", json.dumps(detail))
         self.emit("outcome_source", a, outcome=detail)          # "kind" is the event's own field there
         with self._outcome_sources_lock:
@@ -2912,7 +2829,9 @@ class AgentRunner:
             self.life.to_ready(a, no_outcome=a.no_outcome + 1, wake_text=prompt)
             return
         why = f"{misses} turns in a row ended without a readable outcome" + last
-        if outcome and outcome.note == TIME_WAIT_GUIDANCE:
+        if outcome and outcome.kind == "unparsed" and (outcome.typed or {}).get("wait_kind") == "time":
+            # a time wait Mesh recorded but this runner refuses (no timezone, no published source, a
+            # dependency or poll dressed as a time event), declared again after the correction
             self._correction_hold(a, task, f"{why}; {outcome.note}")
             return
         if (a.mode == "work"
@@ -2942,120 +2861,6 @@ class AgentRunner:
                        for c in self.mesh.comments(a.task_id))
         except MeshError:
             return False
-
-    def _ask_agent(self, task: dict, outcome: Outcome) -> dict | None:
-        """The workspace agent a ``decision:@handle`` wait addresses, when that is unambiguously
-        another agent (not a person, not the asker) and the task is under no human gate; else None.
-        An unreadable roster is None: the usual routing decides."""
-        if outcome.kind != "decision" or not outcome.handle or task.get("human_gate"):
-            return None
-        try:
-            matches = self._recipient_matches(outcome.handle)
-            addressee = self.effects._resolve_agent(outcome.handle, self.me)
-        except MeshError:
-            return None
-        only = next(iter(matches.values())) if len(matches) == 1 else {}
-        if (not addressee or only.get("kind") != "agent" or only.get("id") != addressee.get("id")
-                or addressee.get("id") in (None, self.agent_id)):
-            return None
-        return addressee
-
-    def _default_proceeds(self, a: Attempt, task: dict, outcome: Outcome) -> str:
-        """Wake text when a ``decision:@agent`` question carries the asker's own proposed default
-        (``DEFAULT_MARKER``) and no hard rule (asks.py) matches it: nothing needs to block on it.
-        The question is posted on this task, @-mentioning the addressee, which may object there;
-        no request is filed. '' = route the question as usual (hard, to a person, no marker, an
-        unreadable roster, or the comment could not be posted)."""
-        if not self.cfg.decision_default_proceeds or not DEFAULT_MARKER.search(outcome.note or ""):
-            return ""
-        verdict = asks.classify(outcome.note, task.get("labels"), self.cfg.hard_ask_patterns,
-                                self.cfg.hard_ask_labels)
-        if verdict.hard:
-            return ""
-        addressee = self._ask_agent(task, outcome)
-        if not addressee:
-            return ""
-        name = str(addressee.get("name") or outcome.handle)
-        note = outcome.note.strip()
-        asked = hashlib.sha1(f"{name.casefold()}\n{note}".encode()).hexdigest()[:12]
-        posted = ((self.store.mark(self.agent.name, a.task_id, "default_posted") or ("",))[0] or "").split(",")
-        body = f"[runner] Proceeding with the proposed default; @{name}, reply on this task to object:\n> {note}"
-        if asked not in posted and self._already_posted(a, body):
-            # Posted before a crash that lost the mark: record it, do not post it twice.
-            posted.append(asked)
-            self.store.mark(self.agent.name, a.task_id, "default_posted", ",".join(posted).strip(","))
-        if asked not in posted:
-            try:
-                # "[runner]": a runner note, so it files no mention request and wakes no wait.
-                # Keyed by how many defaults were delivered on the task, not by the question.
-                self.mesh.add_comment(a.task_id, body,
-                                      key=f"default-ask|{a.task_id}|{len([p for p in posted if p])}")
-            except MeshError as e:
-                log.warning("%s: #%s default ask to @%s: post: %s; asking as usual", self.agent.name, a.task8,
-                            name, e)
-                return ""
-            self.store.mark(self.agent.name, a.task_id, "default_posted", ",".join([*posted, asked]).strip(","))
-        self.store.event(a.id, "decision_default_proceeds", f"@{name}: {note[:300]}")
-        self.emit("decision_default_proceeds", a, handle=name)
-        log.info("%s: #%s decision wait to @%s carries a proposed default: no request, proceeding",
-                 self.agent.name, a.task8, name)
-        return (f"your question to @{name} states your own proposed default, so nothing has to wait for it: "
-                f"no request was filed, and the question was posted on this task for @{name} to object. "
-                "Proceed with your stated default now and end the turn with your real next outcome "
-                f"(the event you then wait on, ↻ NEXT, or the review/done status). An objection from @{name} "
-                "reaches you as an ordinary comment.")
-
-    def _live_task_card_wait(self, a: Attempt, task: dict, outcome: Outcome) -> Outcome:
-        """A ``decision:@agent`` question about a task that agent itself holds and is working on
-        (``#<8hex>`` or its uuid in the question; todo, in_progress or review) becomes a card wait on
-        that task. Such a question ("pass the handback from #x when ready", "tell me when #x's verdict
-        is in") can only be answered "not ready", and a request card starts a fresh session for the
-        addressee just to say so. The card wait wakes when the task closes or ships, or when the
-        addressee comments on it; nothing is posted to the addressee. Exactly one other task must be
-        named; anything else (none, several, someone else's, a closed one, unreadable) is unchanged."""
-        if not self.cfg.decision_live_task_card_wait:
-            return outcome
-        refs = []
-        for m in TASK_REF.finditer(outcome.note or ""):
-            ref = (m.group("uuid") or m.group("short")).casefold()
-            if ref[:8] != a.task8 and ref[:8] not in (r[:8] for r in refs):
-                refs.append(ref)
-        if len(refs) != 1:
-            return outcome
-        addressee = self._ask_agent(task, outcome)
-        if not addressee:
-            return outcome
-        ref = refs[0]
-        try:
-            target = self.mesh.task(ref) if len(ref) > 8 else self.mesh.task_by_short(ref)
-            target = target.get("task", target) if isinstance(target, dict) else {}
-            holder = target.get("assignee_id") or (target.get("assignee") or {}).get("id")
-            live = target.get("id") and self.cats.category(target) in ("todo", "in_progress", "review")
-        except MeshError as e:
-            log.info("%s: #%s decision wait names #%s, unreadable (%s): asked as usual", self.agent.name,
-                     a.task8, ref[:8], e.status)
-            return outcome
-        if not live or holder != addressee["id"] or target["id"] == a.task_id:
-            return outcome
-        name = str(addressee.get("name") or outcome.handle)
-        target8 = str(target["id"])[:8]
-        if self._waiting_on_me(a, target8):
-            # That task waits on this agent: as a card wait the question is a wait cycle, whose
-            # notice tells the agent to ask with `decision:@` again, which would be converted
-            # again. The question is filed as a request instead.
-            self.store.event(a.id, "decision_to_card_wait_skipped", f"@{name} #{target8} waits on this card")
-            self.emit("decision_to_card_wait_skipped", a, handle=name, target=target8, reason="cycle")
-            log.info("%s: #%s decision wait to @%s kept as a request: its live task #%s waits on this card",
-                     self.agent.name, a.task8, name, target8)
-            return outcome
-        self.store.event(a.id, "decision_to_card_wait", f"@{name} #{target8}")
-        self.emit("decision_to_card_wait", a, handle=name, target=target8)
-        log.info("%s: #%s decision wait to @%s converted to card wait on #%s (its live task): no request filed",
-                 self.agent.name, a.task8, name, target8)
-        return Outcome("card", target8, note=f"asked @{name}, waits on its live task #{target8}: {outcome.note}",
-                       line=outcome.line,
-                       extra={"watch_comments_by": {"id": addressee["id"], "name": name},
-                              "converted_from": f"decision:@{name}"})
 
     def _recipient_matches(self, handle: str) -> dict:
         """The workspace recipients a handle names, keyed (kind, id). An agent's service user
@@ -3877,8 +3682,8 @@ class AgentRunner:
         return True
 
     def _own_turn_comments(self, a: Attempt, comments: list[dict]) -> list[str]:
-        """What the agent itself wrote on the card during this turn, one text per comment,
-        declaration lines and runner notes left out. Judged by Mesh's clock, like ``_read_outcome``."""
+        """What the agent itself wrote on the card during this turn, one text per comment, runner
+        notes left out. Judged by Mesh's clock, like ``_read_outcome``."""
         started = parse_time(a.turn_started_at)
         if started is None:
             return []
@@ -3889,7 +3694,7 @@ class AgentRunner:
             at = parse_time(c.get("created_at"))
             if author != self.agent_id or body.startswith("[runner") or at is None or at <= started:
                 continue
-            text = "\n".join(l for l in body.splitlines() if not DECLARATION.match(l)).strip()
+            text = body.strip()
             if text:
                 texts.append(text)
         return texts
@@ -4250,7 +4055,7 @@ class AgentRunner:
         self._comment(a.task_id, "⚠️ WAIT CORRECTION REQUIRED: " + why
                       + f". Repair owner: @{self.agent.lead or self.agent.name}; replace the malformed wait with the event "
                       + "or cited external timestamp above, then have another author post a correction, or explicitly "
-                      + "post `↻ NEXT: <what was corrected>` from this Mesh identity. No retry timer was created.", key=f"correction-hold|{a.id}|{a.turns}")
+                      + "call `continue_next note=<what was corrected>` from this Mesh identity. No retry timer was created.", key=f"correction-hold|{a.id}|{a.turns}")
 
     def _give_up(self, a: Attempt, task: dict | None, why: str) -> None:
         """The runner cannot carry this task further. It must not stay in the
@@ -5772,8 +5577,8 @@ class AgentRunner:
         return reg
 
     def _stall_consumed_by_next(self, a: Attempt) -> None:
-        """The notifier's own ``↻ NEXT`` comment can itself be the newest declaration of the turn
-        (``_read_outcome``): the session continues now and has the result in its comments. That
+        """The turn ended with the agent's own ``continue_next`` (``_read_outcome``): the session continues
+        now and has the stall result in its comments. That
         delivers the evidence, so the one-shot mark is written here and a later ``WAIT stall:`` of
         the same registration cannot wake a second time on the same event."""
         if a.mode != "work":
@@ -6020,54 +5825,11 @@ class AgentRunner:
             self.emit("wake", a, event="queue refill first move")
 
     def _reconcile_card_wait(self, a: Attempt, task: dict, comments: list[dict]) -> bool:
-        """Adopt corroborated newer owner intent, retaining WAIT and its free slot.
-
-        True also means fail closed: a newer card intent was observed but could
-        not safely replace this exact generation. Never wake the stale target
-        in that tick, perform remote effects, or take ownership of the new edge.
-        """
-        handled, intent = card_wait_reconcile.latest_intent(
-            a.wait, comments, self.agent_id, a.task_id, now())
-        if not handled:
-            # A prose/status comment is not authority to adopt an older marker.
-            # Nor may it authorize observing a retired target while the current
-            # formal dependency still disagrees. Unknown edge state holds WAIT.
-            return card_wait_reconcile.blocks_stale_observation(
-                self.mesh.dependencies(a.task_id), a.task_id, a.wait.get("target"))
-        if (intent is None or a.agent != self.agent.name or a.state != "waiting"
-                or (a.pid and group_alive(a.pid, a.stamp))
-                or a.wait.get("scheduled") or a.wait.get("scheduled_maybe")):
-            return True
-        # The checkout session identifies the attempt even after lease release;
-        # assignment alone cannot authorize another session sharing this agent.
-        if (task.get("checkout_session_id") != a.id
-                or task.get("checked_out_by") not in (None, "", self.agent_id)):
-            return True
-        edge = card_wait_reconcile.sole_dependency(
-            self.mesh.dependencies(a.task_id), a.task_id, intent.target)
-        if edge is None:
-            return True
-        expected_wait = copy.deepcopy(a.wait)
-        receipt = {"attempt": a.id, "agent_id": self.agent_id,
-                   "old_target": expected_wait.get("target"), "old_since": expected_wait.get("since"),
-                   "comment_id": intent.comment_id, "comment_created_at": intent.created_at,
-                   "dependency_id": edge["id"], "dependency_target": edge["depends_on_task_id"],
-                   "observed_at": iso()}
-        # A new generation drops old observations and the removed owned edge.
-        # fx=True prevents adopt() from claiming/deleting the corroborating edge.
-        wait = {"kind": "card", "target": intent.target, "line": intent.line,
-                "note": intent.note, "since": intent.created_at, "started": intent.created_at,
-                "fx": True, "card_reconcile": receipt}
-
-        def same_owner():
-            stored = self.store.get(a.id)
-            return bool(stored and stored.agent == self.agent.name and stored.task_id == a.task_id)
-
-        if self.store.update_with_marks(a, {"card_wait_reconcile:" + a.id: json.dumps(receipt)},
-                expect="waiting", expect_wait=expected_wait, validate=same_owner, wait=wait):
-            self.emit("wait_reconciled", a, old_target=receipt["old_target"],
-                      target=intent.target, comment_id=intent.comment_id, dependency_id=edge["id"])
-        return True
+        """True holds this card WAIT for the tick: the formal dependency disagrees with the target the
+        wait observes, or the edge set cannot be read. A newer wait replaces this one only through Mesh
+        (a typed ``wait_for`` read when the turn settles); text in a comment is never owner intent."""
+        return card_wait_reconcile.blocks_stale_observation(
+            self.mesh.dependencies(a.task_id), a.task_id, a.wait.get("target"))
 
     def _wake_removed_card_edge(self, a: Attempt, task: dict) -> bool:
         """A user deleted the blocks edge this card WAIT created: wake the same attempt once.
@@ -6157,12 +5919,9 @@ class AgentRunner:
         selector never offers such a task (candidates() skips held attempts), so without this a
         generation change after the first prep would never reach the consumer. Same clearance
         and mark as the first prep; the edges stay open, nothing is released or satisfied here.
-        It runs before the stale-observation guard (which holds every open typed edge) but never
-        over a newer owner WAIT declaration: that one is reconciled first."""
+        It runs before the stale-observation guard (which holds every open typed edge)."""
         if (not getattr(self.agent, "next_action_prep", False) or a.state != "waiting"
                 or a.wait.get("kind") != "card"):
-            return False
-        if card_wait_reconcile.latest_intent(a.wait, comments, self.agent_id, a.task_id, now())[0]:
             return False
         try:
             pairs = blocking_edges(self.mesh, self.cats, a.task_id)
@@ -6777,9 +6536,6 @@ class AgentRunner:
         target = str(wait.get("target") or "")
         since = parse_time(wait.get("since")) or now()
         comments = self.mesh.comments(a.task_id)
-        if (n := own_next_after(comments, self.agent_id, since)):
-            wait["met"] = wait["superseded"] = True    # the agent's newest word is "continue now"
-            return f"you declared ↻ NEXT after this wait ({(n.get('created_at') or '')[:16]}): the wait is superseded"
         foreign = foreign_comments(comments, self.agent_id, since)
         if foreign and self.cfg.comment_wake == "addressed":
             foreign = [x for x in foreign
@@ -6880,7 +6636,7 @@ class AgentRunner:
             if started and now() - started >= dt.timedelta(hours=self.cfg.merge_queue_hours):
                 history = "\n".join(m.get("history") or [])
                 return (f"the merge gate ran {runs} times for MR {wait['target']} and it is still queued after "
-                        f"{self.cfg.merge_queue_hours:g} h. Re-arm with ⏳ WAIT merge: (not mr:, which never runs "
+                        f"{self.cfg.merge_queue_hours:g} h. Re-arm with `wait_for on=merge` (not on=mr, which never runs "
                         f"the gate) once the cause is dealt with. Recent runs:\n{history}")
         try:
             env = self._fresh_env()
@@ -7028,7 +6784,7 @@ class AgentRunner:
         return (f"wait cycle: #{wait['target']} ({other.agent}) is itself waiting on you "
                 f"({str(w.get('line') or w.get('kind'))[:160]}). Your wait for it to close can never "
                 f"end. Do your part of the work now, and if you then need its answer, wait with "
-                f"⏳ WAIT decision:@{other.agent.lower()} instead of card:#{wait['target']}.")
+                f"`ask_agent to={other.agent}` instead of waiting on card #{wait['target']}.")
 
     def _told_cycles(self, task_id: str) -> tuple[str | None, list]:
         """The task-wide ``CYCLE_TOLD`` mark: its raw value (None when absent) and the told signatures."""
@@ -7733,19 +7489,25 @@ class AgentRunner:
             return False
 
     def _correction_rearmed(self, task_id: str, failed_at: dt.datetime) -> bool:
-        """Explicit own NEXT repairs same-identity coordinator holds; routine notes cannot."""
+        """Someone else's comment, or this agent's own ``continue_next`` with a note recorded in Mesh
+        after the hold, repairs a same-identity coordinator hold; routine notes and text lines cannot."""
         try:
             comments = self.mesh.comments(task_id)
         except MeshError:
             return False
         if foreign_comment(comments, self.agent_id, failed_at):
             return True
-        declared = own_next_after(comments, self.agent_id, failed_at)
-        if not declared:
+        try:
+            rows = self.mesh.turn_outcomes(task_id)
+        except (MeshError, OSError):
             return False
-        lines = declaration_lines(declared.get("body") or "")
-        outcome = self._parse(lines[-1], now())
-        return outcome.kind == "next" and bool(outcome.note.strip())
+        for row in rows:                                 # newest first
+            at = parse_time(row.get("created_at"))
+            if at is None or at <= failed_at:
+                return False
+            if row.get("agent_id") == self.agent_id:
+                return row.get("kind") == "next" and bool(" ".join(str(row.get("note") or "").split()))
+        return False
 
     def _failed_recently(self, task_id: str, failed_at: dt.datetime) -> bool:
         """A failed task is not retried until someone else writes on it or the
@@ -7818,8 +7580,7 @@ class AgentRunner:
         mine = [c for c in comments if (c.get("author_id") or (c.get("author") or {}).get("id")) == self.agent_id
                 and not (c.get("body") or "").startswith("[runner")]
         closing = mine[-1] if mine else None
-        declared = declaration_lines((closing or {}).get("body") or "")
-        line = ((prev or a).wait or {}).get("line") or (declared[-1] if declared else "")
+        line = ((prev or a).wait or {}).get("line") or ""
         return prompts.where_you_stopped_block(reason, closing, line, self._linked_merge_requests(task),
                                                [(p, self._git_status(p)) for p in paths])
 
@@ -8121,7 +7882,8 @@ class AgentRunner:
         if newer and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", nsha) and type(nid) is int:
             text = (f"pipeline {pid} is {status}; nothing will change it. Retry it, push, or wait on the newer "
                     f"pipeline {nid} ({str(newer.get('status') or 'unknown')}, {nsha[:8]}) for the same ref: "
-                    f"`⏳ WAIT pipeline:{project}#{nid} until=change after={nsha}:{nid}:{newer.get('status')}`")
+                    f"`wait_for on=pipeline project_path={project} pipeline_id={nid} until=changed after_sha={nsha} "
+                    f"after_pipeline_id={nid} after_status={newer.get('status')}`")
         elif newer and type(nid) is int:
             text = (f"pipeline {pid} is {status}; nothing will change it. Retry it, push, or wait on the newer "
                     f"pipeline {nid} ({str(newer.get('status') or 'unknown')}) for the same ref")
@@ -8340,7 +8102,7 @@ class AgentRunner:
             return (f"{kind} {target}: pipeline {pid} ({sha[:8]}) already finished: {status}, so until=change "
                     "will not arrive on its own: nothing changes without a push or a retry. Fix the cause "
                     f"and push, or retry the failed job once, then wait on the new state ({new}); if the fix "
-                    "belongs to another card, wait on that card (`⏳ WAIT card:#<8hex>`).")
+                    "belongs to another card, wait on that card (`wait_for on=card target_task_id=<card>`).")
         return (f"{kind} {target}: pipeline {pid} ({sha[:8]}) already finished: {status}, so until=change "
                 "will not arrive on its own: nothing changes without your action. Act on the result "
                 f"(merge, hand over), or push and wait on the new state ({new}).")
@@ -8380,18 +8142,6 @@ class AgentRunner:
         except Exception as exc:                # noqa: BLE001 - unreadable: keep the delivery
             log.warning("%s: #%s CI delivery reset failed, kept: %r", self.agent.name, a.task8, exc)
 
-    def _repeated_decision_told(self, a: Attempt, task: dict, outcome: Outcome, comments: list[dict]) -> str:
-        """Text for a ``decision:@agent`` wait that repeats, verbatim, the question its addressee
-        already answered on this task since it was asked ('' = accept). A person's handle, a task
-        under a human gate and an unreadable roster all accept: the usual routing decides."""
-        if outcome.kind != "decision" or not outcome.handle or task.get("human_gate"):
-            return ""
-        try:
-            return self.effects.answered_repeat(a, outcome.handle, outcome.note, comments, self.me)
-        except Exception as exc:                 # noqa: BLE001 - a failed check never blocks the ask
-            log.warning("%s: #%s repeated decision check failed, wait kept: %r", self.agent.name, a.task8, exc)
-            return ""
-
     def _card_wait_told(self, a: Attempt, outcome: Outcome) -> str:
         """Text for a ``card`` wait on X when X itself waits on a timer, a measurement window, a
         person or a review (a human gate): these release gates do not hold
@@ -8406,7 +8156,7 @@ class AgentRunner:
         event happens, so a plain wait on it stands."""
         if outcome.kind != "card" or not outcome.target:
             return ""
-        if card_condition(outcome.line) in ("accepted", "deployed", "shipped"):
+        if (outcome.extra or {}).get("card_condition") in ("accepted", "deployed", "shipped"):
             return ""
         try:
             target = [x for x in self.store.open_on_task(str(outcome.target)) if x.task_id != a.task_id]
@@ -8440,7 +8190,7 @@ class AgentRunner:
                 return ""
             return (f"#{outcome.target} itself waits for {idle}; a release gate does not "
                     "hold development. Do your part now, or name the code in it that you need and wait "
-                    "for its merge (`⏳ WAIT mr:<group>/<project>!<iid>`).")
+                    "for its merge (`wait_for on=mr project_path=<group>/<project> mr_iid=<iid> until=merged`).")
         except Exception as exc:                 # noqa: BLE001 - an unreadable target: the wait stands
             log.warning("%s: #%s card wait check failed, wait kept: %r", self.agent.name, a.task8, exc)
             return ""
@@ -8449,17 +8199,31 @@ class AgentRunner:
         mark = self.store.mark(self.agent.name, task_id, key)
         return Delivered(mark[0], mark[1]) if mark else ""
 
-    def _review_event(self, task: dict, since: dt.datetime, last: dict | None, comments: list[dict]) -> str:
+    def _own_declared_wait(self, task: dict) -> Outcome | None:
+        """The wait this agent still holds on the card in Mesh (its typed ``wait_for`` / ``ask_human`` /
+        ``ask_agent``), as an Outcome; None when it holds none, Mesh cannot be read, or the wait is one this
+        runner does not act on. Text in the agent's comments is not read."""
+        try:
+            wait = self.mesh.active_wait(task["id"], self.agent_id)
+        except (MeshError, OSError):
+            return None
+        if not isinstance(wait, dict) or not wait.get("id"):
+            return None
+        declared = from_typed({"kind": "wait", "wait_id": wait["id"]}, wait, now(), task["id"][:8],
+                              merge=self.merge_enabled)
+        if declared.extra.get("ci_default") or declared.extra.get("mr_default"):
+            declared = self._default_baseline(declared)
+        return declared if declared.kind != "unparsed" else None
+
+    def _review_event(self, task: dict, since: dt.datetime, declared: Outcome | None, comments: list[dict]) -> str:
         """What happened on this task after ``since`` that the agent has not seen
         ('' = nothing): a review verdict, someone else's comment, a change on its linked merge requests
-        (merged, closed, a new head, a pipeline finished), or the wait the agent
-        declared in its last comment being over."""
+        (merged, closed, a new head, a pipeline finished), or the wait the agent still holds in Mesh
+        (``declared``, see ``_own_declared_wait``) being over."""
         if not hasattr(self, "_review_ci_delivery"):
             self._review_ci_delivery = {}
             self._review_ci_observation = {}
         self._review_ci_delivery.pop(task["id"], None)
-        lines = declaration_lines((last or {}).get("body") or "")
-        declared = self._parse(lines[-1], parse_time(last["created_at"]) or since, task["id"][:8]) if lines else None
         if declared and declared.kind == "blocking":
             # a question to a human: only a person's answer (a comment) or the gate it raised
             # being lifted ends it. The gate is not set on this path (the card went to review
@@ -8600,11 +8364,11 @@ class AgentRunner:
         fed_at = parse_time(fed[1]) if fed else None
         hours = self._own_hold_hours()
         own = self._own_work(task["id"], comments)
-        own_lines = declaration_lines((own[2] or {}).get("body") or "") if own else []
-        own_typed = bool(own_lines and typed_wait(self._parse(own_lines[-1], own[1]).extra))
+        declared = self._own_declared_wait(task) if own else None
+        own_typed = bool(declared and typed_wait(declared.extra))
         if own and (own_typed or not (fed_at and fed_at > own[1])):
             event_since = max(own[1], fed_at) if own_typed and fed_at else own[1]
-            event = self._review_event(task, event_since, own[2], comments)
+            event = self._review_event(task, event_since, declared, comments)
             if event:
                 # the next step is the author's (merge, acceptance, a fix, a new request): fed
                 # once with what changed; after that the refeed rule below decides. Only a
@@ -8624,7 +8388,7 @@ class AgentRunner:
                 return "review: typed VCS wait UNKNOWN; baseline retained"
             if now() - own[1] < dt.timedelta(hours=hours):
                 return "review: the agent's own work; waits for someone else to review it"
-            if self._own_wait_pending(task, own[2], own[1]):
+            if self._own_wait_pending(declared, own[1]):
                 # the card went to review without the author (its MR merged mid-turn) and the
                 # author's last word is a WAIT that is not over: that wait stands. Feeding it as
                 # a QA launch of its own work is refused by the gate (author = reviewer) every
@@ -8649,16 +8413,10 @@ class AgentRunner:
         hours = getattr(self.cfg, "review_refeed_hours", 0) or 0
         return dt.timedelta(hours=hours) if hours > 0 else REVIEW_REFEED_MAX
 
-    def _own_wait_pending(self, task: dict, last: dict | None, worked: dt.datetime) -> bool:
-        """The agent's last comment of its work turn ends in a ⏳ WAIT (pipeline, mr, card,
-        decision or time) and is still within its bound. The caller has already seen ``_review_event`` return nothing, so the wait is not over."""
-        lines = declaration_lines((last or {}).get("body") or "")
-        if not lines:
-            return False
-        try:
-            declared = self._parse(lines[-1], parse_time(last["created_at"]) or now(), task["id"][:8])
-        except Exception:
-            return False
+    def _own_wait_pending(self, declared: Outcome | None, worked: dt.datetime) -> bool:
+        """The agent still holds a wait on the card in Mesh (pipeline, mr, card, decision or time) and it
+        is still within its bound. The caller has already seen ``_review_event`` return nothing, so the
+        wait is not over."""
         if not (declared and declared.is_wait):
             return False
         if typed_wait(declared.extra):
@@ -9310,7 +9068,7 @@ class AgentRunner:
             at, note = max(failed, key=lambda f: f[0])
             if note.startswith("wait correction required:"):
                 if not self._correction_rearmed(task["id"], at):
-                    return "wait correction required; waits for a foreign correction comment or explicit own NEXT with repair reason"
+                    return "wait correction required; waits for a foreign correction comment or own continue_next with a repair note"
             elif note.startswith(DAILY_CAP_NOTES):
                 # the per-day budget is spent: a restart today only runs one turn into the same
                 # cap (no lead to take it). It waits for the next UTC day or a new comment; after
@@ -10487,8 +10245,8 @@ class Runner:
         return out
 
     def outcome_sources(self) -> dict[str, dict[str, int]]:
-        """How settled turns ended since start, all agents: {source: {harness: turns}}, source one of
-        typed / comment / final_text / none."""
+        """How settled turns ended since start, all agents: {source: {harness: turns}}, source typed
+        or none (text is not read, so comment / final_text no longer occur)."""
         total: dict[str, dict[str, int]] = {}
         for ar in getattr(self, "agents", ()):                   # a partly built Runner has no agents yet
             counted = getattr(ar, "outcome_sources", None)      # a stand-in agent may count nothing

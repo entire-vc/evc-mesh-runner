@@ -37,11 +37,11 @@ _RECEIPT_LINE = re.compile(r"(?m)^[ \t]*carrier-receipt:[ \t]*(?P<ref>[\w][\w.:/
 _MARKER = re.compile(r"[^\n\r]{3,80}")
 
 WAIT_GUIDANCE = (
-    "invalid recovery wait: `⏳ WAIT recovery:#<this-card-8hex>` is accepted only when the recovery "
+    "invalid recovery wait: `wait_for on=registered registration=recovery` is accepted only when the recovery "
     "observer is enabled on this runner and an operator armed a live registration for this card and "
     "this owner (`mesh-runner recovery-wait arm`). It wakes once when the shared recovery card is "
-    "done and carries an explicit receipt comment. Nothing is armed here: declare another condition "
-    "(card, mr, pipeline, decision) or ask the operator to arm it."
+    "done and carries an explicit receipt comment. Nothing is armed here: wait on another condition "
+    "(card, mr, pipeline, ask_agent) or ask the operator to arm it."
 )
 
 
