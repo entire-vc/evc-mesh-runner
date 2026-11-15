@@ -3,12 +3,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import unittest
 from unittest import mock
 
 from mesh_runner import delivery_recovery, interactive
+from mesh_runner.qa_assignment import native_session_in_argv
 import test_presend_quota_recovery as quota_tests
 from test_runner import Bench
 from fakes import FakeMesh, FakeProfileAdapter, calls, task
@@ -225,22 +227,78 @@ class LegacyHandoff(Bench):
 
 
 class NativeProcessBoundary(unittest.TestCase):
-    def test_real_detached_session_process_is_detected_then_absent(self):
-        session = '0000dddd-0000-4000-8000-000000000004'
-        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)',
-                                  '--session-id', session], start_new_session=True)
+    # Written by the child's final image only: nothing before its exec can produce this line.
+    FINAL = 'import sys, time; sys.stdout.write("exec-ready\\n"); sys.stdout.flush(); time.sleep(60)'
+
+    def spawn(self, session, *, hold_exec=False):
+        """A detached child whose kernel argv names ``--session-id <session>``.
+
+        Popen returning does not mean the kernel already shows the child's own argv: a read in
+        that window returned the parent's argv on Linux CI and an empty argv on macOS. Read argv
+        only after ``await_exec``. ``hold_exec`` starts the child as a holder that execs into the
+        session argv only when ``release`` sends that argv on its stdin, so the holder's own argv
+        carries no trace of the session.
+        """
+        argv = [sys.executable, '-c', self.FINAL, '--session-id', session]
+        if hold_exec:
+            self.held_argv = argv
+            argv = [sys.executable, '-c', 'import json, os, sys; '
+                    'argv = json.loads(sys.stdin.readline()); os.execv(argv[0], argv)']
+        child = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.PIPE,
+                                 stdin=subprocess.PIPE if hold_exec else subprocess.DEVNULL)
+        self.addCleanup(self.reap, child)
+        return child
+
+    @staticmethod
+    def reap(child):
+        if child.poll() is None:
+            child.kill(); child.wait(timeout=5)
+        for stream in (child.stdin, child.stdout):
+            if stream is not None:
+                stream.close()
+
+    def release(self, child):
+        child.stdin.write(json.dumps(self.held_argv).encode() + b'\n'); child.stdin.flush()
+
+    def await_exec(self, child, timeout=20):
+        """Bounded wait for the final image's own line; returns as soon as it is written."""
+        ready, _, _ = select.select([child.stdout], [], [], timeout)
+        self.assertTrue(ready, f'child {child.pid} did not reach its final image in {timeout}s')
+        self.assertEqual(child.stdout.readline(), b'exec-ready\n')
+
+    @staticmethod
+    def enumerate_only(child):
+        """Control only process enumeration; kernel argv and PID checks stay real."""
         run = subprocess.run
         def kernel_run(argv, *args, **kwargs):
             if argv[:2] == ['/bin/ps', '-ax']:
                 return subprocess.CompletedProcess(argv, 0, f'{child.pid} {os.geteuid()}\n', '')
             return run(argv, *args, **kwargs)
-        try:
-            with mock.patch('mesh_runner.delivery_recovery.subprocess.run', side_effect=kernel_run):
-                # Only enumeration is controlled; kernel argv and PID checks are real.
-                self.assertIn(session, delivery_recovery._process_argv(child.pid))
-                self.assertFalse(delivery_recovery._session_process_absent(session, 'attempt'))
-                child.terminate(); child.wait(timeout=5)
-                self.assertTrue(delivery_recovery._session_process_absent(session, 'attempt'))
-        finally:
-            if child.poll() is None:
-                child.kill(); child.wait(timeout=5)
+        return mock.patch('mesh_runner.delivery_recovery.subprocess.run', side_effect=kernel_run)
+
+    def test_real_detached_session_process_is_detected_then_absent(self):
+        session = '0000dddd-0000-4000-8000-000000000004'
+        child = self.spawn(session)
+        self.await_exec(child)
+        with self.enumerate_only(child):
+            self.assertIn(session, delivery_recovery._process_argv(child.pid))
+            self.assertFalse(delivery_recovery._session_process_absent(session, 'attempt'))
+            child.terminate(); child.wait(timeout=5)
+            self.assertTrue(delivery_recovery._session_process_absent(session, 'attempt'))
+
+    def test_argv_read_before_the_child_exec_misses_the_session(self):
+        """Known-broken input of the test above: an argv read before the child's exec.
+
+        The holder keeps the child before its exec deterministically. The unsynchronised read
+        misses the session, as the flaky CI run did; after ``await_exec`` the same read finds it.
+        """
+        session = '0000dddd-0000-4000-8000-000000000005'
+        child = self.spawn(session, hold_exec=True)
+        with self.enumerate_only(child):
+            early = delivery_recovery._process_argv(child.pid)
+            self.assertFalse([token for token in early if session in token], early)
+            self.assertFalse(native_session_in_argv(early, session))
+            self.release(child)
+            self.await_exec(child)
+            self.assertIn(session, delivery_recovery._process_argv(child.pid))
+            self.assertFalse(delivery_recovery._session_process_absent(session, 'attempt'))

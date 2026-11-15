@@ -26,6 +26,9 @@ PIPELINE_DONE = {"success", "failed", "canceled", "cancelled", "skipped", "manua
 JOB_FINAL = frozenset({"success", "failed", "canceled", "skipped", "manual"})
 JOB_STATES = JOB_FINAL | {"cancelled", "created", "pending", "running", "preparing",
                           "waiting_for_resource", "scheduled", "canceling", "waiting_for_callback"}
+# A job that is moving on its own (queued, running, delayed, stopping). ``created`` is not: it waits
+# for the jobs before it, and behind a ``manual`` one it waits for a person.
+JOB_ACTIVE = JOB_STATES - JOB_FINAL - {"cancelled", "created"}
 JOB_PAGES = 10                 # 1000 jobs: past that a pipeline is not one a wait names jobs in
 # Queue and run states of an unfinished pipeline. For ``until=change`` they are ONE phase: a hop
 # between them on the same commit and pipeline (pending -> running) is not news to an agent that
@@ -433,6 +436,27 @@ def foreign_comment(comments: list[dict], agent_id: str, since: dt.datetime) -> 
     return found[-1] if found else None
 
 
+def own_card_comment_event(comments: list[dict], wait: dict, agent_id: str, now: dt.datetime,
+                           comment_wake: str = "all", agent_name="", always_from=()) -> str:
+    """Wake text of a foreign comment on the waiting card itself, '' when none may wake it.
+
+    For a card WAIT whose target observation is held by its formal edges (an open typed edge, an
+    unreadable or ambiguous edge set): what is held is the TARGET's event (closed, shipped, a
+    watched comment there). A comment on the waiting card is news for its own agent, the same as
+    on any card wait: under ``comment_wake = "addressed"`` it passes ``wakes_on_comment`` (an
+    @-mention, a person, an always-from author), so a question another agent delivered here with
+    ``@<lane>`` wakes it and an unaddressed note by another agent still does not."""
+    since = parse_time(wait.get("since")) or now
+    foreign = foreign_comments(comments, agent_id, since)
+    if comment_wake == "addressed":
+        foreign = [x for x in foreign if wakes_on_comment(x, wait, agent_name, always_from)]
+    if not foreign:
+        return ""
+    c = foreign[-1]
+    who = c.get("author_name") or (c.get("author") or {}).get("name") or "someone"
+    return f"{who} commented: {(c.get('body') or '')[:300]}"
+
+
 ANSWER_MARKER = re.compile(r"^\s*(?:[✅*_>\s]*)(?:answer|decision|ответ|решение)\s*[:：]", re.I | re.M)
 
 
@@ -457,13 +481,17 @@ ADDRESSED_FILTERED_KINDS = frozenset({"decision", "pipeline", "mr", "time", "car
 _MENTION = re.compile(r"(?<![\w.\-])@([\w\-]+(?:\.[\w\-]+)*)")
 
 
-def mentions(body: str, name: str) -> bool:
-    """True when ``body`` @-mentions ``name`` anywhere (not only at the start of a line)."""
-    name = (name or "").lstrip("@").casefold()
-    return bool(name) and any(h.casefold() == name for h in _MENTION.findall(body or ""))
+def mentions(body: str, name) -> bool:
+    """True when ``body`` @-mentions ``name`` anywhere (not only at the start of a line). ``name`` is one
+    handle or several: a lane is addressed by its runner name and by its Mesh agent name or slug, and the
+    two differ for a lane that runs a Mesh agent under another name (lane ``ops-vc`` runs Mesh agent ``ops`` of
+    another workspace): a question delivered on its card as ``@ops`` must wake it."""
+    names = (name,) if isinstance(name, str) or name is None else tuple(name)
+    wanted = {str(n or "").lstrip("@").casefold() for n in names} - {""}
+    return bool(wanted) and any(h.casefold() in wanted for h in _MENTION.findall(body or ""))
 
 
-def wakes_on_comment(c: dict, wait: dict, agent_name: str, always_from=()) -> bool:
+def wakes_on_comment(c: dict, wait: dict, agent_name, always_from=()) -> bool:
     """Whether a foreign comment may end ``wait`` early under ``comment_wake = "addressed"``.
 
     Only a comment provably written by another agent (``author_type == "agent"``) is ever
@@ -510,7 +538,7 @@ def is_fyi(body: str) -> bool:
     return bool(_FYI_MARKED_LINE.match(first))
 
 
-def answers_on_source(c: dict, wait: dict, agent_name: str, always_from=()) -> bool:
+def answers_on_source(c: dict, wait: dict, agent_name, always_from=()) -> bool:
     """``decision_wake = "answer"``: whether a foreign comment on the waiting card may end a decision
     wait that has a request card. A person's comment (or one whose author kind is not stated) does;
     so does one by an author in ``comment_wake_always_from``. Another agent's comment does only when
@@ -615,12 +643,26 @@ class UnknownJobs(ValueError):
         self.pipeline, self.names = pipeline, names
 
 
-def target_jobs_state(gitlab, target: str, pipeline: int, names) -> tuple[str, str]:
-    """(status, identity) of the named jobs of ``pipeline``. Status: ``running`` while any of them
-    is not final, else ``success`` when all succeeded, else the worst final status among them
-    (failed, canceled, skipped, manual). Jobs outside ``names`` (manual siblings included) are not
-    read. Identity names each job's id, so a retried job is a new observation. Raises
-    ``UnknownJobs`` for a name the pipeline has no job for; anything unreadable raises too."""
+def target_jobs_state(gitlab, target: str, pipeline: int, names,
+                      pipeline_status: str | None = None) -> tuple[str, str]:
+    """(status, identity) of the named jobs of ``pipeline``; see ``named_jobs_state``."""
+    status, identity, _statuses = named_jobs_state(gitlab, target, pipeline, names, pipeline_status)
+    return status, identity
+
+
+def named_jobs_state(gitlab, target: str, pipeline: int, names,
+                     pipeline_status: str | None = None) -> tuple[str, str, dict[str, str]]:
+    """(status, identity, {name: job status}) of the named jobs of ``pipeline``. Status:
+    ``running`` while any of them is not final, else ``success`` when all succeeded, else the
+    worst final status among them (failed, canceled, skipped, manual). Jobs outside ``names``
+    (manual siblings included) do not decide the status. Identity names each job's id, so a
+    retried job is a new observation. Raises ``UnknownJobs`` for a name the pipeline has no job
+    for; anything unreadable raises too.
+
+    One exception to ``running``: the pipeline is ``manual`` (``pipeline_status``, read by the
+    caller), no job of it is moving (``JOB_ACTIVE``) and every unfinished named job is ``created``.
+    Those jobs wait behind a manual job and start only after a person plays it, so the status is
+    ``manual``: a wait on them would otherwise never wake."""
     project = re.split(r"[!#]", target)[0]
     latest: dict[str, dict] = {}
     for job in gitlab.pipeline_jobs(f"{project}#{pipeline}"):
@@ -631,19 +673,33 @@ def target_jobs_state(gitlab, target: str, pipeline: int, names) -> tuple[str, s
     missing = [n for n in names if n not in latest]
     if missing:
         raise UnknownJobs(pipeline, missing)
-    statuses = []
+    named: dict[str, str] = {}
     for n in names:
         status = latest[n].get("status")
         if not isinstance(status, str) or status not in JOB_STATES:
             raise ValueError("job status unavailable")
-        statuses.append("canceled" if status == "cancelled" else status)
+        named[n] = "canceled" if status == "cancelled" else status
     identity = ",".join(f"{n}={latest[n]['id']}" for n in names)
-    if any(st not in JOB_FINAL for st in statuses):
-        return "running", identity
+    statuses = list(named.values())
+    unfinished = [st for st in statuses if st not in JOB_FINAL]
+    if unfinished:
+        if (pipeline_status == "manual" and all(st == "created" for st in unfinished)
+                and not any(j.get("status") in JOB_ACTIVE for j in latest.values())):
+            return "manual", identity, named
+        return "running", identity, named
     for st in ("failed", "canceled", "skipped", "manual"):
         if st in statuses:
-            return st, identity
-    return "success", identity
+            return st, identity, named
+    return "success", identity, named
+
+
+def jobs_manual_text(named: dict[str, str]) -> str:
+    """'job(s) a manual, b blocked behind it' for named jobs that wait for a person."""
+    manual = [n for n, st in named.items() if st == "manual"]
+    blocked = [n for n, st in named.items() if st == "created"]
+    parts = ([f"job(s) {','.join(manual)} manual"] if manual else []) + \
+        ([f"job(s) {','.join(blocked)} blocked behind a manual job"] if blocked else [])
+    return ", ".join(parts)
 
 
 class Delivered(str):
@@ -860,7 +916,7 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
     sha, pid, status, generation = ci_observation_gen(gitlab, kind, target)
     if contract.get("jobs"):
         return _jobs_event(gitlab, kind, target, contract, sha, pid, delivered, observation,
-                           allow_action_required)
+                           allow_action_required, status)
     if allow_action_required and kind == "pipeline" and contract["predicate"] == "success":
         # A pipeline ID is immutable: a different SHA is not evidence about the
         # exact requested pipeline. Never diagnose an unbound/stale observation.
@@ -918,7 +974,7 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
 
 
 def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: int, delivered,
-                observation, allow_action_required: bool) -> str:
+                observation, allow_action_required: bool, pipeline_status: str | None = None) -> str:
     """``ci_change_event`` for a wait on named jobs (``jobs=[...]``): the predicate is read from
     those jobs, never from the aggregate pipeline status, so a pipeline left ``manual`` by an
     unstarted sibling does not hold back a target job that has finished. Once every named job is
@@ -930,7 +986,7 @@ def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: i
     jobs = tuple(contract["jobs"])
     names = ",".join(jobs)
     try:
-        status, identity = target_jobs_state(gitlab, target, pid, jobs)
+        status, identity, named = named_jobs_state(gitlab, target, pid, jobs, pipeline_status)
     except UnknownJobs as e:
         # an MR head can move to a pipeline without the job; it would never wake by itself
         if not allow_action_required or _owner_action_once(
@@ -944,6 +1000,12 @@ def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: i
         if not allow_action_required or _owner_action_once(
                 target, sha, pid, f"jobs[{names}]:{status}", delivered, observation, identity) is None:
             return ""
+        if status == "manual":
+            return (f"action required: {kind} {target} pipeline {pid} on {sha[:8]}: {jobs_manual_text(named)}; "
+                    "they start only by hand, so the success predicate will not be met by itself. Take the "
+                    "authorized step (the gate's owner plays the manual job, or remove what holds it), then "
+                    "wait on the new result. Do not run jobs or skip a project gate automatically, and do "
+                    "not wait on these jobs again while they are manual.")
         return (f"action required: {kind} {target} pipeline {pid} on {sha[:8]}: job(s) {names} finished: "
                 f"{status}; the success predicate is not met. Inspect the job, fix and push or retry it "
                 "once, then wait on the new result. Do not run sibling jobs or skip a project gate "
@@ -955,6 +1017,9 @@ def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: i
         return ""
     if observation is not None:
         observation.update(key=key, value=fingerprint)
+    if status == "manual" and "created" in named.values():
+        return (f"{kind} {target}: {jobs_manual_text(named)}; they start only by hand (pipeline {pid}, "
+                f"{sha[:8]}, {contract['predicate']}); other jobs of the pipeline were not considered")
     return (f"{kind} {target}: job(s) {names} finished: {status} (pipeline {pid}, {sha[:8]}, "
             f"{contract['predicate']}); other jobs of the pipeline were not considered")
 
@@ -1145,7 +1210,7 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
           wait: dict, agent_id: str, comments: list[dict], now: dt.datetime,
           max_wait: dt.timedelta = dt.timedelta(hours=6), max_errors: int = 5,
           first_recheck: dt.timedelta | None = None, delivery_reader=None,
-          allow_action_required: bool = False, comment_wake: str = "all", agent_name: str = "",
+          allow_action_required: bool = False, comment_wake: str = "all", agent_name="",
           comment_wake_always_from=(), decision_wake: str = "any", merge_gate: bool = False) -> str:
     """Wake event text, or '' while the wait holds. Mutates ``wait`` bookkeeping
     (seen pipeline, consecutive check errors; ``recheck_due`` when the wake is a re-check;

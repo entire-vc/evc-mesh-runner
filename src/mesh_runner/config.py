@@ -17,7 +17,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # gmail_watch_v1 = false           # enables `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     # gmail_watch_reader = ["ssh", "-o", "BatchMode=yes", "<host>", "<readonly-wrapper>"]   # fixed argv; JSON request on stdin
 
-    # The [runner] table has 38 operator options (README "[runner] options") plus native_result_dir /
+    # The [runner] table has 42 operator options (README "[runner] options") plus native_result_dir /
     # native_result_channels_dir, which the native-result adoption protocol reads from this file
     # (docs/native-result-config.md). Keys that used to be options are listed in RETIRED_RUNNER_OPTIONS
     # below: a file that still sets one loads with a warning, and the value stays fixed.
@@ -46,7 +46,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     [[agents]]
     name = "builder"
     key_file = "~/.config/mesh-runner/builder.key"
-    harness = "claude"            # claude | codex
+    harness = "claude"            # claude | codex | kimi | zcode
     profile_dir = "~/agents/builder"   # session cwd: the agent's rules, skills, MCP config
     args = ["--model", "sonnet"]
     max_parallel = 0              # 0: use the agent's max_concurrent_tasks in Mesh
@@ -117,7 +117,6 @@ RETIRED_RUNNER_OPTIONS: dict[str, str] = {
     "checkpoint_budget_gb": "its value is fixed at 4.0",
     "checkpoint_exclude_names": "its value is fixed at the built-in build-cache names",
     "checkpoint_gc_grace_hours": "its value is fixed at 6.0",
-    "completion_comment": "its value is fixed at true",
     "dead_slot_hours": "its value is fixed at 24.0",
     "decision_default_proceeds": "its value is fixed at true",
     "decision_identical_no_reopen": "its value is fixed at true",
@@ -400,6 +399,10 @@ class RunnerConfig:
     wake_budget_seconds: float = 45.0
     heartbeat_seconds: int = 300
     checkout_ttl_minutes: int = 120
+    # The checkout fence (checkout_fence.py, docs/checkout-fence.md): the lane's result writes carry the
+    # lock of the running attempt, and a turn whose lock is gone is stopped. false = today's behaviour
+    # (no fence file, no headers, a lost lock only drops the token): the rollback without a release.
+    checkout_fence: bool = True
     max_no_outcome: int = 1            # immediate corrections (same session) after an unreadable outcome
     # Consecutive turns without a readable outcome on one task (any lane; a readable outcome resets the
     # count) after which it is routed to the lead. The second miss in a row puts the task back in todo
@@ -495,6 +498,10 @@ class RunnerConfig:
     # continues with its default at once. False: a request is filed.
     decision_default_proceeds: bool = True
     time_wait_ignore_names: list[str] = field(default_factory=list)
+    # The deploy inventory (JSON, see deploy_inventory.py): a card wait `until=deployed` on a card whose
+    # merge requests are in a repository it lists without a live-commit source (`type: none`) is told
+    # once that Mesh will never record the deploy. None = no check.
+    deploy_inventory: Path | None = None
     abort_backoff_minutes: int = 15
     gitlab_url: str = ""
     gitlab_token: str = field(default="", repr=False)
@@ -530,7 +537,9 @@ class RunnerConfig:
     # Idempotency-Key on the runner's own writes (comments, spend report) and the same key on a repeat
     # after a lost answer; false = no key and no repeat of a write (rollback without a release)
     idempotency_keys: bool = True
-    completion_comment: bool = True    # time, turns and cost on the task when an attempt completes
+    # time, turns and cost on the task when an attempt completes; false = no such line (a board that
+    # people outside the team read: the line names the harness, the session and the token counts)
+    completion_comment: bool = True
     review_starts_per_tick: int = 1    # a backlog of old review tasks must not crowd out work
     # a review card the agent itself just worked on is not fed back to it for this long, unless
     # something it has not seen happens (a comment, its MR or pipeline changed, its wait is over);
@@ -580,6 +589,11 @@ class RunnerConfig:
     # this (0 = off); released below load_release_per_cpu (0 = three quarters of the hold value)
     load_hold_per_cpu: float = 4.0
     load_release_per_cpu: float = 0.0
+    # a memory or load hold lifts only after its release condition held this long (0 = at once) ...
+    host_release_settle_seconds: float = 120.0
+    # ... and then, for host_ramp_seconds, the host starts at most one session per interval (0 = no ramp)
+    host_ramp_seconds: float = 300.0
+    host_ramp_start_interval_seconds: float = 20.0
     tmux_binary: str = "tmux"               # standing chat sessions and interactive turns
     # strict existing-session readonly_metadata receiver (meta_delivery.Settings); None = off
     session_metadata: object = field(default=None, repr=False)
@@ -657,6 +671,8 @@ class RunnerConfig:
 
 
 LAUNCH_MODES = ("interactive", "headless")
+# kimi and zcode run headless only: their print modes draw on the same subscription as their TUIs
+HARNESSES = ("claude", "codex", "kimi", "zcode")
 
 
 def _probe_version(value, name: str) -> int:
@@ -754,6 +770,12 @@ def _reviewer_select_command(value) -> tuple:
             if name not in ("project_id", "author"):
                 raise ConfigError(f"reviewer_select_command: unknown placeholder {{{name}}}; use {{project_id}}, {{author}}")
     return tuple(value)
+
+
+def _bool(value, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{name} must be true or false, got {value!r}")
+    return value
 
 
 def _loop_streak_limit(value) -> int:
@@ -972,8 +994,11 @@ def load(path: str | Path) -> RunnerConfig:
     agents = []
     for a in raw.get("agents") or []:
         harness = a.get("harness", "claude")
-        if harness not in ("claude", "codex"):
-            raise ConfigError(f"agent {a.get('name')}: harness must be claude or codex")
+        if harness not in HARNESSES:
+            raise ConfigError(f"agent {a.get('name')}: harness must be one of {', '.join(HARNESSES)}")
+        for alt in a.get("alt") or {}:
+            if alt not in HARNESSES:
+                raise ConfigError(f"agent {a.get('name')}: alt harness must be one of {', '.join(HARNESSES)}")
         repos = [_repo_spec(x, f"agent {a.get('name')} repos") for x in a.get("repos") or []]
         ident = a.get("identity")
         if "project_ids" in a:
@@ -1051,8 +1076,10 @@ def load(path: str | Path) -> RunnerConfig:
         archive_require_mount=_path(r.get("archive_require_mount")),
         workspace_wait_release_minutes=float(r.get("workspace_wait_release_minutes", 0.0)),
         gmail_watch_v1=r.get("gmail_watch_v1") is True,
+        checkout_fence=_bool(r.get("checkout_fence", True), "checkout_fence"),
         gmail_watch_reader=_argv(r.get("gmail_watch_reader"), "gmail_watch_reader"),
         time_wait_ignore_names=[str(n) for n in (r.get("time_wait_ignore_names") or [])],
+        deploy_inventory=_path(r.get("deploy_inventory")),
         decision_request_metadata_only_recipients=list(recipients),
         cardless_question_lanes=[v.strip() for v in cardless],
         hold_labels=tuple(hold),
@@ -1097,8 +1124,14 @@ def load(path: str | Path) -> RunnerConfig:
         memory_release_swap_mb=float(r.get("memory_release_swap_mb", 0)),
         load_hold_per_cpu=_idle_hours(r.get("load_hold_per_cpu", 4.0), "load_hold_per_cpu"),
         load_release_per_cpu=_idle_hours(r.get("load_release_per_cpu", 0.0), "load_release_per_cpu"),
+        host_release_settle_seconds=_idle_hours(r.get("host_release_settle_seconds", 120.0),
+                                                "host_release_settle_seconds"),
+        host_ramp_seconds=_idle_hours(r.get("host_ramp_seconds", 300.0), "host_ramp_seconds"),
+        host_ramp_start_interval_seconds=_idle_hours(r.get("host_ramp_start_interval_seconds", 20.0),
+                                                     "host_ramp_start_interval_seconds"),
         announce_controllers=r.get("announce_controllers", False) is True,
         idempotency_keys=_bool_option(r.get("idempotency_keys", True), "idempotency_keys"),
+        completion_comment=_bool_option(r.get("completion_comment", True), "completion_comment"),
         session_metadata=_session_metadata(raw.get("session_metadata")),
         chat_enabled=chat.get("enabled", False) is True,
         chat_agents=tuple(_string_list(chat.get("agents"), "[chat] agents", ())),

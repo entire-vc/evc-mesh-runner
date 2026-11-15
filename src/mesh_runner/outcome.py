@@ -189,8 +189,24 @@ def _typed_card(row: dict, wait: dict, now: dt.datetime, task8: str) -> Outcome:
     criterion = " ".join(str(wait.get("criterion") or "").split()) if cond == "artifact_published" else ""
     line = (f"⏳ WAIT card:#{target}" + (f" until={typed_cond}" if typed_cond else "")
             + (f" criterion={criterion}" if criterion else "") + _tail(note))
-    return Outcome("card", target, note=note, line=line,
-                   extra={"card_condition": typed_cond} if typed_cond else {})
+    extra: dict = {"card_condition": typed_cond} if typed_cond else {}
+    dependency = card_dependency(wait)
+    if dependency is not None:
+        extra["card_dependency"] = dependency
+    return Outcome("card", target, note=note, line=line, extra=extra)
+
+
+def card_dependency(wait: dict) -> dict | None:
+    """The blocks edge Mesh declared for a card wait, as its receipt reports it (``dependency_id``,
+    ``dependency_generation``, ``dependency_owned``): ``owned`` only when Mesh says this wait owns it
+    (created it, or took it over from an earlier wait of the same agent on the same card). None when
+    the receipt names no edge (a Mesh before the owner column): nothing is known, nothing is owned."""
+    if not isinstance(wait, dict) or ("dependency_id" not in wait and "dependency_owned" not in wait):
+        return None
+    generation = wait.get("dependency_generation")
+    return {"id": str(wait.get("dependency_id") or ""),
+            "generation": generation if type(generation) is int else None,
+            "owned": wait.get("dependency_owned") is True}
 
 
 def _typed_project(row: dict, wait: dict, number_field: str) -> tuple[str, int] | Outcome:

@@ -124,7 +124,7 @@ class RunnerHook(unittest.TestCase):
     def test_cleared_once_per_generation_after_real_dispatch(self):
         r = runner()
         self.assertTrue(r._prep_cleared(self.task, EDGES))
-        self.assertEqual(r._prep_pending, {TID: "v1:aa"})
+        self.assertEqual(r._prep_pending, {TID: ("v1:aa", PROJ)})
         # the start was refused: nothing recorded, the same generation is offered again
         self.assertTrue(r._prep_cleared(self.task, EDGES))
         next_action.record(r.store, "A", TID, "v1:aa", "att1")           # dispatched
@@ -162,6 +162,13 @@ class SelectorIntegration(Bench):
         m = r.store.mark(self.agent.name, self.t["id"], next_action.MARK)
         return json.loads(m[0]) if m else None
 
+    def changed(self, generation):
+        """The projection with new content: the blocker changed owner (Mesh's requirement owner)."""
+        p = copy.deepcopy(self.proj)
+        p["generation"] = generation
+        p["requires"][0]["owner"] = "builder"
+        return p
+
     def test_off_keeps_the_task_held_without_reading_the_projection(self):
         r = self.runner(self.mesh)
         self.assertTrue(r.hold_reason(self.t, "work").startswith("blocked by"))
@@ -180,8 +187,11 @@ class SelectorIntegration(Bench):
         r._hold_cache.clear()
         self.assertFalse(r._prep_cleared(self.t, [self.edge]))                      # same generation: no duplicate
         self.assertEqual(self.mesh.deps[self.t["id"]][0]["condition_satisfied"], False)   # edge stays open
-        self.proj = dict(self.proj, generation="v1:bb")
-        self.assertTrue(r._prep_cleared(self.t, [self.edge]))                       # new generation: one more
+        self.proj = dict(self.proj, generation="v1:bb")                             # blocker pushed: same content
+        self.assertFalse(r._prep_cleared(self.t, [self.edge]))
+        self.assertEqual(self.mark(r)["generation"], "v1:bb")                        # the mark follows
+        self.proj = self.changed("v1:cc")
+        self.assertTrue(r._prep_cleared(self.t, [self.edge]))                       # new content: one more
 
     def test_a_refused_start_records_nothing_and_is_offered_again(self):
         self.agent.next_action_prep = True
@@ -196,9 +206,10 @@ class SelectorIntegration(Bench):
         self.assertEqual(len(self.starts()), 1)
         self.assertEqual(self.mark(r)["generation"], "v1:aa")
 
-    def test_new_generation_wakes_the_waiting_attempt_once(self):
+    def test_new_content_wakes_the_waiting_attempt_once(self):
         """After the first prep the attempt stands in a card WAIT and the selector skips it; a new
-        generation must still reach the consumer: one wake, same attempt, edge stays open."""
+        projection content must still reach the consumer: one wake, same attempt, edge stays open.
+        A new generation with the same content (a push or verdict on the blocker) wakes nothing."""
         self.agent.next_action_prep = True
         self.edge["task_id"] = self.t["id"]            # a well-formed Mesh row, as the stale-observation guard requires
         write_replies(self.replies, {self.t["id"][:8]: wait_card(self.blocker["id"])})
@@ -210,12 +221,18 @@ class SelectorIntegration(Bench):
         self.assertEqual(att.state, "waiting")
         r.tick()
         self.assertEqual(r.store.get(first["attempt"]).state, "waiting")     # same generation: no wake
-        self.proj = dict(self.proj, generation="v1:bb")
+        self.proj = dict(self.proj, generation="v1:bb")                     # blocker pushed: same content
+        r._last_wake_check.clear()
+        r._hold_cache.clear()
+        r.tick()
+        self.assertEqual(r.store.get(first["attempt"]).state, "waiting")     # 0.2.53: woken here
+        self.assertEqual(self.mark(r)["generation"], "v1:bb")
+        self.proj = self.changed("v1:cc")
         r._last_wake_check.clear()
         r._hold_cache.clear()
         r.tick()
         again = self.mark(r)
-        self.assertEqual((again["generation"], again["attempt"]), ("v1:bb", first["attempt"]))
+        self.assertEqual((again["generation"], again["attempt"]), ("v1:cc", first["attempt"]))
         self.assertIn(r.store.get(first["attempt"]).state, ("ready", "running", "starting"))
         self.assertEqual(r.store.events_on_task(self.t["id"], "next_action_prep"), 2)   # first prep + this wake
         self.assertEqual(self.mesh.deps[self.t["id"]][0]["condition_satisfied"], False)

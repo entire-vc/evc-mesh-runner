@@ -482,7 +482,11 @@ class HeadlessAcceptedCrash(HeadlessFixture):
                     os.kill(controller, signal.SIGKILL)
                     os.waitpid(controller, 0)
                     controller = 0
-                    restarted = self.runner(FakeMesh([t]))
+                    mesh = FakeMesh([t])
+                    # Mesh keeps the lock across a controller crash: the restarted Runner's heartbeat
+                    # renews it (a lost lock on an open card stops the turn, test_checkout_fence.py)
+                    mesh.checkouts[t['id']] = {'session': receipt['attempt']}
+                    restarted = self.runner(mesh)
                     restarted.refresh_me()
                     a = restarted.store.get(receipt['attempt'])
                     restarted.tick()

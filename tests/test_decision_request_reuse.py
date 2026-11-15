@@ -149,6 +149,62 @@ class DecisionRequestReuse(Bench):
         self.assertEqual(len(mesh.created), 2)
         self.assertEqual(mesh.category(mesh.tasks[request]), 'done')
 
+    def held_edge(self, request, blocker, satisfied=False):
+        return {"id": "edge-held", "task_id": request, "depends_on_task_id": blocker,
+                "dependency_type": "blocks", "condition": "task_done", "condition_satisfied": satisfied}
+
+    def test_closed_request_held_by_a_blocks_edge_is_not_reopened(self):
+        # the addressee's earlier session left request -> its own execution card (waiting
+        # manual); reopening put the next question behind "held: blocked by"
+        r, mesh, source, attempt, wait = self.setup_question()
+        request = wait['request']['id']
+        self.close(r, attempt, wait)
+        mesh.deps[request] = [self.held_edge(request, task(7)['id'])]
+        again = self.question('GO v30 on the execution card?')
+        r.effects.on_wait(attempt, source, again, r.me)
+        self.assertEqual(len(mesh.created), 2)                     # a fresh request card
+        self.assertNotEqual(again['request']['id'], request)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'done')   # the held one stays closed
+        self.assertEqual(self.request_comments(mesh, request), [])
+        self.assertEqual(r.effects._decision(source['id'])['request']['id'], again['request']['id'])
+
+    def test_unreadable_edges_of_a_closed_request_leave_the_question_for_a_later_tick(self):
+        r, mesh, source, attempt, wait = self.setup_question()
+        request = wait['request']['id']
+        self.close(r, attempt, wait)
+        again = self.question('approve the revised plan?')
+        with patch.object(mesh, 'dependencies', side_effect=MeshError(503, 'unavailable')):
+            r.effects.on_wait(attempt, source, again, r.me)
+        self.assertEqual(len(mesh.created), 1)                     # no new card
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'done')   # not reopened
+        self.assertIs(again.get('fx'), False)                      # retried on a later tick
+        r.effects.on_wait(attempt, source, again, r.me)            # Mesh answers again
+        self.assertEqual(len(mesh.created), 1)
+        self.assertEqual(again['request']['id'], request)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'todo')
+
+    def test_malformed_edge_set_keeps_the_old_reuse(self):
+        r, mesh, source, attempt, wait = self.setup_question()
+        request = wait['request']['id']
+        self.close(r, attempt, wait)
+        mesh.deps[request] = [{"id": "edge-held", "task_id": request}]   # not a well-formed edge
+        again = self.question('approve the revised plan?')
+        r.effects.on_wait(attempt, source, again, r.me)
+        self.assertEqual(len(mesh.created), 1)
+        self.assertEqual(again['request']['id'], request)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'todo')
+
+    def test_closed_request_with_a_met_edge_is_reopened(self):
+        r, mesh, source, attempt, wait = self.setup_question()
+        request = wait['request']['id']
+        self.close(r, attempt, wait)
+        mesh.deps[request] = [self.held_edge(request, task(7)['id'], satisfied=True)]
+        again = self.question('approve the revised plan?')
+        r.effects.on_wait(attempt, source, again, r.me)
+        self.assertEqual(len(mesh.created), 1)
+        self.assertEqual(again['request']['id'], request)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'todo')
+
     def test_failed_comment_is_retried_without_a_new_card(self):
         r, mesh, source, attempt, wait = self.setup_question()
         request = wait['request']['id']

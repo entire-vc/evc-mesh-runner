@@ -26,6 +26,7 @@ Safety rules:
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -365,6 +366,14 @@ class WorkspacePool:
         self.root = Path(root) / owner
         self.repos = {r.name: r for r in repos}
         store.db.executescript(SCHEMA)
+
+    def on_store(self, store: Store) -> "WorkspacePool":
+        """This pool read and written through another connection to the same state file. A Store's
+        connection belongs to one thread; a runner-side pass over a lane's pool (checkpoint gc,
+        compaction, ignored cleanup) works through its own."""
+        view = copy.copy(self)
+        view.store = store
+        return view
 
     def disk_hold(self) -> str:
         """No mutation; OFF by default. Check the filesystem hosting the pool."""

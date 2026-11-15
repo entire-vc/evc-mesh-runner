@@ -18,7 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .checkpoint import CheckpointBaseMissing, base_objects_dir, manifest_digest
+from .checkpoint import SCRATCH_PREFIXES, CheckpointBaseMissing, base_objects_dir, manifest_digest
 from .store import Store, iso
 from .workspace import (POOL_ADMIN_HOLD_NOTE, POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE,
                         WorkspacePool, WorkspaceError, _COMMON_DIRS, base_lock, git)
@@ -507,6 +507,22 @@ def _check_pins(pool: WorkspacePool, pins: dict[str, str] | None) -> None:
             _check_pin(pool, root / key, expected)
 
 
+def _orphan_scratch(path: Path) -> bool:
+    """Scratch of a dead process: a verify/compaction/proof directory created before this process
+    started. Birth time where the filesystem records it, else the last change of the directory itself
+    (nothing touches a dead process's scratch). The caller holds _IO_LOCK, so this process uses none."""
+    from .checkpoint import PROCESS_STARTED
+    if not path.name.startswith(SCRATCH_PREFIXES):
+        return False
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    return (getattr(st, "st_birthtime", None) or st.st_mtime) < PROCESS_STARTED
+
+
 def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = False,
                       deadline: float | None = None, checkpoint_pins: dict[str, str] | None = None) -> dict:
     """Remove workspace checkpoints that nothing can restore any more, and the refs pinning them.
@@ -514,8 +530,9 @@ def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = 
     Garbage is: the checkpoint of an attempt that ended (not starting/running/unknown/waiting/
     ready) more than grace_hours ago; a checkpoint directory no journal row names (the generation
     a later suspend replaced) older than grace_hours; a .pending- capture directory while no
-    capture runs in this process. A checkpoint of a live attempt is never touched, and without
-    an attempts table nothing is. Each decision and the rename into .trash- happen under the
+    capture runs in this process; a .verify-/.compact-src-/.preflight- scratch directory created
+    before this process started, while it runs none (a killed runner leaves them). A checkpoint of
+    a live attempt is never touched, and without an attempts table nothing is. Each decision and the rename into .trash- happen under the
     repository base_lock that suspend() holds while it captures and journals, so a capture in
     flight is never mistaken for garbage. Removal is bounded by the deadline; what is left in
     .trash- is finished on the next pass. Dry run reports the same set without touching anything."""
@@ -602,13 +619,20 @@ def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = 
             try:
                 for path in sorted(root.glob(".pending-*")):
                     victim(path, "abandoned capture", None)
+                for path in sorted(root.iterdir()):
+                    if _orphan_scratch(path):
+                        victim(path, "orphan scratch", None)
             finally:
                 _IO_LOCK.release()
         for trash in (trashed if checkpoint_pins is not None else sorted(root.glob(".trash-*"))) if apply else ():
             size = _dir_bytes(trash, deadline)
             _bounded_rmtree(trash, deadline, anchor=root)
             result["freed_bytes"] += size
-            log.info("checkpoint gc: removed %s bytes=%d", trash.name, size)
+            name = trash.name.removeprefix(".trash-")
+            if name.startswith(SCRATCH_PREFIXES):
+                log.info("checkpoint gc: removed orphan scratch %s bytes=%d", name, size)
+            else:
+                log.info("checkpoint gc: removed %s bytes=%d", trash.name, size)
     except WorkspaceError as e:
         if checkpoint_pins is not None:
             result['errors'] += 1

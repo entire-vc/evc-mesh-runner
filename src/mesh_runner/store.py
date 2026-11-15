@@ -122,7 +122,13 @@ _JSON = {"workspaces", "checkout", "wait", "queue_order"}
 class Store:
     def __init__(self, path: str | Path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        # created on the main thread, used by one agent thread at a time (Runner.run_forever)
+        self.path = Path(path)
+        # created on the main thread, then used by exactly one thread (Runner.run_forever): a lane's
+        # store by its agent thread, the runner's store by the status loop. Never iterate one
+        # connection from two threads: rows come back reset (empty or garbage) under concurrency,
+        # and while the other thread's statement is open this connection holds a read snapshot, so
+        # its next write fails at once with "database is locked": SQLite does not call the busy
+        # handler for a connection that already reads. Another thread opens its own Store.
         self.db = sqlite3.connect(str(path), isolation_level=None, timeout=30, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -136,6 +142,9 @@ class Store:
         if "queue_order" not in cols:
             # NULL identifies attempts written before the runner recorded dispatch evidence.
             self.db.execute("ALTER TABLE attempts ADD COLUMN queue_order TEXT")
+
+    def close(self) -> None:
+        self.db.close()
 
     def _row(self, row: sqlite3.Row) -> Attempt:
         # columns this version does not know come from a newer runner sharing the
@@ -461,6 +470,13 @@ class Store:
                               "AND NOT EXISTS (SELECT 1 FROM events WHERE attempt=attempts.id "
                               "AND kind='informed_start')",
                               (agent, task_id, midnight)).fetchone()   # outage-only turns are not a start
+        return int(row[0]) if row else 0
+
+    def review_starts_today(self, agent: str, task_id: str) -> int:
+        """Review attempts this agent began on this task since UTC midnight that ran a turn."""
+        midnight = iso(now().replace(hour=0, minute=0, second=0, microsecond=0))
+        row = self.db.execute("SELECT COUNT(*) FROM attempts WHERE agent=? AND task_id=? AND created_at>=? "
+                              "AND mode='review' AND turns>0", (agent, task_id, midnight)).fetchone()
         return int(row[0]) if row else 0
 
     def events_since_readable(self, task_id: str, kind: str) -> int:

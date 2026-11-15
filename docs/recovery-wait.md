@@ -55,6 +55,11 @@ registration is one-shot and a later `arm` starts a new generation.
   assignee is the registered recovery owner (the card itself never matches). Unrelated cards never bind.
 * Create before arm and arm before create are both reconciled: every tick (throttled to
   two minutes) Runner reads the actual cards, waiting or not.
+* A candidate already finished (`completed_at`, else `updated_at`) more than five minutes before
+  `installed_at` is evidence of an earlier event with the same marker and never binds; a binding to
+  such a card is rejected on the next scan. A card still open at arm time, or finished within those
+  five minutes (the create/arm race), binds as before. A recurring marker (an alert title) can
+  therefore be re-armed without waking at once on the previous incident.
 * The earliest candidate binds (by `created_at`). A cancelled bound card is rejected and the next real
   candidate may bind. Failed/cancelled/not-done targets and a missing receipt give nothing.
 * Completion = bound card `done` + a comment by the receipt author with a line

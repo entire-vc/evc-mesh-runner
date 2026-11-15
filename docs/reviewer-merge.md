@@ -40,6 +40,33 @@ router the adapter prints `unknown: inputs`, the request is refused and nothing 
 The reviewer's runner starts the card; the session ends with `⏳ WAIT merge:<target> after=<sha>`. Before the first gate run `_merge_start` reads the card: if it carries `merge-only`, the request block must match the wait (target, sha) and this lane, and `GET /user` with the **same fresh env the gate gets** (`env_command`) must return the lane's `gitlab_username`. Missing, wrong or unreadable identity: no gate run, the agent is woken with the reason. No token or env is printed. The merge itself is the unchanged `merge_command` (`glab-merge --expected-sha … --use-lead-accept --gate`).
 Set `gitlab_username` on the reviewer lanes that differ from their lane name.
 
+## Merge rights: the runner hands the merge to the lead
+
+A second, automatic source of merge-only cards. When the merge gate of an author's
+`⏳ WAIT merge:` passes every check but the author's GitLab identity may not merge into the target
+(a protected branch where the author is a Developer), the gate's last output line is
+`⛔ MERGE RIGHTS <project>!<iid> @<sha>: ...` with a non-zero exit. The runner then:
+
+- picks the card's nearest lead that is a lane of this runner with a GitLab identity: the author
+  lane's `lead` chain, then `project_leads` for the card's project;
+- finds or creates the one merge-only card for that head (same key and request block as above,
+  `reason: "merge-rights"`) and assigns it to the lead; the lead's runner merges under the lead's
+  identity after the same `GET /user` check;
+- leaves one comment on the author's card naming the merge-only card, and keeps the author asleep.
+
+The author is woken when the MR is merged, closed or gets a new head (the new head is gated
+again), or when the merge-only card is closed while the MR is still open (the lead's last comment
+there says why). No such lead, or a card that cannot be filed after three attempts: the author is
+woken with the reason and the gate output.
+
+The lead may not merge either (its own gate on the merge-only card ends with the same line): the
+card is not passed on. The lead is woken there with the gate output, and the lead's runner leaves
+the note `[runner] merge gate: ⛔ MERGE RIGHTS <project>!<iid> @<sha>: ...` on that card. The
+author's wait reads the merge-only card's comments and wakes on that note, for its own target and
+head and written by the lead the card was assigned to (a runner note wakes nobody by itself). A
+note that cannot be written is retried with the next gate run; after three failures the lead is
+told.
+
 ## Canary (read-only)
 
 ```

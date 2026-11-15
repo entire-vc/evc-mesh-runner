@@ -6,6 +6,11 @@ A lane is paused (starts and resumes nothing; waits are still tracked) while ANY
 2. at least one token exists in `<state_dir>/pause.d/<name>/` or the host-wide
    `<state_dir>/pause.d/_all/`.
 
+Tokens are read live on each tick; taking or releasing one needs no configuration edit or restart.
+A paused lane also starts no merge gate for its `wait_for on=merge` waits. It continues to observe
+merge requests and already running gates; a gate that started before the pause is not interrupted.
+The pause is checked again after environment and identity preparation, before a new gate starts.
+
 The same predicate is used by start, resume, peer availability and status.
 
 To pause a lane by hand, create a token (any name of the form below); to resume it, remove that token:

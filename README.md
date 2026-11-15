@@ -223,6 +223,13 @@ the merge request, never by the command's text:
   asleep. The command is run again when that pipeline or the MR's head pipeline reaches a final
   status, and in any case every `merge_rerun_minutes`; once the wait has been
   queued for 24 hours the agent is woken with the run history.
+- The last line is `⛔ MERGE RIGHTS <project>!<iid> ...` with a non-zero exit (every check passed, but
+  the lane's GitLab identity may not merge into the target, e.g. a Developer on a protected branch):
+  the merge goes to the card's nearest lead that this runner runs (its `lead`, then
+  `project_leads`), as one merge-only card (`docs/reviewer-merge.md` § Merge rights). The agent stays
+  asleep and is woken when the MR is merged, closed or moved, or when that card closes without the
+  merge, or when the lead's own gate on that card ends with the same line (the lead may not merge
+  either). No such lead: the agent is woken with the reason.
 - MR head differs from `after=`, MR closed, a non-zero exit, a refusal, a timeout, or any other
   output: the agent is woken with the tail (last 40 lines) of the command's output.
 
@@ -424,23 +431,38 @@ mesh-runner status --config runner.toml   # local view of attempts
 
 ### `[runner]` options
 
-The `[runner]` table has 41 options; every other key in it is either one of the two native-result
+The `[runner]` table has 47 options; every other key in it is either one of the two native-result
 adoption paths or a retired option. All are optional except `mesh_url`.
 
 | group | keys |
 |---|---|
-| Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers`, `idempotency_keys` ([repeat-safe writes](docs/idempotent-writes.md)) |
+| Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers`, `idempotency_keys` ([repeat-safe writes](docs/idempotent-writes.md)), `checkout_fence` ([checkout fence](docs/checkout-fence.md)), `completion_comment` (below) |
 | Daily budgets and caps | `daily_start_cap`, `daily_next_budget`, `daily_wait_budget`, `daily_step_budget`, `max_compactions` |
 | Interactive sessions | `tmux_binary`, `interactive_idle_minutes`, `interactive_max_sessions`, `turn_first_output_minutes`, `turn_idle_minutes` ([turn watchdog](docs/turn-watchdog.md)) |
-| Waits and wakes | `comment_wake`, `comment_wake_always_from`, `hold_labels` (below), `time_wait_ignore_names`, `workspace_wait_release_minutes`, `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
+| Waits and wakes | `comment_wake`, `comment_wake_always_from`, `hold_labels` (below), `time_wait_ignore_names`, `deploy_inventory` (below), `workspace_wait_release_minutes`, `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
 | Questions and reviews | `login_ask_check`, `repo_access_contacts` ([repository access](docs/repository-access.md)), `decision_request_metadata_only_recipients` ([metadata producer](docs/decision-metadata-producer.md)), `cardless_question_lanes` (answer desk, below), `review_own_hold_hours`, `reviewer_select_command` ([reviewer merge](docs/reviewer-merge.md)) |
 | Merge waits | `merge_command`, `merge_command_cwd`, `merge_rerun_minutes` |
-| Host gates | `min_free_gb`, `archive_root`, `archive_require_mount`, `memory_hold_free_pct`, `memory_release_free_pct`, `memory_hold_swap_mb`, `memory_release_swap_mb`, `load_hold_per_cpu`, `load_release_per_cpu` |
+| Host gates | `min_free_gb`, `archive_root`, `archive_require_mount`, `memory_hold_free_pct`, `memory_release_free_pct`, `memory_hold_swap_mb`, `memory_release_swap_mb`, `load_hold_per_cpu`, `load_release_per_cpu`, `host_release_settle_seconds`, `host_ramp_seconds`, `host_ramp_start_interval_seconds` |
 
 `hold_labels` (list of label names, default `["awaiting-owner"]`): a card carrying one of them is never
 continued automatically by a starvation or queue wake, like a card labelled `no-runner`,
 `rescue-exhausted` or `park:*`. Set it to the label your team puts on a card that waits for a person;
 the list replaces the default.
+
+`completion_comment` (default `true`): when an attempt completes, the runner writes one line on the
+task: `[runner] ✅ completed in ~<minutes>m · session=<id> · <turns> turns · <harness or cost> · <token
+counts>`. Set it to `false` on a runner whose board people outside the team read (a partner's
+instance): the line names the harness, the session and the token counts, and nothing else on the
+task needs it.
+
+`deploy_inventory` (path, default unset = off): the deploy inventory JSON a deploy marker reads
+(`{"repos": {"<group>/<project>": {"components": {"<name>": {"source": {"type": ...}}}}}}`). Mesh
+releases a card wait `until=deployed` only once every open or merged merge request of the target carries
+a deploy record; a repository listed with no component whose sources all read (`type: none`, or no
+source) never gets one. Such a wait is sent back once with the reason and the wait to use instead;
+declared again, it is accepted. The sent-back wait ends in Mesh as `cancelled`, and the blocks edge
+Mesh made for it is removed when the receipt says this wait owns it. A repository the inventory does
+not list is not checked.
 
 `cardless_question_lanes` (list of lane names, `["*"]` = every lane of this runner, default `[]` = off):
 a question one lane asks a listed lane of the same runner with `ask_agent` gets no `[decision]` request
@@ -468,7 +490,7 @@ and `review_own_verdict_pattern` in `[[agents]]` are not affected.
 
 `abort_backoff_minutes`, `background_wait_minutes`, `basic_auth_env` (use `basic_auth_file`),
 `checkout_ttl_minutes`, `checkpoint_budget_gb`, `checkpoint_exclude_names`, `checkpoint_gc_grace_hours`,
-`completion_comment`, `dead_slot_hours`, `decision_default_proceeds`, `decision_identical_no_reopen`,
+`dead_slot_hours`, `decision_default_proceeds`, `decision_identical_no_reopen`,
 `decision_live_task_card_wait`, `decision_reuse_hours`, `decision_wake`, `failed_cooldown_hours`,
 `gmail_watch_interval_seconds`, `gmail_watch_timeout_seconds`, `hard_ask_labels`, `hard_ask_patterns`,
 `heartbeat_seconds`, `ignored_cleanup`, `ignored_cleanup_idle_hours`, `ignored_cleanup_interval_minutes`,
@@ -615,6 +637,15 @@ a runner restart keeps them. A same-named session the runner did not start is
 left alone unless `adopt = true`. The environment goes through a 0600 file the
 shell reads and deletes.
 
+When the routing moves the agent to another harness than the chat command's, the
+session needs a command for that harness: `commands = { codex = ["codex", "--profile",
+"lead"] }` in `[agents.chat]`. A gone session then starts with the routed harness's
+command, and a live one switches (while idle) when the route moves away or comes back.
+Without a command for the routed harness the session is held (a live one keeps running on
+its current harness, a gone one is not started): the runner logs
+`chat session … held` once, reports `chat_hold` / `chat_hold_since` in its status and
+exports `mesh_runner_chat_hold_seconds{agent}` (0 = not held) for alerting.
+
 Host memory gate (`[runner] memory_hold_free_pct = 15`, `memory_release_free_pct = 20`,
 `memory_hold_swap_mb`, `memory_release_swap_mb`): no new or resumed sessions while
 the host is short of memory; running turns are never touched. Off by default.
@@ -626,6 +657,27 @@ hold value). On by default at 4.0; `0` turns it off. An overloaded host starts a
 slowly that the driver's start-up waits run out, and every failed start adds load. The
 runner logs `host load: HOLD new sessions (...)` / `host load: resume new sessions (...)`
 (the memory gate logs `host memory: ...`) and reports `load_hold` in its status.
+
+Both gates are read again, uncached, right before a session's window opens, for a new card and
+for a resumed one alike: a start admitted by an earlier tick does not open a window into a hold
+that began while it was being prepared; the attempt is held as a memory hold holds it and the
+card is not changed. A hold lifts only after its release condition has held for
+`host_release_settle_seconds` (120; the runner logs `release condition met, new sessions wait
+...`); a reading that fails during a hold keeps the hold and starts that wait again, since a
+host short of memory is also when its readers fail. For `host_ramp_seconds` (300) after that
+the host starts at most one session every `host_ramp_start_interval_seconds` (20), so the cards
+held meanwhile do not all start at once.
+`0` turns the settle or the ramp off.
+
+The ramp's slots go to wait roots first, across lanes. While the host holds or ramps, each lane
+tells the ramp which roots it would start or resume now (a card of the lane, or its attempt
+ready to resume, with other cards' `WAIT card:` chains ending there) and how many cards wait
+behind each. A start lighter than the heaviest such root is refused until that root starts
+(`host ramp: next start kept for wait root #… (N waiting behind it, lane …)`, then
+`host ramp: start #… goes first: a wait root with N waiting behind it`). A lane that is paused or
+full, or whose root a local hold stops, claims nothing; a claim not renewed for three intervals
+lapses, and a root that keeps a free slot that long without starting is passed for the rest of
+that ramp (`... did not start within 60s; the slot goes on`).
 
 Codex start-up: a resumed Codex shows its prompt box before it is done starting
 (`Resuming session…`), and a prompt entered then is queued under `Waiting for startup`.

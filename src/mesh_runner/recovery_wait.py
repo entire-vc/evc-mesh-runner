@@ -9,7 +9,10 @@ timer, no relay card. State lives in Runner's own store (marks of the source car
 * registration (``recovery_reg``): reg id, source card, owner, project, marker, recovery owner,
   receipt author, UTC ``installed_at``. Written by ``arm`` before it acknowledges. It may be armed
   before OR after the recovery card exists: ``scan`` reconciles the actual Mesh cards every tick,
-  so the gap between create and registration (and the reverse) loses nothing.
+  so the gap between create and registration (and the reverse) loses nothing. A card that was
+  already FINISHED before ``installed_at`` minus ``ARM_SKEW_SECONDS`` is stale evidence of an
+  earlier event with the same marker (a recurring alert, say) and never binds; a card still open
+  at arm time, or finished within the skew of the create/arm race, still does.
 * binding (``recovery_bound``): the first actual matching card, written once per registration
   generation. A cancelled bound card is rejected (kept in ``rejected``) and the next real
   candidate may bind; unrelated cards (no marker, other project, other assignee) never bind.
@@ -24,6 +27,7 @@ only ids, a short receipt reference and statuses are kept.
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import re
 import uuid
@@ -33,6 +37,8 @@ BOUND_KEY = "recovery_bound"
 PENDING_KEY = "recovery_pending"
 DELIVERED_KEY = "recovery_delivered"
 SUPERSEDED_KEY = "recovery_superseded"
+# create/arm race: a card finished at most this long before the registration still counts
+ARM_SKEW_SECONDS = 300
 _RECEIPT_LINE = re.compile(r"(?m)^[ \t]*carrier-receipt:[ \t]*(?P<ref>[\w][\w.:/#@+-]{3,127})[ \t]*$")
 _MARKER = re.compile(r"[^\n\r]{3,80}")
 
@@ -259,6 +265,26 @@ def _candidate(task: dict, reg: dict) -> bool:
             and task.get("assignee_id") == reg["recovery_owner_id"])
 
 
+def _epoch(value) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+
+
+def _stale(task: dict, reg: dict, category) -> bool:
+    """Finished before this registration (beyond the create/arm skew): evidence of an EARLIER event
+    carrying the same marker, not of the one this registration waits for. Mesh sets completed_at
+    on done and clears it on reopen; updated_at is never earlier, so it bounds a missing one."""
+    if category(task) != "done":
+        return False
+    finished = _epoch(task.get("completed_at")) or _epoch(task.get("updated_at"))
+    return finished is not None and finished < reg["installed_at"] - ARM_SKEW_SECONDS
+
+
 def receipt_ref(comments, reg: dict) -> tuple[str, str] | None:
     """(ref, comment id) of the first explicit receipt comment by the registered author."""
     for c in comments or []:
@@ -297,13 +323,15 @@ def _evaluate(store, agent, task_id, reg, mesh, category) -> dict | None:
     target = None
     if cur and cur.get("task_id"):
         target = mesh.task(cur["task_id"])
-        if category(target) == "cancelled" or not _candidate(target, reg):
-            # cancelled, or edited/reassigned so it no longer matches the registered contract
+        if category(target) == "cancelled" or not _candidate(target, reg) or _stale(target, reg, category):
+            # cancelled, edited/reassigned so it no longer matches the registered contract, or an
+            # earlier event's card bound before stale evidence was refused
             rejected.append(cur["task_id"])
             target = None
     if target is None:
         found = [t for t in mesh.find_tasks_all(reg["project_id"], reg["marker"])
-                 if _candidate(t, reg) and t["id"] not in rejected and category(t) != "cancelled"]
+                 if _candidate(t, reg) and t["id"] not in rejected and category(t) != "cancelled"
+                 and not _stale(t, reg, category)]
         found.sort(key=lambda t: (t.get("created_at") or "", t["id"]))
         target = found[0] if found else None
         if target is None:

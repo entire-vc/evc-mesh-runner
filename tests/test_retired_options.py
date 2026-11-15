@@ -21,12 +21,21 @@ RETIRED = ("mention_requests", "turn_cap_continue_on_progress", "queue_wait_fres
 # The operator options of [runner]. A new one must be a decision: add it here and stay within the cap.
 # 41: idempotency_keys, the rollback of repeat-safe writes without a release (docs/idempotent-writes.md);
 # it is a candidate for retirement (fixed at true) once keyed writes have run on the fleet.
-MAX_RUNNER_OPTIONS = 41
+# 42: checkout_fence, the rollback of the checkout fence without a release (docs/checkout-fence.md).
+# 43-45: host_release_settle_seconds, host_ramp_seconds, host_ramp_start_interval_seconds: the Runner owner
+# asked for the host-gate settle and ramp as config keys, not code constants.
+# 46: deploy_inventory, the host's deploy inventory file: a card wait until=deployed on a repository it
+# lists without a live-commit source is sent back (README, Waits and wakes). A path, so no default fits.
+# 47: completion_comment, back from retirement: a runner whose board people outside the team read turns
+# off the completion line, which names the harness, the session and the token counts.
+MAX_RUNNER_OPTIONS = 47
 RUNNER_OPTIONS = frozenset("""
-announce_controllers archive_require_mount archive_root basic_auth_file cardless_question_lanes comment_wake
+announce_controllers archive_require_mount archive_root basic_auth_file cardless_question_lanes checkout_fence
+comment_wake completion_comment
 comment_wake_always_from daily_next_budget daily_start_cap daily_step_budget daily_wait_budget
-decision_request_metadata_only_recipients
-gmail_watch_reader gmail_watch_v1 hold_labels idempotency_keys interactive_idle_minutes interactive_max_sessions load_hold_per_cpu
+decision_request_metadata_only_recipients deploy_inventory
+gmail_watch_reader gmail_watch_v1 hold_labels host_ramp_seconds host_ramp_start_interval_seconds
+host_release_settle_seconds idempotency_keys interactive_idle_minutes interactive_max_sessions load_hold_per_cpu
 load_release_per_cpu login_ask_check max_compactions memory_hold_free_pct memory_hold_swap_mb
 memory_release_free_pct memory_release_swap_mb merge_command merge_command_cwd merge_rerun_minutes mesh_url
 min_free_gb poll_seconds repo_access_contacts review_own_hold_hours
@@ -51,8 +60,10 @@ def _settable(tmp: str) -> dict:
         "archive_root": ('"/vol/mnt/archive"', "archive_root", Path("/vol/mnt/archive")),
         "basic_auth_file": (f'"{auth}"', "mesh_basic_auth", "user:pw"),
         "cardless_question_lanes": ('["lead"]', "cardless_question_lanes", ["lead"]),
+        "checkout_fence": ("false", "checkout_fence", False),
         "comment_wake": ('"addressed"', "comment_wake", "addressed"),
         "comment_wake_always_from": ('["Lead"]', "comment_wake_always_from", ["Lead"]),
+        "completion_comment": ("false", "completion_comment", False),
         "daily_next_budget": ("7", "daily_next_budget", 7),
         "daily_start_cap": ("2", "daily_start_cap", 2),
         "daily_step_budget": ("25", "daily_step_budget", 25),
@@ -63,6 +74,9 @@ def _settable(tmp: str) -> dict:
         "idempotency_keys": ("false", "idempotency_keys", False),
         "gmail_watch_v1": ("true", "gmail_watch_v1", True),
         "hold_labels": ('["awaiting-lead"]', "hold_labels", ("awaiting-lead",)),
+        "host_ramp_seconds": ("240", "host_ramp_seconds", 240.0),
+        "host_ramp_start_interval_seconds": ("15", "host_ramp_start_interval_seconds", 15.0),
+        "host_release_settle_seconds": ("90", "host_release_settle_seconds", 90.0),
         "interactive_idle_minutes": ("61.5", "interactive_idle_minutes", 61.5),
         "interactive_max_sessions": ("21", "interactive_max_sessions", 21),
         "load_hold_per_cpu": ("5.5", "load_hold_per_cpu", 5.5),
@@ -84,6 +98,7 @@ def _settable(tmp: str) -> dict:
         "reviewer_select_command": ('["select", "{author}"]', "reviewer_select_command", ("select", "{author}")),
         "state_dir": (f'"{tmp}/state"', "state_dir", Path(tmp) / "state"),
         "time_wait_ignore_names": ('["nightly"]', "time_wait_ignore_names", ["nightly"]),
+        "deploy_inventory": ('"/srv/deploy-versions.json"', "deploy_inventory", Path("/srv/deploy-versions.json")),
         "tmux_binary": ('"/usr/bin/tmux"', "tmux_binary", "/usr/bin/tmux"),
         "turn_first_output_minutes": ("20", "turn_first_output_minutes", 20.0),
         "turn_idle_minutes": ("45", "turn_idle_minutes", 45.0),
@@ -204,11 +219,11 @@ class RunnerOptions(Base):
 
     def test_the_option_count_is_capped(self):
         self.assertLessEqual(len(RUNNER_OPTIONS), MAX_RUNNER_OPTIONS)
-        self.assertEqual(len(RUNNER_OPTIONS), 41)
+        self.assertEqual(len(RUNNER_OPTIONS), 47)
 
     def test_retired_and_settable_do_not_overlap(self):
         retired = set(config_mod.RETIRED_RUNNER_OPTIONS)
-        self.assertEqual(len(retired), 63)
+        self.assertEqual(len(retired), 62)
         self.assertEqual(retired & (RUNNER_OPTIONS | PROTOCOL_KEYS), set())
         fields = {f.name for f in dataclasses.fields(config_mod.RunnerConfig)}
         # Most retired keys keep fixed fields; removed observers have no runtime fields.
