@@ -1,8 +1,10 @@
 """Wait-root radar: the graph, the lane's start order, and what it never touches."""
+import dataclasses
 import datetime as dt
 import http.server
 import json
 import threading
+import time
 import unittest
 
 from fakes import AGENT_ID, FakeMesh, task as mesh_task
@@ -10,7 +12,11 @@ from test_runner import Bench
 from test_queue_order import Helper
 
 from mesh_runner import wait_roots
+from mesh_runner.adapters.base import group_alive
+from mesh_runner.config import AgentConfig
+from mesh_runner.hostmem import StartRamp
 from mesh_runner.mesh import MeshClient, MeshError
+from mesh_runner.runner import AgentRunner
 from mesh_runner.store import Store
 
 NOW = dt.datetime(2026, 11, 11, 20, 0, tzinfo=dt.timezone.utc)
@@ -72,6 +78,15 @@ class GraphTest(unittest.TestCase):
         self.assertEqual(radar.roots[0].task_id, tid(3))         # heaviest first
         self.assertIn((tid(3), "B"), self.reads)                 # read with the waiting lane's key
         self.assertEqual(radar.depth, {1: 7, 2: 1})
+
+    def test_startable_roots_by_lane_include_a_root_ready_to_resume(self):
+        root, queued = tid(1), tid(2)
+        open_ = {tid(10): [waiting("A", root)], tid(11): [waiting("A", root)],
+                 tid(12): [waiting("A", queued)],
+                 queued: [{"agent": "Steward", "state": "ready", "wait": {}, "updated_at": ""}]}
+        radar = wait_roots.build(open_, self.reader({root: card(1)}), OURS, NOW)
+        self.assertEqual(radar.weights(), {root: 2})                    # the lane's start order: unchanged
+        self.assertEqual(radar.startable(), {"builder": {root: 2}, "Steward": {queued: 1}})
 
     def test_cycle_and_unknown_target_are_roots_without_weight(self):
         open_ = {tid(1): [waiting("A", tid(2))], tid(2): [waiting("B", tid(1))],
@@ -291,6 +306,132 @@ class LaneOrderTest(Bench):
                          json.dumps({k: v for k, v in json.loads(comments_before).items()
                                      if k != self.light["id"]}, sort_keys=True))
         self.assertTrue(all(p.startswith("/tasks/") for p in r.roots._reader.clients["other"].calls))
+
+
+class FakeHostGate:
+    """A host hold the test lifts by hand: what host_hold(), the look before a start and the ramp read."""
+    def __init__(self):
+        self.holding, self.released_at = True, None
+
+    def check(self, fresh=False):
+        return self.holding
+
+    def describe(self):
+        return "test hold"
+
+
+class RampAcrossLanesTest(Bench):
+    """After a host hold the ramp gave its one start per interval to whichever lane asked first;
+    a root with six waiting cards behind it was passed by every card nobody waits on. Two lanes share
+    the runner's gates, ramp and radar; the light lane asks first and the first slot still goes to the root."""
+
+    def setUp(self):
+        super().setUp()
+        profile = self.root / "profile-steward"
+        profile.mkdir()
+        self.steward = AgentConfig(name="Steward", key="k2", harness="claude", profile_dir=profile,
+                                   repos=list(self.agent.repos), env=dict(self.agent.env))
+        self.cfg = dataclasses.replace(self.cfg, agents=[self.agent, self.steward])
+        self.now = [1000.0]
+        self.gate = FakeHostGate()
+        self.ramp = StartRamp(20, 300, (self.gate,), clock=lambda: self.now[0])
+        self.light, self.root_card = mesh_task(1), mesh_task(2)
+        self.light_lane = self.lane(self.agent, FakeMesh([self.light], max_concurrent=1))
+        self.root_lane = self.lane(self.steward, FakeMesh([self.root_card], max_concurrent=1))
+        store = Store(self.root / "state" / "r.sqlite")
+        for n in range(6):                              # six cards of a third lane wait on the root
+            a = store.create("other", tid(100 + n), "claude", "w")
+            store.update(a, state="waiting", wait={"kind": "card", "target": self.root_card["id"][:8],
+                                                   "target_id": self.root_card["id"],
+                                                   "since": "2026-11-14T13:44:40Z"})
+        radar = wait_roots.RootRadar(self.cfg, db_path=self.root / "state" / "r.sqlite", clients={
+            "other": Cards({self.root_card["id"]: dict(card(2, name="Steward"), id=self.root_card["id"])})})
+        radar.refresh()
+        for r in (self.light_lane, self.root_lane):
+            r.roots = radar
+        self.addCleanup(self.stop_steward)
+
+    def lane(self, agent, mesh):
+        r = AgentRunner(self.cfg, agent, Store(self.root / "state" / "r.sqlite"), mesh=mesh, adapter=self.adapter)
+        self.__dict__.setdefault("_runners", []).append(r)
+        r.memgate = r.loadgate = self.gate            # one host: the runner shares its gates and ramp
+        r.ramp = self.ramp
+        r.refresh_me()
+        return r
+
+    def stop_steward(self):
+        for a in self.root_lane.store.by_state("Steward", ("starting", "running", "unknown")):
+            if a.pid:
+                self.root_lane._kill(a)
+                deadline = time.monotonic() + 5
+                while group_alive(a.pid, a.stamp) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+
+    def started(self, r):
+        return [a.task_id for a in r.store.by_state(r.agent.name, ("starting", "running", "unknown"))]
+
+    def test_first_slot_after_a_hold_goes_to_the_heaviest_root_of_another_lane(self):
+        self.assertEqual(self.light_lane.roots.weight(self.root_card["id"]), 6)
+        for r in (self.light_lane, self.root_lane):    # the hold: both lanes tick, nothing starts
+            r.tick()
+        self.assertEqual(self.started(self.light_lane) + self.started(self.root_lane), [])
+        self.gate.holding, self.gate.released_at = False, self.now[0]    # the hold lifts: the ramp opens
+        self.now[0] += 1
+        self.light_lane.tick()                          # the lane with the card nobody waits on asks first
+        self.assertEqual(self.started(self.light_lane), [], "the first slot is kept for the root")
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            self.root_lane.tick()
+        self.assertEqual(self.started(self.root_lane), [self.root_card["id"]])
+        self.assertTrue(any("host ramp: start #%s goes first: a wait root with 6 waiting" % self.root_card["id"][:8]
+                            in m for m in logs.output), logs.output)
+        self.now[0] += 5
+        self.light_lane.tick()
+        self.assertEqual(self.started(self.light_lane), [], "one start per interval")
+        self.now[0] += 20                               # the next slot: nothing heavier claims it
+        self.light_lane.tick()
+        self.assertEqual(self.started(self.light_lane), [self.light["id"]])
+
+    def test_a_root_ready_to_resume_claims_the_slot_too(self):
+        """The case of the alert: the root's own attempt was woken (state ready) and waited for a resume."""
+        store = Store(self.root / "state" / "r.sqlite")
+        a = store.create("Steward", self.root_card["id"], "claude", "root")
+        store.update(a, state="ready")
+        self.root_lane.roots.refresh()
+        self.assertEqual(self.root_lane.roots.startable_for("Steward"), {self.root_card["id"]: 6})
+        self.assertEqual(self.root_lane.roots.weight(self.root_card["id"]), 0, "a lane's start order is unchanged")
+        self.root_lane._claim_ramp(1)                   # the hold: the lane claims its queued root
+        self.gate.holding, self.gate.released_at = False, self.now[0]
+        self.now[0] += 1
+        self.assertFalse(self.ramp.ready(self.light["id"], 0))
+        self.assertTrue(self.ramp.ready(self.root_card["id"], 6))
+        self.root_lane._resume_hold[a.id] = time.monotonic() + 60
+        self.root_lane._claim_ramp(1)                   # held locally: the claim is withdrawn at once
+        self.assertTrue(self.ramp.ready(self.light["id"], 0))
+
+    def test_a_root_its_lane_would_not_start_claims_nothing(self):
+        """A root a start-time hold stops (here a dependency on an open card) must not keep the slot
+        from the other lane: its own start path would refuse it."""
+        blocker = mesh_task(3, cat="in_progress")
+        blocker["assignee_id"] = "someone-else"
+        mesh = self.root_lane.mesh
+        mesh.tasks[blocker["id"]] = blocker
+        mesh.deps[self.root_card["id"]] = [{"dependency_type": "blocks", "depends_on_task_id": blocker["id"]}]
+        self.assertTrue(self.root_lane.hold_reason(dict(self.root_card, _mode="work"), "work", log_change=False))
+        for r in (self.light_lane, self.root_lane):
+            r.tick()
+        self.gate.holding, self.gate.released_at = False, self.now[0]
+        self.now[0] += 1
+        self.light_lane.tick()
+        self.assertEqual(self.started(self.light_lane), [self.light["id"]], "a held root claims nothing")
+
+    def test_a_paused_lane_claims_nothing(self):
+        self.root_lane.agent.paused = True               # positive control: the root's lane cannot start it
+        for r in (self.light_lane, self.root_lane):
+            r.tick()
+        self.gate.holding, self.gate.released_at = False, self.now[0]
+        self.now[0] += 1
+        self.light_lane.tick()
+        self.assertEqual(self.started(self.light_lane), [self.light["id"]], "a paused lane claims nothing")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +75,12 @@ class CheckpointNestedTooLarge(WorkspaceError):
 # Serialize admission through publication/cleanup, including scratch replay,
 # so they do not all spend the same observed free-space budget.
 _IO_LOCK = TimedLock("checkpoint-io")
+
+# Scratch a verify, compaction or bundle proof makes in the checkpoint root; created and removed under
+# _IO_LOCK. A process killed in the middle leaves it behind. One that predates this process (no scratch
+# can be made before this module loads) belongs to a dead process: checkpoint GC removes it.
+SCRATCH_PREFIXES = ('.verify-', '.compact-src-', '.preflight-')
+PROCESS_STARTED = time.time()
 
 # Directories a build regenerates; a checkpoint copying them moves gigabytes from a freed slot
 # into the snapshot. Matched by basename at any depth, and only when nothing under them is tracked.

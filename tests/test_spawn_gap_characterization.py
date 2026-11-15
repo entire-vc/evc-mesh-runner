@@ -58,11 +58,15 @@ class SpawnCrashCharacterization(Bench):
             os.kill(controller, signal.SIGKILL)
             os.waitpid(controller, 0)
             controller = 0
-            recovered = self.runner(FakeMesh([t]))
+            mesh = FakeMesh([t])
+            recovered = self.runner(mesh)
             recovered.refresh_me()
             rows = recovered.store.by_state('builder', ('running',))
             self.assertEqual(len(rows), 1)
             a = rows[0]
+            # Mesh keeps the lock across a controller crash: the recovered Runner's heartbeat renews
+            # it (a lost lock on an open card stops the turn, test_checkout_fence.py)
+            mesh.checkouts[t['id']] = {'session': a.checkout.get('session_id', a.id)}
             self.assertEqual(a.pid, receipt['pid'])
             self.assertEqual(a.stamp, receipt['stamp'])
             self.assertTrue(a.log_path)

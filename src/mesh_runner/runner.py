@@ -40,6 +40,7 @@ import uuid
 from pathlib import Path
 
 from . import answer_desk
+from . import checkout_fence
 from . import chat_diag
 from . import op_pause
 from . import operator_alert
@@ -47,6 +48,7 @@ from . import harness_hold
 from . import op_resolve
 from . import asks
 from . import card_wait_reconcile
+from . import deploy_inventory
 from . import next_action
 from . import reviewer_merge
 from . import inputs
@@ -71,6 +73,8 @@ from . import watchdog
 from .adapters.base import Adapter, Launch, LaunchExecError, LaunchProbeDenied, TurnResult, group_alive, interrupt_group, pid_reused, proc_stamp, read_events
 from .adapters.claude import ClaudeAdapter
 from .adapters.codex import CodexAdapter
+from .adapters.kimi import KimiAdapter
+from .adapters.zcode import ZCodeAdapter
 from . import queue_wait
 from . import queue_order
 from . import wait_roots
@@ -88,7 +92,7 @@ from .config import AgentConfig, RunnerConfig, read_env_file
 from .effects import (BACKLOG_BLOCKER, EDGE_REMOVED_MARK, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SKIP_EVERY, Effects, own_schedule,
                       skip_state)
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
-from .hostmem import LoadGate, LoadThresholds, MemoryGate, Thresholds
+from .hostmem import LoadGate, LoadThresholds, MemoryGate, StartRamp, Thresholds
 from .mesh import Checkout, MeshClient, MeshError
 from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, QUEUE_WAIT_GUIDANCE, MANUAL_WAIT_GUIDANCE, DECISION_WAIT_GUIDANCE, Outcome, from_typed, typed_unparsed
 from . import gate_owner
@@ -98,7 +102,8 @@ from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewh
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from . import observation_budget
 from .wake import (_read_pinned, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, foreign_comment, foreign_comments, wakes_on_comment,
-                   gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
+                   own_card_comment_event,
+                   GITLAB_MR_URL, gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
                    blocked_mr_next_step, mr_merge_blocker, is_foreign, split_provider, target_jobs_state, UnknownJobs)
 from .workspace import DIRTY_HOLD_NOTE, base_lock as maintenance_lock, RepoSpec, BranchInUse, InventoryError, WorkspaceError, WorkspacePool, CheckpointSuspendError, git
@@ -114,6 +119,9 @@ REVIEW_MIN_AGE = dt.timedelta(minutes=10)
 DAILY_CAP_NOTES = ("turn budget",)   # failed by the per-day turn budget with no lead to take it
 CHECKOUT_PENDING = "checkout_pending"   # store mark: {session_id, request_id} of an acquire whose answer was lost
 RELEASE_PENDING = "release_pending"     # store mark: the lease of a release whose answer never came (token kept)
+# store mark: the turn the runner settled as "no outcome" and corrects. {"attempt", "turn", "since"}: a turn command
+# Mesh recorded after that settle (an interactive session that went on by itself) belongs to that turn.
+NO_OUTCOME_WINDOW = "no_outcome_window"
 RELEASE_RETRY_SECONDS = (30, 120, 300)  # backoff between retries of a pending release; the last step repeats
 GATE_RELEASE_PENDING = "gate_release_pending"   # store mark: a gate reservation whose release was not confirmed
 GATE_RELEASE_WARN = 24 * 3600           # a gate release unconfirmed this long is reported (once a day); never dropped
@@ -134,19 +142,26 @@ LOOP_STREAK = "loop_streak"          # store mark: the task's run of turns witho
 CYCLE_TOLD = "cycle_told"            # store mark: JSON list of the wait-cycle signatures this card was told
 CYCLE_TOLD_KEEP = 64                 # told signatures kept per card (oldest dropped first)
 CAP_REASSIGNED = "cap_reassigned"    # store mark: the UTC day a cap moved this task to this agent
+# why a question cannot reach its addressee: the agent is run here, but no lane of it serves this workspace
+NO_LANE_HERE = "it has no lane of this runner in this workspace"
 WAITING_FOR_INPUT = "waiting for new input after "      # hold reason of a capped task
 DEAD_SLOT_RECHECK = 3600            # seconds between looks at the same held slot
 DEAD_SLOT_PER_TICK = 3              # held slots examined per maintenance pass
 FINISHED_ATTEMPT = ("completed", "failed", "aborted")
+# events of a review attempt that ended without deciding anything: it is not a review
+REVIEW_NO_VERDICT_EVENTS = frozenset({"quiet_resolution", "operator_resolution", "no_outcome"})
 TASK_WIDE = "*"     # marks agent for once-per-task limits that must hold across a reassignment
 REVIEW_REFUSAL_GAP = dt.timedelta(hours=1)
 REVIEW_REFUSALS_AFTER_NOTICE = 2      # refusals a card gets after a comment once its notice was given today    # refusals further apart than this are not one streak
 # attempts that did no work of their own: the task left the agent while it was parked
 LEFT_WHILE_IDLE = ("task left the agent while waiting", "task left the agent before resuming")
+OWN_REVIEW_RESENT = "sent to review again: the card stays in review, the review router assigns the reviewer"
 CLOCK_SLACK = dt.timedelta(minutes=2)     # runner clock vs Mesh clock when matching comments to an attempt
 SELF_ECHO = dt.timedelta(minutes=2)       # webhooks of the agent's own last push/merge land this late
 GITLAB_DOWN_SECONDS = 120                 # after a failed GitLab read, review checks skip GitLab this long
 ENUMERATED_VERDICTS = re.compile(r"\b(?:SHIP|DO-NOT-SHIP)\b\s*(?:/|\||,|\bor\b)\s*\b(?:SHIP|DO-NOT-SHIP)\b")
+CARD_ID8 = re.compile(r"(?<![0-9a-f])[0-9a-f]{8}(?![0-9a-f])", re.I)   # a card short id named in MR text
+MR_CARD_PROBES = 6                        # other cards read to find the one an MR is linked to
 OPEN_CHILD = {"todo", "in_progress", "review", "backlog"}
 ENV_PASSTHROUGH = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TERM", "TZ", "SSH_AUTH_SOCK")
 QUOTA_HINT = re.compile(
@@ -185,9 +200,13 @@ def unknown_comment(resolution: str, diagnostic: str, process_gone: bool) -> str
              "the card starts again in a fresh session." if process_gone else
              f"Its process still runs; once it ends with nothing new, the attempt ends by itself after "
              f"{UNKNOWN_QUIET_MINUTES} min and the card starts again in a fresh session.")
-    return ("[runner] The session did not confirm that it received the last prompt, so this turn's result is "
-            "unknown. The prompt is not sent again (it may have reached the session), and the card is held "
-            "meanwhile; nothing is needed from the card's owner. " + after + "\n"
+    if resolution == delivery_recovery.TAKEN_THEN_FAILED:
+        what = ("[runner] The session took the last prompt and worked on it, then failed before its result was "
+                "recorded, so this turn's result is unknown. The prompt is not sent again (the session had it), ")
+    else:
+        what = ("[runner] The session did not confirm that it received the last prompt, so this turn's result is "
+                "unknown. The prompt is not sent again (it may have reached the session), ")
+    return (what + "and the card is held meanwhile; nothing is needed from the card's owner. " + after + "\n"
             "Technical: MANDATORY DELIVERY PENDING: " + resolution + diagnostic + "; operator signalled.")
 
 
@@ -229,6 +248,11 @@ def startup_error_excerpt(text: str, limit: int = 300) -> str:
     prompt not pasted, window gone). Token-shaped strings are masked; the full text stays local."""
     flat = " ".join(text.split())
     return SECRET_SHAPES.sub("[redacted]", flat)[:limit]
+
+
+class LockLost(Exception):
+    """A fenced write of the Runner was refused while it settled the turn: the attempt has ended failed
+    (``checkout lost``) and the settlement stops here, nothing more is written under it."""
 
 
 class AlreadyRunning(Exception):
@@ -285,6 +309,10 @@ MENTION_MAX_FAILS = 5
 def make_adapter(agent: AgentConfig) -> Adapter:
     if agent.harness == "codex":
         return CodexAdapter(agent.binary or "codex", agent.args, agent.codex_profile)
+    if agent.harness == "kimi":
+        return KimiAdapter(agent.binary or "kimi", agent.args)
+    if agent.harness == "zcode":
+        return ZCodeAdapter(agent.binary or "zcode", agent.args)
     return ClaudeAdapter(agent.binary or "claude", agent.args)
 
 
@@ -293,6 +321,10 @@ def make_alt_adapter(harness: str, spec: dict) -> Adapter:
         return CodexAdapter(spec.get("binary") or "codex", list(spec.get("args") or []), spec.get("profile", ""))
     if harness == "claude":
         return ClaudeAdapter(spec.get("binary") or "claude", list(spec.get("args") or []))
+    if harness == "kimi":
+        return KimiAdapter(spec.get("binary") or "kimi", list(spec.get("args") or []))
+    if harness == "zcode":
+        return ZCodeAdapter(spec.get("binary") or "zcode", list(spec.get("args") or []))
     raise ValueError(f"unknown harness {harness}")
 
 
@@ -329,6 +361,14 @@ MERGE_ENV_RETRIES = 3
 MERGE_FOLLOWS = 5                  # head moves followed by the gate per wait
 # the merge gate's last line when it is queued behind a pipeline: the one convention the runner parses
 MERGE_QUEUED = re.compile(r"^\s*⏳\s*WAIT\s+pipeline:(?P<target>[\w.\-/]+#[1-9]\d{0,11})(?!\d)")
+# the gate's last line when every check passed but the lane's GitLab identity may not merge into the
+# target (a protected branch, a Developer author): the merge goes to the card's lead
+MERGE_RIGHTS = re.compile(r"^\s*⛔\s*MERGE\s+RIGHTS\s+(?P<target>[\w.\-/]+![1-9]\d{0,11})(?!\d)")
+MERGE_DELEGATE_READS = 5           # unreadable reads of the lead's merge-only card before the author is told
+# the note the lead's runner leaves on its merge-only card when the lead may not merge either; the
+# author's wait reads it there (a runner note wakes nobody by itself)
+LEAD_RIGHTS_NOTE = re.compile(r"^\[runner\] merge gate: ⛔ MERGE RIGHTS (?P<target>[\w.\-/]+![1-9]\d{0,11}) "
+                              r"@(?P<sha>[0-9a-f]{64}|[0-9a-f]{40})(?![0-9a-f])")
 
 
 def _drain_tail(stream, tail: "collections.deque[bytes]") -> None:
@@ -504,6 +544,11 @@ class AgentRunner:
         self.mesh = mesh or MeshClient(cfg.mesh_url, agent.key, basic_auth=cfg.mesh_basic_auth,
                                        bearer=cfg.extension_token)
         self.mesh.idempotency_keys = cfg.idempotency_keys
+        # the Runner's own result writes on a card it holds carry that lock (checkout_fence.py)
+        self.mesh.fence_for = self._fence_headers
+        self.mesh.on_fence_refused = self._fence_refused
+        self._fence_swept = False
+        self._settling: str | None = None       # the attempt settle() is ending now
         # the runner decides how turns run (launch_mode); an agent may override it
         self.launch_mode = agent.launch_mode or cfg.launch_mode
         self._tmux = interactive.Tmux(cfg.tmux_binary)
@@ -529,8 +574,12 @@ class AgentRunner:
         self.env = agent_env(agent)
         # one gate per runner process (Runner shares it); a lone AgentRunner builds its own
         self.memgate = MemoryGate(Thresholds(cfg.memory_hold_free_pct, cfg.memory_release_free_pct,
-                                             cfg.memory_hold_swap_mb, cfg.memory_release_swap_mb))
-        self.loadgate = LoadGate(LoadThresholds(cfg.load_hold_per_cpu, cfg.load_release_per_cpu))
+                                             cfg.memory_hold_swap_mb, cfg.memory_release_swap_mb),
+                                  settle_seconds=cfg.host_release_settle_seconds)
+        self.loadgate = LoadGate(LoadThresholds(cfg.load_hold_per_cpu, cfg.load_release_per_cpu),
+                                 settle_seconds=cfg.host_release_settle_seconds)
+        self.ramp = StartRamp(cfg.host_ramp_start_interval_seconds, cfg.host_ramp_seconds,
+                              (self.memgate, self.loadgate))
         self._gate_hold: dict[str, tuple[str, float]] = {}    # task -> (reason, until) from the start gate
         self._agent_gate_hold: tuple[str, float, str] | None = None
         self._gate_failures: dict[tuple[str, str], int] = {}
@@ -557,6 +606,7 @@ class AgentRunner:
         self._chat_error = ""
         self._chat_hold = ""
         self._chat_harness = agent.harness
+        self._chat_commands: dict[str, list[str]] = {}
         if agent.chat.get("session"):
             c = agent.chat
             command = list(c.get("command") or [])
@@ -567,6 +617,11 @@ class AgentRunner:
             # the harness the standing session runs: its own command's binary, else the base harness
             self._chat_harness = next((h for h in ("claude", "codex")
                                        if os.path.basename(str(command[0])) == h), agent.harness)
+            # the command per harness the routing may move the agent to: a gone session is started
+            # with the routed harness's command instead of waiting for the route to come back
+            self._chat_commands = {str(h): [str(x) for x in cmd]
+                                   for h, cmd in (c.get("commands") or {}).items() if cmd}
+            self._chat_commands[self._chat_harness] = command
             self.chat = ChatKeeper(ChatSpec(session=str(c["session"]), command=command,
                                             idle_command=list(c.get("idle_command") or []),
                                             max_age_hours=float(c.get("max_age_hours", 0)),
@@ -590,6 +645,7 @@ class AgentRunner:
         self.procs: dict[str, subprocess.Popen] = {}
         self.me: dict = {}
         self.owners = TaskOwners()               # shared with the Runner: task id -> agent name
+        self.lanes: list | None = None           # every lane of this process (set by the Runner): None = unknown
         self._last_beat: dict[str, float] = {}
         self._closed_seen: set[str] = set()      # attempts whose closed card the beat saw once
         self._last_wake_check: dict[str, float] = {}
@@ -615,7 +671,8 @@ class AgentRunner:
         self._starts_paused_until = 0.0
         self._last_recheck = 0.0
         self._hold_cache: dict[str, tuple[str, float, str]] = {}   # task -> (updated_at, mono, verdict)
-        self._prep_pending: dict[str, str] = {}   # task -> next-action generation cleared for one prep start
+        # task -> (next-action generation, its projection) cleared for one prep start
+        self._prep_pending: dict[str, tuple[str, dict]] = {}
         self._hold_deadline: dict[str, float] = {}   # task -> monotonic time a cached hold must be re-read
         self._review_why: dict[str, dict] = {}   # task -> why its own work is fed back (event/since/unreviewed_hours)
         self._merge_jobs: dict[str, dict] = {}      # attempt id -> a merge gate run (thread, result)
@@ -700,7 +757,7 @@ class AgentRunner:
         return got
 
     def _fresh_env(self, task_id: str = "") -> dict[str, str]:
-        env = self._read_env()
+        env = self._read_env(task_id)
         route = self._task_route(task_id) if task_id else ""
         return self._apply_env(env, route)
 
@@ -725,10 +782,13 @@ class AgentRunner:
                             self.agent.name, task_id[:8], name[:40])
         return ""
 
-    def _read_env(self) -> dict[str, str]:
+    def _read_env(self, task_id: str = "") -> dict[str, str]:
         """Read the session environment: env file, then the operator's env
         command (e.g. the account the lane is routed to now), then inline values.
-        A failure stops the start: a session on the wrong identity is worse than none."""
+        A failure stops the start: a session on the wrong identity is worse than none.
+        For a card start/resume the command sees MESH_RUNNER_TASK / MESH_RUNNER_LANE, so an
+        operator route may pin one card to its own account (per-card overflow); a chat or card-less
+        read gets neither."""
         env: dict[str, str] = {}
         if self.agent.env_file:
             try:
@@ -736,7 +796,13 @@ class AgentRunner:
             except (OSError, ValueError) as e:
                 raise chat_diag.EnvDenied(f"env file unreadable: {type(e).__name__}", "env_file_unreadable") from None
         if self.agent.env_command:
-            res = subprocess.run(self.agent.env_command, capture_output=True, text=True, timeout=60)
+            # the card identity is set here or not at all: a value the runner itself inherited
+            # never reaches a chat or card-less read
+            cmd_env = {k: v for k, v in os.environ.items() if k not in ("MESH_RUNNER_TASK", "MESH_RUNNER_LANE")}
+            if task_id:
+                cmd_env.update(MESH_RUNNER_TASK=task_id, MESH_RUNNER_LANE=self.agent.name)
+            res = subprocess.run(self.agent.env_command, capture_output=True, text=True, timeout=60,
+                                 env=cmd_env)
             if res.returncode != 0:
                 raise chat_diag.EnvDenied(f"env command failed (rc {res.returncode}): {res.stderr.strip()[:200]}", "env_command_failed")
             for line in res.stdout.splitlines():
@@ -783,6 +849,19 @@ class AgentRunner:
     @property
     def agent_id(self) -> str:
         return self.me.get("id", "")
+
+    @property
+    def own_handles(self) -> tuple[str, ...]:
+        """Every handle an ``@``-mention of this lane may use: the runner's lane name, the Mesh agent's name
+        and slug. They differ when a lane runs a Mesh agent under another name (lane ``ops-vc`` runs Mesh agent
+        ``ops``): a comment addressed ``@ops`` is addressed to it, and a wake filter that knew only the
+        lane name slept through such a question."""
+        out: list[str] = []
+        for h in (self.agent.name, (self.me or {}).get("name"), (self.me or {}).get("slug")):
+            h = str(h or "").strip()
+            if h and h.casefold() not in {x.casefold() for x in out}:
+                out.append(h)
+        return tuple(out)
 
     def cap(self) -> int:
         if self.agent.max_parallel > 0:
@@ -865,20 +944,29 @@ class AgentRunner:
             self._errors.pop(key, None)
             self._strikes.pop(key, None)
             self._checkpoint_quarantine.pop(key, None)
+        except LockLost as e:
+            # the attempt already ended failed for its lost lock; not a failure of this step
+            log.info("%s: %s #%s stopped: %s", self.agent.name, what, a.task8, e)
+            self._errors.pop(key, None)
         except Exception as e:
             if (what in ("resume", "ready-workspace-suspend")
                     and isinstance(e, PermissionError) and e.filename):
                 path = str(Path(e.filename).absolute())
                 held = {"attempt": a.id, "path": path, "signature": self._permission_signature(path)}
-                self.store.mark(a.agent, a.task_id, "permission_hold:" + what, json.dumps(held))
-                self.store.update(a, note=f"workspace permission held ({what}): {path}"[:500])
-                self.store.event(a.id, "workspace_permission_hold", f"{what}: {path}"[:500])
-                log.warning("%s: %s #%s permission held; repair exact path %s", self.agent.name, what, a.task8, path)
-                return
+                try:
+                    self.store.mark(a.agent, a.task_id, "permission_hold:" + what, json.dumps(held))
+                    self.store.update(a, note=f"workspace permission held ({what}): {path}"[:500])
+                    self.store.event(a.id, "workspace_permission_hold", f"{what}: {path}"[:500])
+                except sqlite3.Error as err:      # not held: counted below as an ordinary failure
+                    log.warning("%s: %s #%s permission hold not recorded: %s", self.agent.name, what, a.task8, err)
+                else:
+                    log.warning("%s: %s #%s permission held; repair exact path %s",
+                                self.agent.name, what, a.task8, path)
+                    return
             n = self._errors.get(key, 0) + 1
             self._errors[key] = n
             log.warning("%s: %s #%s failed (%d): %s", self.agent.name, what, a.task8, n, e)
-            self.store.event(a.id, f"error:{what}", str(e)[:500])
+            self._step_event(a, f"error:{what}", str(e)[:500])
             if n >= 3:
                 strikes = self._strikes.get(key, 0)
                 self._strikes[key] = strikes + 1
@@ -890,8 +978,20 @@ class AgentRunner:
                     self._checkpoint_quarantine[key] = {**e.binding, "deadline": self._quarantine[key],
                                                         "resume_hold": self._resume_hold.get(a.id),
                                                         "cause": str(e)[:300]}
-                self.store.event(a.id, f"quarantine:{what}", f"{hold}s after repeated failure: {str(e)[:300]}")
-                self._notice_retained_lease(a, what, e)
+                self._step_event(a, f"quarantine:{what}", f"{hold}s after repeated failure: {str(e)[:300]}")
+                try:
+                    self._notice_retained_lease(a, what, e)
+                except sqlite3.Error as err:
+                    log.warning("%s: %s #%s retained-lease notice skipped: %s", self.agent.name, what, a.task8, err)
+
+    def _step_event(self, a: Attempt, kind: str, detail: str) -> None:
+        """Journal a step's failure without failing the tick: the store may be what failed (a locked
+        database), and the step's error is already counted and logged. One attempt's step stays
+        one attempt's step; every other card of the lane still ticks."""
+        try:
+            self.store.event(a.id, kind, detail)
+        except sqlite3.Error as err:
+            log.warning("%s: #%s %s not journaled: %s", self.agent.name, a.task8, kind, err)
 
     def _notice_retained_lease(self, a: Attempt, what: str, e: Exception) -> None:
         """A capture that keeps the lease fails the same way on every pass until someone repairs
@@ -1202,7 +1302,195 @@ class AgentRunner:
                                                 deadline=iso(first + ttl), last_reason=str(e)[:200]))
             self.store.event(a.id, "release_pending", str(e))
             log.warning("%s: release #%s failed (%s); token kept, retrying", self.agent.name, a.task8, e)
+        self._withdraw_fence(a)
         self.store.update(a, checkout={})
+
+    # ------------------------------------------------------------------ checkout fence
+    def _fence(self) -> checkout_fence.FenceDir:
+        """This lane's fence directory; disabled by ``[runner] checkout_fence = false``."""
+        root = checkout_fence.default_dir() if self.cfg.checkout_fence else None
+        return checkout_fence.FenceDir(root, self.agent_id)
+
+    def _publish_fence(self, a: Attempt) -> bool:
+        """Write the attempt's lock and the task's current ``input_revision`` for the MCP. False when the
+        fence is on and the file could not be written: the turn must not start unfenced (fail closed).
+        An unreadable ``input_revision`` only leaves the revision out."""
+        fence = self._fence()
+        if not fence.enabled or not a.checkout.get("token"):
+            return True
+        revision = None
+        try:
+            task = self._task(a.task_id) or {}
+            revision = task.get("input_revision") if type(task.get("input_revision")) is int else None
+        except MeshError as e:
+            log.info("%s: #%s input_revision not read (%s); fence without it", self.agent.name, a.task8, e)
+        try:
+            fence.publish(a.task_id, a.id, a.checkout, revision, turn=a.turns + 1)
+        except (OSError, ValueError) as e:
+            log.warning("%s: #%s fence file not written (%s): start held", self.agent.name, a.task8, e)
+            self.store.event(a.id, "fence_publish_failed", f"{type(e).__name__}: {e}"[:300])
+            return False
+        self.store.event(a.id, "fence_published", json.dumps(
+            {"generation": a.checkout.get("generation"), "input_revision": revision, "turn": a.turns + 1}))
+        return True
+
+    def _withdraw_fence(self, a: Attempt) -> None:
+        try:
+            self._fence().withdraw(a.task_id, a.id)
+        except (OSError, ValueError) as e:
+            log.warning("%s: #%s fence file not removed: %s", self.agent.name, a.task8, e)
+
+    def _sweep_fences(self) -> None:
+        """Once per process: drop fence files of attempts that no longer hold their lock (a crash)."""
+        if self._fence_swept or not self.agent_id:
+            return
+        self._fence_swept = True
+        active = {a.task_id: a.id for a in self.store.by_state(self.agent.name, ACTIVE) if a.checkout.get("token")}
+        try:
+            removed = self._fence().sweep(active)
+        except OSError as e:
+            log.warning("%s: fence sweep: %s", self.agent.name, e)
+            return
+        if removed:
+            log.info("%s: fence files of ended attempts removed: %s", self.agent.name,
+                     ", ".join(t[:8] for t in removed))
+
+    def _holding(self, task_id: str) -> Attempt | None:
+        for a in self.store.by_state(self.agent.name, ACTIVE):
+            if a.task_id == task_id and a.checkout.get("token"):
+                return a
+        return None
+
+    def _fence_headers(self, task_id: str) -> dict:
+        """Headers of the lock this lane holds on ``task_id`` for the Runner's own writes ({} when none).
+        The Runner's notes never send ``input_revision``: a banner is not the agent's result."""
+        if not self.cfg.checkout_fence:
+            return {}
+        a = self._holding(task_id)
+        return checkout_fence.headers(a.checkout) if a is not None else {}
+
+    def _fence_refused(self, task_id: str, code: str, body) -> None:
+        """Mesh refused one of the Runner's own fenced writes."""
+        a = self._holding(task_id)
+        if a is None or code != checkout_fence.LOCK_LOST:
+            return
+        why = self._lock_loss_reason(a, self._safe_task(a.task_id), body)
+        self._lock_lost(a, why)
+        current = self.store.get(a.id)
+        if self._settling == a.id and (current is None or current.state not in ACTIVE):
+            raise LockLost(f"checkout lost: {why}")       # settle() stops: nothing more under this attempt
+
+    def _safe_task(self, task_id: str) -> dict | None:
+        try:
+            return self._task(task_id)
+        except MeshError:
+            return None
+
+    def _lock_loss_reason(self, a: Attempt, task: dict | None, body=None) -> str:
+        """Why the lock is gone, from the task as Mesh shows it now (one line, no secrets)."""
+        ctx = (body or {}).get("context") if isinstance(body, dict) else None
+        if isinstance(ctx, dict) and ctx.get("reassigned"):
+            return "reassigned: the card was given to another assignee while the turn ran"
+        if not task:
+            return "lock gone; the card could not be read"
+        assignee = task.get("assignee_id") or (task.get("assignee") or {}).get("id")
+        holder = task.get("checked_out_by")
+        if assignee and assignee != self.agent_id:
+            return "reassigned: the card was given to another assignee while the turn ran"
+        if holder == self.agent_id and task.get("checkout_session_id") != a.checkout.get("session_id", a.id):
+            return ("self-checkout: the card was checked out again under this agent's identity "
+                    "(same identity, new lock), not by the Runner")
+        if holder and holder != self.agent_id:
+            return "taken over: another holder has the lock"
+        return "released or expired: nobody holds the lock this turn worked under"
+
+    def _lock_lost(self, a: Attempt, why: str) -> None:
+        """The lock of the running attempt is gone and the card is not closed: stop the turn. Nothing more
+        is written under this attempt; settle ends it with ``why`` (see ``_lock_loss_stop``)."""
+        if self._lock_loss_stop(a) is not None:
+            return                                   # already stopping this turn
+        own = self._released_by_own_turn(a)
+        if own is None:
+            return                                   # Mesh unreadable: keep the token, ask again next beat
+        if own:
+            # The turn's own command (wait_for, finish_task, hand_off) let the lock go in Mesh while a
+            # child of the session still runs: the turn has its outcome, settle reads it. Not a lost lock.
+            self.store.event(a.id, "checkout_released_by_turn", own)
+            self._withdraw_fence(a)
+            self.store.update(a, checkout={})
+            return
+        log.warning("%s: #%s lock lost (%s): stopping the turn", self.agent.name, a.task8, why)
+        self.store.event(a.id, "checkout_lost", why)
+        self.store.event(a.id, "lock_lost_stop", json.dumps({"turn": a.turns, "why": why}))
+        self.emit("lock_lost_stop", a, reason=why)
+        self._withdraw_fence(a)
+        self.store.update(a, checkout={})
+        if a.state == "running" and self._settling != a.id:
+            if a.pid and group_alive(a.pid, a.stamp):
+                self.store.event(a.id, "kill", f"checkout lost: {why}")
+                self._kill(a)
+                if isinstance(self.adapter_for(a.harness), interactive.InteractiveAdapter):
+                    self._close_window(a)
+            return              # settle (the next tick) ends it with ``why``
+        # not running, or settle() is ending this turn now: the attempt ends here
+        self._finish(a, "failed", f"checkout lost: {why}", lock_lost=True)
+
+    def _released_by_own_turn(self, a: Attempt) -> str | None:
+        """The kind and id of a turn command of this agent, recorded in Mesh since this turn started, that
+        released the lock (``MESH_RELEASED_ROWS``); "" when there is none; None when Mesh could not be read."""
+        started = ""
+        for at, kind, _ in reversed(self.store.events(a.id)):
+            if kind == "fence_published":
+                started = at
+                break
+        start = parse_time(started or self._turn_wall_start(a))
+        try:
+            rows = self.mesh.turn_outcomes(a.task_id)
+        except MeshError as e:
+            return "" if e.status in (404, 405, 501) else None
+        except OSError:
+            return None
+        for row in rows:
+            at = parse_time(row.get("created_at"))
+            if at is None or (start is not None and at <= start):
+                break                                    # newest first: the rest predate this turn
+            if row.get("agent_id") == self.agent_id and row.get("kind") in self.MESH_RELEASED_ROWS:
+                return f"{row.get('kind')}:{row.get('id') or ''}"
+        return ""
+
+    def _lock_loss_stop(self, a: Attempt) -> str | None:
+        """The reason the current turn was stopped for a lost lock, if it was. Keyed by the turn number:
+        the delivery acknowledgement of the same turn may record ``running`` again after the stop."""
+        for _, kind, detail in reversed(self.store.events(a.id)):
+            if kind != "lock_lost_stop":
+                continue
+            try:
+                row = json.loads(detail)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("turn") == a.turns:
+                return str(row.get("why") or "")
+            return None
+        return None
+
+    def _fence_refusals(self, a: Attempt) -> list:
+        try:
+            return self._fence().refusals(a.task_id, a.id, since=self._turn_wall_start(a), turn=a.turns)
+        except (OSError, ValueError):
+            return []
+
+    def _watch_fence(self, a: Attempt) -> None:
+        """Each tick for a running turn: a fenced write the agent's MCP saw refused for a lost lock
+        stops the turn now, not at the next heartbeat."""
+        if not self.cfg.checkout_fence or not a.checkout.get("token"):
+            return
+        lost = [r for r in self._fence_refusals(a) if r.code == checkout_fence.LOCK_LOST]
+        if lost:
+            task = self._safe_task(a.task_id)
+            if task is not None and self.cats.category(task) in ("done", "cancelled"):
+                return                               # closed: the heartbeat's closed path stops it
+            body = {"context": {"reassigned": True}} if any(r.reassigned for r in lost) else None
+            self._lock_lost(a, self._lock_loss_reason(a, task, body))
 
     # Mesh turn-outcome rows whose command released the caller's checkout in the same step: wait_for,
     # ask_agent and ask_human record a "wait" row, finish_task and hand_off a done/review/handoff row.
@@ -1221,7 +1509,61 @@ class AgentRunner:
         if row_kind not in self.MESH_RELEASED_ROWS or not a.checkout.get("token"):
             return
         self.store.event(a.id, "checkout_released_by_mesh", row_kind)
+        self._withdraw_fence(a)
         self.store.update(a, checkout={})
+
+    @staticmethod
+    def _window_mark(value: str, attempt_id: str) -> dict | None:
+        try:
+            held = json.loads(value) if value else None
+        except ValueError:
+            return None
+        if not isinstance(held, dict) or held.get("attempt") != attempt_id or parse_time(held.get("since")) is None:
+            return None
+        return held
+
+    def _no_outcome_window(self, a: Attempt) -> dt.datetime | None:
+        """Start of the turn this attempt's pending correction is for, while no settle has read the
+        turn outcomes since that turn was settled as "no outcome"; None otherwise."""
+        if a.no_outcome <= 0:
+            return None
+        row = self.store.mark(self.agent.name, a.task_id, NO_OUTCOME_WINDOW)
+        held = self._window_mark(row[0] if row else "", a.id)
+        return parse_time(held["since"]) if held else None
+
+    def _close_no_outcome_window(self, a: Attempt) -> None:
+        row = self.store.mark(self.agent.name, a.task_id, NO_OUTCOME_WINDOW)
+        if row and row[0]:
+            self.store.mark(self.agent.name, a.task_id, NO_OUTCOME_WINDOW, "")
+
+    def _late_outcome(self, a: Attempt, task: dict) -> bool:
+        """Before the correction of a turn settled as "no outcome" is issued: a turn command the session
+        recorded after that settle (an interactive session goes on when a background command it started
+        finishes) is that turn's outcome. It is acted on like any outcome read at a settle, so a lease Mesh
+        released with it is forgotten and no correction runs on it; one this runner cannot act on keeps the
+        correction, naming what was recorded. True when the resume stops here: the outcome was acted on
+        (the next tick resumes whatever it left ready), or Mesh could not be read and the resume is retried."""
+        window = self._no_outcome_window(a)
+        if window is None:
+            return False
+        typed = self._typed_outcome(a, window)
+        if typed is TYPED_UNREADABLE:
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._log_hold("resume", a.task8, "turn outcomes unreadable on Mesh; the correction waits")
+            return True
+        if typed is None:
+            return False
+        if (a.wait or {}).get("interactive_prompt_intent") and not self._retire_proven_unsent_intent(a):
+            return False                         # the correction may have reached the session: its settle reads the window
+        outcome, at = typed
+        self.store.event(a.id, "late_typed_outcome",
+                         f"{str((outcome.typed or {}).get('kind') or '')}:{outcome.kind}"[:200])
+        log.info("%s: #%s a turn command (%s) was recorded after the turn settled without an outcome; "
+                 "it is that turn's outcome", self.agent.name, a.task8, outcome.kind)
+        self._close_no_outcome_window(a)
+        self._settle_outcome(a, task, TurnResult(), self._comments(a.task_id), OutcomeRead(outcome, at, "typed"),
+                             late=True)
+        return True
 
     def _send_release(self, task_id: str, lease: dict) -> None:
         self.mesh.release(Checkout(task_id, lease["token"], lease.get("generation"), "",
@@ -1334,13 +1676,16 @@ class AgentRunner:
             return True
         return False
 
-    def _finish(self, a: Attempt, state: str, note: str = "", report: bool = False) -> None:
+    def _finish(self, a: Attempt, state: str, note: str = "", report: bool = False,
+                lock_lost: bool = False) -> None:
         self._release_gate(a, state)            # no-op unless a gate is still held (crash paths)
         if a.wait:
             wait = dict(a.wait)
             self.effects.on_end(a, wait, f"the attempt is {state}", close_request=False)
-        self.effects.close_terminal_decision(a)
-        self.effects.clear_state(a.task_id)
+        if not lock_lost:
+            # a lost lock: the card may be another holder's now; its decision and runtime state are not ours
+            self.effects.close_terminal_decision(a)
+            self.effects.clear_state(a.task_id)
         self.effects.taken(a.task_id)          # nothing of a skip state is left to clear
         self._release_checkout(a)
         try:
@@ -1674,17 +2019,49 @@ class AgentRunner:
             if not prompt_is_complete:
                 prompt_text += metadata_instructions(sandboxed)
             if sandboxed:
-                argv = adapter.with_read_only(argv)    # enforced by the harness, not only the prompt
+                try:
+                    argv = adapter.with_read_only(argv)    # enforced by the harness, not only the prompt
+                except NotImplementedError:
+                    # this harness cannot confine one turn (Kimi print mode): the turn waits for a
+                    # harness that can, it never runs with write tools on a read-only promise
+                    reason = f"{a.harness} cannot run a read-only metadata turn"
+                    self._release_gate(a, "read-only-unavailable")
+                    self._release_checkout(a)
+                    self.life.to_ready(a, pid=0, stamp="", note=reason)
+                    self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                    return False
         # Session preparation may have consumed free space.
         # Check again before the durable authorization callback or writer creation.
         if self.pool.disk_hold():
             self._disk_hold_attempt(a)
             return False
-        # Memory too, read now: the tick's cached reading may be 30 s old, and a session started into an
-        # exhausted swap does not take its prompt in time. Same hold as disk: nothing changes on the card.
+        # Memory and load too, read now: the tick's cached reading may be 30 s old, a resume never asks the
+        # tick's gate, and a session started into an exhausted swap or an overloaded CPU does not take its
+        # prompt in time. After a hold the ramp spaces the starts. Same hold as disk: nothing changes on
+        # the card, and the tick's start loop stops at it.
+        held, hold_for = "", GATE_HOLD_SECONDS
+        weight = self._ramp_weight(a.task_id)
         if self.memgate.check(fresh=True):
-            log.info("%s: #%s start held: host short of memory (%s)", self.agent.name, a.task8, self.memgate.describe())
-            self._disk_hold_attempt(a)
+            held = "host short of memory (%s)" % self.memgate.describe()
+        elif self.loadgate.check(fresh=True):
+            held = "host overloaded (%s)" % self.loadgate.describe()
+        elif not self.ramp.admit(a.task_id, weight):
+            held = "host ramping up after a hold (%s)" % self.ramp.describe()
+            if weight > 0:
+                hold_for = self.ramp.interval      # a wait root asks again at the next slot, its claim stands
+        if held:
+            log.info("%s: #%s start held: %s", self.agent.name, a.task8, held)
+            self._start_held = True
+            self._disk_hold_attempt(a, hold_for)
+            return False
+        # The turn's lock for the agent's own Mesh MCP, rewritten before the prompt can reach a session:
+        # a resumed session writes with this attempt's lock and this turn's input_revision. Not written:
+        # the turn does not start (it would run unfenced); the start is held like a disk hold and retried.
+        if not self._publish_fence(a):
+            self._release_gate(a, "fence-held")
+            self._release_checkout(a)
+            self.store.update(a, pid=0, stamp="", note="start held: checkout fence file not written")
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
             return False
         interactive_driver = isinstance(adapter, interactive.InteractiveAdapter)
         if profile:
@@ -1872,11 +2249,11 @@ class AgentRunner:
         self.life.to_ready(a, pid=0, stamp="", note=f"authentication held for profile {profile}")
         self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
 
-    def _disk_hold_attempt(self, a: Attempt) -> None:
+    def _disk_hold_attempt(self, a: Attempt, seconds: float = GATE_HOLD_SECONDS) -> None:
         """Return writer authority without changing work, readiness or WAIT context."""
         self._release_gate(a, "disk-held")
         self._release_checkout(a)
-        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        self._resume_hold[a.id] = time.monotonic() + seconds
 
     def _record_authentication_failure(self, a: Attempt, auth_only: bool, verification: bool = False) -> str:
         """Record the exact profile that produced the terminal auth failure.
@@ -2081,11 +2458,23 @@ class AgentRunner:
         without a typed outcome has none. The read costs one Mesh read per settled turn (two when the
         outcome is a wait: the row names only the wait's id). When Mesh cannot be read the result is
         ``deferred``: the turn is not settled as "no outcome"."""
-        typed = self._typed_outcome(a, parse_time(a.turn_started_at))
+        started = turn_start = parse_time(a.turn_started_at)
+        window = self._no_outcome_window(a)
+        widened = window is not None and (started is None or window < started)
+        if widened:
+            # The correction of a turn settled as "no outcome": a command the session recorded after
+            # that settle and before this turn's anchor is read too (it may be all there is, when every
+            # command of this turn was refused on the lease Mesh had already released).
+            started = window
+        typed = self._typed_outcome(a, started)
         if typed is TYPED_UNREADABLE:
             return OutcomeRead(None, "", deferred=True)
         if typed is not None:
             outcome, at = typed
+            recorded = parse_time(at)
+            if widened and turn_start is not None and recorded is not None and recorded <= turn_start:
+                self.store.event(a.id, "late_typed_outcome",
+                                 f"{str((outcome.typed or {}).get('kind') or '')}:{outcome.kind}"[:200])
             return OutcomeRead(outcome, at, "typed")
         return OutcomeRead(None, self._anchor(comments))
 
@@ -2259,7 +2648,15 @@ class AgentRunner:
             alive()
 
     def settle(self, a: Attempt) -> None:
-        """A turn finished: decide what happens to the attempt."""
+        """A turn finished: decide what happens to the attempt. A fenced write of the Runner refused for a
+        lost lock while it settles ends the attempt and stops here (``LockLost``)."""
+        self._settling = a.id
+        try:
+            self._settle(a)
+        finally:
+            self._settling = None
+
+    def _settle(self, a: Attempt) -> None:
         self._release_gate(a, "turn-end")
         result = self.adapter_for(a.harness).parse(Path(a.log_path)) if a.log_path else TurnResult()
         stderr = ""
@@ -2274,6 +2671,11 @@ class AgentRunner:
         if self.observations is not None:
             self._observe_settle(a, result)
         self.procs.pop(a.id, None)
+        lost = self._lock_loss_stop(a)
+        if lost is not None:
+            # stopped for a lost lock: no outcome is read and nothing is written on the card
+            self._finish(a, "failed", f"checkout lost: {lost}", lock_lost=True)
+            return
         task = self._task(a.task_id)
         if self._still_ours(task, a.mode) and not self._settle_native(a, task):
             return
@@ -2378,7 +2780,15 @@ class AgentRunner:
         if read.deferred:
             self._defer_outcome_read(a)
             return
+        self._close_no_outcome_window(a)          # read: this settle stands on what the window held
+        self._settle_outcome(a, task, result, comments, read)
+
+    def _settle_outcome(self, a: Attempt, task: dict, result: TurnResult, comments: list[dict],
+                        read: OutcomeRead, late: bool = False) -> None:
+        """Act on the outcome read for the turn: also (``late``) for a command recorded after its turn
+        was settled as "no outcome" (``_late_outcome``), where ``result`` is empty."""
         outcome, at = read.outcome, read.at
+        late_at = (at or iso()) if late else ""
         self._forget_lease_mesh_released(a, outcome)
         if outcome is not None and outcome.kind == "time":
             # Settlement is the admission boundary. A typed time wait was built from Mesh's own fields
@@ -2406,10 +2816,27 @@ class AgentRunner:
             # possible, so this is a held lane, not a miss of the card
             self._harness_upgrade_required(a, task, result.error_details or result.error)
             return
-        if outcome is None or outcome.kind == "unparsed":
-            self._no_outcome(a, task, outcome)
+        if self._own_review_resent(a, outcome, comments):
+            # The author sent its own card, already in review and still assigned to it,
+            # to review again (finish_task to=review). Mesh moved nothing, so the turn used to be
+            # refused as unsettled and the author asked its lead for a route. The card is where
+            # it should be: the review router assigns the reviewer; the attempt ends here.
+            self._finish(a, "completed", OWN_REVIEW_RESENT)
             return
-        self.store.event(a.id, "readable_outcome")
+        if outcome is None and (changed := [r for r in self._fence_refusals(a)
+                                            if r.code == checkout_fence.REVISION_CHANGED]):
+            # Mesh refused the turn's closing write because the task changed under it: the agent was
+            # told to read it again. Not a turn without an outcome; the next turn starts from the new text.
+            self.store.event(a.id, "input_revision_changed", str(changed[-1].input_revision))
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(
+                task, "the task's title, description or custom fields changed while the previous turn ran, "
+                      "so Mesh refused its closing write (input_revision_changed). Read the task again "
+                      "(get_task) and then end the turn with one Mesh turn command."))
+            return
+        if outcome is None or outcome.kind == "unparsed":
+            self._no_outcome(a, task, outcome, late=late_at, seen=at)
+            return
+        self.store.event(a.id, "readable_outcome", outcome.kind)   # the kind: NEXT is no verdict
         end_digest = self._work_digest(a) if self.cfg.loop_streak_limit > 0 else None
         sent_back = lambda: self._loop_guard(a, task, outcome, comments, end_digest, bounced=True)
         queue_contract = None
@@ -2425,7 +2852,7 @@ class AgentRunner:
                 return  # retry settlement, without another turn or a stale source
         if outcome.kind == "queue" and (queue_contract is None or outcome.target != a.task8):
             # No typed source, an already served one, or another card's id: nothing to observe.
-            self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=QUEUE_WAIT_GUIDANCE))
+            self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=QUEUE_WAIT_GUIDANCE), late=late_at, seen=at)
             return
         native_receiver = None
         if outcome.kind == "native":
@@ -2456,34 +2883,34 @@ class AgentRunner:
         if outcome.kind == "receipt":
             receipt_reg = self._receipt_registration(a, outcome)
             if receipt_reg is None:
-                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=receipt_wait.WAIT_GUIDANCE))
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=receipt_wait.WAIT_GUIDANCE), late=late_at, seen=at)
                 return
         gmail_reg = None
         if outcome.kind == "gmail":
             gmail_reg = self._gmail_registration(a, outcome)
             if gmail_reg is None:
-                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=gmail_watch.WAIT_GUIDANCE))
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=gmail_watch.WAIT_GUIDANCE), late=late_at, seen=at)
                 return
         recovery_reg = None
         if outcome.kind == "recovery":
             recovery_reg = self._recovery_registration(a, outcome)
             if recovery_reg is None:
-                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=recovery_wait.WAIT_GUIDANCE))
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=recovery_wait.WAIT_GUIDANCE), late=late_at, seen=at)
                 return
         stall_reg = None
         if outcome.kind == "stall":
             stall_reg = self._stall_registration(a, outcome)
             if stall_reg is None:
-                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=stall_wait.WAIT_GUIDANCE))
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=stall_wait.WAIT_GUIDANCE), late=late_at, seen=at)
                 return
         if outcome.kind == "manual" and not self._manual_wait_allowed(a, task, outcome):
-            self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=MANUAL_WAIT_GUIDANCE))
+            self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=MANUAL_WAIT_GUIDANCE), late=late_at, seen=at)
             return
         lifecycle_reg = None
         if outcome.kind == "lifecycle":
             lifecycle_reg = self._lifecycle_registration(a, outcome)
             if lifecycle_reg is None:
-                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=lifecycle_wait.WAIT_GUIDANCE))
+                self._no_outcome(a, task, Outcome("unparsed", line=outcome.line, note=lifecycle_wait.WAIT_GUIDANCE), late=late_at, seen=at)
                 return
         missing = self._missing_pipeline_wait(a, outcome)
         if missing:
@@ -2560,8 +2987,23 @@ class AgentRunner:
             if self._over_budget(a, task):
                 return
             self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, idle_card))
-            log.info("%s: #%s card wait on #%s sent back: it waits on a timer or a person",
-                     self.agent.name, a.task8, outcome.target)
+            log.info("%s: #%s card wait on #%s sent back: %s", self.agent.name, a.task8, outcome.target,
+                     # cut at the sentence end, not the first ';': the human-gate kind carries its own
+                     # ("human gate; decision → @lead") and the log would lose the addressee
+                     idle_card.partition("; a release gate")[0].removeprefix(f"#{outcome.target} itself "))
+            return
+        undeployable = "" if outcome.typed.get("server_observed") is True else self._deployed_wait_told(a, outcome)
+        if undeployable:
+            self._drop_sent_back_card_wait(a, outcome, undeployable)
+            if sent_back():
+                return
+            # same budget as the other bounces: a session that keeps re-declaring it reaches the budget
+            self.store.outcome(a, "wait")
+            if self._over_budget(a, task):
+                return
+            self.life.to_ready(a, no_outcome=0, wake_text=prompts.wake_prompt(task, undeployable))
+            log.info("%s: #%s card wait on #%s until=deployed sent back: %s", self.agent.name, a.task8,
+                     outcome.target, undeployable.partition(". No deploy")[0].removeprefix(f"#{outcome.target} "))
             return
         # the wait is accepted from here on: only now may it retire a delivery receipt
         self._forget_spent_ci_delivery(a, outcome)
@@ -2637,7 +3079,8 @@ class AgentRunner:
             wait["lifecycle_reg"] = lifecycle_reg["reg_id"]
         if stall_reg:
             wait["stall_reg"] = stall_reg["reg_id"]
-        for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time", "card_condition"):
+        for key in ("ci_change", "mr_state", "watch_comments_by", "converted_from", "external_time", "card_condition",
+                    "card_dependency"):
             if outcome.extra.get(key):
                 wait[key] = outcome.extra[key]
         if outcome.kind == "merge":
@@ -2712,7 +3155,7 @@ class AgentRunner:
             only = next(iter(matches.values())) if len(matches) == 1 else {}
             if (addressee and only.get("kind") == "agent" and only.get("id") == addressee.get("id")
                     and addressee.get("id") != self.agent_id
-                    and not self._unavailable(str(addressee.get("name") or outcome.handle))
+                    and not self._unavailable(str(addressee.get("name") or outcome.handle), str(addressee["id"]))
                     and (not wait.get("decision_request_id") or self.effects._typed_question(a, wait))):
                 self.effects._file_decision(a, task, wait, self.me)
                 if wait.get("decision_request_id"):
@@ -2736,6 +3179,18 @@ class AgentRunner:
                 self.life.to_ready(a, no_outcome=0, wake_text=told)
                 log.info("%s: #%s ask to @%s not raised by Mesh; told the agent", self.agent.name, a.task8,
                          outcome.handle)
+                return
+        if mesh_ask and outcome.kind == "decision" and outcome.handle:
+            told = self._unserved_typed_ask(a, task, outcome)
+            if (self.store.get(a.id) or a).state in ("failed", "completed", "aborted"):
+                return
+            if told:
+                if outcome.typed.get("wait_id"):
+                    self._queue_wait_resolve(a, str(outcome.typed["wait_id"]), "cancelled",
+                                             f"@{outcome.handle} has no lane in this workspace")
+                self.life.to_ready(a, no_outcome=0, wake_text=told)
+                log.info("%s: #%s ask_agent to @%s: no lane of it in this workspace; told the agent",
+                         self.agent.name, a.task8, outcome.handle)
                 return
         if native_receiver is not None:
             # Save the token-free observation fence BEFORE releasing the lease.
@@ -2807,7 +3262,16 @@ class AgentRunner:
                   for l in (task or {}).get("labels") or []}
         return outcome.target == a.task8 and "wake:manual" in labels
 
-    def _no_outcome(self, a: Attempt, task: dict, outcome: Outcome | None) -> None:
+    def _own_review_resent(self, a: Attempt, outcome: Outcome | None, comments: list[dict]) -> bool:
+        """A review-mode turn on the agent's own work ended with ``finish_task to=review``: Mesh
+        recorded the outcome but the card was already in review, so nothing moved. A reviewer's
+        to=review on someone else's card is not this: it stays a correction."""
+        return (a.mode == "review" and outcome is not None and outcome.kind == "unparsed"
+                and (outcome.typed or {}).get("kind") == "review"
+                and self._own_work(a.task_id, comments) is not None)
+
+    def _no_outcome(self, a: Attempt, task: dict, outcome: Outcome | None, late: str = "",
+                    seen: str = "") -> None:
         """The turn ended without a declaration the runner can read.
 
         Misses are counted while unbroken by a readable outcome, across lanes. The first is
@@ -2815,9 +3279,21 @@ class AgentRunner:
         that correction becomes a correction hold (no timer). Otherwise the second in a row sends
         the task back to todo with the same lane until new input arrives (no timer). From the
         ``no_outcome_route_after``-th in a row it goes to the lead, unless it already went up for
-        this reason: the lead that receives it never hands it further up."""
+        this reason: the lead that receives it never hands it further up.
+
+        ``late`` (the command's created_at): the command was recorded after its turn had been settled,
+        counted and corrected as "no outcome", and this runner cannot act on it either. The correction
+        stands, now naming what was recorded; nothing is counted twice for the one turn.
+
+        ``seen`` (created_at of the row this settle read): the window for a late command opens after it,
+        so the row already counted here is never read again as the late one."""
         line = outcome.line if outcome else ""
         prompt = prompts.no_outcome_prompt(task, line, outcome.note if outcome else "", merge=self.merge_enabled)
+        if late:
+            self.store.event(a.id, "late_outcome_refused", line.strip()[:200])
+            self.life.to_ready(a, marks={NO_OUTCOME_WINDOW: json.dumps(
+                {"attempt": a.id, "turn": a.turns, "since": late})}, wake_text=prompt)
+            return
         self.store.event(a.id, "no_outcome", line.strip()[:200])
         misses = self.store.events_since_readable(a.task_id, "no_outcome")
         routed = self.store.events_on_task(a.task_id, "no_outcome_routed") > 0   # survives readable outcomes
@@ -2826,7 +3302,14 @@ class AgentRunner:
             self._give_up_no_outcome(a, task, f"the session ended without a readable outcome {misses} turns in a row" + last)
             return
         if a.no_outcome < self.cfg.max_no_outcome:
-            self.life.to_ready(a, no_outcome=a.no_outcome + 1, wake_text=prompt)
+            # An interactive session can go on after this settle and record a command: from this turn's
+            # start on it is this turn's outcome, read before the correction is issued and at its settle.
+            since = a.turn_started_at
+            if (read := parse_time(seen)) is not None and ((start := parse_time(since)) is None or read > start):
+                since = seen
+            self.life.to_ready(a, marks={NO_OUTCOME_WINDOW: json.dumps(
+                {"attempt": a.id, "turn": a.turns, "since": since})},
+                no_outcome=a.no_outcome + 1, wake_text=prompt)
             return
         why = f"{misses} turns in a row ended without a readable outcome" + last
         if outcome and outcome.kind == "unparsed" and (outcome.typed or {}).get("wait_kind") == "time":
@@ -2920,15 +3403,17 @@ class AgentRunner:
                 elif addressee.get("id") == self.agent_id:
                     unable = "it is the asking agent itself"
                 else:
-                    unable = self._unavailable(str(addressee.get("name") or outcome.handle))
+                    unable = self._unavailable(str(addressee.get("name") or outcome.handle), str(addressee["id"]))
                 if unable:
                     # nobody would ever answer: the project lead decides (no timer involved)
                     if self.cfg.unanswerable_ask_to_lead and self._ask_to_lead(
                             a, task, outcome, wait, recipient.get("id"), unable):
                         return ""
-                    if not addressee or addressee.get("id") != recipient.get("id") or addressee.get("id") == self.agent_id:
-                        # a question to yourself is answered by nobody, and there is no lead to
-                        # take it: waiting would park the card (and whatever waits on it) for good
+                    if (not addressee or addressee.get("id") != recipient.get("id")
+                            or addressee.get("id") == self.agent_id or unable.startswith(NO_LANE_HERE)):
+                        # a question to yourself, or to an agent no lane of which serves this workspace,
+                        # is answered by nobody, and there is no lead to take it: waiting would park the
+                        # card (and whatever waits on it) for good
                         return self._invalid_ask(a, task, outcome.handle, unable)
                 wait["kind"] = "decision"
                 return ""
@@ -3047,10 +3532,13 @@ class AgentRunner:
         except MeshError:
             return False
         leads = [x for x in leads if x.get("id") and x.get("id") != asked_id]
-        lead = next((x for x in leads if not self._unavailable(str(x.get("name") or ""))), None)
-        # a lead this runner does not run may still be driven from elsewhere; a paused one is not
+        lead = next((x for x in leads if not self._unavailable(str(x.get("name") or ""), str(x.get("id") or ""))),
+                    None)
+        # a lead this runner does not run may still be driven from elsewhere; a paused one is not, nor one
+        # whose lanes here all serve other workspaces
         lead = lead or next((x for x in leads if x.get("name")
-                             and self._unavailable(str(x["name"])) == "it is not run by this runner"), None)
+                             and self._unavailable(str(x["name"]), str(x.get("id") or ""))
+                             == "it is not run by this runner"), None)
         if not lead or not lead.get("name"):
             return False
         wait.update(kind="decision", handle=str(lead["name"]), asked_handle=outcome.handle, redirected=why[:200])
@@ -3068,15 +3556,37 @@ class AgentRunner:
                  lead["name"], why)
         return True
 
+    def _unserved_typed_ask(self, a: Attempt, task: dict, outcome: Outcome) -> str:
+        """An ``ask_agent`` question (Mesh already opened the request) to an agent that is run here, but by no
+        lane in this workspace: its request card would sit in a queue nobody polls. The agent hears at once,
+        the way ``_route_ask`` tells it about an unroutable marker ask; no card is filed. '' = deliver as
+        usual: the addressee has a lane here, or it cannot be told (a failed read, an agent not run here, a
+        lane whose key is not read yet)."""
+        try:
+            addressee = self.effects._resolve_agent(outcome.handle, self.me)
+        except MeshError:
+            return ""                             # the card path retries the lookup
+        if not addressee or not addressee.get("id") or addressee.get("id") == self.agent_id:
+            return ""
+        unable = self._unavailable(str(addressee.get("name") or outcome.handle), str(addressee["id"]))
+        if not unable.startswith(NO_LANE_HERE):
+            return ""
+        return self._invalid_ask(a, task, outcome.handle, unable)
+
     def _invalid_ask(self, a: Attempt, task: dict, handle: str, reason: str) -> str:
         """One correction per attempt, then a visible release, never a silent WAIT.
 
         This also bounds roster outages: at most two lookups/turns before the
         normal failed-attempt gate applies its comment/cooldown policy.
         """
-        text = (f"Task #{a.task8}: cannot route recipient @{handle}: {reason}. No human ask was posted. "
-                "Use an exact workspace agent name or user slug, choose a real card/event to wait on, "
-                "or make the decision and continue. Local helper types are not workspace recipients.")
+        if reason.startswith(NO_LANE_HERE):
+            text = (f"Task #{a.task8}: cannot route recipient @{handle}: {reason}. No request card was filed. "
+                    "Ask an agent that answers in this workspace, ask a person with ask_human, choose a real "
+                    "card/event to wait on, or make the decision and continue.")
+        else:
+            text = (f"Task #{a.task8}: cannot route recipient @{handle}: {reason}. No human ask was posted. "
+                    "Use an exact workspace agent name or user slug, choose a real card/event to wait on, "
+                    "or make the decision and continue. Local helper types are not workspace recipients.")
         previous = self.store.mark(self.agent.name, a.task_id, "ask_invalid")
         if not previous or previous[0] != a.id:
             self.store.mark(self.agent.name, a.task_id, "ask_invalid", a.id)
@@ -3497,9 +4007,47 @@ class AgentRunner:
         return (bool(repos) and repos == {r.name for r in other.repos}
                 and mine.lead.casefold() == other.lead.casefold())
 
-    def _unavailable(self, name: str) -> str:
-        """Why the named agent cannot take or answer anything now ('' = it can): it is not run by
-        this runner, or it is paused (config ``paused`` or a pause token)."""
+    def _serving_lanes(self, agent_id: str) -> list | None:
+        """The lanes of this process that are agent ``agent_id`` in this lane's workspace, or None when that
+        cannot be told: no id, no lane list, this lane's workspace unread, the agent not run here at all,
+        or a lane whose key was not read yet (it may be the one). One agent can have several lanes, one per
+        workspace its keys open (``ops`` and ``ops-vc``); a lane name says nothing about the workspace,
+        the ``me`` of its key does. An empty list: the agent is run here, only for other workspaces."""
+        lanes, ws = self.lanes, str((self.me or {}).get("workspace_id") or "")
+        if not agent_id or not lanes or not ws:
+            return None
+        theirs = [ar for ar in lanes if str((ar.me or {}).get("id") or "") == agent_id]
+        if not theirs:
+            return None
+        here = [ar for ar in theirs if str(ar.me.get("workspace_id") or "") == ws]
+        if not here and any(not (ar.me or {}).get("id") for ar in lanes):
+            return None
+        return here
+
+    def _lanes_in_workspace(self) -> list[str]:
+        """Names of the other lanes of this process in this lane's workspace (a hint for a refused ask)."""
+        ws = str((self.me or {}).get("workspace_id") or "")
+        return sorted({str((ar.me or {}).get("name") or ar.agent.name) for ar in (self.lanes or [])
+                       if ar is not self and ws and str((ar.me or {}).get("workspace_id") or "") == ws})
+
+    def _no_lane_reason(self) -> str:
+        here = self._lanes_in_workspace()
+        return (NO_LANE_HERE + " (its lanes serve other workspaces), so a request card would never be answered; "
+                + ("agents answering in this workspace: " + ", ".join(here) if here
+                   else "no other agent answers in this workspace")
+                + "; a person is asked with ask_human")
+
+    def _unavailable(self, name: str, agent_id: str = "") -> str:
+        """Why the named agent cannot take or answer anything now ('' = it can): it has no lane of this
+        runner in this lane's workspace (``agent_id`` given), it is not run by this runner, or it is paused
+        (config ``paused`` or a pause token)."""
+        serving = self._serving_lanes(agent_id)
+        if serving is not None:
+            if not serving:
+                return self._no_lane_reason()
+            if all(self._name_paused(ar.agent) for ar in serving):
+                return "it is paused"
+            return ""
         ours = next((ag for ag in self.cfg.agents if ag.name.casefold() == name.casefold()), None)
         if ours is None:
             return "it is not run by this runner"
@@ -4152,9 +4700,12 @@ class AgentRunner:
     # ------------------------------------------------------------------ phases
     def heartbeat(self) -> None:
         mono = time.monotonic()
+        self._sweep_fences()
         for a in self.store.by_state(self.agent.name, ACTIVE):
             if a.state != "running" and not (a.wait or {}).get("interactive_prompt_intent"):
                 continue               # only this protocol's pending outbox keeps its existing lease
+            if a.state == "running":
+                self._guard(a, "fence", self._watch_fence)
             if not a.checkout.get("token") or mono - self._last_beat.get(a.id, 0) < self.cfg.heartbeat_seconds:
                 continue
             self._last_beat[a.id] = mono
@@ -4173,15 +4724,24 @@ class AgentRunner:
             if e.status in (403, 404, 409):
                 # The agent checked the task out itself (same identity, new token) or
                 # someone took it over. Either way our token is dead: stop renewing it.
-                closed = self._card_closed(a)
-                if closed is None:
+                try:
+                    task = self._task(a.task_id)
+                except MeshError:
                     return                         # unknown: keep the token, ask again next beat
+                closed = bool(task) and self.cats.category(task) in ("done", "cancelled")
                 if closed and a.id not in self._closed_seen:
                     # closed once: an agent that closed its own card may still be writing;
                     # keep the token so the next beat confirms before stopping it
                     self._closed_seen.add(a.id)
                     return
+                if not closed and self.cfg.checkout_fence:
+                    # A card that is not closed: whoever holds it now (the agent's own checkout under
+                    # the same identity, another lane, nobody) did not get it from this turn. The turn
+                    # stops; nothing more is written under this attempt.
+                    self._lock_lost(a, self._lock_loss_reason(a, task or None))
+                    return
                 self.store.event(a.id, "checkout_lost", str(e))
+                self._withdraw_fence(a)
                 self.store.update(a, checkout={})
                 if closed:
                     self.store.event(a.id, "kill", "task closed while the turn ran")
@@ -4197,6 +4757,7 @@ class AgentRunner:
                     self._closed_seen.add(a.id)
                     return
                 self.store.event(a.id, "checkout_lost", "heartbeat accepted on a closed card")
+                self._withdraw_fence(a)
                 self.store.update(a, checkout={})
                 self.store.event(a.id, "kill", "task closed while the turn ran")
                 self._kill(a)
@@ -4245,6 +4806,10 @@ class AgentRunner:
             if terminals and (len(terminals) != 1 or terminals[0].get("session_id") != result.session_id):
                 return "headless-native-terminal-mismatch"
             if not terminals and not accepted:
+                return "headless-native-terminal-mismatch"
+        elif a.harness in ("kimi", "zcode"):
+            # print modes write no acceptance receipt: only a finished, session-bound stream acknowledges
+            if not result.finished:
                 return "headless-native-terminal-mismatch"
         else:
             sessions = [e.get("thread_id") for e in events if e.get("type") == "thread.started"]
@@ -4551,7 +5116,10 @@ class AgentRunner:
         key = "unknown:" + a.id + ":" + str(intent.get("token") or "")
         if not self.store.add_mark("_runtime", "_operator_alert_" + key, "sent", iso()):
             return
-        text = (f"{self.agent.name} #{a.task8}: the session did not confirm it took the prompt ({resolution}); "
+        what = ("the session took the prompt, worked and then failed"
+                if resolution == delivery_recovery.TAKEN_THEN_FAILED else
+                "the session did not confirm it took the prompt")
+        text = (f"{self.agent.name} #{a.task8}: {what} ({resolution}); "
                 f"the card is held. It ends by itself {UNKNOWN_QUIET_MINUTES} min after its process is gone with no "
                 f"new evidence; resolve.d/{a.id} ends it now.")
         log.warning("operator alert [%s]: %s", key, text)
@@ -5915,7 +6483,8 @@ class AgentRunner:
 
     def _wake_prep_generation(self, a: Attempt, task: dict, comments: list[dict]) -> bool:
         """next-action v1 (opt-in), for a task whose attempt already stands in a card WAIT: a NEW
-        projection generation that still says continue_prep wakes the same attempt once. The
+        projection content (next_action.dispatched) that still says continue_prep wakes the same
+        attempt once; a new generation with the recorded content only moves the mark. The
         selector never offers such a task (candidates() skips held attempts), so without this a
         generation change after the first prep would never reach the consumer. Same clearance
         and mark as the first prep; the edges stay open, nothing is released or satisfied here.
@@ -5927,16 +6496,18 @@ class AgentRunner:
             pairs = blocking_edges(self.mesh, self.cats, a.task_id)
             if not pairs:
                 return False
-            generation, _why = next_action.clearance(
-                a.task_id, [e for _b, e in pairs], self.mesh.next_action(a.task_id))
+            projection = self.mesh.next_action(a.task_id)
+            generation, _why = next_action.clearance(a.task_id, [e for _b, e in pairs], projection)
         except MeshError:
             return False
-        if not generation or next_action.dispatched(self.store, self.agent.name, a.task_id, generation):
+        # a generation with the recorded content is not news (this wait re-declared with a new edge
+        # id, a push or verdict on the blocker that releases nothing): dispatched() moves the mark
+        if not generation or next_action.dispatched(self.store, self.agent.name, a.task_id, generation, projection):
             return False
         expected = copy.deepcopy(a.wait)
-        event = (f"the next-action projection of this card has a new generation ({generation}): continue the "
+        event = (f"the next-action projection of this card has changed (generation {generation}): continue the "
                  "prep stage once; the open typed edges stay open and the final acceptance gates are not released")
-        mark = json.dumps({"generation": generation, "attempt": a.id})
+        mark = next_action.mark_value(generation, a.id, projection)
         if self.life.to_ready(a, marks={next_action.MARK: mark}, expect="waiting", expect_wait=expected,
                 wait=copy.deepcopy(expected), wake_text=prompts.wake_prompt(task, event)):
             self.store.event(a.id, "next_action_prep", generation)
@@ -6031,7 +6602,7 @@ class AgentRunner:
                  f"{span.total_seconds() / 3600:.1f}h, last: {cause}. Its target is UNKNOWN (unread, not done): "
                  "check it yourself and declare the next step, or the same wait again if it still applies")
         try:
-            self.effects.on_end(stored, wait, f"woken: {event[:120]}")
+            self._end_on_wake(stored, wait, f"woken: {event[:120]}")
         except Exception as e:                   # noqa: BLE001 - the channel may be the broken part
             log.warning("%s: #%s wait cleanup after read failures skipped: %r", self.agent.name, stored.task8, e)
         stub = {"id": stored.task_id, "title": stored.title}
@@ -6077,31 +6648,76 @@ class AgentRunner:
         self.store.mark(self.agent.name, a.task_id, self.WAIT_RESOLVE, json.dumps(pending))
         self._send_wait_resolve(a.task_id, pending)
 
+    @staticmethod
+    def _wait_resolve_record(raw: str | None) -> dict | None:
+        """The pending resolve stored under ``WAIT_RESOLVE``, or None when it is missing or malformed.
+        ``_queue_wait_resolve`` writes every field, so each is required: a non-empty text ``wait``, a
+        ``met``/``cancelled`` ``resolution``, a text ``attempt`` and ``cause``, and non-negative integer
+        ``tries``. A field absent, null or of another type makes the whole record malformed; a
+        malformed record is never sent as it is."""
+        try:
+            pending = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(pending, dict):
+            return None
+        tries = pending.get("tries")
+        if (not isinstance(pending.get("wait"), str) or not pending["wait"]
+                or pending.get("resolution") not in ("met", "cancelled")
+                or not all(isinstance(pending.get(k), str) for k in ("attempt", "cause"))
+                or isinstance(tries, bool) or not isinstance(tries, int) or tries < 0):
+            return None
+        return pending
+
     def _retry_wait_resolves(self) -> None:
-        """Resend resolves a transient failure left pending (``WAIT_RESOLVE_TRIES`` sends in all)."""
+        """Resend resolves a transient failure left pending (``WAIT_RESOLVE_TRIES`` sends in all). A
+        malformed record is dropped; a server-observed wait's resume rebuilds its own."""
         for task_id, raw in self.store.marked(self.agent.name, self.WAIT_RESOLVE).items():
-            try:
-                pending = json.loads(raw)
-            except ValueError:
-                pending = None
-            if not isinstance(pending, dict) or not pending.get("wait"):
+            pending = self._wait_resolve_record(raw)
+            if pending is None:
                 self.store.mark(self.agent.name, task_id, self.WAIT_RESOLVE, "")
                 continue
             self._send_wait_resolve(task_id, pending)
 
+    def _settle_wait_resolve(self, a: Attempt, wait_id: str) -> bool:
+        """True once Mesh wait ``wait_id`` has a final resolve (``WAIT_RESOLVED``: sent, already ended
+        by Mesh, met on its receipt, or given up after ``WAIT_RESOLVE_TRIES``). Until then the resume
+        of a server-observed wait keeps its edge (``_end_on_wake``): its removal would end the wait as
+        ``invalid`` first. One more try is sent here; a record that is missing, malformed in any field
+        (``_wait_resolve_record``) or another wait's is rebuilt for this wait as ``cancelled`` (a held
+        server-observed wake is never met), so the budget always runs out and the edge is never held
+        for good."""
+        if not wait_id:
+            return True
+        done = self.store.mark(self.agent.name, a.task_id, self.WAIT_RESOLVED)
+        if done and done[0] == wait_id:
+            return True
+        raw = self.store.mark(self.agent.name, a.task_id, self.WAIT_RESOLVE)
+        pending = self._wait_resolve_record(raw[0] if raw else None)
+        if pending is None or pending["wait"] != wait_id:
+            cause = prompts.wake_event(a.wake_text) or "the runner stopped observing it"
+            pending = {"attempt": a.id, "wait": wait_id, "resolution": "cancelled",
+                       "cause": " ".join(cause.split())[:200], "tries": 0}
+            self.store.mark(self.agent.name, a.task_id, self.WAIT_RESOLVE, json.dumps(pending))
+        self._send_wait_resolve(a.task_id, pending)
+        done = self.store.mark(self.agent.name, a.task_id, self.WAIT_RESOLVED)
+        return bool(done and done[0] == wait_id)
+
     def _send_wait_resolve(self, task_id: str, pending: dict) -> None:
         """One ``POST /tasks/:id/waits/:wait_id/resolve``. Success, 404 (no such wait) and 409 (the wait
-        already ended otherwise) are final; anything else stays pending until the tries are spent. A
+        already ended otherwise) are final; anything else, an unexpected exception included, counts as
+        one try and stays pending until the tries are spent, so a pending resolve always ends. A
         failure is logged and recorded as an ``mesh_wait_resolve_failed`` event once per wait."""
         wait_id, attempt_id = str(pending["wait"]), str(pending.get("attempt") or "")
-        tries = int(pending.get("tries") or 0) + 1
+        sent = pending.get("tries")
+        tries = (sent if isinstance(sent, int) and not isinstance(sent, bool) and sent > 0 else 0) + 1
         try:
             self.mesh.resolve_wait(task_id, wait_id, str(pending.get("resolution") or "cancelled"),
                                    str(pending.get("cause") or "") or "the runner stopped observing it")
             error = None
         except MeshError as e:
             error = e
-        except OSError as e:                     # a transport failure outside MeshClient's own wrapping
+        except Exception as e:                   # noqa: BLE001 - transport outside MeshClient, or a bug: one try
             error = MeshError(0, f"{type(e).__name__}: {str(e)[:200]}")
         final = error is None or error.status in (404, 409) or tries >= self.WAIT_RESOLVE_TRIES
         if error is not None and tries == 1:
@@ -6282,8 +6898,9 @@ class AgentRunner:
             self.store.event(a.id, "quota_time_wait_rejected")
 
     def _wake_server_card(self, a: Attempt, task: dict) -> None:
-        # The source receipt is authoritative. Never fall through to legacy
-        # edge/cycle/target readers, including when this read fails.
+        # The source receipt is authoritative for the TARGET's event. Never fall through to legacy
+        # edge/target readers (the target may sit in a workspace this lane's key cannot read),
+        # including when this read fails.
         expected = copy.deepcopy(a.wait)
         receipt = self.mesh.wait_receipt(a.task_id, expected["mesh_wait_id"])
         try:
@@ -6292,6 +6909,18 @@ class AgentRunner:
             self.store.event(a.id, "wake_receipt_invalid", str(exc))
             return
         if not event:
+            # Pending receipt: the target event stays held, exactly as an open typed edge holds it on a
+            # runner-observed wait. What happens on this card itself (an @-mention, a question
+            # delivered here by ask_agent, a person) and a wait cycle read from the runner's own store
+            # are news for this agent; Mesh never resolves the receipt on them (seen: a server-observed
+            # wait slept through a person's question on its own card while the target stayed open).
+            wait = copy.deepcopy(expected)
+            wait.pop("card_comment_observation", None)
+            cycle = self._wait_cycle(a, wait)
+            self._wake_held_card(a, task, expected, wait, cycle or own_card_comment_event(
+                self.mesh.comments(a.task_id), wait, self.agent_id, now(), comment_wake=self.cfg.comment_wake,
+                agent_name=self.own_handles, always_from=self.cfg.comment_wake_always_from),
+                wait.get("cycle_told") if cycle else None)
             return
         marks = {"met_wake": a.id} if met else {}
         if self.life.to_ready(a, marks=marks, expect="waiting", expect_wait=expected,
@@ -6321,16 +6950,22 @@ class AgentRunner:
             self._wake_native(a, task)
             return
         comments = None
+        # An open typed edge (or an edge set that cannot be read) holds the TARGET's event only: no
+        # "target closed/shipped" and no edge wake while it stands. A comment on this card that may
+        # wake it (an @-mention, a question delivered here, a person) and a wait cycle are news for
+        # this agent and are still checked below (seen: a typed card wait slept through the question
+        # its target's owner asked on it, and both sides waited on each other).
+        target_held = False
         if a.mode == "work" and a.wait.get("kind") == "card":
             comments = self.mesh.comments(a.task_id)
             if self._wake_prep_generation(a, task, comments):
                 return
-            if self._reconcile_card_wait(a, task, comments):
-                return
-            if self._wake_removed_card_edge(a, task):
-                return
-            if self._wake_satisfied_card_edge(a, task):
-                return
+            target_held = self._reconcile_card_wait(a, task, comments)
+            if not target_held:
+                if self._wake_removed_card_edge(a, task):
+                    return
+                if self._wake_satisfied_card_edge(a, task):
+                    return
         if a.mode == "work" and a.wait.get("kind") == "time":
             try:
                 source = self._queue_source(task, time.time())
@@ -6382,13 +7017,18 @@ class AgentRunner:
         self._classify_person_ask(wait)
         cycle = self._wait_cycle(a, wait)
         cycle_sig = wait.get("cycle_told") if cycle else None
+        if target_held:
+            self._wake_held_card(a, task, expected_wait, wait, cycle or own_card_comment_event(
+                comments, wait, self.agent_id, now(), comment_wake=self.cfg.comment_wake,
+                agent_name=self.own_handles, always_from=self.cfg.comment_wake_always_from), cycle_sig)
+            return
         event = cycle or (self._merge_event(a, wait) if wait.get("kind") == "merge" else wake_check(
             self.mesh, self.cats, self.gitlab, task, wait, self.agent_id,
             comments if comments is not None else self.mesh.comments(a.task_id), now(),
             max_wait=dt.timedelta(hours=self.cfg.max_wait_hours),
             first_recheck=dt.timedelta(hours=self.cfg.wait_first_recheck_hours),
             delivery_reader=lambda key: self._ci_delivered(a.task_id, key),
-            allow_action_required=True, comment_wake=self.cfg.comment_wake, agent_name=self.agent.name,
+            allow_action_required=True, comment_wake=self.cfg.comment_wake, agent_name=self.own_handles,
             comment_wake_always_from=self.cfg.comment_wake_always_from,
             decision_wake=self.agent.decision_wake or self.cfg.decision_wake, merge_gate=self.merge_enabled))
         negative = wait.pop("negative_observation", None)   # telemetry only, never persisted
@@ -6453,11 +7093,43 @@ class AgentRunner:
                 return
             if not self.effects.adopt(a, task, wait, self.me):
                 self.effects.renew(a, wait)
+            self.effects.watch_delivered(a, wait)
             if wait != a.wait and not self.store.update_with_marks(
                     a, {}, expect="waiting", expect_wait=expected_wait, wait=wait):
                 return                           # state or wait moved under us: the observation is stale
             if negative:
                 self._record_suppressed_wake(a, negative)
+
+    def _wake_held_card(self, a: Attempt, task: dict, expected_wait: dict, wait: dict, event: str,
+                        cycle_sig: str | None) -> None:
+        """A card WAIT whose target observation is held (``_reconcile_card_wait``): only a comment on
+        this card or a wait cycle may end it. Same READY CAS, cycle claim and edge cleanup as any card
+        wake, never ``met`` (the awaited card did not deliver). Without an event nothing is renewed or
+        adopted, as before; only a cycle signature told before is kept, so it is not re-read every tick."""
+        if not event:
+            if wait != a.wait:
+                self.store.update_with_marks(a, {}, expect="waiting", expect_wait=expected_wait, wait=wait)
+            return
+        self._end_on_wake(a, wait, f"woken: {event[:120]}")
+
+        def claim():
+            return not cycle_sig or self._claim_cycle(a, cycle_sig) is True
+        if self.life.to_ready(a, marks={}, expect="waiting", expect_wait=expected_wait,
+                              validate=claim if cycle_sig else None, wait=wait,
+                              wake_text=prompts.wake_prompt(task, event)):
+            self.emit("wake", a, event=event[:200], target_held=True)
+            log.info("%s: #%s woke (target held by its edge): %s", self.agent.name, a.task8, event[:120])
+
+    def _end_on_wake(self, a: Attempt, wait: dict, why: str) -> None:
+        """Undo the wait's side effects as it is woken, except the edge of a server-observed card wait.
+        For Mesh that edge's removal is an event of the TARGET: ``server_card_wait_dependency_event``
+        ends the open wait as ``invalid``/``dependency_removed``, and the ``cancelled`` this wake owes
+        (``_resolve_left_wait``) then gets 409. That edge stays on the READY wait instead: the resolve
+        runs right after the wake, and ``_resume_one`` removes the edge (``pending_cleanup``) once that
+        resolve is final. A lost READY CAS thereby leaves Mesh untouched as well."""
+        if wait.get("kind") == "card" and wait.get("server_observed") is True:
+            return
+        self.effects.on_end(a, wait, why)
 
     PARKED_CHECK_TRIES = 3
 
@@ -6539,7 +7211,7 @@ class AgentRunner:
         foreign = foreign_comments(comments, self.agent_id, since)
         if foreign and self.cfg.comment_wake == "addressed":
             foreign = [x for x in foreign
-                       if wakes_on_comment(x, wait, self.agent.name, self.cfg.comment_wake_always_from)]
+                       if wakes_on_comment(x, wait, self.own_handles, self.cfg.comment_wake_always_from)]
         c = foreign[-1] if foreign else None
         if c:
             who = c.get("author_name") or (c.get("author") or {}).get("name") or "someone"
@@ -6582,14 +7254,16 @@ class AgentRunner:
             # and that refusal wakes the author. Bounded, so a head that keeps moving still wakes.
             m["history"] = (list(m.get("history") or []) + [f"{iso()} head {m['sha'][:12]} -> {head[:12]}"])[-MERGE_HISTORY:]
             m.update(sha=head, runs=0, follows=int(m.get("follows", 0) or 0) + 1)
-            for k in ("obs", "pipeline", "first_run", "last_run"):
-                m.pop(k, None)
+            for k in ("obs", "pipeline", "first_run", "last_run", "delegate", "delegate_errors"):
+                m.pop(k, None)             # a lead's merge-only card names the old head: its gate refuses it
             result = None
         if head != m["sha"]:
             return (f"MR {target}: the head moved to {head[:12] or 'an unknown commit'} (you waited on "
                     f"{m['sha'][:12]}); the review covers the old head, a new review is needed")
         if result is not None:
-            return self._merge_result(wait, m, mr, result)
+            return self._merge_result(a, wait, m, mr, result)
+        if m.get("delegate"):
+            return self._merge_delegated(a, wait, m)
         return self._merge_start(a, wait, m, mr)
 
     @staticmethod
@@ -6611,7 +7285,7 @@ class AgentRunner:
                 obs["p"] = (prev or {}).get("p", f"{pipeline}:?")
         return obs
 
-    def _merge_result(self, wait: dict, m: dict, mr: dict, result: tuple[int, str]) -> str:
+    def _merge_result(self, a: Attempt, wait: dict, m: dict, mr: dict, result: tuple[int, str]) -> str:
         rc, tail = result
         lines = [ln for ln in tail.splitlines() if ln.strip()]
         last = lines[-1] if lines else ""
@@ -6621,11 +7295,155 @@ class AgentRunner:
             m["pipeline"] = queued["target"]
             m["obs"] = self._merge_obs(mr, m["pipeline"], m.get("obs"))
             return ""                          # queued behind other work: nothing for a model to do
+        rights = MERGE_RIGHTS.match(last)
+        if rights and rc != 0 and rights["target"] == wait["target"]:
+            return self._merge_to_lead(a, wait, m, result)
         state = "is still open" if rc == 0 else f"failed (exit {rc})"
         return f"the merge gate for MR {wait['target']} {state} and did not merge it.{self._merge_tail(result)}"
 
+    def _merge_to_lead(self, a: Attempt, wait: dict, m: dict, result: tuple[int, str]) -> str:
+        """Every gate check passed, but this lane's GitLab identity may not merge into the target
+        (the gate's last line ``⛔ MERGE RIGHTS``: a protected branch, a Developer author). Waking the
+        author spends a turn on a merge it cannot do. The merge goes to the
+        card's nearest lead that this runner runs, as one merge-only card (``reviewer_merge``): the
+        lead's runner runs the same gate under the lead's own env and checks its GitLab user before
+        anything is merged. The author keeps sleeping on the merge request and wakes when it is
+        merged, closed or moved, or when that card closes without the merge.
+
+        '' = handed over, or a transient failure retried with the next gate run; else the wake text."""
+        target = wait["target"]
+        project, iid = target.rsplit("!", 1)
+
+        def tell(why: str) -> str:
+            m.pop("delegate_errors", None)
+            return (f"the merge gate for MR {target} passed every check, but this lane's GitLab identity may "
+                    f"not merge into its target, and {why}. A maintainer of {project} must merge it."
+                    f"{self._merge_tail(result)}")
+
+        def retry(why: str) -> str:
+            m["delegate_errors"] = int(m.get("delegate_errors", 0) or 0) + 1
+            return tell(why) if m["delegate_errors"] >= MERGE_ENV_RETRIES else ""
+
+        try:
+            task = self.mesh.task(a.task_id)
+            task = task.get("task", task) if isinstance(task, dict) else None
+            if not isinstance(task, dict) or task.get("id") != a.task_id:
+                raise ValueError("card unavailable")
+        except Exception as e:                 # noqa: BLE001
+            return retry(f"the card could not be read to find its lead ({type(e).__name__})")
+        labels = [str(l.get("name") if isinstance(l, dict) else l) for l in task.get("labels") or []]
+        if reviewer_merge.LABEL in labels:
+            # the lead may not merge either: the lead is woken here, and the note on this card is
+            # what the author's wait reads (``_merge_delegated``); a note not written is retried
+            if not self._comment(a.task_id, f"merge gate: ⛔ MERGE RIGHTS {target} @{m['sha']}: {self.agent.name}'s "
+                                 f"GitLab identity may not merge into its target either. A maintainer of {project} "
+                                 "must merge it.", key=f"merge-rights-lead|{a.id}|{m['sha']}"):
+                return retry("the refusal could not be written on this merge-only card")
+            return tell("this is a merge-only card already: it is not handed on again")
+        try:
+            leads, notes = self._lead_chain(task)
+        except MeshError as e:
+            return retry(f"the workspace agents could not be read ({e.status})")
+        pick = None
+        for lead in leads:
+            ours = next((ag for ag in self.cfg.agents
+                         if ag.name.casefold() == str(lead.get("name") or "").casefold()), None)
+            if (ours is not None and ours.gitlab_username and lead.get("id")
+                    and ours.name.casefold() != self.agent.name.casefold()):
+                pick = (lead, ours)
+                break
+        if pick is None:
+            return tell("no lead of this card is a lane of this runner with a GitLab identity"
+                        + (f" ({'; '.join(notes)})" if notes else ""))
+        lead, ours = pick
+        req = {"key": reviewer_merge.request_key(a.task_id, project, iid, m["sha"]), "source_task": a.task_id,
+               "project": project, "iid": iid, "sha": m["sha"], "reviewer_lane": ours.name,
+               "reviewer_username": ours.gitlab_username, "reason": reviewer_merge.RIGHTS_REASON,
+               "author_lane": self.agent.name, "author_family": ""}
+        try:
+            card = self._merge_only_card(task, req, str(lead["id"]))
+        except (MeshError, reviewer_merge.Refused) as e:
+            return retry(f"the merge-only card for {ours.name} could not be filed "
+                         f"({e if isinstance(e, reviewer_merge.Refused) else e.status})")
+        m.pop("delegate_errors", None)
+        m["delegate"] = {"card": card, "lane": ours.name, "lead_id": str(lead["id"]), "at": iso()}
+        m["history"] = (list(m.get("history") or [])
+                        + [f"{iso()} handed to {ours.name}: #{card[:8]}"])[-MERGE_HISTORY:]
+        self._comment(a.task_id, f"merge gate: MR {target} @{m['sha'][:12]} passed every check, but this lane's "
+                      f"GitLab identity may not merge into its target. The merge goes to {ours.name}: merge-only "
+                      f"card #{card[:8]}, run under {ours.name}'s identity. This card keeps waiting on the merge "
+                      "request and wakes when it is merged, or when that card closes without the merge.",
+                      key=f"merge-to-lead|{a.id}|{req['key']}")
+        self.emit("merge_to_lead", a, target=target, sha=m["sha"], lane=ours.name, card=card)
+        log.info("%s: #%s merge of %s handed to %s: merge-only #%s", self.agent.name, a.task8, target,
+                 ours.name, card[:8])
+        return ""
+
+    def _merge_only_card(self, task: dict, req: dict, lead_id: str) -> str:
+        """The one merge-only card of ``req`` (stable key): found, or created and assigned to the lead.
+        A found open card that lost its assignee is assigned again; a closed one is left as it is (its
+        closure wakes the author with the lead's reason)."""
+        project_id = str(task.get("project_id") or "")
+        if not project_id:
+            raise reviewer_merge.Refused("card-project-unknown")
+        with reviewer_merge._serialized(str(self.cfg.state_dir / "reviewer-merge"), req["key"]):
+            for t in self.mesh.find_tasks(project_id, req["key"]):
+                found = reviewer_merge.parse_request(t.get("description"))
+                if not found or found["key"] != req["key"]:
+                    continue
+                if found["reviewer_lane"].casefold() != req["reviewer_lane"].casefold():
+                    raise reviewer_merge.Refused(f"merge-only #{t['id'][:8]} names {found['reviewer_lane']}")
+                if t.get("assignee_id") != lead_id and self.cats.category(t) not in ("done", "cancelled"):
+                    self.mesh.assign(t["id"], lead_id)
+                return t["id"]
+            todo = reviewer_merge.resolve_todo(self.mesh.statuses(project_id))
+            made = self.mesh.create_task(project_id, reviewer_merge.card_fields(req, project_id, todo))
+            if not made.get("id"):
+                raise reviewer_merge.Refused("card-not-created")
+            self.mesh.assign(made["id"], lead_id)
+            return made["id"]
+
+    def _merge_delegated(self, a: Attempt, wait: dict, m: dict) -> str:
+        """The author's merge wait after the merge went to a lead: no gate runs on this side; the MR is
+        observed by the caller (merged, closed, moved wake as before) and the lead's merge-only card
+        here. It closed while the MR is still open: the lead did not merge, its comment says why. The
+        lead's own gate said MERGE RIGHTS for this head (the lead's runner note on that card, written
+        by the lead): nobody in the chain can merge, the author is told as well as the lead."""
+        d = m["delegate"]
+        card, lane = str(d.get("card") or ""), str(d.get("lane") or "the lead")
+        target = wait["target"]
+        try:
+            t = self.mesh.task(card)
+            t = t.get("task", t) if isinstance(t, dict) else None
+            if not isinstance(t, dict) or t.get("id") != card:
+                raise ValueError("card unavailable")
+            cat = self.cats.category(t)
+            notes = [] if cat in ("done", "cancelled") else self.mesh.comments(card)
+        except Exception as e:                 # noqa: BLE001
+            m["delegate_errors"] = int(m.get("delegate_errors", 0) or 0) + 1
+            if m["delegate_errors"] >= MERGE_DELEGATE_READS:
+                return (f"cannot read the merge-only card #{card[:8]} ({lane}) for MR {target} "
+                        f"({type(e).__name__}); check it and the merge request yourself")
+            return ""
+        m.pop("delegate_errors", None)
+        if cat in ("done", "cancelled"):
+            return (f"the merge-only card #{card[:8]} ({lane}) for MR {target} is {cat}, and the MR is "
+                    f"still open: read its last comment for why it was not merged. Re-arm `wait_for on=merge` "
+                    "once the cause is dealt with.")
+        lead_id = str(d.get("lead_id") or t.get("assignee_id") or "")
+        for c in notes if lead_id else ():
+            hit = LEAD_RIGHTS_NOTE.match(str(c.get("body") or ""))
+            author = str(c.get("author_id") or (c.get("author") or {}).get("id") or "")
+            if hit and hit["target"] == target and hit["sha"] == m.get("sha") and author == lead_id:
+                return (f"the merge gate of {lane} on the merge-only card #{card[:8]} refused too: {lane}'s GitLab "
+                        f"identity may not merge MR {target} into its target either. A maintainer of "
+                        f"{target.rsplit('!', 1)[0]} must merge it; {lane} was woken on that card with the gate output.")
+        return ""
+
     def _merge_start(self, a: Attempt, wait: dict, m: dict, mr: dict) -> str:
         """Start the next gate run when one is due ('' = not now, or a wake text)."""
+        if self.paused():
+            return ""                          # observation continues; the operator holds new merge effects
         runs = int(m.get("runs", 0) or 0)
         last = parse_time(m.get("last_run"))
         if runs:
@@ -6651,6 +7469,8 @@ class AgentRunner:
             return ""                          # the card could not be read just now: try again later
         if refusal:
             return refusal
+        if self.paused():
+            return ""                          # a token may have arrived during environment/identity reads
         m["runs"], m["last_run"] = runs + 1, iso()
         m.setdefault("first_run", m["last_run"])
         m["obs"] = self._merge_obs(mr, m.get("pipeline"), m.get("obs"))
@@ -6833,18 +7653,23 @@ class AgentRunner:
     def resume_ready(self, room: int) -> int:
         if self.paused() or time.monotonic() < self._starts_paused_until or self._outage_paused():
             return room                       # a limit error: do not burn resumes either
-        if self.host_hold():
+        if self.host_hold() or not self.ramp.open():
             return room
-        for a in self.store.by_state(self.agent.name, ("ready",)):
+        ready = self.store.by_state(self.agent.name, ("ready",))
+        weight = {a.task_id: self._ramp_weight(a.task_id) for a in ready}
+        ready.sort(key=lambda a: -weight[a.task_id])     # a wait root resumes first; stable otherwise
+        for a in ready:
             if room <= 0:
                 break
-            if self.paused():                 # a pause that arrived while this loop was walking the queue
+            if self.paused() or not self.ramp.open():    # a pause that arrived meanwhile, or the ramp spaces starts
                 break
             self._recheck_checkpoint_quarantine(a)
             if time.monotonic() < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold.get(a.id, 0)):
                 continue
             if self._branch_blocked(a) or self._maintenance_held(a):
                 continue
+            if not self.ramp.ready(a.task_id, weight[a.task_id]):
+                continue                      # the ramp keeps the next slot for a heavier wait root
             before = self.store.active_count(self.agent.name)
             self._guard(a, "resume", self._resume_one)
             if self.store.active_count(self.agent.name) > before:
@@ -6970,6 +7795,8 @@ class AgentRunner:
             self._retire_proven_unsent_intent(a)
             self._park(self.store.get(a.id) or a, task, label, "resume")
             return
+        if self._late_outcome(a, task):
+            return                               # the late command settled the turn: no correction on a dead lease
         if a.wait.get("quota_wait_rejected"):
             # Removing our obsolete quota date grants no exemption from a
             # person's schedule, human gate, labels or other ordinary policy.
@@ -7014,6 +7841,21 @@ class AgentRunner:
             return
         if a.wait and self.effects.pending_cleanup(a.wait):
             wait = dict(a.wait)                  # an earlier wake could not undo its side effects
+            if wait.get("server_observed") is True:
+                try:
+                    final = self._settle_wait_resolve(a, str(wait.get("mesh_wait_id") or ""))
+                except Exception as e:                   # noqa: BLE001 - unknown is never taken for final
+                    final = False
+                    log.warning("%s: #%s Mesh wait resolve before edge cleanup failed, edge kept: %r",
+                                self.agent.name, a.task8, e)
+                if not final:
+                    # The wait ends before its edge goes (``_end_on_wake``): until its resolve is final
+                    # the edge stays and the resume waits for the next tick. Bounded: every send counts
+                    # as a try, whatever it returns or raises, and the resolve is final after
+                    # ``WAIT_RESOLVE_TRIES`` of them.
+                    log.info("%s: #%s resume waits for the resolve of Mesh wait %s before removing its edge",
+                             self.agent.name, a.task8, str(wait.get("mesh_wait_id"))[:8])
+                    return
             self.effects.on_end(a, wait, "resuming", close_request=False)
             self.store.update(a, wait=wait)
         if a.mode == "review" and self._unstartable_hold(task, self._comments(a.task_id)):
@@ -7795,8 +8637,8 @@ class AgentRunner:
             return ""
         target, names = outcome.target, ",".join(jobs)
         try:
-            sha, pid, _status = ci_observation(self.gitlab, outcome.kind, target)
-            status, identity = target_jobs_state(self.gitlab, target, pid, jobs)
+            sha, pid, pipeline_status = ci_observation(self.gitlab, outcome.kind, target)
+            status, identity = target_jobs_state(self.gitlab, target, pid, jobs, pipeline_status)
         except UnknownJobs as e:
             return (f"{outcome.kind} {target}: {e} (pipeline {pid}, {sha[:8]}), so this wait cannot complete "
                     "and was sent back. Copy the job names from the pipeline, or wait on the pipeline itself.")
@@ -7818,7 +8660,9 @@ class AgentRunner:
             told = delivered(ci_delivery_key(target, pid, jobs)) == f"{sha}:{pid}:{identity}:{status}"
         if not told:
             return ""                           # new to the agent: the evaluator wakes on it
-        return (f"{outcome.kind} {target}: job(s) {names} already finished: {status} (pipeline {pid}, "
+        state = ("are held by a manual job (it starts only by hand)" if status == "manual"
+                 else f"already finished: {status}")
+        return (f"{outcome.kind} {target}: job(s) {names} {state} (pipeline {pid}, "
                 f"{sha[:8]}) and you were told, so this wait would never wake. Act on the result (fix, "
                 "retry the job, merge, ROUTE), then wait on the new state.")
 
@@ -7914,7 +8758,9 @@ class AgentRunner:
           ``manual`` included) at the declared baseline: only the agent's own action moves it;
         - ``mr ... until=merged`` or ``until=change`` on the task's own open MR whose head
           pipeline is ``success`` or ``manual`` and which carries no review label
-          (``review_label_prefix``): nobody will merge it, nothing will change it;
+          (``review_label_prefix``): nobody will merge it, nothing will change it. Behind a merge
+          gate an ``until=merged`` wait is accepted without the label when the MR's card carries a
+          SHIP verdict on its head (``_ship_on_head``): the gate reads that verdict;
         - ``mr ... until=change`` on an MR whose head pipeline is ``failed``/``canceled`` (any MR),
           or ``manual`` (the task's own MR, review label or not): a new head or a retry is the
           agent's or the owner's action, not an event that will arrive by itself;
@@ -7928,7 +8774,8 @@ class AgentRunner:
           ``failed``/``canceled``/``skipped`` after that red result was already delivered to the
           agent: no new head pipeline comes by itself. Not yet delivered: accepted once, as above.
         The MR is the task's own when it is linked to the task, names the task id in its title,
-        description or source branch, or was authored by this agent's GitLab user. A result that
+        description or source branch, or was authored by this agent's GitLab user and is linked to
+        no other card (``_owns_mr``). A result that
         differs from the declared baseline and is new to the agent is left to wake the wait on the
         next tick.
         '' = accept: anything else, an until=change whose new observation will wake the wait
@@ -8010,12 +8857,16 @@ class AgentRunner:
             return ""
         if is_success:
             return ""                       # a green or manual head: success may still arrive
+        if parked:
+            return ""                       # a reviewer may still label the MR: no owner lookup needed
         if not self._owns_mr(a, row, target):
             return ""                       # someone else's MR: its owner may still review it
-        if reviewed or not prefix or parked:   # parked: a reviewer may still label the MR
+        if reviewed or not prefix:
             if status == "manual" and is_change:
                 return self._dead_change_text("MR", target, sha, pid, status)
             return ""
+        if merged and self.merge_enabled and self._ship_on_head(a, row, target):
+            return ""                       # the merge gate reads the SHIP verdict on the head, not the label
         until = "merged" if merged else "change"
         return (f"MR {target} has no review label ({prefix}...) and its head pipeline {pid} is {status} "
                 f"({sha[:8]}), so nobody will merge it and until={until} will not arrive on its own. "
@@ -8110,16 +8961,91 @@ class AgentRunner:
     def _owns_mr(self, a: Attempt, row: dict, target: str) -> bool:
         """The MR belongs to this task: linked to it, naming its id in the title, description
         or source branch, or authored by this agent's GitLab user (``gitlab_username``): an agent
-        that opened the MR itself often neither links it nor names the task in it."""
+        that opened the MR itself often neither links it nor names the task in it. Authorship
+        does not count when the MR is linked in Mesh to another card (``_mr_cards_elsewhere``):
+        one lane often holds both cards, and that card has its own reviewer and merge gate."""
         if target in gitlab_mr_targets(self.mesh.vcs_links(a.task_id), self.gitlab.base_url):
+            return True
+        if re.search(rf"(?<![0-9a-f]){re.escape(a.task8)}(?![0-9a-f])", self._mr_text(row), re.IGNORECASE):
             return True
         mine = (self.agent.gitlab_username or "").casefold()
         author = row.get("author")
         username = author.get("username") if isinstance(author, dict) else None
-        if mine and isinstance(username, str) and username.casefold() == mine:
-            return True
-        text = " ".join(str(row.get(k) or "") for k in ("title", "description", "source_branch"))
-        return re.search(rf"(?<![0-9a-f]){re.escape(a.task8)}(?![0-9a-f])", text, re.IGNORECASE) is not None
+        if not (mine and isinstance(username, str) and username.casefold() == mine):
+            return False
+        return not self._mr_cards_elsewhere(a, row, target, first=True)
+
+    @staticmethod
+    def _mr_text(row: dict) -> str:
+        return " ".join(str(row.get(k) or "") for k in ("title", "description", "source_branch"))
+
+    def _mr_cards_elsewhere(self, a: Attempt, row: dict, target: str, first: bool = False) -> list[str]:
+        """Ids of the other cards the MR is linked to in Mesh (vcs link); with ``first`` only the
+        first one found (enough to tell the MR is not this task's). Candidates: the 8-hex ids its
+        title, description or source branch names (the card an MR delivers is named there), then
+        this agent's other open cards; at most ``MR_CARD_PROBES`` of them are read. An id that names
+        no card this agent can read (a commit fragment, a date, a card of another workspace: Mesh
+        answers 403 for those) is skipped; any other Mesh error raises: the caller keeps the wait."""
+        names = [m.group(0).lower() for m in CARD_ID8.finditer(self._mr_text(row))]
+        others = [x.task_id for x in self.store.by_state(self.agent.name, OPEN) if x.task_id != a.task_id]
+        seen, out, probes = {a.task8.lower()}, [], 0
+        for cand in names + others:
+            if cand[:8].lower() in seen:
+                continue
+            seen.add(cand[:8].lower())
+            if probes >= MR_CARD_PROBES:
+                break
+            probes += 1
+            tid = cand
+            if len(cand) == 8:
+                try:
+                    tid = str(self.mesh.task_by_short(cand).get("id") or "")
+                except MeshError as e:
+                    if e.status in (400, 403, 404, 409, 410):
+                        continue                # no card this agent can read, or an ambiguous id
+                    raise
+            if tid and tid != a.task_id and target in gitlab_mr_targets(self.mesh.vcs_links(tid),
+                                                                         self.gitlab.base_url):
+                out.append(tid)
+                if first:
+                    break
+        return out
+
+    def _ship_on_head(self, a: Attempt, row: dict, target: str) -> bool:
+        """The newest review verdict naming the MR's head across its cards (this task and the other
+        cards the MR is linked to) is SHIP: what the merge gate reads (``Verify: SHIP @<sha>``), not
+        a label. A newer DO-NOT-SHIP on any of them wins over an older SHIP on another. A verdict
+        without a commit does not count; the agent's own comment counts only as a plain verdict line
+        (``review_own_verdict_pattern``), as in ``_verdict_event``."""
+        sha = str(row.get("sha") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            return False
+        theirs, mine = self._verdict_re(), self._verdict_re(own=True)
+        newest: tuple[dt.datetime, str] | None = None
+        for tid in [a.task_id] + self._mr_cards_elsewhere(a, row, target):
+            for c in reversed(self.mesh.comments(tid, limit=100)):
+                body = c.get("body") or ""
+                if body.startswith("[runner"):
+                    continue
+                author = c.get("author_id") or (c.get("author") or {}).get("id")
+                pattern = mine if author == self.agent_id else theirs
+                if pattern is None:
+                    continue
+                verdicts = []
+                for m in pattern.finditer(body):
+                    line = body[body.rfind("\n", 0, m.start()) + 1:].split("\n", 1)[0]
+                    named = (m.groupdict().get("sha") or "").lower()
+                    if named and sha.startswith(named) and not ENUMERATED_VERDICTS.search(line):
+                        verdicts.append(m.groupdict().get("verdict") or "")
+                if verdicts:
+                    at = parse_time(c.get("created_at"))
+                    if at is None:
+                        if verdicts[-1] != "SHIP":
+                            return False        # a rejection of unknown age is not outranked
+                    elif newest is None or at > newest[0]:
+                        newest = (at, verdicts[-1])
+                    break                       # this card's newest verdict on the head
+        return newest is not None and newest[1] == "SHIP"
 
     def _forget_spent_ci_delivery(self, a: Attempt, outcome: Outcome) -> None:
         """A retried pipeline keeps its id and returns to a state the agent was already told about
@@ -8153,7 +9079,13 @@ class AgentRunner:
         A wait for X ``until=accepted|deployed|shipped`` is accepted too: it names a release gate
         itself, not development. And a timer on X that is a published external event (its
         ``on=time`` stored an event and a source) is not a measurement window: X moves when that
-        event happens, so a plain wait on it stands."""
+        event happens, so a plain wait on it stands. Nor is a question X put to an agent
+        (``ask_agent``, see ``_asks_an_agent``), this waiter included: an agent answers it and X
+        runs on; only a human gate on X makes it a person's. The text names what X waits for
+        (``ask_human → @owner``, ``decision → @lead``, ``time until …``).
+        It is told once per (this task, X's state): the same wait declared again while X's wait
+        has not changed is accepted, since a second wake brings no new event; a new wait or gate
+        on X tells it once more."""
         if outcome.kind != "card" or not outcome.target:
             return ""
         if (outcome.extra or {}).get("card_condition") in ("accepted", "deployed", "shipped"):
@@ -8163,19 +9095,42 @@ class AgentRunner:
             if not target:
                 return ""
             idle = ""
+            state = []
             for x in target:
                 w = x.wait or {}
                 kind = w.get("kind")
                 ext = w.get("external_time") if kind == "time" else None
                 if x.state == "waiting" and isinstance(ext, dict) and ext.get("event") and ext.get("source"):
                     return ""                    # X waits for a published external event
+                handle = "@" + str(w.get("handle") or "?").lstrip("@")
+                gate = ""
+                if x.state == "waiting" and kind == "decision" and self._asks_an_agent(w):
+                    t = self._task(x.task_id)
+                    if not (t and t.get("human_gate")):
+                        return ""                # X waits for an agent's answer, not a person's
+                    idle = idle or f"a person (human gate; decision → {handle})"
+                    g = t.get("human_gate_info") if isinstance(t.get("human_gate_info"), dict) else {}
+                    gate = str(g.get("marker_comment_id") or g.get("marker_created_at") or t.get("updated_at") or "")
+                elif x.state == "waiting" and kind in ("time", "decision", "blocking"):
+                    idle = idle or (f"the timer or the measurement window (time until {w.get('until') or '?'})"
+                                    if kind == "time" else
+                                    f"a person (ask_human → {handle})" if kind == "blocking" else
+                                    f"a person (decision → {handle})")
                 if x.state == "waiting" and kind in ("time", "decision", "blocking"):
-                    idle = idle or ("the timer or the measurement window" if kind == "time" else "a person")
+                    state.append("|".join(str(v or "") for v in (
+                        x.id, kind, w.get("target"), w.get("handle"), w.get("until"),
+                        w.get("mesh_wait_id") or w.get("decision_request_id") or w.get("human_gate_ref"),
+                        gate)))
                 elif x.state == "ready":
                     t = self._task(x.task_id)
                     if not (t and t.get("human_gate")):
                         return ""
                     idle = idle or "a person (human gate)"
+                    # the gate's own identity: a gate cleared and raised again is a new state
+                    g = t.get("human_gate_info") if isinstance(t.get("human_gate_info"), dict) else {}
+                    state.append("|".join(str(v or "") for v in (
+                        x.id, "gate", g.get("marker_comment_id") or g.get("marker_created_at")
+                        or t.get("updated_at"))))
                 else:
                     return ""                    # running, or waiting for code (pipeline/mr/card/queue)
             t = self._task(target[0].task_id)
@@ -8188,12 +9143,106 @@ class AgentRunner:
             mine = {str(l.get("name") if isinstance(l, dict) else l).casefold() for l in (me or {}).get("labels") or []}
             if mine & {"release-batch", "kind:release", "kind:review"}:
                 return ""
+            told = f"{outcome.target}:" + ";".join(sorted(state))
+            if not self.store.claim(self.agent.name, a.task_id, "idle_card_told", told):
+                log.info("%s: #%s card wait on #%s accepted: already told, #%s has not changed",
+                         self.agent.name, a.task8, outcome.target, outcome.target)
+                return ""
             return (f"#{outcome.target} itself waits for {idle}; a release gate does not "
                     "hold development. Do your part now, or name the code in it that you need and wait "
                     "for its merge (`wait_for on=mr project_path=<group>/<project> mr_iid=<iid> until=merged`).")
         except Exception as exc:                 # noqa: BLE001 - an unreadable target: the wait stands
             log.warning("%s: #%s card wait check failed, wait kept: %r", self.agent.name, a.task8, exc)
             return ""
+
+    def _drop_sent_back_card_wait(self, a: Attempt, outcome: Outcome, why: str) -> None:
+        """End what Mesh recorded for a card wait the runner sends back at its declaration. It is never
+        armed, so no wake would end it: its Mesh wait is resolved as cancelled with ``why``, then the
+        blocks edge Mesh made for it is removed if the receipt says this wait owns it. Left alone, an
+        until=deployed edge on a closed target is never released and the card reads as waiting on it.
+        A resolve another wait of this card still has pending is not overwritten: the next outcome ends
+        this wait in Mesh anyway. Bookkeeping only: a failure never holds the send-back."""
+        wait_id = str(outcome.typed.get("wait_id") or "")
+        if not wait_id:
+            return
+        try:
+            pending = self._wait_resolve_record(self.store.mark(self.agent.name, a.task_id, self.WAIT_RESOLVE))
+            if pending is None or pending["wait"] == wait_id:
+                self._queue_wait_resolve(a, wait_id, "cancelled", why)
+            wait = {"kind": "card", "target": outcome.target, "mesh_wait_id": wait_id,
+                    "card_condition": (outcome.extra or {}).get("card_condition") or "",
+                    "card_dependency": (outcome.extra or {}).get("card_dependency")}
+            self.effects.end_unarmed_card_wait(a, wait, f"sent back: {why[:120]}")
+        except Exception as e:                   # noqa: BLE001 - bookkeeping never blocks the send-back
+            log.warning("%s: #%s sent-back wait %s not ended in Mesh: %r", self.agent.name, a.task8,
+                        wait_id[:8], e)
+
+    def _deployed_wait_told(self, a: Attempt, outcome: Outcome) -> str:
+        """Text for a card wait ``until=deployed`` on X when an open or merged merge request of X is in a
+        repository the deploy inventory lists without a live-commit source (``type: none``). Mesh
+        releases ``deployed`` only once every such merge request carries a deploy record, and nothing
+        writes one there: the runner would hold the card on that edge for good. '' = accept: no
+        inventory configured or readable, no merge request of X in such a repository (or it already
+        carries a record), X unreadable. Told once per (this task, X, those merge requests): the same
+        wait declared again is accepted, the owner may record the deploy by hand."""
+        if (outcome.kind != "card" or not outcome.target or not self.cfg.deploy_inventory
+                or (outcome.extra or {}).get("card_condition") != "deployed"):
+            return ""
+        try:
+            repos = deploy_inventory.load(self.cfg.deploy_inventory)
+            if repos is None:
+                log.warning("%s: #%s deploy inventory %s unreadable, until=deployed wait kept",
+                            self.agent.name, a.task8, self.cfg.deploy_inventory)
+                return ""
+            target = self.mesh.task_by_short(str(outcome.target))
+            tid = (target or {}).get("id")
+            if not tid:
+                return ""
+            gaps: list[str] = []
+            mrs: list[str] = []
+            for link in self.mesh.vcs_links(tid):
+                if (not isinstance(link, dict) or link.get("deployed_at") or link.get("status") == "closed"
+                        or link.get("link_type") not in ("pr", "pull_request", "mr", "merge_request")):
+                    continue
+                m = GITLAB_MR_URL.match(str(link.get("url") or ""))
+                why = deploy_inventory.never_deployed(m[2], repos) if m else ""
+                if why:
+                    mrs.append(f"{m[2]}!{m[3]}")
+                    if why not in gaps:
+                        gaps.append(why)
+            if not gaps:
+                return ""
+            told = f"{outcome.target}:deployed:" + ",".join(sorted(mrs))
+            if not self.store.claim(self.agent.name, a.task_id, "deployed_wait_told", told):
+                log.info("%s: #%s until=deployed wait on #%s accepted: already told", self.agent.name,
+                         a.task8, outcome.target)
+                return ""
+            first = mrs[0].rpartition("!")
+            return (f"#{outcome.target} never becomes `deployed`: " + "; ".join(gaps) + ". No deploy is "
+                    f"recorded for {', '.join(mrs)}, so this wait would never end. Wait for what does change: "
+                    f"the card itself (`wait_for on=card` without a condition) or its merge request "
+                    f"(`wait_for on=mr project_path={first[0]} mr_iid={first[2]} until=merged`). If you "
+                    "deploy it by hand, record that deploy on the link and declare this wait again.")
+        except Exception as exc:                 # noqa: BLE001 - an unreadable target: the wait stands
+            log.warning("%s: #%s until=deployed check failed, wait kept: %r", self.agent.name, a.task8, exc)
+            return ""
+
+    def _asks_an_agent(self, w: dict) -> bool:
+        """A ``decision`` wait addressed to an agent: an ``ask_agent`` request, the agent recipient
+        effects filed it for, a question redirected to the lead, or a handle that is a workspace
+        agent (this runner's own agent included: X may wait for the waiter's own answer). A person
+        ask and a wait with no handle are not. A roster failure propagates: the caller keeps the
+        wait, an unknown addressee is never taken for a person."""
+        if w.get("person_ask"):
+            return False
+        if w.get("decision_request_id") or w.get("recipient_id"):
+            return True
+        handle = str(w.get("handle") or "").lstrip("@")
+        if not handle:
+            return False
+        if handle.casefold() == self.agent.name.casefold():
+            return True
+        return bool(self.effects._resolve_agent(handle, self.me))
 
     def _ci_delivered(self, task_id: str, key: str) -> str:
         mark = self.store.mark(self.agent.name, task_id, key)
@@ -8362,6 +9411,18 @@ class AgentRunner:
             return "review: just sent by this agent"
         fed = self.store.mark(self.agent.name, task["id"], "review_fed")
         fed_at = parse_time(fed[1]) if fed else None
+        if fed_at and self._review_without_verdict(fed[0]):
+            # the fed review ended without anything it decided (a harness error, an unknown attempt
+            # closed by the quiet rule or an operator, no readable outcome): nobody reviewed the card,
+            # so it is fed again now, not after the refeed window. Review starts are not under the
+            # work start cap, so the same cap bounds these refeeds here.
+            cap = self.cfg.daily_start_cap
+            if cap and self.store.review_starts_today(self.agent.name, task["id"]) >= cap:
+                return "review: the review attempts ended without a verdict; daily start cap reached"
+            if self.store.claim(self.agent.name, task["id"], "review_refeed_unverdicted", fed[0]):
+                log.info("%s: #%s review fed again: attempt %s ended without a verdict",
+                         self.agent.name, task["id"][:8], fed[0][:8])
+            fed_at = None
         hours = self._own_hold_hours()
         own = self._own_work(task["id"], comments)
         declared = self._own_declared_wait(task) if own else None
@@ -8408,6 +9469,24 @@ class AgentRunner:
                 and not self._ship_since(task, comments, own[1])):
             self._unreviewed(task, own[1])         # fed again later: still its own, still unreviewed
         return ""
+
+    def _review_without_verdict(self, attempt_id: str) -> bool:
+        """The review attempt ``attempt_id`` is over and decided nothing: its last word was no verdict
+        and it ended as a failure (failed, an unknown delivery closed without proof, or a turn without a
+        readable outcome). A verdict is a readable outcome other than NEXT that no failure followed: a
+        NEXT, then a turn that died, is no review. A live attempt, one whose last outcome decided, or one
+        completed for another reason (the card left review, the author's own resend) keeps its feed. A
+        readable outcome recorded without its kind (before this rule) counts as a verdict."""
+        a = self.store.get(attempt_id) if attempt_id else None
+        if not a or a.mode != "review" or a.state not in (*FINISHED_ATTEMPT, "aborted-notified"):
+            return False
+        decided, failed = False, a.state == "failed"
+        for _at, kind, detail in self.store.events(a.id):
+            if kind == "readable_outcome":
+                decided = detail != "next"
+            elif kind in REVIEW_NO_VERDICT_EVENTS:
+                decided, failed = False, True
+        return failed and not decided
 
     def _refeed_max(self) -> dt.timedelta:
         hours = getattr(self.cfg, "review_refeed_hours", 0) or 0
@@ -9127,9 +10206,9 @@ class AgentRunner:
         if not generation:
             log.debug("%s: #%s next-action: %s", self.agent.name, task["id"][:8], why)
             return False
-        if next_action.dispatched(self.store, self.agent.name, task["id"], generation):
+        if next_action.dispatched(self.store, self.agent.name, task["id"], generation, projection):
             return False
-        self._prep_pending[task["id"]] = generation
+        self._prep_pending[task["id"]] = (generation, projection)
         return True
 
     def _blocked_verdict(self, blockers: list[dict]) -> str:
@@ -9223,6 +10302,56 @@ class AgentRunner:
         # decision requests stay first, CAP_WAIT last: only the ordinary slots are refilled
         return [next(observed) if rank(t) == 1 else t for t in ranked]
 
+    def _ramp_weight(self, task_id: str) -> int:
+        """Waiting cards behind ``task_id`` when it is a root this lane would start or resume now
+        (``RootRadar.startable_for``); 0 without a radar. The host ramp orders its slots by it."""
+        radar = getattr(self, "roots", None)
+        if radar is None or not task_id:
+            return 0
+        return radar.startable_for(self.agent.name).get(task_id, 0)
+
+    def _claim_ramp(self, room: int) -> None:
+        """While the host holds or ramps up, tell the shared ramp which wait roots this lane would
+        start now (``StartRamp.claim``), so the next slot goes to the heaviest root on the host, not to
+        the lane that asks first. Only a root the lane would really take claims: one its own start or
+        resume path would refuse (no room, paused, a full disk or worktree pool, a branch or maintenance
+        hold, or any ``hold_reason`` such as dependencies) claims nothing, so it never keeps a slot from
+        another lane. The ramp also drops a claim that is not renewed or not taken."""
+        ramp, radar = self.ramp, getattr(self, "roots", None)
+        if radar is None or not ramp.claiming():
+            return
+        claims: dict[str, int] = {}
+        mine = radar.startable_for(self.agent.name)
+        if (mine and room > 0 and not self.paused() and time.monotonic() >= self._starts_paused_until
+                and not self._outage_paused() and not self.pool.disk_hold()):
+            mono = time.monotonic()
+            ready = {a.task_id: a for a in self.store.by_state(self.agent.name, ("ready",))}
+            busy = {a.task_id for a in self.store.by_state(self.agent.name, ACTIVE + ("waiting",))}
+            fresh = [tid for tid in mine if tid not in ready and tid not in busy]
+            feed: dict[str, dict] = {}
+            if fresh:
+                try:                                   # what start_new would see: its feed and its holds
+                    feed = {t.get("id"): t for t in self.candidates()}
+                except MeshError as e:
+                    log.warning("%s: ramp claim: feed unread, no new start claimed: %s", self.agent.name, e)
+            pool_full = bool(fresh) and any(self.pool.full(r.name) for r in self.lane_repos)
+            for task_id, weight in mine.items():
+                a = ready.get(task_id)
+                if a is not None:
+                    if (mono < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold.get(a.id, 0))
+                            or self._branch_blocked(a) or self._maintenance_held(a)):
+                        continue
+                elif task_id in busy:
+                    continue
+                else:
+                    t = feed.get(task_id)
+                    mode = (t or {}).get("_mode", "work")
+                    if (t is None or t.get("human_gate") or (pool_full and not metadata_only(t, mode))
+                            or self.hold_reason(t, mode, log_change=False)):
+                        continue
+                claims[task_id] = weight
+        ramp.claim(self.agent.name, claims)
+
     def _root_weight(self, t: dict) -> int:
         radar = getattr(self, "roots", None)
         if radar is None or t.get("human_gate"):
@@ -9275,19 +10404,27 @@ class AgentRunner:
         if self.paused() or time.monotonic() < self._starts_paused_until or self._outage_paused():
             self._break_review_streaks()
             return room
-        if self.host_hold():
+        if self.host_hold() or not self.ramp.open():
             self._break_review_streaks()
-            return room                        # host short of memory or overloaded: no new sessions
+            return room                        # host short of memory, overloaded or ramping up: no new sessions
         if self.pool.disk_hold():
             self._pool_full()
             self._break_review_streaks()
             return room
         reviews = 0
+        kept = False                           # the ramp kept this tick's slot for another lane's root
         passed_over: list[str] = []
         for task in self.candidates():
-            if room <= 0 or time.monotonic() < self._starts_paused_until or self.paused():
+            if (room <= 0 or time.monotonic() < self._starts_paused_until or self.paused()
+                    or not self.ramp.open()):
                 self._break_review_streaks()
-                break                          # a start just paused the agent, or an operator token landed
+                break                          # a start just paused the agent, an operator token landed, or the ramp spaces starts
+            tid = task.get("id") or ""
+            if not self.ramp.ready(tid, 0 if task.get("human_gate") else self._ramp_weight(tid)):
+                if not kept:
+                    kept = True
+                    self._break_review_streaks()
+                continue                       # the ramp keeps the next slot for a heavier wait root
             if self._pool_full() and not metadata_only(task, task.get("_mode", "work")):
                 self._break_review_streaks()
                 continue                       # a later typed decision may need no Git slot
@@ -9415,10 +10552,10 @@ class AgentRunner:
             if not (cur and cur.pid):
                 self._release_gate(a, "not-started")
             raise
-        generation = self._prep_pending.pop(task["id"], None)
+        generation, projection = self._prep_pending.pop(task["id"], None) or ("", None)
         if started and generation:
             # recorded only now that the attempt really started: a refused start is retried
-            next_action.record(self.store, self.agent.name, task["id"], generation, a.id)
+            next_action.record(self.store, self.agent.name, task["id"], generation, a.id, projection)
             self.store.event(a.id, "next_action_prep", generation)
             log.info("%s: #%s prep started on next-action generation %s", self.agent.name, task["id"][:8], generation)
         if not started:
@@ -9942,9 +11079,13 @@ class AgentRunner:
             # is written: a card turn's route stays what the card set
             env, harness, profile = self._route_env(self._read_env())
             env = session_env(env)
-            if harness != self._chat_harness:
-                return env, None              # routed to a harness this session cannot run: held, no foreign env
-            return env, env_digest({**env, "MESH_RUNNER_PROFILE": str(profile or "")})
+            command = self._chat_commands.get(harness)
+            if command is None:
+                return env, None, None        # routed to a harness this session cannot run: held, no foreign env
+            marks = {"MESH_RUNNER_PROFILE": str(profile or "")}
+            if harness != self._chat_harness:  # an alt-harness session differs from the home one by its digest
+                marks["MESH_RUNNER_CHAT_HARNESS"] = harness
+            return env, env_digest({**env, **marks}), command
         try:
             reason, _ = self._gate("transport", "", "chat")
             if reason:
@@ -9957,6 +11098,7 @@ class AgentRunner:
             return
         self._chat_error = self.chat.error
         self._chat_hold = ("restart pending since " + time.strftime("%H:%M", time.localtime(self.chat.held_since))
+                           + (" (no chat command for the routed harness)" if self.chat.hold_kind == "route" else "")
                            if self.chat.held_since else "")
 
     def tick(self) -> dict:
@@ -9978,6 +11120,7 @@ class AgentRunner:
         maintenance.consume(self.cfg.state_dir, self.agent.name, self._maintenance_request)
         self.deliver_mentions()
         room = self.cap() - self.store.active_count(self.agent.name)
+        self._claim_ramp(room)
         room = self.resume_ready(room)
         self.start_new(room)
         self.recheck_slots()
@@ -10046,14 +11189,20 @@ class AgentRunner:
                 "load_hold": self.loadgate.describe() if self.loadgate.check() else "",
                 "would_start": min(eligible, max(0, self.cap() - active)), "tasks": rows}
 
-    def _own_profiles(self) -> set[str]:
+    def _own_profiles(self, store: Store | None = None) -> set[str]:
         """The logins this lane uses now: those it launched in the last OWN_PROFILE_DAYS and
         the one any of its attempts is held on. A hold of a login no lane launches any more
         (a retired personal login) is shown nowhere: not on live lanes and not in the runner-wide
-        status.json list. It stays stored and comes back the moment a lane launches that login."""
+        status.json list. It stays stored and comes back the moment a lane launches that login.
+
+        ``store`` is the connection of the calling thread. A sqlite connection belongs to one
+        thread: the lane's own ``self.store`` is read only from the lane's thread; the runner's
+        status loop passes its own store. Two threads iterating one connection get rows reset
+        under them (an empty row, "not enough values to unpack", or garbage text)."""
+        store = store or self.store
         cutoff = iso(now() - dt.timedelta(days=OWN_PROFILE_DAYS))
         own = set()
-        for (value,) in self.store.db.execute(
+        for (value,) in store.db.execute(
                 "SELECT value FROM marks WHERE agent=? AND key='auth_launch' AND at>=?", (self.agent.name, cutoff)):
             try:
                 profile = json.loads(value).get("profile") if value else ""
@@ -10061,7 +11210,7 @@ class AgentRunner:
                 continue
             if isinstance(profile, str) and auth.PROFILE.fullmatch(profile):
                 own.add(profile)
-        for a in self.store.by_state(self.agent.name, ("ready",)):
+        for a in store.by_state(self.agent.name, ("ready",)):
             note = a.note or ""
             if note.startswith("authentication held for profile "):
                 own.add(note.removeprefix("authentication held for profile ").strip())
@@ -10101,6 +11250,8 @@ class AgentRunner:
             out["chat_error"] = self._chat_error
         if self._chat_hold:
             out["chat_hold"] = self._chat_hold
+        if self.chat is not None:
+            out["chat_hold_since"] = int(self.chat.held_since) if self.chat.held_since else 0
         return out
 
 
@@ -10170,6 +11321,7 @@ class Runner:
             for ar in self.agents[1:]:
                 ar.memgate = self.agents[0].memgate
                 ar.loadgate = self.agents[0].loadgate
+                ar.ramp = self.agents[0].ramp          # its gates are the shared ones above
         self._latest: dict[str, tuple[dict, float]] = {}
         self._ignored_next = 0.0
         self.ignored_freed_bytes = 0
@@ -10184,6 +11336,7 @@ class Runner:
             ar.owners = self._task_owner
             ar.legacy_pause = legacy_pause
             ar.roots = self.roots
+            ar.lanes = self.agents             # whom a question can reach: an agent's lanes by workspace
 
     def wake(self, names=()) -> None:
         """Make the loops of these agents poll now, not at poll_seconds; nobody else wakes."""
@@ -10274,7 +11427,8 @@ class Runner:
             try:                # runner-wide, once: holds of the logins some lane uses now
                 in_use = set()
                 for ar in getattr(self, "agents", ()):
-                    in_use |= ar._own_profiles()
+                    # the runner's own connection: ar.store belongs to the lane's thread, ticking now
+                    in_use |= ar._own_profiles(self.store)
                 status["auth_holds"] = auth.status(self.store, self.cfg.config_path or "<runner.toml>",
                                                    profiles=in_use)
                 status["harness_holds"] = harness_hold.status(self.store)
@@ -10308,7 +11462,8 @@ class Runner:
                  "# TYPE mesh_runner_checkpoint_gc_freed_bytes_estimate_total counter",
                  f"mesh_runner_checkpoint_gc_freed_bytes_estimate_total {getattr(self, 'checkpoint_gc_freed_bytes', 0)}",
                  "# TYPE mesh_runner_attempts gauge", "# TYPE mesh_runner_agent_error gauge",
-                 "# TYPE mesh_runner_agent_paused gauge", "# TYPE mesh_runner_agent_pause_tokens gauge"]
+                 "# TYPE mesh_runner_agent_paused gauge", "# TYPE mesh_runner_agent_pause_tokens gauge",
+                 "# TYPE mesh_runner_chat_hold_seconds gauge"]
         if getattr(self, "checkpoint_bytes", None) is not None:
             lines += ["# TYPE mesh_runner_checkpoint_bytes gauge", f"mesh_runner_checkpoint_bytes {self.checkpoint_bytes}"]
         for st in out:
@@ -10316,6 +11471,9 @@ class Runner:
             lines.append(f'mesh_runner_agent_error{{agent="{name}"}} {1 if "error" in st else 0}')
             lines.append(f'mesh_runner_agent_paused{{agent="{name}"}} {1 if st.get("paused") else 0}')
             lines.append(f'mesh_runner_agent_pause_tokens{{agent="{name}"}} {len(st.get("pause_tokens", []))}')
+            if "chat_hold_since" in st:        # how long the agent's standing chat has not been (re)started
+                held = st["chat_hold_since"]
+                lines.append(f'mesh_runner_chat_hold_seconds{{agent="{name}"}} {max(0, int(stamp - held)) if held else 0}')
             counts: dict[str, int] = {}
             for a in st.get("attempts", []):
                 counts[a["state"]] = counts.get(a["state"], 0) + 1
@@ -10353,6 +11511,27 @@ class Runner:
         self._ignored_worker.start()
 
     def _prune_ignored_pass(self) -> None:
+        # This worker is not a lane's thread. A lane's Store belongs to its agent thread: a statement of
+        # this pass open on it made the lane's next write fail at once with "database is locked", the
+        # busy timeout unused, and its tick fail. The pass works through its own connection.
+        own: dict[Path, Store] = {}
+
+        def pool_of(ar):
+            store = getattr(ar.pool, "store", None)
+            if not isinstance(store, Store):
+                return ar.pool                     # no Store behind it: nothing shared
+            if store.path not in own:
+                own[store.path] = Store(store.path)
+            return ar.pool.on_store(own[store.path])
+
+        try:
+            Runner._prune_pools(self, pool_of)
+        finally:
+            for store in own.values():
+                store.close()
+        self._measure_checkpoints()
+
+    def _prune_pools(self, pool_of) -> None:
         cfg = self.cfg
         from . import pool_ops
         deadline = time.monotonic() + 120          # one budget for the whole pass, not per agent
@@ -10360,7 +11539,7 @@ class Runner:
             if time.monotonic() >= deadline:
                 break
             try:
-                res = pool_ops.prune_checkpoints(ar.pool, grace_hours=cfg.checkpoint_gc_grace_hours, apply=True,
+                res = pool_ops.prune_checkpoints(pool_of(ar), grace_hours=cfg.checkpoint_gc_grace_hours, apply=True,
                                                  deadline=deadline)
                 self.checkpoint_gc_freed_bytes = getattr(self, "checkpoint_gc_freed_bytes", 0) + res["freed_bytes"]
             except Exception as e:
@@ -10369,7 +11548,7 @@ class Runner:
             if time.monotonic() >= deadline:
                 break
             try:
-                res = pool_ops.prune_ignored(ar.pool, idle_hours=cfg.ignored_cleanup_idle_hours, apply=True,
+                res = pool_ops.prune_ignored(pool_of(ar), idle_hours=cfg.ignored_cleanup_idle_hours, apply=True,
                                              deadline=deadline)
                 self.ignored_freed_bytes = getattr(self, "ignored_freed_bytes", 0) + res["freed_bytes"]
             except Exception as e:
@@ -10382,13 +11561,12 @@ class Runner:
             if time.monotonic() >= compact_deadline:
                 break
             try:
-                res = pool_ops.compact_checkpoints(ar.pool, apply=True, deadline=compact_deadline)
+                res = pool_ops.compact_checkpoints(pool_of(ar), apply=True, deadline=compact_deadline)
                 self.checkpoint_gc_freed_bytes = getattr(self, "checkpoint_gc_freed_bytes", 0) + res["freed_bytes"]
                 if res.get("errors"):
                     log.warning("%s: checkpoint compact: %d error(s), see earlier lines", ar.agent.name, res["errors"])
             except Exception as e:
                 log.warning("%s: checkpoint compact failed: %s", ar.agent.name, e)
-        self._measure_checkpoints()
 
     def _measure_checkpoints(self) -> None:
         """Total WAIT-snapshot size for status.json, the gauge and the alert. A budget overrun is

@@ -1,9 +1,13 @@
-"""A ``wait_for on=card`` on X is sent back when X itself waits on a timer, a person or a human gate."""
+"""A ``wait_for on=card`` on X is sent back when X itself waits on a timer, a person or a human gate.
+A question X put to an agent (``ask_agent``), the waiter itself included, is not a person's."""
 import datetime as dt
 
 from fakes import FakeMesh, task, write_replies, wait_card, wait_time
 from mesh_runner.store import iso
 from test_runner import Bench
+
+# a decision wait addressed to a person: the handle is no workspace agent (FakeMesh has builder and lead)
+PERSON_ASK = {'kind': 'decision', 'target': '', 'handle': 'owner'}
 
 
 class CardWaitOnIdleTarget(Bench):
@@ -32,8 +36,98 @@ class CardWaitOnIdleTarget(Bench):
         self.assertTrue(self.sent_back(self.turn(r, t, x)))
 
     def test_decision_target_is_sent_back(self):
-        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead'})
+        r, t, x = self.flow(x_wait=PERSON_ASK)
+        a = self.turn(r, t, x)
+        self.assertTrue(self.sent_back(a))
+        self.assertIn('a person (decision → @owner)', a.wake_text)
+
+    def test_marked_person_ask_target_is_sent_back(self):
+        r, t, x = self.flow(x_wait={**PERSON_ASK, 'handle': 'lead', 'person_ask': True})
         self.assertTrue(self.sent_back(self.turn(r, t, x)))
+
+    # a question to an agent is answered by an agent, not a person
+    def test_ask_agent_target_is_accepted(self):
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead',
+                                    'decision_request_id': 'dr-6b0e2240'})
+        a = self.turn(r, t, x)
+        self.assertEqual(a.state, 'waiting', a.wake_text)
+
+    def test_agent_handle_decision_target_is_accepted(self):
+        # a marker question to an agent (no request id yet): the handle resolves to a workspace agent
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead'})
+        a = self.turn(r, t, x)
+        self.assertEqual(a.state, 'waiting', a.wake_text)
+
+    def test_filed_agent_recipient_target_is_accepted(self):
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'Someone-Renamed',
+                                    'recipient_id': 'agent-lead'})
+        a = self.turn(r, t, x)
+        self.assertEqual(a.state, 'waiting', a.wake_text)
+
+    def test_target_waiting_for_the_waiters_own_answer_is_accepted(self):
+        # the live case: X asked this very agent; its answer is on the way, X is not a person's
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': self.agent.name,
+                                    'decision_request_id': 'dr-6b0e2240'})
+        a = self.turn(r, t, x)
+        self.assertEqual(a.state, 'waiting', a.wake_text)
+
+    def test_target_waiting_for_the_waiters_own_marker_answer_is_accepted(self):
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': '@' + self.agent.name.upper()})
+        a = self.turn(r, t, x)
+        self.assertEqual(a.state, 'waiting', a.wake_text)
+
+    def test_ask_human_target_is_sent_back(self):
+        # negative control: `ask_human` (Mesh armed the gate) is still a person's
+        r, t, x = self.flow(x_wait={'kind': 'blocking', 'target': '', 'handle': 'owner',
+                                    'human_gate_ref': 'gate-1'}, x_gate=True)
+        a = self.turn(r, t, x)
+        self.assertTrue(self.sent_back(a))
+        self.assertIn('a person (ask_human → @owner)', a.wake_text)
+
+    def test_ask_agent_target_under_a_human_gate_is_sent_back(self):
+        # negative control: a human gate on X holds it whoever X asked
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead',
+                                    'decision_request_id': 'dr-1'}, x_gate=True)
+        a = self.turn(r, t, x)
+        self.assertTrue(self.sent_back(a))
+        self.assertIn('human gate; decision → @lead', a.wake_text)
+
+    def test_roster_failure_keeps_the_wait(self):
+        # an unknown addressee is never taken for a person
+        r, t, x = self.flow(x_wait=PERSON_ASK)
+        def down(ws):
+            from mesh_runner.mesh import MeshError
+            raise MeshError(503, 'roster down')
+        r.mesh.workspace_agents = down
+        r.effects._agents_at = None
+        r.effects._agents = {}
+        self.assertEqual(self.turn(r, t, x).state, 'waiting')
+
+    def test_send_back_log_names_kind_and_addressee(self):
+        r, t, x = self.flow(x_wait={'kind': 'blocking', 'target': '', 'handle': 'owner',
+                                    'human_gate_ref': 'gate-1'}, x_gate=True)
+        with self.assertLogs('mesh_runner', level='INFO') as logs:
+            self.assertTrue(self.sent_back(self.turn(r, t, x)))
+        line = next(m for m in logs.output if 'sent back' in m and f"#{x['id'][:8]}" in m)
+        self.assertIn('waits for a person (ask_human → @owner)', line)
+        self.assertNotIn('a timer or a person', line)
+
+    def test_send_back_log_keeps_the_human_gate_addressee(self):
+        # the human-gate text holds a ';' of its own; the log line kept only
+        # 'waits for a person (human gate' and lost the addressee
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead',
+                                    'decision_request_id': 'dr-1'}, x_gate=True)
+        with self.assertLogs('mesh_runner', level='INFO') as logs:
+            self.assertTrue(self.sent_back(self.turn(r, t, x)))
+        line = next(m for m in logs.output if 'sent back' in m and f"#{x['id'][:8]}" in m)
+        self.assertIn('waits for a person (human gate; decision → @lead)', line)
+        self.assertNotIn('a release gate', line)
+
+    def test_time_target_text_names_the_timer(self):
+        r, t, x = self.flow(x_wait={'kind': 'time', 'target': '', 'until': '2026-11-20T04:00:00+00:00'})
+        a = self.turn(r, t, x)
+        self.assertTrue(self.sent_back(a))
+        self.assertIn('time until 2026-11-20T04:00:00+00:00', a.wake_text)
 
     def test_human_gate_ready_target_is_sent_back(self):
         r, t, x = self.flow(x_state='ready', x_gate=True)
@@ -71,7 +165,7 @@ class CardWaitOnIdleTarget(Bench):
         self.assertEqual(self.turn(r, t, x).state, 'waiting')
 
     def test_umbrella_target_is_accepted(self):
-        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead'}, x_extra={'labels': ['umbrella']})
+        r, t, x = self.flow(x_wait=PERSON_ASK, x_extra={'labels': ['umbrella']})
         self.assertEqual(self.turn(r, t, x).state, 'waiting')
 
     def test_running_target_is_accepted(self):
@@ -102,8 +196,7 @@ class CardWaitOnIdleTarget(Bench):
         self.addCleanup(r.store.db.close)
         r.refresh_me()
         ax = r.store.create(self.agent.name, x['id'], 'claude')
-        r.store.update(ax, state='waiting', wait={'kind': 'decision', 'target': '', 'handle': 'lead',
-                                                 'since': iso(), 'started': iso()})
+        r.store.update(ax, state='waiting', wait={**PERSON_ASK, 'since': iso(), 'started': iso()})
         self.assertEqual(self.turn(r, t, x).state, 'waiting')
 
     def test_repeat_counts_in_the_wait_budget(self):
@@ -117,7 +210,44 @@ class CardWaitOnIdleTarget(Bench):
         self.assertNotEqual(a.state, 'ready')
         self.assertGreaterEqual(r.store.idle_waits_today(self.agent.name, t['id']), 1)
 
-    # 53db6352: what the waiter waits for, and what the target's timer is, decide the send-back
+    def test_same_wait_redeclared_on_unchanged_target_is_accepted(self):
+        # told once, the dependent declares the same wait again while X has not moved:
+        # waking it again brings no new event, the wait stands
+        r, t, x = self.flow(x_wait={'kind': 'time', 'target': '', 'until': iso(), 'mesh_wait_id': 'w1'})
+        self.assertTrue(self.sent_back(self.turn(r, t, x)))
+        a = self.turn(r, t, x, first=False)
+        self.assertEqual(a.state, 'waiting')
+
+    def test_changed_target_state_is_told_once_more(self):
+        # a new (dependent, target state) pair is told again: real ungated work is not stuck
+        r, t, x = self.flow(x_wait={'kind': 'time', 'target': '', 'until': iso(), 'mesh_wait_id': 'w1'})
+        self.assertTrue(self.sent_back(self.turn(r, t, x)))
+        ax = r.store.waiting_on_task(x['id'][:8])[0]
+        r.store.update(ax, wait={'kind': 'decision', 'target': '', 'handle': 'lead', 'person_ask': True,
+                                 'mesh_wait_id': 'w2', 'since': iso(), 'started': iso()})
+        self.assertTrue(self.sent_back(self.turn(r, t, x, first=False)))
+        self.assertEqual(self.turn(r, t, x, first=False).state, 'waiting')
+
+    def test_new_human_gate_on_same_target_is_told_again(self):
+        # a gate cleared and raised again on the same attempt is a new target state
+        r, t, x = self.flow(x_state='ready', x_gate=True)
+        x['human_gate_info'] = {'gated': True, 'marker_comment_id': 'c1'}
+        self.assertTrue(self.sent_back(self.turn(r, t, x)))
+        x['human_gate_info'] = {'gated': True, 'marker_comment_id': 'c2'}
+        self.assertTrue(self.sent_back(self.turn(r, t, x, first=False)))
+        self.assertEqual(self.turn(r, t, x, first=False).state, 'waiting')
+
+    def test_gated_agent_question_target_is_told_once_per_gate(self):
+        # X asked an agent and a human gate holds it: told once, again only for a new gate
+        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead',
+                                    'decision_request_id': 'dr-1'}, x_gate=True)
+        x['human_gate_info'] = {'gated': True, 'marker_comment_id': 'c1'}
+        self.assertTrue(self.sent_back(self.turn(r, t, x)))
+        x['human_gate_info'] = {'gated': True, 'marker_comment_id': 'c2'}
+        self.assertTrue(self.sent_back(self.turn(r, t, x, first=False)))
+        self.assertEqual(self.turn(r, t, x, first=False).state, 'waiting')
+
+    # what the waiter waits for, and what the target's timer is, decide the send-back
     def turn_line(self, r, t, x, line):
         write_replies(self.replies, {t['id'][:8]: line, t['id'][:8] + ':resume': line})
         r.start_new(1)
@@ -141,7 +271,7 @@ class CardWaitOnIdleTarget(Bench):
         self.condition_on_time_target('shipped')
 
     def test_acceptance_condition_on_decision_target_is_accepted(self):
-        r, t, x = self.flow(x_wait={'kind': 'decision', 'target': '', 'handle': 'lead'})
+        r, t, x = self.flow(x_wait=PERSON_ASK)
         a = self.turn_line(r, t, x, wait_card(x['id'], condition='accepted'))
         self.assertEqual(a.state, 'waiting', a.wake_text)
 

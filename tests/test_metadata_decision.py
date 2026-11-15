@@ -397,6 +397,21 @@ class MetadataAttemptIsolation(Bench):
         argv, = self.argv_of_first_turn(runner)
         self.assertIn("--disallowedTools", argv)
 
+    def test_harness_without_read_only_holds_the_metadata_turn(self):
+        """Kimi print mode cannot confine one turn: the decision waits, it never runs with write tools."""
+        t = decision()
+        runner = self.runner(FakeMesh([t], max_concurrent=1))
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="awaiting evidence")})
+        with patch.object(runner.adapter, "with_read_only", side_effect=NotImplementedError("no read-only")), \
+             patch.object(runner.adapter, "spawn") as native:
+            runner.tick()
+        native.assert_not_called()
+        # a cold start is given back (the task backs off for the gate-hold period), nothing ran
+        attempt, = runner.store.by_state(self.agent.name, ("aborted",))
+        self.assertIn("cannot run a read-only metadata turn", attempt.note)
+        self.assertFalse(runner.pool.leased_to(attempt.id))
+        self.assertIn(t["id"], runner._task_backoff)
+
     def test_code_attempt_keeps_its_tools(self):
         plain = task(2)
         runner = self.runner(FakeMesh([plain], max_concurrent=1))

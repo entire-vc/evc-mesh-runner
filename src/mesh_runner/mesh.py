@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from . import coalesced_http
+from . import checkout_fence, coalesced_http
 from . import observation_budget as budget
 
 log = logging.getLogger("mesh_runner")
@@ -38,6 +38,15 @@ RATE_LIMIT_MAX_SLEEP = 30.0
 RATE_LIMIT_DEFAULT_SLEEP = 2.0
 # producer the Runner declares on POST /tasks/:id/move (activity_log.source)
 MOVE_SOURCE = "mesh-runner"
+
+# The runner's own notes open with this prefix and carry ``metadata.source`` = RUNNER_NOTE_SOURCE.
+# Mesh reads a comment whose source is anything but api/ui/mcp as automation, so a note that lands
+# on a card someone else has just closed (a reviewer lane's completion line) does not open a
+# follow-up card. Text the runner relays for others (mail, questions) does not open with the
+# prefix and stays unlabelled. ``source`` only: readers deciding whether a comment needs
+# attention key on ``informational``, and runner notes must stay visible to them.
+RUNNER_NOTE_PREFIX = "[runner]"
+RUNNER_NOTE_SOURCE = "mesh-runner"
 # Idempotency-Key of a spend report: uuid5 of the report id under this namespace, so the same report
 # carries the same key on every send (a 429 repeat, a settle that runs again) and another report a new one
 SESSION_REPORT_KEY_NS = uuid.UUID("5b0c6f1e-2f7d-4c55-9a51-0d8e3b6a7c42")
@@ -124,6 +133,11 @@ class MeshClient:
         self._bearer = bearer
         self.timeout = timeout
         self._open = opener or coalesced_http.urlopen
+        # The checkout fence (checkout_fence.py). ``fence_for(task_id)`` returns the headers naming the
+        # lock this lane holds on the task ({} when it holds none); ``on_fence_refused(task_id, code, body)``
+        # hears a 409 Mesh gave a fenced write. Both unset: the writes go out unfenced, as before.
+        self.fence_for = None
+        self.on_fence_refused = None
 
     def __repr__(self) -> str:  # never show the key
         return f"MeshClient({self.base!r})"
@@ -340,14 +354,30 @@ class MeshClient:
         """Post a comment. ``key`` names this write (kind, attempt, turn); it becomes the request's
         Idempotency-Key, so a repeat after a lost answer or a restart posts nothing new. A key
         already used for another body means this write happened before: nothing is posted and
-        ``{"idempotent_reused": True}`` is returned."""
+        ``{"idempotent_reused": True}`` is returned. A card this lane holds gets its fence too.
+        A runner note (``[runner]`` prefix) is labelled automation: see RUNNER_NOTE_SOURCE."""
         try:
-            return self.request("POST", f"/tasks/{task_id}/comments", {"body": body},
+            payload: dict[str, Any] = {"body": body}
+            if body.lstrip().startswith(RUNNER_NOTE_PREFIX):
+                payload["metadata"] = {"source": RUNNER_NOTE_SOURCE}
+            return self._fenced("POST", task_id, f"/tasks/{task_id}/comments", payload,
                                 idem_key=write_key("comment", task_id, key) if key else "")
         except MeshError as e:
             if key and self.idempotency_keys and e.status == 409 and error_code(e) == IDEMPOTENCY_KEY_REUSED:
                 log.info("comment on #%s already written under key %s; not posted again", task_id[:8], key)
                 return {"idempotent_reused": True}
+            raise
+
+    def _fenced(self, method: str, task_id: str, path: str, body: Any, idem_key: str = "") -> Any:
+        """A result write on ``task_id``: with the fence of the lock this lane holds on it, if any."""
+        fence = (self.fence_for(task_id) if self.fence_for else None) or {}
+        try:
+            return self.request(method, path, body, headers=fence or None, idem_key=idem_key)
+        except MeshError as e:
+            if fence and e.status == 409 and self.on_fence_refused is not None:
+                code = checkout_fence.refusal_code(e.body)
+                if code:
+                    self.on_fence_refused(task_id, code, e.body)
             raise
 
     def dependencies(self, task_id: str) -> dict:
@@ -413,7 +443,7 @@ class MeshClient:
             body["expected_version"] = int(expected_version)
         if expected_status_id:
             body["expected_status_id"] = expected_status_id
-        return self.request("POST", f"/tasks/{task_id}/move", body)
+        return self._fenced("POST", task_id, f"/tasks/{task_id}/move", body)
 
     def session_report(self, task_id: str, tokens_in: int | None, tokens_out: int | None, model: str, cost: float | None,
                        report_id: str = "") -> None:

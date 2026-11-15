@@ -545,6 +545,10 @@ class TargetJobs(Bench):
             with self.subTest(status=status):
                 self.tearDown(), self.setUp()
                 r, a, t, gl, o = self.setup_wait(target_status=status)
+                if status == 'created':
+                    # created waits for a job that moves; behind a manual job with nothing moving it
+                    # needs a person (test_jobs_blocked_behind_manual)
+                    gl.jobs[self.TARGET].append({'id': 9020, 'name': 'build', 'status': 'running'})
                 r._wake_one(a)
                 self.assertEqual(r.store.get(a.id).state, 'waiting')
 

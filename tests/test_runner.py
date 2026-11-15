@@ -429,6 +429,24 @@ class Loop(Bench):
         self.assertRegex(line, r"^\[runner\] ✅ completed in ~\d+m · session=\w+ · 1 turns · ~\$[\d.]+ notional "
                                r"\(out [\d.]+k tok, cache_rd [\d.]+M\)$")
 
+    def test_completion_comment_off_writes_no_completion_line(self):
+        """[runner] completion_comment = false: an attempt that completes leaves no line on the task
+        (the line names the harness, the session and the token counts)."""
+        self.cfg.completion_comment = False
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: "done"})
+        r = self.runner(mesh)
+        r.tick()
+        a = r.store.by_state("builder", ("running",))[0]
+        mesh.set_category(t["id"], "review")
+        self.settle_all(r)
+        self.assertEqual(r.store.get(a.id).state, "completed")
+        self.assertEqual(mesh.checkouts, {})
+        bodies = [c["body"] for c in mesh.comment_log.get(t["id"], [])]
+        self.assertEqual([b for b in bodies if "completed in" in b], [])
+        self.assertEqual([b for b in bodies if "session=" in b or " tok" in b], [])
+
     def test_background_child_keeps_the_slot_until_it_exits(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
@@ -2521,6 +2539,7 @@ class Hardening(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
         r.memgate.t.hold_free_pct, r.memgate.t.release_free_pct = 15, 20
+        r.memgate.settle_seconds = 0                               # the settle has its own tests (test_hostmem)
         r.memgate._read = lambda: (10.0, None)
         r.tick()
         self.assertEqual(calls(self.calls), [])
@@ -2535,6 +2554,7 @@ class Hardening(Bench):
         mesh = FakeMesh([t], max_concurrent=1)
         r = self.runner(mesh)
         r.loadgate.t.hold_per_cpu = 4.0
+        r.loadgate.settle_seconds = 0                              # the settle has its own tests (test_hostmem)
         r.loadgate._read = lambda: (80.0, 10)                      # 8 per CPU
         with self.assertLogs("mesh_runner", "WARNING") as logs:
             r.tick()
@@ -2562,6 +2582,24 @@ class Hardening(Bench):
         r.tick()
         self.assertEqual(len(calls(self.calls)), 1)                   # no session on an unknown identity
         self.assertNotIn(t2["id"][:8], {k for k, v in self.states(r).items() if v == "running"})
+
+    def test_env_command_sees_the_card_it_starts(self):
+        # per-card overflow: an operator route can pin one card to its own account only if the
+        # env command knows which card the session is for; a card-less read names none
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.agent.env_command = [sys.executable, "-c",
+                                  "import os; print('PROBE=' + os.environ.get('MESH_RUNNER_TASK', 'none') + '|'"
+                                  " + os.environ.get('MESH_RUNNER_LANE', 'none'))"]
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        self.assertEqual(calls(self.calls)[0]["probe"], f"{t['id']}|{self.agent.name}")
+        self.assertEqual(r._read_env().get("PROBE"), "none|none")        # no card: neither variable
+        with mock.patch.dict(os.environ, {"MESH_RUNNER_TASK": "stale-card", "MESH_RUNNER_LANE": "other"}):
+            self.assertEqual(r._read_env().get("PROBE"), "none|none")    # nor an inherited one
+            self.assertEqual(r._fresh_env(t["id"]).get("PROBE"), f"{t['id']}|{self.agent.name}")
 
     def test_env_command_routes_the_harness_profile_per_spawn(self):
         # a Codex lane moved to another account gets another --profile, not an env var
@@ -2747,6 +2785,44 @@ class OwnWorkInReview(Bench):
         self.assertIn("MR !7 merged", prompts[0])
         self.assertIn("accept: everything the task asks for", prompts[0])  # someone else spoke on it
 
+    def test_own_card_sent_to_review_again_ends_the_attempt_without_a_correction(self):
+        """Fed back with news, the author calls finish_task to=review once more
+        on its own card that is already in review. Mesh moves nothing; the turn is settled (the review
+        router routes the card), not refused with "does not settle a turn" and a correction turn."""
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        self.own_work(mesh, r, t)
+        mesh.add_comment(t["id"], "route is free again, send it to review once more", author="agent-lead")
+        write_replies(self.replies, {t["id"][:8]: finish("review", evidence="same head, same evidence")})
+        r._hold_cache.clear()
+        r.tick()
+        self.settle_all(r)
+        review = [a for a in r.store.by_state("builder", ("completed", "ready", "waiting", "failed"))
+                  if a.mode == "review"]
+        self.assertEqual(len(review), 1, [(a.mode, a.state, a.note) for a in r.store.by_state(
+            "builder", ("completed", "ready", "waiting", "failed", "running"))])
+        self.assertEqual(review[0].state, "completed")
+        self.assertTrue(review[0].note.startswith("sent to review again"), review[0].note)
+        self.assertEqual(review[0].no_outcome, 0)
+        self.assertEqual(mesh.tasks[t["id"]]["status_id"], "s-rev")
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], AGENT_ID)
+        self.assertFalse(any("does not settle" in c["prompt"] for c in calls(self.calls)))
+
+    def test_a_reviewers_to_review_on_someone_elses_card_stays_a_correction(self):
+        t = task(1, cat="review")
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: finish("review")})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        review = [a for a in r.store.by_state("builder", ("completed", "ready", "waiting", "failed"))
+                  if a.mode == "review"]
+        self.assertEqual(len(review), 1)
+        self.assertNotEqual(review[0].note, "sent to review again: the card stays in review, "
+                                            "the review router assigns the reviewer")
+        self.assertEqual(review[0].no_outcome, 1)
+
     def test_without_news_it_waits_for_someone_else(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
@@ -2801,7 +2877,9 @@ class OwnWorkInReview(Bench):
         self.assertIn("MR !7 fix was merged", prompts[0])
         self.assertIn("You must not accept your own work", prompts[0])     # merged, but nobody reviewed it
         self.assertNotIn("accept: everything the task asks for", prompts[0])
-        self.assertIn("already reviewed", r._review_hold(mesh.tasks[t["id"]]))   # fed once, then the refeed rule
+        # fed once; that feed ended without a readable outcome, so it is no review, and
+        # the no-outcome rule holds it for someone else's word instead of the refeed window
+        self.assertEqual(self.review_hold(r, t), "no readable outcome; waits for a comment from someone else")
 
     def test_a_pipeline_finished_on_gitlab_since_releases_it(self):
         t = task(1)
@@ -3125,6 +3203,99 @@ review_own_hold_hours = 0.5
         from mesh_runner.config import ConfigError
         with self.assertRaises(ConfigError):
             load(cfg)
+
+
+class ReviewWithoutVerdict(Bench):
+    """A review attempt that ended without deciding anything is not a review."""
+
+    def fed_review(self, r, t, state, events=(), turns=1, ended_minutes_ago=0):
+        """``events``: kinds, or (kind, detail) pairs (a readable outcome carries the outcome kind)."""
+        a = r.store.create("builder", t["id"], "claude", mode="review")
+        ended = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=ended_minutes_ago)).isoformat()
+        r.store.db.execute("UPDATE attempts SET state=?, turns=?, updated_at=? WHERE id=?",
+                           (state, turns, ended, a.id))
+        for event in events:
+            r.store.event(a.id, *((event,) if isinstance(event, str) else event))
+        r.store.mark("builder", t["id"], "review_fed", a.id)
+        return a
+
+    def hold(self, r, t):
+        r._hold_cache.clear()
+        return r.hold_reason(dict(r.mesh.tasks[t["id"]], _mode="review"), "review")
+
+    def test_an_unknown_attempt_ended_by_the_quiet_rule_is_fed_again(self):
+        t = task(1, cat="review")
+        r = self.runner(FakeMesh([t], max_concurrent=1))
+        self.fed_review(r, t, "completed", ("prompt_delivery_unknown", "quiet_resolution"))
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            self.assertEqual(self.hold(r, t), "")
+        self.assertTrue(any("review fed again" in line for line in logs.output))
+
+    def test_a_failed_review_waits_only_for_the_failure_cooldown(self):
+        # a harness error ends the attempt failed: the 30 min failure cooldown (no hot loop on a
+        # repeating error) applies, and nothing longer
+        t = task(1, cat="review")
+        r = self.runner(FakeMesh([t], max_concurrent=1))
+        self.fed_review(r, t, "failed")
+        self.assertEqual(self.hold(r, t), "failed recently; waits for a new comment")
+
+    def test_a_harness_error_or_no_outcome_is_fed_again(self):
+        cases = (("failed", ()), ("failed", ("no_outcome",)), ("completed", ("operator_resolution",)))
+        tasks = [task(n + 1, cat="review") for n in range(len(cases))]
+        r = self.runner(FakeMesh(tasks, max_concurrent=1))
+        for t, (state, events) in zip(tasks, cases):
+            with self.subTest(state=state, events=events):
+                self.fed_review(r, t, state, events, ended_minutes_ago=40)
+                self.assertEqual(self.hold(r, t), "")
+
+    def test_a_next_then_a_turn_that_died_is_fed_again(self):
+        # continue_next is a readable outcome but no verdict; the next turn went unknown and was closed
+        for closed in ("quiet_resolution", "operator_resolution"):
+            with self.subTest(closed=closed):
+                t = task(1 if closed == "quiet_resolution" else 2, cat="review")
+                r = self.runner(FakeMesh([t], max_concurrent=1))
+                self.fed_review(r, t, "completed", (("readable_outcome", "next"), "prompt_delivery_unknown", closed))
+                self.assertEqual(self.hold(r, t), "")
+
+    def test_a_verdict_followed_by_a_dead_turn_is_no_review(self):
+        # a decision, then more turns, the last of them died: the attempt ended deciding nothing
+        t = task(1, cat="review")
+        r = self.runner(FakeMesh([t], max_concurrent=1))
+        self.fed_review(r, t, "completed", (("readable_outcome", "mr"), ("readable_outcome", "next"),
+                                            "quiet_resolution"))
+        self.assertEqual(self.hold(r, t), "")
+
+    def test_a_review_with_a_readable_outcome_still_holds(self):
+        # positive control: an attempt whose last word decided is the review it always was, also when an
+        # earlier turn missed, and a readable outcome without its kind (written before the rule) too
+        cases = ((("no_outcome", ("readable_outcome", "review")), "completed"),
+                 ((("readable_outcome", "next"), ("readable_outcome", "handoff")), "completed"),
+                 (("no_outcome", ("readable_outcome", "review")), "failed"),
+                 (("no_outcome", "readable_outcome"), "completed"))
+        tasks = [task(n + 1, cat="review") for n in range(len(cases))]
+        r = self.runner(FakeMesh(tasks, max_concurrent=1))
+        for t, (events, state) in zip(tasks, cases):
+            with self.subTest(events=events, state=state):
+                self.fed_review(r, t, state, events, ended_minutes_ago=40)
+                self.assertEqual(self.hold(r, t), "review: already reviewed; waits for a new comment")
+
+    def test_a_live_or_otherwise_completed_review_still_holds(self):
+        t = task(1, cat="review")
+        r = self.runner(FakeMesh([t], max_concurrent=1))
+        a = self.fed_review(r, t, "waiting")
+        self.assertEqual(self.hold(r, t), "review: already reviewed; waits for a new comment")
+        r.store.db.execute("UPDATE attempts SET state='completed' WHERE id=?", (a.id,))
+        self.assertEqual(self.hold(r, t), "review: already reviewed; waits for a new comment")
+
+    def test_refeeds_without_a_verdict_stop_at_the_daily_start_cap(self):
+        t = task(1, cat="review")
+        r = self.runner(FakeMesh([t], max_concurrent=1))
+        self.cfg.daily_start_cap = 2
+        self.fed_review(r, t, "failed", ended_minutes_ago=90)
+        self.assertEqual(self.hold(r, t), "")
+        self.fed_review(r, t, "failed", ended_minutes_ago=40)
+        self.assertEqual(self.hold(r, t),
+                         "review: the review attempts ended without a verdict; daily start cap reached")
 
 
 class SkipStates(Bench):

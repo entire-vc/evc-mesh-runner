@@ -204,6 +204,19 @@ class Request(MergeBench):
     def test_unknown_pools_close_the_handoff(self):
         self.refused("no-reviewer:unknown: pools", sel=lambda *a, **k: {"lane": None, "reason": "unknown: pools"})
 
+    def test_same_family_reasons_are_assignable(self):
+        # other-provider review preferred, not required
+        for reason in ("same-family: quota", "same-family: other-unavailable", "same-family: ci-only"):
+            with self.subTest(reason=reason):
+                mesh, gl = world(None, None)
+                out = ask(mesh, gl, apply=True, sel=lambda *a, _r=reason, **k: {**SELECTION, "reason": _r})
+                self.assertTrue(out["ready"], out["refusals"])
+
+    def test_bare_or_foreign_reasons_stay_refused(self):
+        for reason in ("same-family: ", "same-family:quota", "skip: no-cross-family-reviewer", "no-reviewer: quota"):
+            with self.subTest(reason=reason):
+                self.refused("no-reviewer:", sel=lambda *a, _r=reason, **k: {**SELECTION, "lane": "Reviewer-Codex", "reason": _r})
+
     def test_malformed_router_answer_fails_closed(self):
         for bad in ({"lane": ["x"], "reason": "cross-family", "username": "u"},
                     {"lane": "l", "reason": ["cross-family"], "username": "u"},

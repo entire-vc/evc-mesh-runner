@@ -3,7 +3,10 @@ held, the card keeps its counters, the operator gets one signal naming the accou
 import datetime as dt
 import json
 import os
+import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from mesh_runner.adapters.codex import CodexAdapter
 from fakes import FakeMesh, task
 from test_runner import Bench
 from mesh_runner.runner import Runner
+from mesh_runner.store import Store
 
 # verbatim from provider turn logs (Codex CLI 0.159.3)
 REFUSAL = ('{"type":"error","status":400,"error":{"type":"invalid_request_error","message":'
@@ -214,6 +218,72 @@ class Alerts(Bench):
         status = json.loads((self.cfg.state_dir / "status.json").read_text())
         self.assertEqual([h["profile"] for h in status["auth_holds"]], [live])
         self.assertNotIn(stale, json.dumps(status))
+
+    # ------------------------------------------- 3b. status loop never reads a lane's connection
+    def _lane_with_live_login(self):
+        t = task(88)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r = self.runner(mesh)
+        r.refresh_me()
+        live = "c311f056c7fa60485963258e3c0aa840"
+        auth.hold(r.store, live)
+        r.store.mark(self.agent.name, t["id"], "auth_launch", json.dumps({"attempt": "y", "turn": 1, "profile": live}))
+        outer = Runner(self.cfg, lock=False)
+        outer.agents = [r]
+        outer.store = Store(Path(r.store.db.execute("PRAGMA database_list").fetchone()[2]))
+        return r, outer, live
+
+    def test_runner_wide_holds_are_read_through_the_runners_own_connection(self):
+        # A sqlite connection belongs to its lane's thread; the status loop runs on another one.
+        r, outer, live = self._lane_with_live_login()
+        owner = threading.get_ident() + 1                      # the lane's thread, not this one
+        real = r.store.db
+
+        class OwnedConnection:
+            def execute(self, *args, **kwargs):
+                if threading.get_ident() != owner:
+                    raise sqlite3.ProgrammingError("lane connection used from another thread")
+                return real.execute(*args, **kwargs)
+
+        r.store.db = OwnedConnection()
+        try:
+            outer.write_status([])
+        finally:
+            r.store.db = real
+        status = json.loads((self.cfg.state_dir / "status.json").read_text())
+        self.assertEqual([h["profile"] for h in status.get("auth_holds", [])], [live])
+
+    def test_lane_tick_and_status_loop_in_parallel_never_break_a_row(self):
+        # The live failure: 'not enough values to unpack (expected 1, got 0)' in _own_profiles while
+        # the runner's status loop iterated the same connection from the main thread.
+        r, outer, live = self._lane_with_live_login()
+        for i in range(200):
+            r.store.mark(self.agent.name, f"bulk-{i}", "auth_launch", json.dumps({"attempt": "z", "turn": 1,
+                                                                                  "profile": live}))
+        errors, stop = [], threading.Event()
+        deadline = time.monotonic() + 2.0
+
+        def lane():
+            while not stop.is_set() and time.monotonic() < deadline:
+                try:
+                    self.assertEqual(r._own_profiles(), {live})
+                except Exception as e:                         # noqa: BLE001 - any break is the defect
+                    errors.append(f"lane: {type(e).__name__}: {e}")
+                    stop.set()
+
+        worker = threading.Thread(target=lane)
+        worker.start()
+        try:
+            while not stop.is_set() and time.monotonic() < deadline:
+                try:
+                    outer.write_status([])
+                except Exception as e:                         # noqa: BLE001
+                    errors.append(f"status: {type(e).__name__}: {e}")
+                    stop.set()
+        finally:
+            stop.set()
+            worker.join()
+        self.assertEqual(errors, [])
 
     def agent_store(self):
         from mesh_runner.store import Store

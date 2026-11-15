@@ -5,9 +5,12 @@ of card waits to the card that does not wait on another card: the root. A root i
 holds it (a lane working it, a pipeline, a person, another workspace, a card nobody runs, ...) and
 counted: how many waiting cards stand behind it and how old the oldest of those waits is.
 
-Only one kind of root is acted on: a card of one of this runner's agents that has no open attempt
-and is ready to start (``ready``). Its lane starts it before its other ordinary work, heaviest first
-(``AgentRunner._work_order``). Every other root is only shown (status file, ``mesh-runner roots``).
+Two kinds of root are acted on: a card of one of this runner's agents that has no open attempt
+and is ready to start (``ready``), and a root whose own attempt here is ready to resume (``queued``).
+A lane starts a ``ready`` root before its other ordinary work and resumes a ``queued`` one before its
+other ready attempts, heaviest first (``AgentRunner._work_order``, ``resume_ready``); after a host hold
+the shared start ramp gives its slots to the heaviest of both across lanes (``hostmem.StartRamp``).
+Every other root is only shown (status file, ``mesh-runner roots``).
 The radar writes nothing: no comment, no store row, no Mesh write; a card read that fails or is out
 of budget classifies the root as unread, never as ready.
 """
@@ -35,6 +38,7 @@ OLD_HOURS = 72.0             # the measured share: card waits older than three d
 STATUS_ROOTS = 25
 
 BOOST = "ready"
+QUEUED = "queued"          # the root's own attempt here is ready to resume
 ACTIVE_STATES = ("running", "starting")
 HUMAN = "human"
 
@@ -62,6 +66,17 @@ class Radar:
         for r in self.roots:
             if r.kind == BOOST:
                 out[r.task_id] = out.get(r.task_id, 0) + r.behind
+        return out
+
+    def startable(self) -> dict[str, dict[str, int]]:
+        """lane -> {root: waiting cards behind it} for the roots a lane of this runner would start now:
+        ``ready`` (a card of the lane with no open attempt) and ``queued`` (the lane's attempt is ready
+        to resume). The host's start ramp orders its slots by these across lanes."""
+        out: dict[str, dict[str, int]] = {}
+        for r in self.roots:
+            if r.kind in (BOOST, QUEUED) and r.holder:
+                lane = out.setdefault(r.holder, {})
+                lane[r.task_id] = lane.get(r.task_id, 0) + r.behind
         return out
 
     def kinds(self) -> dict[str, int]:
@@ -175,7 +190,7 @@ def build(open_: dict[str, list[dict]], read_card: Callable[[str, str], dict | N
         if r["state"] in ACTIVE_STATES:
             return task, "working", r["agent"], d
         if r["state"] == "ready":
-            return task, "queued", r["agent"], d
+            return task, QUEUED, r["agent"], d
         if r["state"] != "waiting":
             return task, "unknown-state", r["agent"], d
         if r["wait"].get("kind") == "card":
@@ -311,12 +326,17 @@ class RootRadar:
         self._reader: CardReader | None = None
         self.radar: Radar | None = None
         self._weights: dict[str, int] = {}
+        self._startable: dict[str, dict[str, int]] = {}
         self._next = 0.0
         self._worker: threading.Thread | None = None
         self._failing = False
 
     def weight(self, task_id: str) -> int:
         return self._weights.get(task_id, 0)
+
+    def startable_for(self, lane: str) -> dict[str, int]:
+        """The roots ``lane`` would start or resume now, with the waiting cards behind each (Radar.startable)."""
+        return dict(self._startable.get(lane, {}))
 
     def refresh(self) -> Radar | None:
         try:
@@ -331,7 +351,7 @@ class RootRadar:
         if self._failing:
             self._failing = False
             log.info("wait roots: refresh recovered")
-        self.radar, self._weights = radar, radar.weights()
+        self.radar, self._weights, self._startable = radar, radar.weights(), radar.startable()
         return radar
 
     def refresh_if_due(self) -> None:

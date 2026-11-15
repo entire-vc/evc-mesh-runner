@@ -3,7 +3,9 @@
 Default stays "the author merges their own MR". This module adds an explicit request: a
 separate merge-only card, assigned to the project's reviewer chosen by the stock router, that
 the reviewer's own runner runs through ``WAIT merge:`` under the reviewer's fresh env. The
-product card (assignee, checkout, deploy, live QA) is never touched.
+product card (assignee, checkout, deploy, live QA) is never touched. The runner also files such a
+card itself, for the card's lead, when the author's merge gate ends with ``⛔ MERGE RIGHTS``
+(``RIGHTS_REASON``; ``Runner._merge_to_lead``).
 
 ``evaluate`` is pure: it turns facts into a plan or a named refusal. Anything unknown refuses.
 ``request`` reads the facts and, with ``apply``, creates the one card (stable key, no duplicates).
@@ -26,11 +28,22 @@ from .mesh import MeshError
 
 LABEL = "merge-only"
 MARKER = "reviewer-merge:v1"
+# reason of a merge-only card the runner files for the card's lead when the author's GitLab identity
+# may not merge (the merge gate's `⛔ MERGE RIGHTS` line); the router's reasons are others
+RIGHTS_REASON = "merge-rights"
 BLOCK = re.compile(r"<!-- reviewer-merge:v1 (\{.*?\}) -->", re.S)
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 TARGET = re.compile(r"(?P<project>[^\s!]+/[^\s!]+)!(?P<iid>[1-9][0-9]{0,11})")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
-SELECT_REASONS = ("cross-family", "same-family: quota")   # the router's only assignable reasons
+SELECT_REASONS = ("cross-family", "same-family: quota")   # the router's assignable reasons, plus:
+# the reviewer router assigns the author's own family when no other
+# family can review: "same-family: <why>" (quota, other-unavailable, ci-only). Other-provider review is
+# preferred, not required; the author is still never the reviewer (checked below).
+SAME_FAMILY_PREFIX = "same-family: "
+
+
+def assignable(reason):
+    return reason in SELECT_REASONS or (reason.startswith(SAME_FAMILY_PREFIX) and len(reason) > len(SAME_FAMILY_PREFIX))
 CI_OK = ("success", "manual")                              # post-review jobs wait for the gate itself
 DONE = ("done", "cancelled")
 
@@ -124,7 +137,7 @@ def evaluate(*, source: dict, project: str, iid: str, sha: str, mr: dict, select
     if (lane is not None and not isinstance(lane, str)) or not isinstance(selection.get("username", ""), str):
         bad.append("reviewer-select-malformed")             # a list or number is not a lane: nothing below runs on it
         lane = None
-    elif not lane or reason not in SELECT_REASONS:
+    elif not lane or not assignable(reason):
         bad.append("no-reviewer:" + (reason or "unknown")[:60])
     elif str(lane).casefold() == author.casefold():
         bad.append("reviewer-is-author")
@@ -171,16 +184,27 @@ def resolve_todo(statuses) -> str:
 def card_fields(req: dict, project_id: str, status_id: str) -> dict:
     target = f"{req['project']}!{req['iid']}"
     src8 = req["source_task"][:8]
+    rights = req.get("reason") == RIGHTS_REASON
+    if rights:                                           # the runner's merge-rights handover to the lead
+        who = (f"Merge-only поручение лиду по MR {target}; продуктовая карточка #{src8} остаётся у автора "
+               f"({req['author_lane']}): checkout, deploy и live QA не меняются.\n\n"
+               f"Мёржит: {req['reviewer_lane']} (GitLab `{req['reviewer_username']}`). Merge gate автора прошёл "
+               "все проверки, но GitLab-личность автора не может вливать в целевую ветку (MERGE RIGHTS).\n")
+        refused = ("тогда прокомментируй причину и закрой эту карточку (finish_task): автор проснётся на своей "
+                   "карточке и прочтёт причину.")
+    else:
+        who = (f"Merge-only поручение reviewer'у по MR {target}; продуктовая карточка #{src8} остаётся у автора "
+               f"({req['author_lane']}): checkout, deploy и live QA не меняются.\n\n"
+               f"Reviewer: {req['reviewer_lane']} (GitLab `{req['reviewer_username']}`), выбран router: {req['reason']}.\n")
+        refused = "тогда прокомментируй причину и верни карточку автору."
     body = (
-        f"Merge-only поручение reviewer'у по MR {target}; продуктовая карточка #{src8} остаётся у автора "
-        f"({req['author_lane']}): checkout, deploy и live QA не меняются.\n\n"
-        f"Reviewer: {req['reviewer_lane']} (GitLab `{req['reviewer_username']}`), выбран router: {req['reason']}.\n"
+        who +
         f"Expected HEAD: `{req['sha']}`.\n\n"
         f"Сделай ровно одно: заверши ход командой Mesh\n\n"
         f"wait_for on=merge project_path={req['project']} mr_iid={req['iid']} after_sha={req['sha']}\n\n"
         "Runner запустит штатный gate под твоим fresh env и сверит GitLab /user с этой lane до мутации. "
         "Review заново не запускать. HEAD drift, hold, чужой receipt или красный CI — gate откажет; "
-        "тогда прокомментируй причину и верни карточку автору.\n\n"
+        + refused + "\n\n"
         f"<!-- reviewer-merge:v1 {json.dumps(req, sort_keys=True, separators=(',', ':'))} -->")
     return {"title": f"[merge-only] {target} @{req['sha'][:12]} ({req['key']})", "description": body,
             "priority": "urgent", "labels": [LABEL, "kind:ops", req["key"]], "status_id": status_id}

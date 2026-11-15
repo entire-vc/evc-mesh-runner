@@ -156,6 +156,95 @@ class AgentAddressee(AskBench):
         self.assertEqual(self.wait["handle"], "lead")
 
 
+def lane(name, agent_id="", workspace="ws1", paused=False):
+    """Another lane of the same process as the runner sees it: its config name and the ``me`` of its key
+    (empty ``me``: its key was not read yet)."""
+    me = {"id": agent_id, "name": name.split("-")[0], "workspace_id": workspace} if agent_id else {}
+    return SimpleNamespace(agent=SimpleNamespace(name=name, paused=paused), me=me)
+
+
+class WorkspaceLane(AskBench):
+    """An agent is run by this runner per workspace (one lane per workspace its keys open). A
+    question to an agent none of whose lanes serves the asking card's workspace is filed nowhere: its
+    request card would sit in a queue no lane polls."""
+
+    def with_lanes(self, *others):
+        self.r.lanes = [self.r, *others]
+
+    def test_an_agent_run_here_only_for_another_workspace_is_refused_with_who_answers_here(self):
+        self.setup_route("reviewer")
+        self.agent.lead = ""
+        self.with_lanes(lane("reviewer", "agent-reviewer", "ws2"), lane("editor", "agent-editor", "ws1"))
+        told = self.route()
+        self.assertIn("no lane of this runner in this workspace", told)
+        self.assertIn("No request card was filed", told)
+        self.assertIn("agents answering in this workspace: editor", told)
+        self.assertIn("ask_human", told)
+        self.assertNotIn("builder", told.split("answering in this workspace:")[1])
+        self.assertEqual(self.mesh.created, [])
+        # the same ask again in the same attempt: released visibly, still no request card
+        self.assertEqual(self.route(), "")
+        self.assertEqual(self.r.store.get(self.a.id).state, "failed")
+        self.assertEqual(self.mesh.created, [])
+        self.assertIn("no lane of this runner in this workspace", self.bodies()[-1])
+
+    def test_the_lead_takes_it_when_the_lead_answers_in_this_workspace(self):
+        self.setup_route("reviewer")
+        self.with_lanes(lane("reviewer", "agent-reviewer", "ws2"), lane("lead", "agent-lead", "ws1"))
+        self.assertEqual(self.route(), "")
+        self.assertEqual((self.wait["kind"], self.wait["handle"], self.wait["asked_handle"]),
+                         ("decision", "lead", "reviewer"))
+        self.assertIn("no lane of this runner in this workspace", self.wait["redirected"])
+
+    def test_a_lead_with_no_lane_here_is_not_chosen_either(self):
+        self.setup_route("reviewer")
+        self.with_lanes(lane("reviewer", "agent-reviewer", "ws2"), lane("lead", "agent-lead", "ws2"))
+        told = self.route()
+        self.assertIn("no lane of this runner in this workspace", told)
+        self.assertEqual(self.wait["handle"], "reviewer")
+        self.assertNotIn("asked_handle", self.wait)
+        self.assertEqual(self.mesh.created, [])
+
+    def test_its_lane_in_this_workspace_is_asked_whatever_that_lane_is_called(self):
+        # the positive control: the agent's lane for this workspace has another config name (ops-vc)
+        self.setup_route("reviewer")
+        self.with_lanes(lane("reviewer", "agent-reviewer", "ws2"), lane("reviewer-ws1", "agent-reviewer", "ws1"))
+        self.assertEqual(self.route(), "")
+        self.assertEqual((self.wait["kind"], self.wait["handle"]), ("decision", "reviewer"))
+        self.assertNotIn("asked_handle", self.wait)
+        self.r.effects.on_wait(self.a, self.source, self.wait, self.r.me)
+        self.assertEqual(self.mesh.created[0]["assignee_id"], "agent-reviewer")
+
+    def test_its_paused_lane_here_sends_the_question_to_the_lead(self):
+        from mesh_runner import op_pause
+        self.setup_route("reviewer")
+        self.with_lanes(lane("reviewer", "agent-reviewer", "ws1"))
+        op_pause.take(self.cfg.state_dir, "reviewer", "maintenance")
+        self.assertEqual(self.route(), "")
+        self.assertEqual((self.wait["handle"], self.wait["asked_handle"]), ("lead", "reviewer"))
+        self.assertIn("paused", self.wait["redirected"])
+
+    def test_an_unread_lane_or_no_lane_list_keeps_the_old_path(self):
+        for label, others in (("a lane whose key was not read yet", [lane("reviewer", "agent-reviewer", "ws2"),
+                                                                      lane("other")]),
+                              ("no lane list", None)):
+            with self.subTest(label):
+                self.setUp()
+                self.setup_route("reviewer")
+                self.agent.lead = ""
+                if others is not None:
+                    self.with_lanes(*others)
+                self.assertEqual(self.route(), "")
+                self.assertEqual((self.wait["kind"], self.wait["handle"]), ("decision", "reviewer"))
+                self.tmp.cleanup()
+
+    def test_the_runner_gives_every_lane_the_lane_list(self):
+        from mesh_runner.runner import Runner
+        self.agent_cfg("reviewer")
+        runner = Runner(self.cfg, lock=False)
+        self.assertEqual([ar.lanes for ar in runner.agents], [runner.agents, runner.agents])
+
+
 class PersonAsk(AskBench):
     def test_a_payment_question_stays_a_human_gate(self):
         self.setup_route("person", "Should we pay for the annual plan?")

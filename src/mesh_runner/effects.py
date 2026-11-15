@@ -24,7 +24,8 @@ a task assigned to it. This module keeps those in step with the attempt:
   assigned to it (a mention alone wakes nobody), retained until answered,
   superseded, or the source task ends; asked again within ``decision_reuse_hours``
   of filing, the same source and addressee reuse that task (the new question is
-  a comment on it, a closed one is reopened) instead of filing another; the same
+  a comment on it, a closed one is reopened unless an unmet ``blocks`` edge would
+  hold it, then a new one is filed) instead of filing another; the same
   question again (``normalized_question``) is attached to its request with no
   comment and no reopen (``identical_no_reopen``); a repeat of any question
   already answered on that request (closed as done) never reopens it, not even
@@ -603,12 +604,16 @@ class Effects:
             self._schedule(a, wait, wait["until"])
         else:
             self._drop_event_hold(a, wait)
-        if kind == "card" and not wait.get("server_observed"):
+        # A typed card wait whose receipt says Mesh made the edge for it binds that edge as its own;
+        # anything else (a marker wait, an edge a person or another agent made) takes the old path.
+        if kind == "card" and not self._bind_wait_edge(wait) and not wait.get("server_observed"):
             self._add_edge(a, wait)
         if kind == "decision" and wait.get("handle"):
             if wait.get("decision_request_id") and not self._typed_question(a, wait):
                 return                      # the question could not be read: adopt() retries
-            if answer_desk.defer(self.desk, self, a, task, wait, me):
+            if self._deliver_to_addressee_card(a, wait, me):
+                return                      # an order for the addressee's own live card: asked there
+            if not wait.get("names_addressee_card") and answer_desk.defer(self.desk, self, a, task, wait, me):
                 return                      # the addressee's answer desk takes it; adopt() files the card if not
             # ``ask_agent`` records the question on Mesh, but its comment wakes nobody and no queue
             # shows the addressee an open request: the request card is still what starts the addressee
@@ -686,7 +691,11 @@ class Effects:
         self._retain_legacy_decision(a, wait)
         if wait.get("scheduled") or wait.get("scheduled_maybe"):
             self._end_schedule(a, wait)
-        if wait.get("edge"):
+        if not wait.get("edge") and self._legacy_typed_card_wait(wait):
+            self._adopt_wait_edge(a, wait)
+        if wait.get("edge") and wait.get("edge_owner_wait"):
+            self._end_wait_edge(a, wait)
+        elif wait.get("edge"):
             if self._edge_denied(a.task_id, "del:" + wait["edge"]):
                 wait.pop("edge", None)         # a denial is permanent for this key: not asked again
             else:
@@ -959,6 +968,86 @@ class Effects:
                          self.lane, a.task8, wait["edge"], e.get("dependency_type"), e.get("condition"))
                 return False
         return False
+
+    # The keys a typed card wait keeps for the edge Mesh made for it: removed together when it ends.
+    _WAIT_EDGE_KEYS = ("edge", "edge_generation", "edge_owner_wait", "edge_condition")
+
+    @staticmethod
+    def _bind_wait_edge(wait: dict) -> bool:
+        """A typed card wait takes the edge Mesh declared for it as its own (``edge`` with the generation
+        and the owning wait id) when the receipt says this wait owns it. Without that proof (no receipt
+        fields, owned=false: a person's, a lead's or another agent's edge) nothing is bound and the
+        edge stays the old read-only ``observe_edge``, never deleted. True when bound."""
+        dep, owner = wait.get("card_dependency"), wait.get("mesh_wait_id")
+        if (wait.get("kind") != "card" or not isinstance(dep, dict) or dep.get("owned") is not True
+                or not isinstance(owner, str) or not owner
+                or not isinstance(dep.get("id"), str) or not dep["id"]
+                or type(dep.get("generation")) is not int or dep["generation"] < 1):
+            return False
+        wait.update(edge=dep["id"], edge_generation=dep["generation"], edge_owner_wait=owner)
+        wait.pop("observe_edge", None)
+        if wait.get("card_condition"):
+            wait["edge_condition"] = wait["card_condition"]
+        return True
+
+    def end_unarmed_card_wait(self, a: Attempt, wait: dict, why: str) -> None:
+        """A typed card wait the runner sent back at its declaration is never armed, so no wake ends it.
+        Remove the edge Mesh declared for it, only when the receipt says this wait owns it (the same
+        owner-checked delete a wake uses); any other edge stays. A failed delete is logged and left."""
+        if self.enabled and self._bind_wait_edge(wait):
+            self.on_end(a, wait, why, close_request=False)
+
+    @staticmethod
+    def _legacy_typed_card_wait(wait: dict) -> bool:
+        """A typed card wait declared before this runner carried the receipt's edge fields: it only
+        observes the edge Mesh made for it (or, server-observed, never looked at it)."""
+        return bool(wait.get("kind") == "card" and wait.get("mesh_wait_id") and "card_dependency" not in wait
+                    and (wait.get("observe_edge") or wait.get("server_observed") is True))
+
+    def _adopt_wait_edge(self, a: Attempt, wait: dict) -> None:
+        """Read a legacy typed card wait's receipt once, when it ends, and bind its edge if Mesh says this
+        wait owns it (the same proof a new wait carries from its turn). A failed read binds nothing."""
+        try:
+            receipt = self.mesh.wait_receipt(a.task_id, wait["mesh_wait_id"])
+        except (MeshError, OSError) as e:
+            log.warning("%s: wait edge #%s: receipt %s unreadable (%s); edge left in place",
+                        self.lane, a.task8, str(wait["mesh_wait_id"])[:8], e)
+            return
+        receipt = receipt if isinstance(receipt, dict) else {}
+        dep = outcome.card_dependency(receipt) if receipt.get("id") == wait["mesh_wait_id"] else None
+        wait["card_dependency"] = dep or {"id": "", "generation": None, "owned": False}
+        if wait.get("observe_edge") and wait["card_dependency"]["id"] != wait["observe_edge"]:
+            return                                   # the receipt names another edge: not this one
+        self._bind_wait_edge(wait)
+
+    def _end_wait_edge(self, a: Attempt, wait: dict) -> None:
+        """Remove the edge Mesh made for this typed card wait with the owner-checked delete (the
+        generation and owner wait it was declared with). 409: an operator or a newer wait of this agent
+        took or changed the edge; 404/410: gone; 403: not this lane's to remove. Each leaves the edge
+        as it is and is not asked again. Only a transient failure keeps it for the next cleanup."""
+        edge = str(wait["edge"])
+        if not self._edge_denied(a.task_id, "del:" + edge):
+            try:
+                self.mesh.delete_wait_dependency(a.task_id, edge, wait.get("edge_generation"),
+                                                 str(wait["edge_owner_wait"]))
+                log.info("%s: #%s removed the edge %s of its wait %s", self.lane, a.task8, edge,
+                         str(wait["edge_owner_wait"])[:8])
+            except ValueError as e:                  # no compare-delete possible: never a blind delete
+                log.warning("%s: wait edge #%s %s: %s; left in place", self.lane, a.task8, edge, e)
+            except (MeshError, OSError) as e:
+                status = e.status if isinstance(e, MeshError) else 0
+                if status == 0 or status == 429 or status >= 500:
+                    log.warning("%s: wait edge #%s %s: %s; kept for the next cleanup", self.lane, a.task8, edge, e)
+                    return
+                if status == 403:
+                    self._deny_edge(a.task_id, "del:" + edge)
+                if status == 409:
+                    log.info("%s: wait edge #%s %s changed owner or generation since the wait declared it; "
+                             "left in place", self.lane, a.task8, edge)
+                elif status not in (404, 410):
+                    log.warning("%s: wait edge #%s %s: %s; left in place, not retried", self.lane, a.task8, edge, e)
+        for key in self._WAIT_EDGE_KEYS:
+            wait.pop(key, None)
 
     def _add_edge(self, a: Attempt, wait: dict) -> None:
         if self._edge_denied(a.task_id, "add:" + str(wait.get("target"))):
@@ -1427,6 +1516,8 @@ class Effects:
             return
         if not addressee or addressee.get("id") in (me.get("id"), None):
             return                          # a person or ourselves: the comment is the ask
+        if self._deliver_to_addressee_card(a, wait, me, addressee):
+            return
         wait["recipient_id"] = addressee["id"]
         note = (wait.get("note") or "").strip()
         key = self._decision_key(a.task_id, addressee["id"], wait)
@@ -1505,6 +1596,226 @@ class Effects:
                 active["reported"] = True
                 self._save_decision(a.task_id, active)
             log.warning("%s: decision request #%s: HTTP %s", self.lane, a.task8, e.status)
+
+    @staticmethod
+    def _ordered_refs(note: str, own: str) -> list[str]:
+        """Short ids of the cards a question names, in the order it names them, the asking task's own excluded."""
+        out: list[str] = []
+        for ref in re.findall(r"(?<![\w-])#([0-9a-f]{8})\b", (note or "").casefold()):
+            if ref != own[:8].casefold() and ref not in out:
+                out.append(ref)
+        return out
+
+    DEFINITE_REFUSALS = frozenset({400, 401, 403, 404, 409, 410, 422})   # a definite answer; any other may pass
+    ORDER_LOOKUP_PASSES = 30                # passes an unread named card is read again (~10 min at a 20 s tick)
+
+    # Mesh wait kinds an ``@addressee`` comment on the card does not end: a registered observer (queue, receipt,
+    # gmail, lifecycle, stall, recovery, native) wakes on its own event only, and a person's ask on the answer or
+    # the lifted gate. A question delivered on such a card sleeps until that event.
+    ORDER_DEAF_WAITS = frozenset({"registered", "human"})
+
+    def _addressee_wait(self, task_id: str, agent_id: str) -> dict | None:
+        """The addressee's declared wait on the card: the wait row, ``{}`` when it holds none (or the read was
+        definitely refused), None when the read failed and may pass."""
+        try:
+            held = self.mesh.active_wait(task_id, agent_id)
+        except MeshError as e:
+            log.info("%s: wait read #%s for %s: HTTP %s", self.lane, task_id[:8], agent_id[:8], e.status)
+            return {} if e.status in self.DEFINITE_REFUSALS else None
+        return held if isinstance(held, dict) and held else {}
+
+    def _order_unread(self, a: Attempt, wait: dict, why: str) -> bool:
+        """A card the question names, or its addressee, could not be read (no answer, 429, 5xx): whether this is
+        an order for the addressee's own card is not known, so no route is chosen on this pass. ``fx`` stays off
+        and True keeps the question off the desk and off a request card; ``adopt`` reads again on the next pass.
+        After ``ORDER_LOOKUP_PASSES`` passes it is taken as naming the addressee's card: never the desk (which
+        does not take orders), a request card, which reaches the addressee whatever the card is."""
+        tries = int(wait.get("order_unread") or 0) + 1
+        if tries >= self.ORDER_LOOKUP_PASSES:
+            wait.pop("order_unread", None)
+            wait["order_checked"] = True
+            wait.setdefault("names_addressee_card", "unread")
+            log.warning("%s: #%s question names a card still unread after %d passes (%s): request card, not the "
+                        "answer desk", self.lane, a.task8, tries, why)
+            return False
+        wait["order_unread"] = tries
+        wait["fx"] = False
+        (log.warning if tries == 1 else log.info)(
+            "%s: #%s question names a card not read yet (%s): no route chosen, read again on the next pass",
+            self.lane, a.task8, why)
+        return True
+
+    def _deliver_to_addressee_card(self, a: Attempt, wait: dict, me: dict, addressee: dict | None = None) -> bool:
+        """A question that names a card of its addressee is an order to act there, not a question for its
+        answer desk or a request card (a lead's go-ahead for a card waiting ``manual`` went to the desk, failed
+        there, and the fallback request card sat blocked for hours). The first named card assigned to
+        the addressee that is not closed and is in progress or holds a declared wait gets the question as an
+        ``@addressee`` comment, written with this lane's key, so it wakes that card (a ``manual`` wait included).
+        The Mesh request stays open: the addressee answers it with ``answer_decision`` and the asker wakes as on
+        any answer. A named card of the addressee that is not live, or whose wait a comment does not end
+        (``ORDER_DEAF_WAITS``), keeps the question off the desk (``names_addressee_card``): it goes to a request
+        card. A named card that itself waits on another card is context and is passed over; named only such
+        cards, the question takes the ordinary desk / request-card path. A read that failed and may pass chooses
+        no route (``_order_unread``). True when the question was delivered or its route waits for a read."""
+        if wait.get("delivered"):
+            return True
+        if wait.get("delivering"):
+            return self._post_order(a, wait)    # an earlier POST may have landed: the same write again
+        if wait.get("order_checked") or not wait.get("handle"):
+            return False
+        # Every named card is looked up, in order, until the first live card of the addressee: a cap would skip
+        # that card when it is named after the cap and send the order to the desk. The walk runs once per
+        # question (``order_checked``) and Mesh bounds a question's length, so the lookups are bounded too.
+        refs = self._ordered_refs(wait.get("question") or wait.get("note") or "", a.task_id)
+        if not refs:
+            wait["order_checked"] = True
+            return False
+        try:
+            addressee = addressee or self._resolve_agent(wait["handle"], me)
+        except MeshError as e:
+            if e.status in self.DEFINITE_REFUSALS:
+                return False                # the card path reads the addressee itself
+            return self._order_unread(a, wait, f"addressee {wait['handle']}: HTTP {e.status}")
+        if not addressee or addressee.get("id") in (me.get("id"), None):
+            return False
+        # A live card of the addressee found after an unread one is delivered at once: either reaches them.
+        # A card of the addressee that itself waits on another card is named as context ("check #C"), not as
+        # the card to act on: its session sleeps until that other card moves, so the question goes the
+        # ordinary way (desk, then a request card). A card whose wait a comment does not end (``ORDER_DEAF_WAITS``)
+        # cannot take it either: a request card. Otherwise a question naming such a card as context is
+        # delivered there and lies unread.
+        live: dict | None = None
+        live_wait = ""
+        unread: list[str] = []
+        passed: list[str] = []
+        name = addressee.get("name") or wait["handle"]
+        for ref in refs:
+            try:
+                card = self.mesh.task_by_short(ref)
+                card = card.get("task", card) if isinstance(card, dict) else {}
+                assignee = card.get("assignee_id") or (card.get("assignee") or {}).get("id")
+                if not card.get("id") or assignee != addressee["id"]:
+                    continue
+                category = self.cats.category(card)
+            except MeshError as e:
+                log.info("%s: #%s question names #%s: lookup HTTP %s", self.lane, a.task8, ref, e.status)
+                if e.status not in self.DEFINITE_REFUSALS:
+                    unread.append(f"#{ref}: HTTP {e.status}")
+                continue
+            if category in ("done", "cancelled"):
+                wait.setdefault("names_addressee_card", ref)
+                continue
+            held = self._addressee_wait(card["id"], addressee["id"])
+            if held is None:
+                wait.setdefault("names_addressee_card", ref)
+                unread.append(f"#{ref}: wait read")
+                continue
+            kind = str(held.get("kind") or "")
+            if kind == "card":
+                target = str(held.get("target_task_id") or "")[:8] or "?"
+                passed.append(f"#{ref} waits card #{target} (context, not the card to act on)")
+                continue
+            wait.setdefault("names_addressee_card", ref)
+            if kind in self.ORDER_DEAF_WAITS:
+                passed.append(f"#{ref} waits {kind}, which a comment does not end")
+                continue
+            if held or category == "in_progress":
+                live, live_wait = card, str(held.get("id") or "")
+                break
+        if live is None and unread:
+            return self._order_unread(a, wait, ", ".join(unread))
+        wait.pop("order_unread", None)
+        wait["order_checked"] = True
+        if live is None:
+            if passed:
+                route = "request card" if wait.get("names_addressee_card") else "answer desk, then a request card"
+                wait["order_passed"] = passed
+                log.info("%s: #%s question to %s not delivered on a named card: %s; %s instead",
+                         self.lane, a.task8, name, "; ".join(passed), route)
+                if self.store is not None:
+                    self.store.event(a.id, "decision_not_delivered", "; ".join(passed)[:200])
+            return False
+        rid = str(wait.get("decision_request_id") or "")
+        short = live["id"][:8]
+        question = "\n> ".join((wait.get("question") or wait.get("note") or "").strip().splitlines() or [""])
+        answer = (f"When done, answer request `{rid}` with the Mesh command `answer_decision` (request_id `{rid}`): "
+                  f"it writes the answer on #{a.task8} and resumes {self.lane}." if rid else
+                  f"When done, answer with a comment on #{a.task8} (start it with `Answer:` or @-mention "
+                  f"{self.lane}): that comment resumes {self.lane}.")
+        body = (f"@{name}, {self.lane} asks on #{a.task8} ({a.task_id}) for this card #{short}.\n\n"
+                f"Question (verbatim):\n> {question}\n\n"
+                f"Act on it here, on #{short}: it names this card, so it is delivered here instead of an answer "
+                f"desk or a request card. {answer}")
+        wait["delivering"] = {"card": live["id"], "body": body, "key": f"order:{a.task_id}:{rid or a.id}",
+                              "name": name, "recipient": addressee["id"], "addressee_wait": live_wait}
+        return self._post_order(a, wait)
+
+    def _post_order(self, a: Attempt, wait: dict) -> bool:
+        """Write the comment ``_deliver_to_addressee_card`` prepared. A definite refusal (4xx) drops it: the
+        request card path takes the question. Any other failure (no answer, 5xx) may have written it: the wait
+        keeps the same body and Idempotency-Key and leaves ``fx`` off, so ``adopt`` writes it again (Mesh
+        returns the comment it already has) and no request card is filed meanwhile. True unless refused."""
+        pending = wait["delivering"]
+        card, name, short = pending["card"], pending.get("name") or wait.get("handle"), pending["card"][:8]
+        rid = str(wait.get("decision_request_id") or "")
+        try:
+            posted = self.mesh.add_comment(card, pending["body"], key=pending["key"])
+        except MeshError as e:
+            if e.status in self.DEFINITE_REFUSALS:
+                wait.pop("delivering", None)
+                log.warning("%s: #%s question to %s: delivery on #%s refused HTTP %s; request card path instead",
+                            self.lane, a.task8, name, short, e.status)
+                return False
+            wait["fx"] = False
+            log.warning("%s: #%s question to %s: delivery on #%s HTTP %s, outcome unknown; written again with "
+                        "the same key on the next pass", self.lane, a.task8, name, short, e.status)
+            return True
+        wait.pop("delivering", None)
+        wait["delivered"] = {"card": card, "comment": str((posted or {}).get("id") or ""), "at": iso(),
+                             "addressee_wait": str(pending.get("addressee_wait") or "")}
+        wait["recipient_id"] = pending.get("recipient") or wait.get("recipient_id")
+        wait["ask_filed"] = True
+        wait["fx"] = True
+        if self.store is not None:
+            self.store.event(a.id, "decision_delivered", f"#{short} {rid}".strip())
+        log.info("%s: #%s question to %s delivered on its card #%s (request %s): no answer desk, no request card",
+                 self.lane, a.task8, name, short, rid[:8] or "-")
+        return True
+
+    DELIVERED_UNHEARD_MINUTES = 30.0        # a delivered question still unanswered this long is checked once
+
+    def watch_delivered(self, a: Attempt, wait: dict) -> None:
+        """A question delivered on its addressee's card (``_post_order``) is answered from that card's session.
+        Still unanswered ``DELIVERED_UNHEARD_MINUTES`` after the delivery, the addressee's wait on that card is
+        read once: the same wait it held when the question was written means its session never woke for it.
+        That is logged as a WARNING, recorded as the event ``decision_delivered_unheard`` and kept on the wait
+        (``delivered.unheard``), where wait-cycle-watch reads it as a dead end (FleetWaitDeadEnd). A wait the
+        addressee declared since then (``delivered.heard``) is a session that woke. Nothing is re-routed here:
+        the question stays where it is, the signal makes it seen. A failed read is read again."""
+        d = wait.get("delivered")
+        if (not self.enabled or wait.get("kind") != "decision" or not isinstance(d, dict)
+                or not d.get("addressee_wait") or d.get("heard") or d.get("unheard")):
+            return
+        at = parse_time(d.get("at"))
+        if at is None or now() - at < dt.timedelta(minutes=self.DELIVERED_UNHEARD_MINUTES):
+            return
+        held = self._addressee_wait(str(d.get("card") or ""), str(wait.get("recipient_id") or ""))
+        if held is None:
+            return
+        if str(held.get("id") or "") != str(d["addressee_wait"]):
+            d["heard"] = iso()
+            return
+        minutes = int((now() - at).total_seconds() // 60)
+        kind = str(held.get("kind") or "?")
+        target = str(held.get("target_task_id") or "")[:8]
+        d["unheard"] = iso()
+        log.warning("%s: #%s question to %s delivered on #%s %d min ago is unanswered: the session there still "
+                    "sleeps in the %s wait%s it held before the delivery", self.lane, a.task8,
+                    wait.get("handle") or "?", str(d.get("card") or "")[:8], minutes, kind,
+                    f" on #{target}" if target else "")
+        if self.store is not None:
+            self.store.event(a.id, "decision_delivered_unheard",
+                             f"#{str(d.get('card') or '')[:8]} {kind}{(':' + target) if target else ''} {minutes}m")
 
     @staticmethod
     def _card_refs(note: str, own: str) -> set[str]:
@@ -1632,6 +1943,15 @@ class Effects:
                 if not todo:
                     return False
                 self._retire_decision_wait(req["id"], a.task_id, addressee["id"])
+                blocker = self._held_request(req["id"])
+                if blocker:
+                    # a closed request still carrying a blocks edge from an earlier session would be
+                    # reopened into "held: blocked by" and never started: file a new one
+                    if self.store is not None:
+                        self.store.event(a.id, "decision_request_held", f"#{req['id'][:8]} by #{blocker[:8]}")
+                    log.info("%s: #%s decision request → %s: #%s not reused: held by a blocks edge on #%s",
+                             self.lane, a.task8, addressee.get("name"), req["id"][:8], blocker[:8])
+                    return self._forget_request(a.task_id, addressee["id"])
                 self.mesh.move(req["id"], todo)     # idempotent: a retry after a failed comment repeats it
             asking = iso()
             posted = self.mesh.add_comment(req["id"], self._decision_ask(a, task, wait, addressee, again=True),
@@ -1655,6 +1975,18 @@ class Effects:
         log.info("%s: #%s decision request → %s: #%s reused%s", self.lane, a.task8, addressee.get("name"),
                  req["id"][:8], " (reopened)" if reopened else "")
         return True
+
+    def _held_request(self, request_id: str) -> str:
+        """The card a closed request would be held behind once reopened: an unmet ``blocks`` edge left on
+        it (a wait its addressee declared in a session that has ended, or a manual edge). '' when none,
+        and when the answer is not a well-formed edge set (reused as before: a duplicate card is the worse
+        failure). A failed read raises ``MeshError`` like ``_retire_decision_wait`` before it: the caller
+        leaves the question for a later tick (``fx`` cleared), nothing is moved or filed."""
+        edges = card_wait_reconcile.readable_outgoing(self.mesh.dependencies(request_id), request_id)
+        for edge in edges or []:
+            if edge["dependency_type"] == "blocks" and not edge["condition_satisfied"]:
+                return edge["depends_on_task_id"]
+        return ""
 
     def _attach_identical(self, a: Attempt, wait: dict, addressee: dict, key: str, reuse: dict, req: dict,
                           closed: bool, answered: bool = False) -> bool:

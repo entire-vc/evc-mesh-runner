@@ -281,7 +281,13 @@ def unknown_restored_unsent(db, directory: Path, key: str, agent: str, tmux: Tmu
 
 _NEEDS_NATIVE = ("the exact native acceptance record for this token and prompt hash "
                  "(a single UserPromptSubmit/turn-complete bound to this session, then its terminal event)")
+# The driver itself saw the session take the prompt (journal phase ``accepted``), but the session ended without
+# the native record of it: the turn ran and failed. Still unknown and never replayed, yet not the same event as
+# a prompt that may never have gone in (such failures used to be labelled as the other).
+TAKEN_THEN_FAILED = 'prompt-taken-session-failed'
 EXPLAIN = {
+    TAKEN_THEN_FAILED: ("the driver saw the session take the prompt, then the session ended without "
+                        + _NEEDS_NATIVE + "; the turn ran and failed, its result is unknown"),
     'acceptance-unproven': _NEEDS_NATIVE + " is missing or ambiguous in the native event stream",
     'codex-acceptance-unproven': _NEEDS_NATIVE + " is missing or ambiguous in the codex notify stream",
     'session-unbound': "no native session is bound to this send and no typed bootstrap-failure proof exists",
@@ -385,7 +391,7 @@ def recover(directory: Path, key: str, intent: dict, agent: str, tmux: Tmux,
     ours = [(i, e) for i, e in submits if e.get('session_id') == sid and e.get('prompt_id')
             and _exact(str(e.get('prompt') or '')) == _exact(intent['prompt'])]
     if len(ours) != 1:
-        return 'acceptance-unproven'
+        return TAKEN_THEN_FAILED if not ours and journal.get('phase') == 'accepted' else 'acceptance-unproven'
     index, submitted = ours[0]
     if any(i > index for i, _ in submits):
         return 'later-native-prompt'
@@ -448,7 +454,7 @@ def recover_codex(d: Driver, journal: dict, native: list[dict], base: int, sid: 
             and e['input-messages'] and isinstance(e['input-messages'][-1], str)
             and _exact(e['input-messages'][-1]) == _exact(intent['prompt'])]
     if len(ours) != 1:
-        return 'codex-acceptance-unproven'
+        return TAKEN_THEN_FAILED if not ours and journal.get('phase') == 'accepted' else 'codex-acceptance-unproven'
     end = ours[0]
     if notes != [end]:
         return 'later-native-prompt'

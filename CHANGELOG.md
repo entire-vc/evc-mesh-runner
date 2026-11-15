@@ -1,5 +1,311 @@
 # Changelog
 
+## 0.2.65 — 2026-11-14
+
+- **`[runner] completion_comment` is an option again (default `true`).** Set it to `false` on a runner
+  whose board people outside the team read: the completion line names the harness, the session and the
+  token counts. An older file that sets it no longer logs "no longer an option"; the value now applies.
+
+## 0.2.64 — 2026-11-14
+
+- **A question delivered on the addressee's card reaches a session that wakes for it.**
+  The `comment_wake = "addressed"` filter matched an @-mention against the lane name only. A lane that
+  runs a Mesh agent under another name (lane `ops-vc`, Mesh agent `ops`) slept through
+  `@ops, … asks …`, the comment the runner writes when it delivers an `ask_agent` question on the
+  addressee's card. An @-mention of the lane name, the Mesh agent
+  name or its slug now wakes every filtered wait (card, server-observed card, mr, pipeline, time,
+  merge, decision). Delivery itself reads the named card's wait first: a card that waits on another
+  card is context, not the card to act on (the question takes the answer desk / request card path),
+  and a card whose wait a comment does not end (`registered`, `human`) gets a request card. A
+  delivered question still unanswered after 30 minutes, while the addressee still holds the wait it
+  held at delivery, is logged as a WARNING and kept on the wait as `delivered.unheard`.
+
+## 0.2.63 — 2026-11-14
+
+- **A turn command recorded after its turn was settled as "no outcome" is now that turn's outcome.**
+  An interactive session can go on after the runner settled its turn (a background command it started
+  finishes) and call `wait_for`; Mesh accepts it and releases the checkout. Before, that command belonged
+  to no turn: the correction turn resumed on the released lease, every command of it got 409, the second
+  "no outcome" sent the card back to todo and the declared wait (a merge gate) never ran. The runner now
+  reads the turn outcomes from the start of the turn counted as "no outcome", before it issues the
+  correction and again when the correction settles: a command found there is acted on like any outcome
+  read at a settle, the lease Mesh released is forgotten and no correction runs; one the runner cannot act
+  on keeps the one correction, naming what was recorded, and frees the dead lease. Events
+  `late_typed_outcome` and `late_outcome_refused` record it.
+
+## 0.2.62 — 2026-11-14
+
+- **A card waiting on another card is no longer woken by every push and review of that card.** With
+  `next_action_prep` on, the prep wake counted every new next-action generation, and Mesh's
+  generation also hashes the blocker's HEAD and review verdict: a waiting card got one empty turn
+  per push and per SHIP on its blocker. The wake and the prep start
+  now count only the projection's content (stages, requirements, what they gate and release, the
+  next action); a new generation with the same content moves the mark without a turn. A push or
+  verdict that releases or holds an edge still wakes once. A card that must follow every push of its
+  blocker (a rebase onto a stacked branch) waits on the blocker's merge request with
+  `wait_for on=mr until=changed`. No new option.
+
+## 0.2.61 — 2026-11-14
+
+- **The runner's own notes are labelled automation.** Every comment the runner writes in its own
+  name (body opening with `[runner]`, e.g. the completion line) now carries
+  `metadata.source = "mesh-runner"`. Mesh treats such a comment as a driver note, so a completion
+  line that lands on a card another lane has just closed (a reviewer closing the owner's card) no
+  longer opens an urgent follow-up card. Text the runner relays for others is not labelled, and
+  `informational` is never set, so attention readers still see runner notes.
+
+## 0.2.60 — 2026-11-14
+
+- **A `until=deployed` card wait sent back at its declaration no longer leaves its edge behind.** The
+  runner never armed that wait, so no wake ended it: the wait stayed open in Mesh and its blocks edge
+  on the target stayed too. On a closed target such an edge is never released, so the card kept
+  reading as waiting on it. The sent-back wait is now resolved as `cancelled` with the reason, and
+  the edge Mesh made for it is removed with the owner-checked delete, only when the receipt says this
+  wait owns it. A failed delete is logged and does not hold the send-back.
+- **After a host hold the start ramp gives its slots to wait roots first, across lanes.** Before,
+  the one start per interval went to whichever lane asked first, so a card with several others
+  waiting on it could be passed by every card nobody waits on and its whole team stood still. Each
+  lane now tells the ramp which roots it would start or resume and how many cards wait behind each;
+  a lighter start is refused until the heaviest root starts. A root its lane cannot start keeps a
+  free slot for at most three intervals per ramp. No new option; `runner.log` shows
+  `host ramp: next start kept for wait root …` and `host ramp: start … goes first`. README, host gates.
+- **A merge the author's GitLab identity may not do goes to the card's lead.** When the merge gate
+  passes every check but ends with `⛔ MERGE RIGHTS <project>!<iid>` (a Developer on a protected
+  branch), the runner files one merge-only card for the nearest lead it runs (`lead`, then
+  `project_leads`), whose runner merges under the lead's identity; the author keeps sleeping on the
+  merge request instead of being woken for a merge it cannot do. See `docs/reviewer-merge.md`
+  § Merge rights.
+
+## 0.2.59 — 2026-11-14
+
+- **The periodic checkpoint/cleanup pass no longer reads through a lane's database connection.** The pass
+  ran in its own thread but used each lane's connection; while one of its statements was open, the lane's
+  next write failed at once with `database is locked` (SQLite does not wait out the busy timeout for a
+  connection that is already reading), and the failed journal write in the step's error handler turned
+  that into `tick failed` for the whole lane, most often in the first minute after a restart. The pass now
+  opens its own connection and closes it when done, and a journal write that fails in a step's error
+  handler is logged as a warning: the step's failure stays the step's failure and the lane's other cards
+  still tick.
+
+## 0.2.58 — 2026-11-14
+
+- **A question to an agent whose lanes all serve other workspaces is refused instead of filed.**
+  An agent the Runner drives only in another workspace cannot read the card, so a request card
+  addressed to it was never answered. Both `ask_agent` and the `decision:@x` marker now resume the
+  asker with the reason, the agents that do answer in that workspace, and the hint to use
+  `ask_human`. No request card is filed and the typed wait is cancelled. A lead that has no lane in the
+  workspace is not chosen for the redirect either. Lanes are matched by agent id and workspace, not
+  by config name. When a lane's identity is not yet read, the old name rule applies.
+- **A card wait `until=deployed` that can never end is sent back once.** With the new optional
+  `deploy_inventory` (path to the deploy inventory JSON, default unset = no check), a
+  `wait_for on=card target_condition=deployed` on a card whose open or merged merge request is in a
+  repository the inventory lists without a live-commit source (`type: none`) is returned to the
+  agent with the reason and the wait to use instead (the card itself, or its merge request until
+  merged): no deploy is ever recorded there, so Mesh would never release the edge and the card stayed
+  waiting for good. The same wait declared again is accepted. See README, *Waits and wakes*.
+
+## 0.2.57 — 2026-11-14
+
+- **A server-observed card wait woken by a comment, a wait cycle or failed receipt reads now ends in
+  Mesh as `cancelled`, not `invalid`/`dependency_removed`.** The runner removed the wait's blocks edge
+  before it reported the wake, and for a server-observed wait Mesh takes that removal as an event of
+  the target: it ended the wait as `invalid` first, and the runner's `cancelled` came back 409 (a
+  `resolving Mesh wait … failed` warning and a `mesh_wait_resolve_failed` event on every such wake).
+  The edge now stays until the wake is recorded and the wait is resolved with its cause; the resume
+  removes it afterwards, and only once the resolve of that very wait is recorded as final. A resolve
+  that failed is sent again first (a missing or unreadable resolve record is rebuilt for the wait), and
+  while it is not final the resume waits for the next tick, at most until the resolve's three tries
+  are spent. The target stays
+  held throughout; the runner-observed card wait and the met path are unchanged.
+
+## 0.2.56 — 2026-11-14
+
+- **A host hold now holds every session start until the host has settled.** Both host gates
+  (memory and load) are read again, uncached, right before a window opens, for new and resumed
+  sessions alike, so a start admitted before a hold no longer opens into it. A hold lifts only after
+  its release condition has held for `host_release_settle_seconds` (default 120); a reading that
+  fails meanwhile keeps the hold and starts that wait again. Then for
+  `host_ramp_seconds` (default 300) the host starts at most one session every
+  `host_ramp_start_interval_seconds` (default 20). A session that took its prompt, worked and then
+  failed is now reported as `prompt-taken-session-failed` ("the session took the prompt, worked and
+  then failed") instead of "did not confirm it took the prompt"; it is still closed after the quiet
+  period without sending the prompt again. See the host load gate in the README.
+
+## 0.2.55 — 2026-11-14
+
+- **A server-observed card wait (target in another workspace) wakes on an addressed comment and on a
+  wait cycle.** Mesh resolves such a wait's receipt only on the target's events, and the runner read
+  nothing else: an @-mention of the lane on the waiting card, a person's question there, a question
+  another agent delivered there with `ask_agent` and the mutual-wait detector never woke it, while the
+  same comment on a same-workspace card wait woke it in the next tick. While the receipt is pending the
+  runner now also reads the waiting card's own comments (the same `comment_wake` rules) and its own wait
+  store for a cycle. The receipt stays the only reader of the target: no target or edge read, no
+  "target closed" and no `met` without a resolved receipt; a comment wake ends the Mesh wait as
+  `cancelled`.
+
+## 0.2.54 — 2026-11-14
+
+- **A card wait held by an open typed edge still wakes on an addressed comment and on a wait cycle.**
+  A `wait_for on=card` with `artifact_published`, `shipped`, `deployed`, `accepted`, `access_ready` or
+  `contract_ready` (or an edge set the runner cannot read) used to skip every check while the edge
+  was open: an @-mention of the lane, a question another agent delivered on its card and the
+  mutual-wait detector were never read, so two lanes could wait on each other until someone released
+  the edge by hand. The open edge now holds only the target's own event (closed, shipped); a comment
+  that passes `comment_wake` and a wait cycle wake the same attempt as on any card wait.
+
+## 0.2.53 — 2026-11-14
+
+- **A re-declared card wait no longer wakes its own card through the next-action prep stage.**
+  Mesh folds every edge id into the next-action generation. Since 0.2.51 a typed card wait owns its
+  edge and the wake removes it, so re-declaring the same wait made a new edge, a new generation and
+  another "continue the prep stage once" wake every 1-2 minutes with nothing new, until the turn cap
+  handed the card up. The prep mark now also keeps the projection's content without edge ids: a
+  generation that differs only in edge ids moves the mark without a wake. A change of the blocker
+  under the same edges, prep becoming ready, a gate shift or another target or condition still wakes
+  once. A mark written by 0.2.51 compares generations only and gains the content at its next wake.
+
+## 0.2.52 — 2026-11-14
+
+- **An 8-hex in an MR's text that Mesh refuses to resolve no longer turns the merge-wait check into a
+  kept wait.** When the runner looks for the other card an MR is linked to, it reads each 8-hex the
+  MR's title, description or source branch names as a short card id. Mesh answers 403 (`workspace
+  access denied`) for an id that names no card the agent can read, such as a commit fragment in a
+  release description; that answer used to abort the whole check, so the wait was kept for the
+  wrong reason, and the agent's own unreviewed MR naming such a commit was no longer sent back.
+  A 403 is now skipped like a 404, and the ownership check stops at the first other card the MR is
+  linked to, so later ids are not read at all.
+- **The `sent back` log line of a card wait keeps the addressee under a human gate.** When the target card waited on an agent's answer under a human gate, `runner.log` cut the line at the first `;` and showed only `waits for a person (human gate`, so it did not say whom the decision went to. The line now reads `waits for a person (human gate; decision → @lead)` in full. The wake text was not affected.
+- **A card wait on a target that itself waits on a timer or a person is sent back once, not on
+  every declaration.** The runner remembers the target's state it already told the dependent
+  about; the same wait declared again while that target has not changed is accepted, so the
+  dependent is no longer woken turn after turn with no new event. A new wait or gate on the
+  target sends it back once more.
+- **Checkpoint GC removes the scratch a killed runner left in the checkpoint root.** A runner stopped
+  in the middle of a verify, compaction or bundle proof left `.verify-*`, `.compact-src-*` or
+  `.preflight-*` directories that no pass ever removed. Such a directory created
+  before the current runner process started is now removed by the next GC pass while no checkpoint
+  work runs, logged as `checkpoint gc: removed orphan scratch <name> bytes=<n>`; the scratch of the
+  running process is never touched.
+
+## 0.2.51 — 2026-11-14
+
+- **A lane tick no longer fails with "not enough values to unpack".** The status loop read every
+  lane's recent logins through that lane's own database connection while the lane's thread was
+  ticking on it; two threads reading one connection get rows reset under them, and the whole lane
+  tick failed. The status loop now reads through the runner's own connection, so each connection is
+  used by exactly one thread.
+- **A card wait on a card that waits for an agent's answer is accepted.** The runner sent back a `wait_for on=card` on X whenever X waited on any `decision`, calling it "a person", although a question X put to an agent (`ask_agent`, a question redirected to the lead, a marker question to an agent) is answered by an agent and X runs on. When X had asked the waiting agent itself, the agent answered, got its own wait sent back as "waits for a person" before X even woke, and spent a turn on a false integration blocker. Only a question to a person (`ask_human`, a decision addressed to a person) or a human gate on X still sends the wait back. The wake text and the `sent back` log line now name what X waits for (`ask_human → @owner`, `decision → @lead`, `human gate; decision → @lead`, `time until …`) instead of "a timer or a person". An unreadable agent roster keeps the wait.
+
+## 0.2.50 — 2026-11-14
+
+- **A wait for the merge of another card's MR is no longer sent back for a missing review label.** The MR an agent's own GitLab user authored counted as the waiting card's own even when Mesh links it to another card (one lane often holds both cards; that card has its own reviewer and merge gate), so `wait_for on=mr until=merged` from the dependent card was sent back with "no review label ... nobody will merge it". Authorship now counts only when no other card the MR names (title, description, source branch) or the lane holds open links that MR; a link to the waiting card or its id in the MR still makes it its own. Behind a merge gate a review verdict SHIP naming the MR head on its card now stands in for the `verified-by:` label, since that verdict is what the gate reads; without a merge gate the label rule is unchanged.
+- **A lane's result writes carry the lock of the running attempt, and a turn that lost its lock
+  stops.** At every turn start the Runner writes the attempt's checkout (token, session, generation)
+  and the task's `input_revision` to `~/.mesh-runner/checkout-fence/<agent_id>/<task_id>.json`; the
+  agent's Mesh MCP sends it with every comment, artifact, finish and move on that card, and the
+  Runner sends it with its own notes there. When Mesh refuses a fenced write for a lost lock, or
+  refuses the heartbeat of a card that is not closed (another holder, the agent's own checkout under
+  the same identity, a reassignment, an expired lock), the turn is stopped at once and the attempt
+  ends `failed` with the reason in its note; nothing more is written under it. A closing write
+  refused because the task changed (`input_revision_changed`) sends the next turn to read the task
+  again and is not counted as a turn without an outcome. `[runner] checkout_fence = false` turns all
+  of it off (today's behaviour) without a release. See `docs/checkout-fence.md`.
+- **A question that names a live card of its addressee is delivered on that card.** When an
+  `ask_agent` question names (`#<8hex>`) a card assigned to the addressee that is in progress or holds a
+  declared wait (`manual` included), the asking lane posts it as an `@addressee` comment on that card,
+  with the request id to answer through `answer_decision`, instead of putting it on the answer desk or
+  filing a `[decision]` request card. The comment wakes that card; the Mesh request stays open until
+  answered. A question that names a card of the addressee that is not live still skips the desk and gets
+  a request card; questions that name no card of the addressee behave as before. Every named card is
+  checked, not only the first few. A named card that cannot be read (no answer, 429, 5xx) chooses no
+  route: it is read again on the next passes, and if it is still unread after about ten minutes the
+  question gets a request card, never the answer desk. `runner.log` line:
+  `question to <lane> delivered on its card #<id>`.
+
+## 0.2.49 — 2026-11-14
+
+- **A typed card wait removes the blocks edge Mesh made for it when the wait ends.** `wait_for on=card` makes Mesh create the edge to the target and name the owning wait on the receipt (`dependency_id`, `dependency_generation`, `dependency_owned`). The runner used to take that edge for an operator's and only observe it, so it stayed in the graph after the wake, and a later wait the other way round (consumer and producer waiting on each other in turn) was refused as a dependency cycle (422). The runner now binds an edge the receipt says this wait owns and, when the wait ends, removes it with the owner-checked delete (`expected_generation` and `expected_owner_wait_id`). A 409 (an operator or a newer wait of the same agent took or changed the edge) or 403 leaves the edge in place and is not asked again; a 404 or 410 means the edge is already gone; a transient failure keeps it for the next cleanup. An edge with no owner or another wait's is never removed. A typed card wait parked by an older runner reads its receipt once when it ends and gets the same cleanup.
+
+## 0.2.48 — 2026-11-14
+
+- **Kimi usage is counted per turn.** 0.2.47 read the whole session's journal at card end, so an attempt that continued an earlier attempt's session (a card returned to its lane) counted that earlier usage again, and the Kimi home came from the lane's current environment rather than the turn's. Before a Kimi turn starts the adapter now notes, in a `.wire` file next to the turn log, which Kimi home and session it runs in and how far the session's journal (`$KIMI_CODE_HOME/sessions/<workspace>/<session>/agents/main/wire.jsonl`) already runs, and reads the `usage.record` events of that one turn into `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. Each runner turn reads only its own Kimi turn; a turn refused before its prompt, a journal replaced or rewritten since the turn started, a session id not in the CLI's shape, or a log written before this version stays without usage. The whole-session fallback is removed.
+
+## 0.2.47 — 2026-11-14
+
+- **Kimi cards report their usage.** Kimi's print mode writes no usage to stdout; the completion line now reads the session's own wire log (`usage.record` events) once per card when the turns carried none, so it no longer reads `0.0k tok` for Kimi cards.
+
+## 0.2.46 — 2026-11-14
+
+- **The operator env command sees the card it starts.** For a card start or resume it receives `MESH_RUNNER_TASK` and `MESH_RUNNER_LANE` (a chat or card-less read gets neither), so an operator route can run one card on its own account, for example when the lane's profile has no free slot. Nothing changes for an env command that ignores them.
+- **ZCode cards report their usage.** The ZCode adapter adds `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens` next to the provider's own camelCase keys, so the completion line no longer reads `0.0k tok` for ZCode cards.
+
+## 0.2.45 — 2026-11-14
+
+- **A standing chat session follows the routed harness.** `[agents.chat] commands = { <harness> =
+  [...] }` gives the session a command per harness: a gone session routed to another harness than
+  its configured command's now starts with that harness's command instead of waiting silently, and
+  switches back (while idle) when the route returns. A chat that is still held (gone, or live and
+  routed to a harness it has no command for) is logged once as a
+  WARNING, reported as `chat_hold_since` in the status and exported as
+  `mesh_runner_chat_hold_seconds{agent}`.
+
+## 0.2.44 — 2026-11-13
+
+- **A `required_jobs` wait wakes when a named job is stuck behind a manual job.** GitLab leaves a job
+  `created` while the job it needs is `manual`; such a wait read as running and never woke, so an
+  owner slept on a pipeline only a person could move. When the pipeline is `manual`, no job of it is
+  moving and every unfinished named job is `created`, the named jobs now count as `manual`: an
+  `until=green` wait wakes its owner once with `action required: … job(s) X manual, job(s) Y blocked
+  behind a manual job`, an `until=changed` wait wakes on that state, and the same wait declared again
+  after the notice is sent back. A named job that is `created` while any job of the pipeline runs,
+  queues or is scheduled keeps the wait asleep as before.
+
+## 0.2.43 — 2026-11-13
+
+- **A review attempt that decided nothing no longer counts as a review.** A review whose last word
+  was no verdict and that ended as a failure (a harness error, an unknown delivery closed by the
+  quiet rule or an operator token, turns without an outcome) used to hold the card as "already
+  reviewed" for `review_refeed_hours` (4 h). `continue_next` is not a verdict: a NEXT followed by a
+  turn that died is no review either. The card is now fed to the reviewer again on the next pass (a
+  failed attempt still waits out `failed_cooldown_hours`; the no-outcome hold still waits for someone
+  else's comment), at most `daily_start_cap` review starts a day. `runner.log` says
+  `review fed again: attempt <id> ended without a verdict`. A review whose last outcome decided holds
+  as before. The `readable_outcome` event now carries the outcome kind.
+
+## 0.2.42 — 2026-11-13
+
+- **An author sending its own card to review again is settled, not refused.** When the card is
+  already in review and still assigned to its author, `finish_task to=review` moves nothing; the
+  runner used to refuse that turn ("does not settle a turn") and the author asked its lead for a
+  route. The attempt now ends, the card stays in review and the review router assigns the
+  reviewer. A reviewer's `to=review` on someone else's card is still sent back for correction.
+- **A re-armed recovery wait no longer wakes at once on an earlier card with the same marker.** A
+  candidate already finished more than five minutes before the registration was armed is evidence of
+  a previous event (a recurring alert, say), so it no longer binds and a binding to it is rejected; a
+  card still open at arm time or finished inside the create/arm race window binds as before. See
+  `docs/recovery-wait.md`.
+
+## 0.2.41 — 2026-11-13
+
+- **Two more harnesses: `kimi` (Kimi Code CLI) and `zcode` (ZCode agent CLI).** A lane may run on
+  either (`harness = "kimi" | "zcode"`) or be routed to it (`[agents.alt.kimi]`, `[agents.alt.zcode]`
+  with `binary` and `args`). Both run in their print modes in every launch mode: their TUIs draw on
+  the same subscription, so there is no per-token cost to avoid. Sessions resume by id; a provider
+  limit reaches the existing account switch; Kimi cannot confine one turn read-only, so a
+  metadata-only decision turn routed to it is held instead of running with write tools. The config
+  now refuses an unknown `harness` or `alt` key. See `docs/harnesses-kimi-zcode.md`.
+- **The reviewer merge handoff accepts every `same-family: <why>` selection.** The reviewer
+  router now prefers another model family without requiring it: when no other family can review, it
+  assigns the author's own family (`same-family: quota`, `other-unavailable`, `ci-only`). The handoff
+  used to accept only `cross-family` and `same-family: quota` and refused the rest; the author is
+  still never the reviewer.
+- **Operator pauses hold merges.** Paused lanes continue observing merge waits but start no new merge gate, including when a pause arrives during environment preparation. Token changes take effect without restarting the Runner.
+- **A closed decision request held by a `blocks` edge is no longer reopened.** A request card that
+  still carried an unmet `blocks` edge (its addressee's wait from an ended session) was reopened for
+  the asker's next question and then sat behind "held: blocked by" while the asker waited on it; such
+  a request is now left closed and a new one is filed (store event `decision_request_held`). A
+  failed dependency read leaves the question for a later pass; a malformed edge set keeps the old reuse.
+
 ## 0.2.40 — 2026-11-13
 
 - **An amount with a currency word is a money question.** "20 долларов", "50 евро", "30

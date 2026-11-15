@@ -375,6 +375,43 @@ class Settle(TypedTurn):
         self.assertTrue(a.wait["ask_filed"])
         self.assertEqual(len(calls(self.calls)), 1)
 
+    def test_ask_agent_to_an_agent_with_no_lane_in_this_workspace_files_no_card_and_tells_the_asker(self):
+        """The addressee is run by this runner, but only for another workspace. Its request card
+        here would sit in a queue no lane polls; the asker hears at once whom it can ask, the Mesh wait is
+        resolved as cancelled, and nothing is filed."""
+        from types import SimpleNamespace
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.cfg.mesh_effects = True
+        r = self.run_turn(mesh, t)
+        r.lanes = [r, SimpleNamespace(agent=SimpleNamespace(name="lead", paused=False),
+                                      me={"id": "agent-lead", "name": "lead", "workspace_id": "ws2"})]
+        self.ask_agent(mesh, t)
+        a = self.finish_turn(r)
+        self.assertEqual(a.state, "ready", a.wake_text)
+        self.assertIn("cannot route recipient @lead: it has no lane of this runner in this workspace",
+                      a.wake_text)
+        self.assertIn("No request card was filed", a.wake_text)
+        self.assertEqual(mesh.created, [])
+        self.assertEqual([(w, res) for _, w, res, _ in getattr(mesh, "resolved", [])], [("w-1", "cancelled")])
+
+    def test_ask_agent_to_the_agents_lane_in_this_workspace_files_its_card(self):
+        """The positive control of the one above: the same agent with a lane in this workspace (under another
+        config name, as ``ops-vc``) gets its request card."""
+        from types import SimpleNamespace
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.cfg.mesh_effects = True
+        r = self.run_turn(mesh, t)
+        r.lanes = [r, SimpleNamespace(agent=SimpleNamespace(name="lead", paused=False),
+                                      me={"id": "agent-lead", "name": "lead", "workspace_id": "ws2"}),
+                   SimpleNamespace(agent=SimpleNamespace(name="lead-ws1", paused=False),
+                                   me={"id": "agent-lead", "name": "lead", "workspace_id": "ws1"})]
+        self.ask_agent(mesh, t)
+        a = self.finish_turn(r)
+        self.assertEqual((a.state, a.wait["kind"], a.wait["handle"]), ("waiting", "decision", "lead"), a.wake_text)
+        self.assertEqual([c["assignee_id"] for c in mesh.created], ["agent-lead"])
+
     def test_an_ask_agent_wait_parked_without_a_request_card_gets_one_on_the_next_pass(self):
         """A wait parked by the runner that left the asking to Mesh (fx set, no request card): the
         addressee was never started. The next pass over the wait files the card, once."""

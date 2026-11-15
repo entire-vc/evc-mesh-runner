@@ -19,7 +19,7 @@ import uuid
 from unittest import mock
 from pathlib import Path
 
-from fakes import FakeMesh, task
+from fakes import FakeMesh, ask_agent, calls, task, wait_time, write_replies
 from mesh_runner import host_admission, hostmem, interactive, runner as runner_mod, tui_driver
 from mesh_runner.adapters.base import interrupt_group, proc_stamp
 from test_runner import Bench
@@ -35,13 +35,15 @@ def dead_pid():
 class UnknownAfterPaste(Bench):
     """The incident's exact state: journal at ``send-intent`` (pasted), no UserPromptSubmit, driver gone."""
 
+    MODE, CATEGORY, PHASE = "work", "in_progress", "send-intent"
+
     def setUp(self):
         super().setUp()
-        self.t = task(1, cat="in_progress")
+        self.t = task(1, cat=self.CATEGORY)
         self.mesh = FakeMesh([self.t])
         self.r = self.runner(self.mesh)
         self.children = []
-        a = self.r.store.create(self.agent.name, self.t["id"], "claude", self.t["title"])
+        a = self.r.store.create(self.agent.name, self.t["id"], "claude", self.t["title"], mode=self.MODE)
         self.directory = interactive.agent_dir(self.cfg.state_dir, self.agent.name)
         self.directory.mkdir(parents=True, exist_ok=True)
         log = self.root / f"{a.id}.turn2.claude.jsonl"
@@ -53,7 +55,7 @@ class UnknownAfterPaste(Bench):
                        "prior": {"turns": 1, "session_id": "", "log_path": "", "turn_started_at": "",
                                  "source_read_at": ""}}
         interactive.write_delivery(self.directory, a.id, {
-            "version": 1, "token": self.intent["token"], "sha256": self.intent["sha256"], "phase": "send-intent",
+            "version": 1, "token": self.intent["token"], "sha256": self.intent["sha256"], "phase": self.PHASE,
             "harness": "claude", "session_id": self.intent["session_id"], "cwd": str(self.root),
             "native_base": 0, "native_prefix": hashlib.sha256(json.dumps([], sort_keys=True).encode()).hexdigest(),
             "offset": 0, "meta": {}})
@@ -162,6 +164,76 @@ class UnknownAfterPaste(Bench):
             self.r.settle_finished()
         self.assertEqual(self.r.store.get(self.a.id).state, "unknown")
         self.assertNotIn("quiet_resolution", [k for _, k, _ in self.r.store.events(self.a.id)])
+
+
+class TakenThenFailed(UnknownAfterPaste):
+    """The driver saw the session take the prompt (journal ``accepted``), the session worked and then failed with no
+    native record of the prompt. Same hold and the same quiet ending, without
+    a replay (every inherited test runs on this journal), but its own reason and words, never "did not confirm"."""
+
+    PHASE = "accepted"
+
+    def test_unknown_signals_once_and_explains_itself(self):
+        for _ in range(3):
+            self.r.settle_finished()
+        a = self.r.store.get(self.a.id)
+        self.assertEqual(a.state, "unknown")
+        reason = a.wait["interactive_prompt_intent"]["resolution"]
+        self.assertEqual(reason, "prompt-taken-session-failed")
+        self.assertEqual([d for _, k, d in self.r.store.events(a.id) if k == "prompt_delivery_unknown"], [reason])
+        self.assertEqual(len(self.alerts()), 1, "one operator signal per event, not per tick")
+        alert = self.alerts()[0]
+        self.assertIn("took the prompt, worked and then failed", alert["text"])
+        self.assertNotIn("did not confirm", alert["text"])
+        held = [c for c in self.comments() if "MANDATORY DELIVERY PENDING" in c]
+        self.assertEqual(len(held), 1)
+        self.assertIn("took the last prompt and worked on it, then failed", held[0])
+        self.assertNotIn("did not confirm", held[0])
+        self.assertIn("is not sent again", held[0])
+
+    def test_two_prompts_of_this_session_stay_unproven(self):
+        # positive control: an ambiguous native record is not "taken then failed", whatever the journal says
+        with open(self.directory / f"{self.a.id}.events.jsonl", "a") as fh:
+            for _ in range(2):
+                fh.write(json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": self.intent["session_id"],
+                                     "prompt_id": str(uuid.uuid4()), "prompt": "PROMPT"}) + "\n")
+        self.r.settle_finished()
+        a = self.r.store.get(self.a.id)
+        self.assertEqual(a.wait["interactive_prompt_intent"]["resolution"], "acceptance-unproven")
+
+
+class ReviewUnknownAfterNext(UnknownAfterPaste):
+    """A reviewer's first turn ended in NEXT (a readable outcome, no verdict); its second turn is the incident's
+    unknown paste. The quiet rule closes it: nobody reviewed the card, so it is fed again at once, not after the
+    refeed window."""
+
+    MODE, CATEGORY = "review", "review"
+
+    def review_hold(self):
+        self.r._hold_cache.clear()
+        return self.r.hold_reason(dict(self.mesh.tasks[self.t["id"]], _mode="review"), "review")
+
+    def close_by_the_quiet_rule(self):
+        self.r.settle_finished()
+        self.age_quiet_clock(runner_mod.UNKNOWN_QUIET_MINUTES + 1)
+        self.r.settle_finished()
+        self.assertEqual(self.r.store.get(self.a.id).state, "completed")
+
+    def test_a_review_closed_by_the_quiet_rule_after_next_is_fed_again(self):
+        self.r.store.event(self.a.id, "readable_outcome", "next")       # what settle writes for turn 1's NEXT
+        self.r.store.mark(self.agent.name, self.t["id"], "review_fed", self.a.id)
+        self.r.settle_finished()
+        self.assertEqual(self.r.store.get(self.a.id).state, "unknown")
+        self.assertEqual(self.review_hold(), "review: already reviewed; waits for a new comment")  # still live
+        self.close_by_the_quiet_rule()
+        self.assertEqual(self.review_hold(), "")
+
+    def test_a_review_whose_last_word_decided_still_holds(self):
+        # positive control: the turn decided (a hand-off) and the attempt ended on it, not on a failure
+        self.r.store.event(self.a.id, "readable_outcome", "handoff")
+        self.r.store.mark(self.agent.name, self.t["id"], "review_fed", self.a.id)
+        self.r._finish(self.r.store.get(self.a.id), "completed", "routed")
+        self.assertEqual(self.review_hold(), "review: already reviewed; waits for a new comment")
 
 
 class FakeTmux:
@@ -281,3 +353,68 @@ class MemoryFloor(Bench):
         self.assertEqual(head[head.index("--memory-hold-swap-mb") + 1], "300")
         opts, _ = tui_driver.parse_args(head[2:] + ["--key", "k", "--", "x"])
         self.assertEqual(opts["memory_hold_free_pct"], "15")
+
+
+class HostGateBeforeAWindow(Bench):
+    """The look right before a window reads memory and load now, for a resume as for a new start:
+    resumes admitted by an open tick went into a CPU overload minutes later and never took their
+    prompt. The held attempt keeps its card as it is and starts once the host is back and settled."""
+
+    def waiting_card(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: ask_agent("lead", "ready?"),
+                                     t["id"][:8] + ":resume": wait_time(why="soak window")})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        self.assertEqual(self.states(r)[t["id"][:8]], "waiting")
+        return t, mesh, r
+
+    def overload_after_the_tick(self, r):
+        """The tick's cached reading says open; the host is at 9.3 per CPU when the window would start."""
+        reading = [(30.0, 10)]
+        r.loadgate.t.hold_per_cpu, r.loadgate.t.release_per_cpu = 8.0, 5.0
+        r.loadgate._read = lambda: reading[0]
+        r.loadgate._at = None
+        self.assertFalse(r.loadgate.check())
+        reading[0] = (93.0, 10)
+        return reading
+
+    def test_a_resume_under_a_load_hold_starts_no_window(self):
+        t, mesh, r = self.waiting_card()
+        reading = self.overload_after_the_tick(r)
+        before = (mesh.tasks[t["id"]].get("status_id"), dict(mesh.tasks[t["id"]]).get("category"))
+        mesh.add_comment(t["id"], "SHIP: looks good", author="lead")
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            r.tick()                                              # wake; the resume meets the fresh reading
+        self.assertEqual([x["resume"] for x in calls(self.calls)], [False], "no window for the resume")
+        self.assertTrue(any("start held: host overloaded (load5 93.0" in m for m in logs.output), logs.output)
+        self.assertNotIn(self.states(r)[t["id"][:8]], ("running", "unknown"))
+        self.assertEqual((mesh.tasks[t["id"]].get("status_id"), dict(mesh.tasks[t["id"]]).get("category")), before)
+        [a] = r.store.by_state(self.agent.name, ("starting", "running", "ready", "waiting", "unknown"))
+        self.assertNotIn("prompt_delivery_unknown", [k for _, k, _ in r.store.events(a.id)])
+        # the host is back: once settled the same attempt resumes the same session
+        reading[0] = (30.0, 10)
+        r.loadgate.settle_seconds, r.ramp.interval, r.loadgate._at = 0, 0, None
+        r._resume_hold.clear()
+        r.tick()
+        self.settle_all(r)
+        c = calls(self.calls)
+        self.assertEqual([x["resume"] for x in c], [False, True])
+        self.assertEqual(c[0]["sid"], c[1]["sid"])
+
+    def test_a_memory_hold_holds_a_resume_the_same_way(self):
+        # positive control on the memory side of the same look
+        t, mesh, r = self.waiting_card()
+        r.memgate.t.hold_free_pct, r.memgate.t.release_free_pct = 15, 20
+        r.memgate._read = lambda: (50.0, None)
+        r.memgate._at = None
+        self.assertFalse(r.memgate.check())
+        r.memgate._read = lambda: (10.0, None)
+        mesh.add_comment(t["id"], "SHIP: looks good", author="lead")
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            r.tick()
+        self.assertEqual([x["resume"] for x in calls(self.calls)], [False])
+        self.assertTrue(any("start held: host short of memory" in m for m in logs.output), logs.output)
+

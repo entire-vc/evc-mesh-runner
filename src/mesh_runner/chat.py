@@ -35,7 +35,10 @@ log = logging.getLogger("mesh_runner")
 
 NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-ROUTING_KEYS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "MESH_RUNNER_PROFILE", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL")
+# MESH_RUNNER_CHAT_HARNESS enters the digest only when the session runs another harness's
+# command than its configured one, so the digest of a session on its own harness is unchanged
+ROUTING_KEYS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "MESH_RUNNER_PROFILE", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+                "MESH_RUNNER_CHAT_HARNESS")
 CRASH_WINDOW = 300.0          # a session gone within this after its start counts as a crash
 CRASH_BACKOFF = 600.0
 COMPARE_EVERY = 300.0         # how often a live session's routing is compared (builds the env)
@@ -76,6 +79,8 @@ class ChatKeeper:
         self.last_start: float | None = None
         self.backoff_until = 0.0
         self.held_since: float | None = None
+        self.hold_kind = ""                       # "idle": a restart waits for an idle moment;
+                                                   # "route": routed to a harness without a command
         self.error = ""
         self._compared_at = -1e18
 
@@ -129,12 +134,13 @@ class ChatKeeper:
                 if ENV_KEY.fullmatch(k):
                     fh.write(f"export {k}={shlex.quote(v)}\n")
 
-    def start(self, env: dict[str, str], digest: str) -> bool:
+    def start(self, env: dict[str, str], digest: str, command: list[str] | None = None) -> bool:
         env = dict(env)
+        command = list(command or self.spec.command)
         env.setdefault("TERM", "xterm-256color")    # env -i drops what tmux would have set
         self._write_env(env)
         f = shlex.quote(str(self.env_file))
-        inner = f". {f}; rm -f {f}; exec {' '.join(shlex.quote(x) for x in self.spec.command)}"
+        inner = f". {f}; rm -f {f}; exec {' '.join(shlex.quote(x) for x in command)}"
         res = self._tmux("new-session", "-d", "-s", self.spec.session, "-c", str(self.cwd),
                          "/usr/bin/env", "-i", "/bin/sh", "-c", inner)
         if res.returncode != 0:
@@ -153,9 +159,21 @@ class ChatKeeper:
         self._tmux("kill-session", "-t", self._target())
         self.env_file.unlink(missing_ok=True)
 
+    def _hold(self, now: float, why: str, kind: str = "idle") -> str:
+        if self.held_since is None:                # once per episode: the hold is visible in the log
+            log.warning("%s: chat session %s held: %s", self.agent, self.spec.session, why)
+        self.held_since = self.held_since or now
+        self.hold_kind = kind
+        return "held"
+
+    def _release(self) -> None:
+        self.held_since, self.hold_kind = None, ""
+
     def check(self, env_of) -> str:
         """One check; env_of() builds the agent's environment (only called when
-        needed). Returns started / restarted / kept / held / foreign / backoff / failed."""
+        needed) and returns (env, digest) or (env, digest, command): digest None =
+        routed to a harness this session has no command for; command None = the
+        configured one. Returns started / restarted / kept / held / foreign / backoff / failed."""
         now = self.clock()
         state = self.state()
         if state in ("gone", "dead"):
@@ -169,27 +187,29 @@ class ChatKeeper:
                 return "backoff"
             if state == "dead":
                 self.stop()
-            env, digest = env_of()
+            env, digest, command = _unpack(env_of())
             if digest is None:                     # routed to a harness this session cannot run
-                self.held_since = self.held_since or now
-                return "held"
-            ok = self.start(env, digest)
+                self.error = "chat session is gone and routed to a harness it has no command for"
+                return self._hold(now, "gone, routed to a harness without a chat command", "route")
+            ok = self.start(env, digest, command)
             if ok:
                 self.error = ""
+                self._release()
             return "started" if ok else "failed"
         self.env_file.unlink(missing_ok=True)       # the shell has read it (or never will)
         if state == "unknown":
             return "kept"                          # tmux did not answer: decide next time
-        if state == "ours" and now - self._compared_at < COMPARE_EVERY and self.held_since is None:
-            return "kept"                          # alive and recently verified: no env build
+        if state == "ours" and now - self._compared_at < COMPARE_EVERY and self.hold_kind != "idle":
+            # alive and recently verified: no env build (a route hold changes only with the route)
+            return "held" if self.held_since is not None else "kept"
         if state == "foreign" and not self.spec.adopt:
             self.error = f"tmux session {self.spec.session} exists and is not the runner's (adopt = false)"
             return "foreign"
-        env, digest = env_of()
+        env, digest, command = _unpack(env_of())
         self._compared_at = now
-        if digest is None:
-            self.held_since = None
-            return "kept"                          # routing says nothing about this session now
+        if digest is None:                         # the live session stays on its old route, visibly
+            return self._hold(now, "routed to a harness without a chat command; the live session "
+                                   "keeps its current harness", "route")
         recorded = self.option("@mr_digest") if state == "ours" else ""
         started = self.option("@mr_started") if state == "ours" else ""
         if recorded is None or started is None:
@@ -198,16 +218,21 @@ class ChatKeeper:
         old = (self.spec.max_age_hours > 0 and started.isdigit()
                and now - int(started) > self.spec.max_age_hours * 3600)
         if not (stale or old):
-            self.held_since, self.error = None, ""
+            self._release()
+            self.error = ""
             return "kept"
         if not self.idle():
-            self.held_since = self.held_since or now
-            return "held"
+            return self._hold(now, "routing changed or session aged, waiting for an idle moment")
         log.info("%s: chat session %s restarts (%s)", self.agent, self.spec.session,
                  "adopted" if state == "foreign" else "routing changed" if stale else "age")
-        self.held_since = None
+        self._release()
         self.stop()
-        ok = self.start(env, digest)
+        ok = self.start(env, digest, command)
         if ok:
             self.error = ""
         return "restarted" if ok else "failed"
+
+
+def _unpack(res) -> tuple:
+    env, digest = res[0], res[1]
+    return env, digest, (res[2] if len(res) > 2 else None)

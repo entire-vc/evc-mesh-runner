@@ -247,7 +247,7 @@ class SameAttemptWake(Bench):
         self.assertFalse(self.calls.exists())
 
     def test_done_card_does_not_bypass_unfulfilled_deployment(self):
-        r, a = self.prepare(body="@builder continue the remaining delivery")
+        r, a = self.prepare(body="FYI progress only")
         r.mesh.tasks[task(2)["id"]]["status_id"] = "s-done"
         r.mesh.deps[a.task_id] = [dict(edge(2, a.task_id, satisfied=False),
             condition="deployed", depends_on_task_id=task(2)["id"])]
@@ -255,6 +255,22 @@ class SameAttemptWake(Bench):
         self.assertEqual(r.store.get(a.id).state, "waiting")
         self.assertFalse(r.procs)
         self.assertFalse(self.calls.exists())
+
+    def test_addressed_comment_beside_unfulfilled_deployment_wakes_as_a_comment(self):
+        # The open typed edge holds the target's event, not this card's own addressed comment.
+        r, a = self.prepare(body="@builder continue the remaining delivery")
+        r.mesh.tasks[task(2)["id"]]["status_id"] = "s-done"
+        r.mesh.deps[a.task_id] = [dict(edge(2, a.task_id, satisfied=False),
+            condition="deployed", depends_on_task_id=task(2)["id"])]
+        original_edges = copy.deepcopy(r.mesh.deps)
+        r._wake_one(a)
+        b = r.store.get(a.id)
+        self.assertEqual((b.id, b.state), (a.id, "ready"))
+        self.assertIn("continue the remaining delivery", b.wake_text)
+        self.assertNotIn("is done", b.wake_text)               # no "target closed" through the open edge
+        self.assertIsNone(r.store.mark(self.agent.name, a.task_id, "met_wake"))
+        self.assertEqual(r.mesh.deps, original_edges)
+        self.assertFalse(r.procs)
 
     def test_fulfilled_deployment_alone_is_not_a_wake_event(self):
         r, a = self.prepare(body="FYI progress only")
@@ -289,8 +305,21 @@ class SameAttemptWake(Bench):
         self.assertEqual(r.store.get(a.id).state, "waiting")
         self.assertFalse(r.procs)
 
-    def test_addressed_comment_cannot_bypass_ambiguous_unsatisfied_edges(self):
+    def test_addressed_comment_wakes_beside_ambiguous_unsatisfied_edges(self):
+        # Ambiguous edges hold the target's event; an addressed comment on this card still wakes it,
+        # with the comment as the event, and no edge is retargeted or removed.
         r, a = self.prepare(satisfied=False)
+        original_wait, original_edges = copy.deepcopy(a.wait), copy.deepcopy(r.mesh.deps)
+        r._wake_one(a)
+        b = r.store.get(a.id)
+        self.assertEqual((b.id, b.state, b.turns), (a.id, "ready", a.turns))
+        self.assertIn("continue the remaining delivery", b.wake_text)
+        self.assertEqual(b.wait["target"], original_wait["target"])
+        self.assertEqual(r.mesh.deps, original_edges)
+        self.assertFalse(r.procs)
+
+    def test_unaddressed_comment_beside_ambiguous_unsatisfied_edges_keeps_waiting(self):
+        r, a = self.prepare(body="FYI progress only", satisfied=False)
         r._wake_one(a)
         self.assertEqual(r.store.get(a.id).state, "waiting")
         self.assertFalse(r.procs)

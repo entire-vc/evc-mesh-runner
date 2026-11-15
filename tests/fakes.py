@@ -11,7 +11,9 @@ import time
 import uuid
 from pathlib import Path
 
-from mesh_runner import lifecycle
+import tempfile
+
+from mesh_runner import checkout_fence, lifecycle
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.adapters.codex import CodexAdapter
 from mesh_runner.mesh import Checkout, MeshError
@@ -19,6 +21,10 @@ from mesh_runner.mesh import Checkout, MeshError
 # Every test that drives a runner through these doubles also checks the lifecycle table: a state change
 # the table does not name raises instead of being recorded (see mesh_runner.lifecycle).
 lifecycle.STRICT = True
+
+# The checkout fence's default directory is in the real home (where the agent's MCP looks); tests never
+# write there.
+checkout_fence.DEFAULT_DIR = Path(tempfile.mkdtemp(prefix="mesh-runner-fence-"))
 
 # A moment ahead of the real clock for time-WAIT fixtures: the parser refuses a past or bare
 # timestamp, so a fixed calendar date would turn these tests red once it passes.

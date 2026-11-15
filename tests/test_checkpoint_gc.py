@@ -123,6 +123,88 @@ class CheckpointGC(unittest.TestCase):
         self.gc(grace_hours=0)
         self.assertFalse(pending.exists())
 
+    def scratch(self, name, before_start=True):
+        """Scratch a verify/compaction/proof leaves behind; before_start: made by a process that ran
+        before this one (a day ago is before the test process imported the checkpoint module)."""
+        path = self.cps / name
+        (path / 'objects').mkdir(parents=True)
+        (path / 'objects' / 'pack').write_bytes(b'x' * 64 * 1024)
+        if before_start:
+            stamp = time.time() - 86400
+            os.utime(path / 'objects', (stamp, stamp))
+            os.utime(path, (stamp, stamp))
+        return path
+
+    def test_orphan_scratch_of_a_dead_process_removed_this_process_kept(self):
+        cp = self.suspend()
+        dead = [self.scratch(n) for n in ('.verify-skj5p1ww', '.compact-src-a1b2', '.preflight-c3d4')]
+        fresh = self.scratch('.verify-fresh', before_start=False)
+        with self.assertLogs('mesh_runner', 'INFO') as logs:
+            res = self.gc()
+        for path in dead:
+            self.assertFalse(path.exists(), path.name)
+            self.assertRegex('\n'.join(logs.output),
+                             r'checkpoint gc: removed orphan scratch %s bytes=[1-9]\d*' % path.name)
+        self.assertTrue((fresh / 'objects' / 'pack').exists())
+        self.assertTrue((cp / 'manifest.json').exists())
+        self.assertEqual(len(self.pool._checkpoint_rows('attempt')), 1)
+        self.assertGreater(res['freed_bytes'], 0)
+        self.assertEqual(sorted(c['reason'] for c in res['checkpoints']), ['orphan scratch'] * 3)
+        self.assertEqual(sorted(p.name for p in self.cps.iterdir()), sorted([cp.name, fresh.name]))
+
+    def test_orphan_scratch_kept_while_this_process_works_in_the_root(self):
+        self.suspend()
+        dead = self.scratch('.verify-dead')
+        held, release = threading.Event(), threading.Event()
+
+        def verify():
+            with checkpoint._IO_LOCK:
+                held.set()
+                release.wait(10)
+        t = threading.Thread(target=verify)
+        t.start()
+        held.wait(10)
+        try:
+            self.gc()
+            self.assertTrue(dead.exists())
+        finally:
+            release.set()
+            t.join()
+        self.gc()
+        self.assertFalse(dead.exists())
+
+    def test_orphan_scratch_dry_run_and_pinned_pass_touch_nothing(self):
+        self.suspend()
+        dead = self.scratch('.compact-src-dead')
+        res = self.gc(apply=False)
+        self.assertEqual([(c['checkpoint'], c['reason']) for c in res['checkpoints']],
+                         [(str(dead), 'orphan scratch')])
+        self.assertGreater(res['checkpoints'][0]['bytes'], 0)
+        self.assertTrue(dead.exists())
+        res = self.gc(checkpoint_pins={})
+        self.assertEqual(res['checkpoints'], [])
+        self.assertTrue(dead.exists())
+
+    def test_other_dot_entries_are_not_orphan_scratch(self):
+        cp = self.suspend()
+        kept = [self.scratch(n) for n in ('.retired-x', '.verify', '.ita-index-x')]
+        (self.cps / '.verify-file').write_text('not a directory')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'keep').write_text('keep')
+        (self.cps / '.preflight-link').symlink_to(outside)
+        for path in (self.cps / '.verify-file', self.cps / '.preflight-link'):
+            os.utime(path, (time.time() - 86400,) * 2, follow_symlinks=False)
+        res = self.gc()
+        for path in kept:
+            self.assertTrue(path.exists(), path.name)
+        self.assertTrue((self.cps / '.verify-file').exists())
+        self.assertTrue((self.cps / '.preflight-link').is_symlink())
+        self.assertTrue((outside / 'keep').exists())
+        self.assertTrue(cp.exists())
+        self.assertEqual(res['checkpoints'], [])
+        self.assertEqual(res['errors'], 0)
+
     def test_dry_run_reports_and_changes_nothing(self):
         cp = self.suspend(state='failed', ended_hours_ago=8)
         refs = self.refs()
