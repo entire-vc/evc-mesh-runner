@@ -117,5 +117,97 @@ class Driver(unittest.TestCase):
         self.assertEqual(evs[-1], {"type": "final", "stop_reason": "cancelled"})
 
 
+# What tui_driver writes when its window start found the host cap full for its whole wait (start_window): the
+# host-wait record, then its ordinary error result. Nothing was started or pasted.
+CAP_TIMEOUT = [{"type": "mesh_runner.host_wait", "state": "waiting", "reason": "cap"},
+               {"type": "mesh_runner.host_wait", "state": "timeout", "reason": "cap"},
+               {"type": "system", "subtype": "init", "session_id": "s1", "model": "", "launch_mode": "interactive"},
+               {"type": "result", "subtype": "error_during_execution", "is_error": True,
+                "result": "host session cap reached (22 live sessions, all busy)", "session_id": "s1", "usage": {}}]
+
+
+def busy_then_turn(root: Path, busy_runs: int) -> str:
+    """A driver whose first ``busy_runs`` runs find no room on the host; the next one runs the turn. Every run
+    is counted in ``runs`` once it has written all it writes; a run that reaches the session records the
+    prompt in ``delivered``."""
+    lines = "\n".join(f"    print({json.dumps(json.dumps(e))}, flush=True)" for e in CAP_TIMEOUT)
+    turn = "\n".join(f"    print({json.dumps(json.dumps(e))}, flush=True)" for e in CLAUDE)
+    return (f"import os, sys\nprompt = sys.stdin.read()\nruns = {str(root / 'runs')!r}\n"
+            f"n = len(open(runs).read()) if os.path.exists(runs) else 0\n"
+            f"if n < {busy_runs}:\n{lines}\n"
+            f"else:\n    open({str(root / 'delivered')!r}, 'a').write(prompt + '\\n')\n{turn}\n"
+            f"open(runs, 'a').write('x')\n")
+
+
+class HostCap(unittest.TestCase):
+    """a chat turn whose window found the host cap full is not a failed turn: nothing reached the
+    session, so it waits for a slot (chat) or comes back unstarted (answer desk), and runs exactly once."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+
+    def delivery(self, script, **kw):
+        return DriverDelivery("claude", lambda t: ([sys.executable, "-c", script], self.root, {}, "the question"),
+                              self.root / "logs", poll=0.02, term_wait=2, **kw)
+
+    def runs(self):
+        return len((self.root / "runs").read_text()) if (self.root / "runs").exists() else 0
+
+    def delivered(self):
+        p = self.root / "delivered"
+        return p.read_text().splitlines() if p.exists() else []
+
+    def test_a_chat_turn_waits_out_a_full_host_and_runs_once_when_a_slot_frees(self):
+        turn = {"turn_id": "turn-12345678"}
+        with self.assertLogs("mesh_runner.chat_delivery", level="INFO") as cm:
+            evs = list(self.delivery(busy_then_turn(self.root, 2)).run(turn, lambda: False))
+        self.assertEqual(evs[-1], {"type": "final", "stop_reason": "end_turn"})
+        self.assertNotIn("error", [e["type"] for e in evs])            # not a terminal failure
+        self.assertEqual([e["type"] for e in evs].count("session"), 1)  # the unstarted runs say nothing
+        self.assertEqual(self.runs(), 3)
+        self.assertEqual(self.delivered(), ["the question"])            # exactly one turn reached the session
+        waiting = [m for m in cm.output if "waits for a free slot" in m]
+        self.assertEqual(len(waiting), 1)                               # one line per waiting turn
+        self.assertIn("host session cap reached", waiting[0])
+        self.assertEqual(list(self.root.joinpath("logs").rglob("*.*")), [])
+
+    def test_without_wait_for_room_the_turn_comes_back_unstarted(self):
+        evs = list(self.delivery(busy_then_turn(self.root, 1), wait_for_room=False).run(
+            {"turn_id": "turn-12345678"}, lambda: False))
+        self.assertEqual([e["type"] for e in evs], ["error"])
+        self.assertEqual((evs[0]["code"], evs[0]["retryable"]), ("host_busy", True))
+        self.assertEqual((self.runs(), self.delivered()), (1, []))
+
+    def test_stop_while_waiting_for_room_ends_cancelled_with_no_session(self):
+        script = ("import signal,sys,time\nsignal.signal(signal.SIGTERM,lambda *a:sys.exit(0))\nsys.stdin.read()\n"
+                  "print('{\"type\":\"mesh_runner.host_wait\",\"state\":\"waiting\",\"reason\":\"cap\"}',flush=True)\n"
+                  "time.sleep(60)")
+        flag = {"n": 0}
+
+        def cancelled():
+            flag["n"] += 1
+            return flag["n"] > 5
+        turn = {"turn_id": "turn-12345678"}
+        evs = list(self.delivery(script).run(turn, cancelled))
+        self.assertEqual(evs, [{"type": "final", "stop_reason": "cancelled"}])
+        self.assertEqual(turn["_host_wait"], "cancelled")
+
+    def test_stop_after_a_run_that_found_no_room_ends_cancelled_with_no_session(self):
+        turn = {"turn_id": "turn-12345678"}
+        evs = list(self.delivery(busy_then_turn(self.root, 5)).run(turn, lambda: self.runs() >= 1))
+        self.assertEqual(evs, [{"type": "final", "stop_reason": "cancelled"}])
+        self.assertEqual(turn["_host_wait"], "cancelled")
+        self.assertEqual((self.runs(), self.delivered()), (1, []))
+
+    def test_a_turn_that_got_room_after_waiting_is_an_ordinary_turn(self):
+        script = "import sys\nsys.stdin.read()\n" + "\n".join(f"print({json.dumps(json.dumps(e))})" for e in (
+            [{"type": "mesh_runner.host_wait", "state": "waiting", "reason": "cap"},
+             {"type": "mesh_runner.host_wait", "state": "room"}] + CLAUDE))
+        turn = {"turn_id": "turn-12345678"}
+        evs = list(self.delivery(script).run(turn, lambda: False))
+        self.assertEqual(evs[-1], {"type": "final", "stop_reason": "end_turn"})
+        self.assertEqual(turn["_host_wait"], "room")
+
+
 if __name__ == "__main__":
     unittest.main()

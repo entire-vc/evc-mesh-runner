@@ -68,6 +68,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import asks, catalog_launch
+from . import api_mode as _api_mode
 from .selection import Policy
 from .workspace import RepoSpec
 
@@ -267,6 +268,11 @@ class AgentConfig:
     task_route_harnesses: list[str] = field(default_factory=list)  # alt harnesses a card may select by label runner-harness:<h>; empty = none
     chat: dict = field(default_factory=dict)   # standing interactive session: session, command, idle_command, max_age_hours
     launch_mode: str = ""              # "" inherits RunnerConfig.launch_mode; "interactive" or "headless"
+    # API mode (api_mode.py): consent, the explicit primary <account>/api profile, and the providers whose
+    # API profile the lane's route may use as a reserve. Without consent no turn runs under a key.
+    api_optin: bool = False
+    api_primary_profile: str = ""
+    api_reserve_providers: list[str] = field(default_factory=list)
     decision_wake: str = ""            # "" inherits RunnerConfig.decision_wake; "any" or "answer"
     preamble_file: str = ""
     paused: bool = False
@@ -597,8 +603,9 @@ class RunnerConfig:
     tmux_binary: str = "tmux"               # standing chat sessions and interactive turns
     # strict existing-session readonly_metadata receiver (meta_delivery.Settings); None = off
     session_metadata: object = field(default=None, repr=False)
-    # how turns run: "interactive" (the harness's interactive program in tmux, fed by a driver;
-    # what a subscription covers) or "headless" (claude -p / codex exec, billed per token)
+    # how turns run: "interactive" (the harness's interactive program in tmux, fed by a driver)
+    # or "headless" (claude -p / codex exec, one process per turn); both draw on the same
+    # subscription windows
     launch_mode: str = "interactive"
     interactive_idle_minutes: float = 60.0  # a warm session idle this long is closed
     interactive_max_sessions: int = 20      # live interactive sessions on this host, all agents
@@ -606,6 +613,7 @@ class RunnerConfig:
     # (Claude Code resumes the main thread itself when one finishes); 0 = paste at once
     background_wait_minutes: float = 45.0
     catalog: CatalogConfig = field(default_factory=CatalogConfig)
+    api: object = None                  # api_mode.ApiConfig: [api] spend pools and key carriers
     git_index_admission: "GitIndexAdmissionConfig | None" = None
     mesh_basic_auth: str = field(default="", repr=False)   # "user:pass" for a Mesh behind HTTP basic auth
     # Mesh extension: the service endpoint (/healthz, /mesh/install, /mesh/events) and the extension
@@ -685,6 +693,21 @@ def _flag(value, key: str, name: str) -> bool:
     if type(value) is not bool:
         raise ValueError(f"agent {name}: {key} must be true or false")
     return value
+
+
+def _api_profile(value, name: str) -> str:
+    from .api_mode import _PROFILE
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str) or not _PROFILE.fullmatch(value):
+        raise ConfigError(f"agent {name}: api_primary_profile must be an '<account>/api' profile ref")
+    return value
+
+
+def _str_list(value, key: str, name: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(v, str) or not v.strip() for v in value):
+        raise ConfigError(f"agent {name}: {key} must be a list of names")
+    return [v.strip() for v in value]
 
 
 def _qo_argv(value, name: str) -> list[str]:
@@ -1033,6 +1056,9 @@ def load(path: str | Path) -> RunnerConfig:
             queue_order_cache_seconds=_qo_seconds(a.get("queue_order_cache_seconds", 60), "queue_order_cache_seconds", a["name"], zero=True),
             chat=dict(a.get("chat") or {}),
             launch_mode=_launch_mode(a.get("launch_mode", ""), f"agent {a['name']}", allow_empty=True),
+            api_optin=_flag(a.get("api_optin", False), "api_optin", a["name"]),
+            api_primary_profile=_api_profile(a.get("api_primary_profile", ""), a["name"]),
+            api_reserve_providers=_str_list(a.get("api_reserve_providers", []), "api_reserve_providers", a["name"]),
             decision_wake=_decision_wake(a.get("decision_wake", ""), f"agent {a['name']}", allow_empty=True),
             alt={str(k): dict(v) for k, v in (a.get("alt") or {}).items()},
             task_route_harnesses=[str(h) for h in (a.get("task_route_harnesses") or [])],
@@ -1094,6 +1120,8 @@ def load(path: str | Path) -> RunnerConfig:
         interactive_max_sessions=int(r.get("interactive_max_sessions", 20)),
         mesh_basic_auth=_basic_auth(r),
         catalog=_catalog(raw.get("catalog"), _path(r.get("state_dir") or _default_state_dir())),
+        api=_api_mode.parse_config(raw.get("api"), _path(r.get("state_dir") or _default_state_dir()),
+                                   _path((raw.get("catalog") or {}).get("manifest")), ConfigError),
         git_index_admission=_git_index_admission(raw.get("git_index_admission")),
         extension_enabled=ext.get("enabled", False) is True,
         extension_host=str(ext.get("host", "127.0.0.1")),

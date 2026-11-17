@@ -76,12 +76,21 @@ class DeadWaits(Bench):
         self.assertIn('pipeline 16447 failed', a.wake_text)
 
     def test_failed_head_at_the_declared_baseline_of_a_foreign_mr_is_sent_back(self):
-        # the shape of the wait that sat for hours: an MR already [opened/failed]
+        # the shape of the wait that sat for hours: an MR already [opened/failed]. Someone else's
+        # MR is sent back too, but names its owner and never asks this task to push into it
         r, t, gl = self.flow(mr=mr_row('failed'), linked=False)
         a = self.turn(r, t, change('mr', 'failed'))
         self.assert_bounced(a, f'MR {MR}', 'pipeline 16447', 'already finished: failed',
-                            'nothing changes without a push or a retry', 'wait_for on=card')
+                            "nothing changes without the MR owner's push or retry", "This MR is not this task's",
+                            'do not push, merge or rebase its branch')
+        self.assertNotIn('Fix the cause and push', a.wake_text)
         self.assertEqual(r.store.idle_waits_today(self.agent.name, t['id']), 1)
+
+    def test_failed_head_at_the_declared_baseline_of_the_own_mr_asks_for_the_fix(self):
+        r, t, gl = self.flow(mr=mr_row('failed'))
+        a = self.turn(r, t, change('mr', 'failed'))
+        self.assert_bounced(a, 'already finished: failed', 'nothing changes without a push or a retry',
+                            'Fix the cause and push', 'wait_for on=card')
 
     def test_canceled_or_skipped_head_is_sent_back_like_failed(self):
         for status in ('canceled', 'cancelled', 'skipped'):

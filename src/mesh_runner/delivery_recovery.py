@@ -315,6 +315,17 @@ def explain(resolution: str) -> dict:
     }
 
 
+def journal_accepted(directory: Path, key: str, intent: dict) -> bool:
+    """The driver's own journal shows the session took THIS prompt: token and hash match, phase ``accepted``.
+    Wording only (what the operator and the card are told); never an acknowledgement, never consumes the outbox."""
+    try:
+        journal = read_delivery(directory, key)
+    except (OSError, ValueError):
+        return False
+    return (journal.get('token') == intent.get('token') and journal.get('sha256') == intent.get('sha256')
+            and journal.get('phase') == 'accepted')
+
+
 def proven_unsent(directory: Path, key: str, intent: dict, other_sessions: frozenset = frozenset()) -> bool:
     """True only when the durable journal itself proves the native send never began for THIS intent: the
     token/sha match and the phase precedes every paste (`reserved`/`received` or the typed pre-send quota failure), or the typed bootstrap proofs

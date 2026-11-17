@@ -197,6 +197,8 @@ class CodexAdapter(Adapter):
             elif t in ("turn.failed", "error"):
                 r.finished = True
                 r.is_error = True
+                if isinstance(ev.get("usage"), dict):
+                    r.usage = ev["usage"]
                 err = ev.get("error") or {}
                 r.error = (err.get("message") if isinstance(err, dict) else str(err)) or ev.get("message", "") or t
                 # typed provider refusal only; never assistant prose or a quoted report

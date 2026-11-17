@@ -383,13 +383,23 @@ class HeadlessTerminalContract(HeadlessFixture):
                 self.assertEqual(r.store.get(a.id).state, 'unknown')
                 self.assert_pending(r, r.store.get(a.id))
 
-    def test_multiple_terminals_retain_every_mandatory_delivery(self):
-        for kind in ('claude', 'codex'):
-            with self.subTest(kind=kind):
-                r, a = self.terminal(kind, 'multiple-terminal')
-                self.assertFalse(r._reconcile_interactive_prompt(a))
-                self.assertEqual(r.store.get(a.id).state, 'unknown')
-                self.assert_pending(r, r.store.get(a.id))
+    def test_multiple_codex_terminals_retain_every_mandatory_delivery(self):
+        r, a = self.terminal('codex', 'multiple-terminal')
+        self.assertFalse(r._reconcile_interactive_prompt(a))
+        self.assertEqual(r.store.get(a.id).state, 'unknown')
+        self.assert_pending(r, r.store.get(a.id))
+
+    def test_multiple_claude_terminals_of_the_bound_session_acknowledge_delivery(self):
+        # One process, one input: a background task of the same session adds its own `result`.
+        # A terminal of another session stays a mismatch (test_wrong_session_error_retains_every_mandatory_delivery).
+        r, a = self.terminal('claude', 'multiple-terminal')
+        self.assertTrue(r._reconcile_interactive_prompt(a))
+        after = r.store.get(a.id)
+        self.assertNotIn('interactive_prompt_intent', after.wait)
+        self.assertEqual(len(self.records('prompts')), 1)
+        self.assertEqual([d for _, k, d in r.store.events(a.id) if k == 'prompt_native_result_recovered'],
+                         ['headless.bound-terminal'])
+        self.assertEqual([d for _, k, d in r.store.events(a.id) if k == 'prompt_delivery_unknown'], [])
 
     def test_missing_native_terminal_retains_every_mandatory_delivery(self):
         for kind in ('claude', 'codex'):

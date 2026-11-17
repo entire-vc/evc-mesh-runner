@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .chat_delivery import HOST_WAIT
 from .chat_pool import ChatPool
 from .chat_protocol import ChatClient, ChatError
 from .chat_token import TokenKeeper
@@ -222,7 +223,10 @@ class ChatService:
             log.log(logging.WARNING if out.state in ("failed", "dropped", "released") else logging.INFO,
                     "chat turn %s %s: %s (%.1fs)", tid[:8], out.state, out.detail or "-", time.monotonic() - t0)
             stuck = out.detail == "delivery_stuck"
-            if out.state in ("failed", "dropped", "released"):
+            # Stop while the turn waited for room on the host: no window was started, so the chat holds no
+            # session and its slot goes back now, not at the idle reap
+            unstarted = out.state == "cancelled" and turn.get(HOST_WAIT) == "cancelled"
+            if out.state in ("failed", "dropped", "released") or unstarted:
                 # a session that did not finish its turn cleanly is not trusted warm
                 if out.state != "released":
                     self.pool.release(agent, thread)

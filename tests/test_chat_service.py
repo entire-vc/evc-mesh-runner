@@ -194,5 +194,58 @@ class Service(unittest.TestCase):
         self.assertEqual(cb["state"], "queued")
 
 
+class HostCapStop(unittest.TestCase):
+    """a chat turn waiting for a slot of a full host is still Mesh's started turn. Stop ends it
+    cancelled (the claim is done), gives its chat slot back at once (it never got a session) and touches no
+    busy session."""
+
+    def test_stop_while_waiting_for_room_frees_the_claim_and_the_slot_and_busy_chats_go_on(self):
+        mesh = FakeChatMesh()
+        client = ChatClient("https://mesh.test", "secret", opener=mesh)
+        pool = ChatPool(max_per_agent=2, max_host=5, idle_minutes=10)
+        stopped, go_on = [], threading.Event()
+
+        class Busy:                                     # a chat mid-turn in its own window
+            def run(self, turn, cancelled):
+                yield {"type": "text_delta", "text": "working"}
+                go_on.wait(5)
+                yield {"type": "final", "stop_reason": "end_turn"}
+
+        class NoRoom:                                   # DriverDelivery while the host cap stays full
+            def run(self, turn, cancelled):
+                turn["_host_wait"] = "waiting"
+                while not cancelled():
+                    time.sleep(0.01)
+                turn["_host_wait"] = "cancelled"
+                yield {"type": "final", "stop_reason": "cancelled"}
+
+        class ByThread:
+            def run(self, turn, cancelled):
+                return (Busy() if turn["thread_id"] == "busy" else NoRoom()).run(turn, cancelled)
+        svc = ChatService(client, ["agent-1"], pool, lambda a: ByThread(), lambda a, t: stopped.append(t),
+                          lambda a, t: True, spawn=lambda fn: threading.Thread(target=fn, daemon=True).start())
+        busy = mesh.queue_turn("busy one", thread="busy")
+        waiting = mesh.queue_turn("waits", thread="waits")
+        self.assertEqual(svc.step(1), 2)
+        deadline = time.monotonic() + 5
+        while mesh.turns[waiting["turn_id"]]["state"] != "streaming" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(mesh.turns[waiting["turn_id"]]["state"], "streaming")
+        svc._command({"kind": "cancel_turn", "turn_id": waiting["turn_id"]})     # Stop
+        while waiting["turn_id"] in svc.running and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(mesh.turns[waiting["turn_id"]]["state"], "cancelled")  # the claim is done
+        self.assertNotIn(("agent-1", "waits"), pool.slots)                         # no session, no slot
+        self.assertEqual(stopped, ["waits"])
+        self.assertEqual(mesh.turns[busy["turn_id"]]["state"], "streaming")      # the busy chat goes on
+        go_on.set()
+        while busy["turn_id"] in svc.running and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual((mesh.turns[busy["turn_id"]]["state"], mesh.turns[busy["turn_id"]]["text"]),
+                         ("done", "working"))
+        self.assertIn(("agent-1", "busy"), pool.slots)                             # warm, kept
+        self.assertEqual(stopped, ["waits"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -99,6 +100,46 @@ def say(prompt):
             sys.stdout.write("\x1b[2J\x1b[H> \r\n"); sys.stdout.flush()
             hook("Stop", last_assistant_message="final answer", prompt_id=pid)
             return
+        if os.environ.get("FAKE_BG_TASK"):       # the turn ends on text while its background check runs
+            task = {"id": "bgtask1", "type": "shell", "status": "running", "description": "run the tests"}
+            first = [{"type": "text", "text": "Tests still run in the background; I continue when they finish"}]
+            if os.environ.get("FAKE_BG_CMD"):    # ... after the turn already called a Mesh turn command
+                first = [{"type": "tool_use", "id": "tu-1", "name": "mcp__evc-mesh__wait_for", "input": {}}] + first
+            with open(transcript, "a") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": recorded}}) + "\n")
+                fh.write(json.dumps({"type": "assistant", "message": {"id": "bg1-" + pid, "model": "fake",
+                    "content": first, "usage": {"output_tokens": 3}}}) + "\n")
+                if os.environ.get("FAKE_BG_CMD"):
+                    fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "tu-1",
+                         "is_error": os.environ["FAKE_BG_CMD"] == "refused", "content": "ok"}]}}) + "\n")
+            hook("Stop", last_assistant_message=first[-1]["text"], prompt_id=pid, background_tasks=[task])
+            if os.environ["FAKE_BG_TASK"] == "never":
+                return
+            time.sleep(float(os.environ["FAKE_BG_TASK"]))
+            note_text = ("<task-notification>\n<task-id>bgtask1</task-id>\n<status>completed</status>\n"
+                         "<summary>Background command completed (exit code 0)</summary>\n</task-notification>")
+            # FAKE_BG_CHAIN=n: n notification turns that start the next check and end on text again
+            for step in range(int(os.environ.get("FAKE_BG_CHAIN") or 0)):
+                pid_n = str(uuid.uuid4())
+                hook("UserPromptSubmit", prompt=note_text, prompt_id=pid_n)
+                chained = "check %d still runs in the background" % (step + 2)
+                with open(transcript, "a") as fh:
+                    fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": note_text}}) + "\n")
+                    fh.write(json.dumps({"type": "assistant", "message": {"id": "bgc%d-%s" % (step, pid), "model": "fake",
+                        "content": [{"type": "text", "text": chained}], "usage": {"output_tokens": 1}}}) + "\n")
+                hook("Stop", last_assistant_message=chained, prompt_id=pid_n, background_tasks=[task])
+                time.sleep(float(os.environ["FAKE_BG_TASK"]))
+            pid2 = str(uuid.uuid4())
+            hook("UserPromptSubmit", prompt=note_text, prompt_id=pid2)
+            with open(transcript, "a") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": note_text}}) + "\n")
+                fh.write(json.dumps({"type": "assistant", "message": {"id": "bg2-" + pid, "model": "fake",
+                    "content": [{"type": "tool_use", "id": "tu-2", "name": "mcp__evc-mesh__continue_next", "input": {}},
+                                {"type": "text", "text": "tests passed, turn command sent"}],
+                    "usage": {"output_tokens": 5}}}) + "\n")
+            hook("Stop", last_assistant_message="tests passed, turn command sent", prompt_id=pid2, background_tasks=[])
+            return
         if os.environ.get("FAKE_SLOW"):          # a long think / tool: the screen is busy, the transcript silent
             sys.stdout.write("\x1b[2J\x1b[H✻ Working… (esc to interrupt)\r\n"); sys.stdout.flush()
             time.sleep(float(os.environ["FAKE_SLOW"]))
@@ -147,9 +188,17 @@ def say(prompt):
                   "content": [{"type": "input_text", "text": prompt}]}})     # Codex records the prompt text
             note({"type": "event_msg", "payload": {"type": "token_count"}})
             quoted_title()
-            if os.environ["FAKE_ROLLOUT"] == "empty":      # the task ends with no model record and no notify
+            if os.environ["FAKE_ROLLOUT"] in ("empty", "refused"):  # no model record or notify
+                error = {
+                    "refused": {"message": "This content was flagged for possible cybersecurity risk.",
+                                "codex_error_info": "cyber_policy"},
+                }.get(os.environ["FAKE_ROLLOUT"])
                 note({"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": None,
-                      "error": {"message": "stream disconnected", "codex_error_info": "other"}}})
+                      **({"error": error} if error else {})}})
+                sys.stdout.write("\x1b[2J\x1b[H› Ask Codex to do anything\r\n"); sys.stdout.flush()
+                return
+            if os.environ["FAKE_ROLLOUT"] == "aborted":     # interrupted (Escape) before any model record
+                note({"type": "event_msg", "payload": {"type": "turn_aborted"}})
                 sys.stdout.write("\x1b[2J\x1b[H› Ask Codex to do anything\r\n"); sys.stdout.flush()
                 return
             note({"type": "response_item", "payload": {"type": "reasoning"}})
@@ -525,11 +574,48 @@ class DriverTurns(unittest.TestCase):
     def test_codex_task_that_ends_with_no_model_record_ends_the_turn_as_no_output(self):
         self.assert_no_outcome_turn(*self.codex_rollout_turn("empty"))
 
+    def assert_failed_codex_turn(self, d, out, error):
+        start = time.time()
+        self.assertEqual(d.run("Fix the lint"), 1, out.getvalue()[-300:])
+        self.assertLess(time.time() - start, 12)
+        evs = self.events(out)
+        self.assertEqual(evs[-1]["type"], "turn.failed")
+        self.assertIn(error, evs[-1]["error"]["message"])
+        self.assertFalse(any(e["type"] == "turn.completed" for e in evs))
+        log = self.root / "turn.jsonl"
+        log.write_text(out.getvalue())
+        result = CodexAdapter().parse(log)
+        self.assertTrue(result.is_error)
+        self.assertTrue(result.finished)
+        self.assertEqual(result.session_id, self.THREAD)
+        self.assertIn(error, result.error)
+        # a failed turn closes its window and forgets it, as a Claude StopFailure does
+        self.assertEqual(self.tmux.windows(interactive.session_name("builder")), {})
+        self.assertEqual(interactive.read_progress(self.state, "att-1"), {})
+        return result
+
+    def test_codex_policy_refusal_reaches_the_adapter_as_a_failed_turn(self):
+        d, out = self.codex_rollout_turn("refused")
+        self.assert_failed_codex_turn(d, out, "cyber_policy")
+        self.assertFalse(d.turn_end["output"])
+        self.assertIn("flagged for possible cybersecurity risk", CodexAdapter().parse(self.root / "turn.jsonl").error)
+        # no synthetic empty message before the failure: the adapter still sees a turn without model work
+        self.assertEqual([e for e in self.events(out) if e["type"] == "item.completed"], [])
+
     def test_codex_task_that_ends_with_an_error_after_model_work_ends_the_turn_as_no_output(self):
+        # model work may already have recorded the turn's outcome in Mesh: the runner reads it first
         d, out = self.codex_rollout_turn("errored")
         self.assert_no_outcome_turn(d, out)
+        self.assertFalse(any(e["type"] == "turn.failed" for e in self.events(out)))
         self.assertTrue(d.turn_end["output"])
         self.assertIn("server_overloaded", d.turn_end["error"])
+
+    def test_codex_turn_interrupted_before_model_work_ends_the_turn_as_no_output(self):
+        d, out = self.codex_rollout_turn("aborted")
+        self.assert_no_outcome_turn(d, out)
+        self.assertFalse(any(e["type"] == "turn.failed" for e in self.events(out)))
+        self.assertFalse(d.turn_end["output"])
+        self.assertTrue(d.turn_end["aborted"])
 
     def test_codex_task_complete_with_a_message_ends_the_turn_even_without_a_notify(self):
         d, out = self.codex_rollout_turn("nonotify")
@@ -555,7 +641,7 @@ class DriverTurns(unittest.TestCase):
                         fh.write(json.dumps(rec) + "\n")
             return ok
         d.accepted = accepted
-        self.assert_no_outcome_turn(d, out)
+        self.assert_failed_codex_turn(d, out, "server_overloaded")
         self.assertEqual(written, [1])
 
     def test_codex_task_that_ends_after_model_records_is_the_normal_end(self):
@@ -627,6 +713,34 @@ class DriverTurns(unittest.TestCase):
         self.assertEqual(set(results.values()), {0})
         self.assertLessEqual(len(self.tmux.windows(interactive.session_name("builder"))), 3)
 
+    def test_a_new_window_is_not_the_oldest_idle_one_once_its_start_lock_is_released(self):
+        # Without a live busy claim only last_end orders the eviction. A rival start that takes the host lock right
+        # after this window was created must see it as just started, not idle since the epoch (last_end=0): under CI
+        # load a fresh window was closed that way and its own start failed.
+        import contextlib
+        for key in ("i1", "i2", "i3"):
+            d, _ = self.driver("claude", key=key, sid=key)
+            self.assertEqual(d.run("hi"), 0)
+        a, _ = self.driver("claude", key="c0", sid="c0")
+        b, _ = self.driver("claude", key="c1", sid="c1")
+        a.max_sessions = b.max_sessions = 3
+        session, lock, rival = interactive.session_name("builder"), a.host_lock, []
+
+        @contextlib.contextmanager
+        def lock_then_rival():
+            with lock():
+                yield
+            if not rival and "c0" in self.tmux.windows(session):
+                rival.append(b.run("hi c1"))               # the rival's make_room runs in the gap after the lock
+        a.host_lock = lock_then_rival
+        with mock.patch.object(tui_driver, "pid_alive", lambda pid: False):
+            self.assertEqual(a.run("hi c0"), 0)
+        self.assertEqual(rival, [0])
+        windows = self.tmux.windows(session)
+        self.assertIn("c0", windows)
+        self.assertIn("c1", windows)
+        self.assertNotIn("i2", windows)                     # the rival closed the window idle longest
+
     def test_stop_failure_without_prompt_id_ends_the_turn_as_an_error(self):
         d, out = self.driver("claude", sid="s-1", FAKE_FAIL="1")
         started = time.time()
@@ -652,8 +766,34 @@ class DriverTurns(unittest.TestCase):
         d.max_sessions = 1
         d.t.update(cap_wait=1, cap_poll=0.2)
         self.assertEqual(d.run("hi"), 1)
-        self.assertIn("host session cap reached", self.events(out)[-1]["result"])
+        evs = self.events(out)
+        self.assertIn("host session cap reached", evs[-1]["result"])
+        # the wait is marked for chat deliveries: one "waiting", one "timeout", nothing started or pasted
+        waits = [e for e in evs if e.get("type") == interactive.HOST_WAIT_EVENT]
+        self.assertEqual([(e["state"], e.get("reason")) for e in waits], [("waiting", "cap"), ("timeout", "cap")])
         self.assertEqual(set(self.tmux.windows(interactive.session_name("builder"))), {"b1"})
+
+    def test_a_start_that_waited_for_the_cap_runs_once_a_slot_frees(self):
+        d, _ = self.driver("claude", key="b1", sid="b1")
+        self.assertEqual(d.run("hi"), 0)
+        meta = interactive.read_meta(self.state, "b1")
+        meta["busy_pid"] = os.getpid()
+        interactive.write_meta(self.state, "b1", meta)
+        d, out = self.driver("claude", key="b2", sid="b2")
+        d.max_sessions = 1
+        d.t.update(cap_wait=15, cap_poll=0.2)
+
+        def free():                                               # the busy turn ends while b2 waits
+            m = interactive.read_meta(self.state, "b1")
+            m.pop("busy_pid", None)
+            interactive.write_meta(self.state, "b1", m)
+        threading.Timer(0.8, free).start()
+        self.assertEqual(d.run("hi"), 0)
+        evs = self.events(out)
+        waits = [e["state"] for e in evs if e.get("type") == interactive.HOST_WAIT_EVENT]
+        self.assertEqual(waits, ["waiting", "room"])
+        self.assertEqual(evs[-1]["type"], "result")
+        self.assertEqual(set(self.tmux.windows(interactive.session_name("builder"))), {"b2"})
 
     def test_a_window_is_claimed_busy_from_its_creation(self):
         d, _ = self.driver("claude", key="w1", sid="w1")
@@ -705,6 +845,60 @@ class DriverTurns(unittest.TestCase):
         self.assertEqual(d.run("hello"), 0)
         last = self.events(out)[-1]
         self.assertEqual(last["result"], "final answer")
+
+    def test_a_turn_that_ends_on_a_running_background_task_ends_with_the_notification_turn(self):
+        """The turn ended on text while its background check ran; Claude Code went on by itself
+        3 s later on the task's notification and called the turn command there. The runner settled the
+        first Stop and counted no outcome. The turn now ends with the notification turn's Stop."""
+        d, out = self.driver("claude", sid="s-1", FAKE_BG_TASK="3")
+        self.assertEqual(d.run("run the tests"), 0, out.getvalue()[-300:])
+        evs = self.events(out)
+        self.assertEqual(evs[-1]["result"], "tests passed, turn command sent")
+        said = [b.get("name") or b.get("text") for e in evs if e.get("type") == "assistant"
+                for b in e["message"]["content"]]
+        self.assertIn("mcp__evc-mesh__continue_next", said)               # the continuation's records reach the log
+        self.assertEqual(evs[-1]["usage"]["output_tokens"], 8)             # both sub-turns, once each
+        self.assertFalse(d.progress["held"])
+
+    def test_a_running_background_task_does_not_hold_a_turn_that_called_its_turn_command(self):
+        d, out = self.driver("claude", sid="s-1", FAKE_BG_TASK="3", FAKE_BG_CMD="ok")
+        self.assertEqual(d.run("run the tests"), 0, out.getvalue()[-300:])
+        self.assertIn("Tests still run in the background", self.events(out)[-1]["result"])
+
+    def test_a_refused_turn_command_still_holds_for_the_background_task(self):
+        d, out = self.driver("claude", sid="s-1", FAKE_BG_TASK="3", FAKE_BG_CMD="refused")
+        self.assertEqual(d.run("run the tests"), 0, out.getvalue()[-300:])
+        self.assertEqual(self.events(out)[-1]["result"], "tests passed, turn command sent")
+
+    def test_a_background_task_that_never_finishes_holds_the_turn_only_for_background_wait(self):
+        d, out = self.driver("claude", sid="s-1", FAKE_BG_TASK="never")
+        d.t["background_wait"], d.t["background_poll"] = 4, 0.2
+        started = time.monotonic()
+        self.assertEqual(d.run("run the tests"), 0, out.getvalue()[-300:])
+        self.assertGreaterEqual(time.monotonic() - started, 4)
+        self.assertIn("Tests still run in the background", self.events(out)[-1]["result"])
+        self.assertFalse(d.progress["held"])
+
+    def test_a_session_that_goes_on_through_several_background_checks_is_held_past_background_wait(self):
+        """Live: a session ran its checks one after another in the background; every notification
+        turn started the next and ended on text again. The hold ran out 45 min after the first Stop
+        while the session still worked, and the runner counted no outcome. ``background_wait`` now
+        counts from the last Stop the session went on to."""
+        d, out = self.driver("claude", sid="s-1", FAKE_BG_TASK="2", FAKE_BG_CHAIN="3")
+        d.t["background_wait"], d.t["background_poll"] = 4, 0.2
+        started, err = time.monotonic(), io.StringIO()
+        with mock.patch.object(sys, "stderr", err):
+            self.assertEqual(d.run("run the tests"), 0, out.getvalue()[-300:])
+        self.assertGreater(time.monotonic() - started, 6)                  # past one background_wait
+        self.assertEqual(self.events(out)[-1]["result"], "tests passed, turn command sent")
+        self.assertEqual(err.getvalue().count("stopped again with 1 background task(s)"), 3)
+        self.assertFalse(d.progress["held"])
+
+    def test_no_background_wait_settles_the_first_stop_as_before(self):
+        d, out = self.driver("claude", sid="s-1", FAKE_BG_TASK="3")
+        d.t["background_wait"] = 0
+        self.assertEqual(d.run("run the tests"), 0, out.getvalue()[-300:])
+        self.assertIn("Tests still run in the background", self.events(out)[-1]["result"])
 
     def test_a_session_still_busy_after_its_turn_gets_the_next_prompt_when_idle(self):
         d, _ = self.driver("claude", sid="s-1", FAKE_BG="10")

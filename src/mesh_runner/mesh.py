@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from . import checkout_fence, coalesced_http
+from . import checkout_fence, coalesced_http, progress
 from . import observation_budget as budget
 
 log = logging.getLogger("mesh_runner")
@@ -47,6 +47,20 @@ MOVE_SOURCE = "mesh-runner"
 # attention key on ``informational``, and runner notes must stay visible to them.
 RUNNER_NOTE_PREFIX = "[runner]"
 RUNNER_NOTE_SOURCE = "mesh-runner"
+# ``metadata.source`` values Mesh reads as an actor writing (any other label marks automation).
+ACTOR_COMMENT_SOURCES = frozenset({"", "api", "ui", "mcp"})
+
+
+def automation_comment(c: dict) -> bool:
+    """Written by a program under an agent's key, not by that agent's session: a runner note
+    (``[runner]`` prefix) or a comment labelled ``metadata.source`` other than api/ui/mcp (the
+    runner's own notes, a census or report script). The label is self-declared: read it only
+    where a false label costs its author, never to grant anything."""
+    if str(c.get("body") or "").lstrip().startswith(RUNNER_NOTE_PREFIX):
+        return True
+    metadata = c.get("metadata")
+    source = metadata.get("source") if isinstance(metadata, dict) else None
+    return isinstance(source, str) and source.strip().lower() not in ACTOR_COMMENT_SOURCES
 # Idempotency-Key of a spend report: uuid5 of the report id under this namespace, so the same report
 # carries the same key on every send (a 429 repeat, a settle that runs again) and another report a new one
 SESSION_REPORT_KEY_NS = uuid.UUID("5b0c6f1e-2f7d-4c55-9a51-0d8e3b6a7c42")
@@ -154,6 +168,7 @@ class MeshClient:
         delays = list(GET_RETRY_DELAYS) if method == "GET" else list(LOST_ANSWER_DELAYS) if keyed else []
         limited = 0
         while True:
+            progress.beat()                        # a tick of many Mesh reads shows its lane is alive
             try:
                 return self._request(method, path, body, query, headers=headers)
             except MeshError as e:
@@ -335,6 +350,28 @@ class MeshClient:
             if len(items) < limit and pages > 1:
                 items = _items(page(pages - 1)) + items
         return sorted(items, key=lambda c: c.get("created_at") or "")
+
+    def comments_since(self, task_id: str, since: str, page_size: int = 100) -> list[dict]:
+        """EVERY comment of the card created at or after ``since`` (RFC 3339), oldest first, however long its
+        history: Mesh pages comments oldest-first, so the pages are read from the last one back until a page
+        starts before ``since`` (or the first page is read). Comments added meanwhile land after the pages read."""
+        cutoff = _stamp(since)
+
+        def page(n: int) -> dict:
+            res = self.request("GET", f"/tasks/{task_id}/comments",
+                               query={"limit": page_size, "page_size": page_size, "page": n})
+            return res if isinstance(res, dict) else {"items": res or []}
+        first = page(1)
+        n = int(first.get("total_pages") or 1)
+        items: list[dict] = []
+        while n >= 1:
+            got = _items(first if n == 1 else page(n))
+            items = got + items
+            if n == 1 or not got or min(_stamp(c.get("created_at") or "") for c in got) < cutoff:
+                break
+            n -= 1
+        return sorted((c for c in items if _stamp(c.get("created_at") or "") >= cutoff),
+                      key=lambda c: c.get("created_at") or "")
 
     def comments_all(self, task_id: str, page_size: int = 100, max_pages: int = 100) -> list[dict]:
         """EVERY comment of the card, oldest first (a receipt must be found however old it is)."""
@@ -609,6 +646,17 @@ class MeshClient:
         except MeshError as e:
             if e.status not in (403, 404, 409):  # already released or taken over
                 raise
+
+
+def _stamp(value: str) -> float:
+    """An RFC 3339 stamp as epoch seconds; one that does not parse counts as newest (kept, never a stop)."""
+    try:
+        t = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return math.inf
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t.timestamp()
 
 
 def _items(res: Any) -> list[dict]:

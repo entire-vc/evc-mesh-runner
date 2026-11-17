@@ -118,9 +118,12 @@ class Adapters(unittest.TestCase):
         self.assertEqual(r.final_text, "↻ NEXT")
 
     def test_codex_failed_turn(self):
-        r = CodexAdapter().parse(write(CODEX_STREAM[:2] + [{"type": "turn.failed", "error": {"message": "quota"}}]))
+        usage = {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 2}
+        r = CodexAdapter().parse(write(CODEX_STREAM[:2] + [{"type": "turn.failed", "error": {"message": "quota"},
+                                                         "usage": usage}]))
         self.assertTrue(r.is_error)
         self.assertEqual(r.error, "quota")
+        self.assertEqual(r.usage, usage)
 
 
 class CarrySession(unittest.TestCase):

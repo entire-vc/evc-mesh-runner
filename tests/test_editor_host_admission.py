@@ -335,9 +335,12 @@ class ShutdownDrain(BridgeBase):
     def test_close_kills_the_child_group_cleans_scratch_and_delivers_no_success(self):
         pidfile = Path(self.dir.name) / "child.pid"
         ex = self.real_executor(f"""
-            import subprocess, sys, time
+            import os, subprocess, sys, time
             c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-            open({str(pidfile)!r}, "w").write(str(c.pid) + " " + str(__import__("os").getpid()))
+            f = open({str(pidfile)!r}, "w")      # the file exists and is still empty: the window a reader must wait through
+            time.sleep(0.3)
+            f.write(str(c.pid) + " " + str(os.getpid()))
+            f.close()
             time.sleep(60)
         """)
         self.build(executor=ex)
@@ -345,11 +348,7 @@ class ShutdownDrain(BridgeBase):
         out = []
         t = threading.Thread(target=lambda: out.append(self.post(env)))
         t.start()
-        end = time.monotonic() + 10
-        while not pidfile.exists() and time.monotonic() < end:
-            time.sleep(0.02)
-        self.assertTrue(pidfile.exists())
-        child, leader = (int(x) for x in pidfile.read_text().split())
+        child, leader = self.wait_pids(pidfile, 2)
         self.assertEqual(len(self.leases()), 1)
         t0 = time.monotonic()
         self.assertTrue(self.bridge.close(5))
@@ -363,6 +362,19 @@ class ShutdownDrain(BridgeBase):
         self.assertEqual(self.leases(), [])
         self.assertTrue(self.bridge.close(1))                # idempotent
         self.assertEqual(self.post(self.envelope(publication_id="pub-9"))[0], 503)
+
+    def wait_pids(self, pidfile, n, timeout=10):
+        """The pids once the file holds all n of them: an existing file may still be empty (open before write)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                parts = pidfile.read_text().split()
+            except FileNotFoundError:
+                parts = []
+            if len(parts) == n and all(p.isdigit() for p in parts):
+                return tuple(int(p) for p in parts)
+            time.sleep(0.02)
+        self.fail(f"{pidfile} never held {n} pids")
 
     def assertDead(self, pid):
         end = time.monotonic() + 3

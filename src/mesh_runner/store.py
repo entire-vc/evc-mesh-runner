@@ -33,6 +33,8 @@ log = logging.getLogger("mesh_runner")
 
 ACTIVE = ("starting", "running", "unknown")          # occupy a slot
 OPEN = ACTIVE + ("waiting", "ready")                  # hold the task for this agent
+# events of an attempt whose turn the runner read to its end (an outcome, or none): it held a round
+REVIEW_ROUND_EVENTS = ("readable_outcome", "no_outcome", "late_outcome_refused")
 assert set(OPEN) == set(lifecycle.LIVE)
 
 SCHEMA = """
@@ -472,20 +474,44 @@ class Store:
                               (agent, task_id, midnight)).fetchone()   # outage-only turns are not a start
         return int(row[0]) if row else 0
 
-    def review_starts_today(self, agent: str, task_id: str) -> int:
-        """Review attempts this agent began on this task since UTC midnight that ran a turn."""
-        midnight = iso(now().replace(hour=0, minute=0, second=0, microsecond=0))
+    def review_starts_today(self, agent: str, task_id: str, since: "dt.datetime | None" = None) -> int:
+        """Review attempts this agent began on this task since UTC midnight (or since ``since``, a
+        reset of the count after a hand-up, when that is later) that held a round: at least one turn
+        the runner read to its end (``REVIEW_ROUND_EVENTS``: a readable outcome, or a turn that ended
+        without one). An attempt that never got that far through the infrastructure (a quota or limit
+        switch, a harness error, a spawn failure, a prompt never proven delivered) reviewed nothing and
+        is not counted."""
+        floor = now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if since is not None and since > floor:
+            floor = since
+        kinds = ",".join("?" for _ in REVIEW_ROUND_EVENTS)
         row = self.db.execute("SELECT COUNT(*) FROM attempts WHERE agent=? AND task_id=? AND created_at>=? "
-                              "AND mode='review' AND turns>0", (agent, task_id, midnight)).fetchone()
+                              "AND mode='review' AND turns>0 AND EXISTS (SELECT 1 FROM events "
+                              f"WHERE attempt=attempts.id AND kind IN ({kinds}))",
+                              (agent, task_id, iso(floor), *REVIEW_ROUND_EVENTS)).fetchone()
         return int(row[0]) if row else 0
+
+    def review_attempts_since(self, agent: str, task_id: str, since: "dt.datetime") -> list[Attempt]:
+        """This agent's review attempts on the task created at or after ``since``, oldest first."""
+        rows = self.db.execute("SELECT * FROM attempts WHERE agent=? AND task_id=? AND mode='review' "
+                               "AND created_at>=? ORDER BY created_at, rowid", (agent, task_id, iso(since)))
+        return [self._row(r) for r in rows]
+
+    def held_round(self, attempt_id: str) -> bool:
+        """The attempt had a turn the runner read to its end (see ``review_starts_today``)."""
+        kinds = ",".join("?" for _ in REVIEW_ROUND_EVENTS)
+        return self.db.execute(f"SELECT 1 FROM events WHERE attempt=? AND kind IN ({kinds}) LIMIT 1",
+                               (attempt_id, *REVIEW_ROUND_EVENTS)).fetchone() is not None
 
     def events_since_readable(self, task_id: str, kind: str) -> int:
         """Events of ``kind`` on any attempt of this task (any agent) after its latest
-        ``readable_outcome`` event: a run of misses is counted only while it is unbroken."""
+        ``readable_outcome`` (or ``no_outcome_reset``: a give-up re-fed in a fresh session) event:
+        a run of misses is counted only while it is unbroken."""
         row = self.db.execute(
             "SELECT COUNT(*) FROM events e JOIN attempts a ON a.id=e.attempt WHERE a.task_id=? AND e.kind=? "
             "AND e.rowid > COALESCE((SELECT MAX(x.rowid) FROM events x JOIN attempts b ON b.id=x.attempt "
-            "WHERE b.task_id=? AND x.kind='readable_outcome'), 0)", (task_id, kind, task_id)).fetchone()
+            "WHERE b.task_id=? AND x.kind IN ('readable_outcome','no_outcome_reset')), 0)",
+            (task_id, kind, task_id)).fetchone()
         return int(row[0]) if row else 0
 
     def events_on_task(self, task_id: str, kind: str) -> int:

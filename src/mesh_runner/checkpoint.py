@@ -10,7 +10,9 @@ tree, the fingerprint and the status hash, and the manifest records which paths 
 oldest format and is replayed in full. A slim bundle's base is resolved in the object store recorded
 at capture (`objects`: a pool slot's is its base clone's, which outlives the slot). Configured
 submodules (empty or populated, one level) are captured with their own bundle/index and replayed
-into the target's private modules directory. A repository nested in an untracked path (an evidence
+into the target's private modules directory; in the slim form the delta also holds each populated
+submodule's part, over that submodule's own HEAD (manifest version 3; an earlier runner refuses it).
+A repository nested in an untracked path (an evidence
 checkout, a cloned fixture, a vendored repo) is opaque data: the directory is stored whole, its own
 `.git` included, and put back byte for byte; its size is capped (`max_nested_bytes`, per repository).
 Unconfigured populated gitlinks, recursive submodules, special files and split indexes fail closed.
@@ -18,6 +20,7 @@ Checkpoints are retained after restore, including failures, for operator recover
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 from functools import lru_cache
@@ -36,6 +39,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import progress
 from .workspace import TimedLock, WorkspaceError, git
 
 log = logging.getLogger("mesh_runner")
@@ -52,7 +56,7 @@ def _run(args, *, timeout=600, input=None, capture_output=False, check=False, **
         kwargs['stdin'] = subprocess.PIPE
     proc = subprocess.Popen(args, **kwargs)
     try:
-        out, err = proc.communicate(input, timeout=timeout)
+        out, err = progress.communicate(proc, input, timeout)
     except subprocess.TimeoutExpired as e:
         proc.kill()
         try:
@@ -358,17 +362,29 @@ def _check_locks(source: Path, modules: Path, plan: list) -> None:
         raise WorkspaceError('checkpoint: active git writer; lease retained')
 
 
+def _gitdir_state(gd: Path) -> dict:
+    """What a submodule's fingerprint records of its gitdir: HEAD, the branch it names, the refs."""
+    return {'gitdir': True, 'head': _gitdir(gd, 'rev-parse', '--verify', 'HEAD'),
+            'branch': _gitdir(gd, 'symbolic-ref', '--quiet', 'HEAD', check=False),
+            'refs': hashlib.sha256('\n'.join(
+                line[1:] for line in _gitdir(gd, 'for-each-ref', '--format=%(symref)|%(refname) %(objectname)',
+                                              'refs/heads', 'refs/tags', 'refs/remotes').splitlines()
+                if line.startswith('|')  # symbolic refs (origin/HEAD) are not bundled
+            ).encode(errors='surrogateescape')).hexdigest()}
+
+
+def _worktree_state(raw) -> dict:
+    """What a submodule's fingerprint records of its worktree; `raw(*args)` hashes a git command's output."""
+    return {'staged': raw('diff', '--cached', '--binary', '--no-ext-diff'),
+            'unstaged': raw('diff', '--binary', '--no-ext-diff'),
+            'status': raw('status', '--porcelain=v1', '-z', '--untracked-files=all')}
+
+
 def _submodule_state(path: Path, entry: dict, modules: Path) -> dict:
     gd = modules / entry['name']
     if not os.path.lexists(gd):
         return {'gitdir': False}
-    state = {'gitdir': True, 'head': _gitdir(gd, 'rev-parse', '--verify', 'HEAD'),
-             'branch': _gitdir(gd, 'symbolic-ref', '--quiet', 'HEAD', check=False),
-             'refs': hashlib.sha256('\n'.join(
-                 line[1:] for line in _gitdir(gd, 'for-each-ref', '--format=%(symref)|%(refname) %(objectname)',
-                                               'refs/heads', 'refs/tags', 'refs/remotes').splitlines()
-                 if line.startswith('|')  # symbolic refs (origin/HEAD) are not bundled
-             ).encode(errors='surrogateescape')).hexdigest()}
+    state = _gitdir_state(gd)
     wt = path / entry['path']
     if (wt / '.git').is_file():
         def raw(*args):
@@ -376,9 +392,7 @@ def _submodule_state(path: Path, entry: dict, modules: Path) -> dict:
             if r.returncode:
                 raise WorkspaceError('checkpoint: cannot fingerprint submodule state')
             return hashlib.sha256(r.stdout).hexdigest()
-        state.update(staged=raw('diff', '--cached', '--binary', '--no-ext-diff'),
-                     unstaged=raw('diff', '--binary', '--no-ext-diff'),
-                     status=raw('status', '--porcelain=v1', '-z', '--untracked-files=all'))
+        state.update(_worktree_state(raw))
     return state
 
 
@@ -460,6 +474,7 @@ def _stale_submodule_work(target: Path, entry: dict, gd: Path) -> str:
     else:
         return 'worktree holds files outside any repository'
     for root, dirs, files in os.walk(wt):
+        progress.beat()
         if root == str(wt):
             dirs[:] = [d for d in dirs if d != '.git']
             files = [f for f in files if f != '.git']
@@ -516,13 +531,28 @@ def _clonefile():
     return clone
 
 
+COPY_CHUNK = 8 << 20                       # a portable copy of a large file beats after each chunk
+
+
 def _copy_file(src, dst):
-    """Clone on APFS in-process; portable copy when cloning is unavailable."""
+    """Clone on APFS in-process; portable copy when cloning is unavailable. A file larger than one
+    chunk is copied chunk by chunk with a beat between chunks, so one large file on a slow volume
+    does not freeze the lane's status row; anything smaller, and every special file, goes through
+    shutil.copy2 as before."""
+    progress.beat()                         # a large tree copies file by file
     clone = _clonefile()
     if clone is not None and clone(os.fsencode(src), os.fsencode(dst), 0) == 0:
         shutil.copystat(src, dst)
         return dst
-    return shutil.copy2(src, dst)
+    st = os.stat(src)
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= COPY_CHUNK:
+        return shutil.copy2(src, dst)
+    with open(src, 'rb') as fin, open(dst, 'wb') as fout:
+        while chunk := fin.read(COPY_CHUNK):
+            fout.write(chunk)
+            progress.beat()
+    shutil.copystat(src, dst)
+    return dst
 
 
 def manifest_digest(checkpoint: Path) -> str:
@@ -554,10 +584,10 @@ def _copy(src: Path, dst: Path, excludes: frozenset = frozenset()) -> None:
 _TRACE = threading.local()
 SLIM_STAGES = frozenset({
     'capture-plan', 'capture-copy', 'capture-stash', 'capture-refs', 'capture-bundle', 'capture-submodule',
-    'verify-setup', 'verify-snapshot', 'verify-base', 'verify-fetch', 'verify-checkout', 'verify-overlay',
-    'verify-index', 'verify-refresh', 'verify-fingerprint', 'source-recheck', 'unknown'})
+    'verify-setup', 'verify-pack', 'verify-proof', 'verify-snapshot', 'verify-base', 'verify-fetch',
+    'verify-checkout', 'verify-overlay', 'verify-index', 'verify-refresh', 'verify-fingerprint', 'source-recheck', 'unknown'})
 SLIM_GIT_COMMANDS = frozenset({
-    'bundle', 'cat-file', 'checkout', 'checkout-index', 'config', 'diff', 'fetch', 'init', 'ls-files',
+    'bundle', 'cat-file', 'checkout', 'checkout-index', 'config', 'diff', 'fetch', 'init', 'ls-files', 'read-tree',
     'rev-list', 'rev-parse', 'stash', 'status', 'symbolic-ref', 'update-index', 'update-ref'})
 # Fixed checkpoint messages, checked in order; the first fragment found names the class.
 _SLIM_FIXED = (
@@ -573,6 +603,7 @@ _SLIM_FIXED = (
     ('special file unsupported', 'special-file'),
     ('submodule', 'submodule'),
     ('disk availability unknown', 'disk-unknown'),
+    ('bundle invalid', 'bundle-invalid'),
 )
 # What a failed git command said, reduced to a class (stderr itself is never kept).
 _SLIM_GIT_ERRORS = (
@@ -657,13 +688,33 @@ def _same_volume(a: Path, b: Path) -> bool:
         return False
 
 
+def _rmtree(path, ignore_errors: bool = False) -> None:
+    """shutil.rmtree with a beat per directory, so removing a large tree does not freeze the lane's
+    status row. Directories are emptied bottom-up through os.fwalk (relative to open directory fds;
+    no symlink is followed, a symlink root is never entered); whatever that leaves (a refused
+    unlink, a missing or symlinked root) goes to shutil.rmtree, which raises or ignores it as before."""
+    try:
+        for _root, dirs, files, dfd in os.fwalk(path, topdown=False):
+            progress.beat()
+            for name in files:
+                os.unlink(name, dir_fd=dfd)
+            for name in dirs:
+                try:
+                    os.rmdir(name, dir_fd=dfd)
+                except NotADirectoryError:      # a symlink to a directory is listed in dirs
+                    os.unlink(name, dir_fd=dfd)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=ignore_errors)
+
+
 def _clear_tree(root: Path) -> None:
     # Called only for an owned lease after a durable checkpoint; never on a base clone.
     for child in root.iterdir():
         if child.name == '.git':
             continue
         if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child)
+            _rmtree(child)
         else:
             child.unlink()
 
@@ -744,13 +795,38 @@ def find_large_untracked(source: Path, covered: list, limit: int) -> list:
     return out
 
 
-def _delta_plan(source: Path, before: dict, excludes: list, ignored: list) -> dict:
+def _delta_plan(source: Path, before: dict, excludes: list, ignored: list, plan: list = ()) -> dict:
     """What the worktree holds that `checkout` of HEAD does not give back: changed/untracked files,
     paths deleted from the worktree and empty untracked directories. A superset is harmless; the
-    capture-time replay proves the plan complete or the caller falls back to a full tree."""
-    skip = [*excludes, *ignored]
+    capture-time replay proves the plan complete or the caller falls back to a full tree.
+
+    A populated submodule is a repository of its own: its part of the delta is taken against its own
+    HEAD (see `_repo_delta`), and the superproject's part stops at its gitlink. All paths are relative
+    to `source`; `_split_delta` separates the parts again."""
+    tree = before['tree']
+    roots = [e['path'] for e in plan if e['populated']]
+    files, deleted, dirs = _repo_delta(source, tree, [*excludes, *ignored], roots=roots)
+    for root in roots:
+        more = _repo_delta(source, tree, [], prefix=root)
+        files |= more[0]
+        deleted |= more[1]
+        dirs |= more[2]
+    return {'files': sorted(files), 'deleted': sorted(deleted), 'dirs': sorted(dirs)}
+
+
+def _repo_delta(source: Path, tree: dict, skip: list, prefix: str = '', roots: list = ()) -> tuple:
+    """(files, deleted, dirs) of one repository: the superproject (no `prefix`; nothing beneath the
+    populated submodule `roots`) or the populated submodule at `prefix`. A submodule's part also holds
+    every file of it git does not track: its ignored files were always restored (the superproject's
+    ignore listing never enters a submodule), and they still are."""
+    repo = source / prefix if prefix else source
+    pre = prefix + '/' if prefix else ''
+
+    def mine(name: str) -> bool:
+        return name.startswith(pre) if prefix else not any(name.startswith(r + '/') for r in roots)
     files, deleted = set(), set()
-    for xy, name, orig in _status_entries(source):
+    for xy, name, orig in _status_entries(repo):
+        name, orig = pre + name, (pre + orig if orig is not None else None)
         if any(name == c or name.startswith(c + '/') for c in skip):
             continue
         if orig is not None and not os.path.lexists(source / orig):
@@ -760,20 +836,34 @@ def _delta_plan(source: Path, before: dict, excludes: list, ignored: list) -> di
                 files.add(name)
         else:
             deleted.add(name)
-    r = _run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
+    r = _run(['git', '-C', str(repo), 'ls-files', '-z'], capture_output=True)
     if r.returncode:
         raise _CheckpointListError('tracked', 'ls-files', r)
-    tracked_dirs = set()
+    tracked, tracked_dirs = set(), set()
     for item in r.stdout.split(b'\0'):
-        parts = Path(item.decode('utf-8', 'surrogateescape')).parts
+        if not item:
+            continue
+        parts = Path(pre + item.decode('utf-8', 'surrogateescape')).parts
+        tracked.add('/'.join(parts))
         tracked_dirs.update('/'.join(parts[:i]) for i in range(1, len(parts) + 1))   # a gitlink is a dir too
-    tree = before['tree']
+    scope = {k: v for k, v in tree.items() if mine(k)}
     # A nested repository is opaque: git lists it as one directory, so take every file beneath it.
-    for root in nested_repos(tree):
-        files.update(k for k, v in tree.items() if k.startswith(root + '/') and v[0] in ('file', 'link'))
-    dirs = sorted(n for n, v in tree.items() if v[0] == 'dir' and n not in tracked_dirs
-                  and not any(k.startswith(n + '/') for k in tree))
-    return {'files': sorted(files), 'deleted': sorted(deleted), 'dirs': dirs}
+    for root in nested_repos(scope):
+        files.update(k for k, v in scope.items() if k.startswith(root + '/') and v[0] in ('file', 'link'))
+    if prefix:
+        files.update(k for k, v in scope.items() if v[0] in ('file', 'link') and k not in tracked)
+    dirs = {n for n, v in scope.items() if v[0] == 'dir' and n not in tracked_dirs
+            and not any(k.startswith(n + '/') for k in tree)}
+    return files, deleted, dirs
+
+
+def _split_delta(delta: dict, roots) -> tuple:
+    """The superproject's part of a delta and {root: part} of each populated submodule's."""
+    def part(keep) -> dict:
+        return {key: [n for n in delta.get(key, []) if keep(n)] for key in ('files', 'deleted', 'dirs')}
+    roots = tuple(roots)
+    outer = part(lambda n: not any(n.startswith(r + '/') for r in roots))
+    return outer, {r: part(lambda n, r=r: n.startswith(r + '/')) for r in roots}
 
 
 def _delta_keep(full: dict, delta: dict) -> dict:
@@ -824,6 +914,156 @@ def _alternate(gitdir_objects: Path, reference: Path) -> None:
     info = gitdir_objects / 'info'
     info.mkdir(parents=True, exist_ok=True)
     (info / 'alternates').write_text(str(reference) + '\n')
+
+
+class _NotProvable(Exception):
+    """The in-place proof cannot decide this snapshot; the scratch replay is the authority.
+    `reason` is a fixed word, never a path or command output."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+# Read-only git in the capture source: never take the index lock to refresh stat data.
+_READ_ONLY_GIT = {'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'}
+
+# Config keys in the sections that steer a checkout (`core`, `checkout`, `submodule`) under which the
+# in-place proof predicts the replay's checkout: what `git init` writes on the checkpoint volume, keys
+# that change no file a checkout writes, and the few whose value `_predict_in` checks. Any other key in
+# those sections hands the proof over to the scratch replay.
+_CHECKOUT_CONFIG = frozenset({
+    'core.repositoryformatversion', 'core.bare', 'core.logallrefupdates', 'core.filemode',
+    'core.ignorecase', 'core.precomposeunicode',                            # `git init` writes these
+    'core.autocrlf', 'core.eol', 'core.symlinks', 'core.fsmonitor', 'core.hookspath',   # values checked
+    'core.excludesfile', 'core.attributesfile',             # read here as in the replay; absolute only
+    'core.editor', 'core.pager', 'core.askpass', 'core.sshcommand', 'core.quotepath', 'core.abbrev',
+    'core.whitespace', 'core.commentchar', 'core.commentstring', 'core.notesref', 'core.warnambiguousrefs',
+    'core.compression', 'core.loosecompression', 'core.bigfilethreshold', 'core.packedgitlimit',
+    'core.packedgitwindowsize', 'core.deltabasecachelimit', 'core.commitgraph', 'core.multipackindex',
+    'core.preloadindex', 'core.untrackedcache', 'core.trustctime', 'core.checkstat', 'core.safecrlf',
+    'core.fsync', 'core.fsyncmethod', 'core.fsyncobjectfiles',
+    'checkout.workers', 'checkout.thresholdforparallelism', 'checkout.defaultremote', 'checkout.guess',
+})
+
+# Every other key the replay's config may hold while the proof decides in place: sections that no command
+# of the proof or the replay (init, fetch from the bundle, checkout, checkout-index, update-index, diff,
+# status, rev-parse) reads, and a few keys read here as the replay reads them. Any other key hands over by
+# name: `diff` and `filter` (programs and files Git starts or reads in the work tree), `fetch`,
+# `transfer`, `url`, `protocol`, `gc`, `maintenance`, `pack`, `index`, a section not thought of.
+_INERT_CONFIG_SECTIONS = frozenset({
+    'user', 'author', 'committer', 'credential', 'credentialcache', 'safe', 'alias', 'advice', 'color',
+    'column', 'help', 'pager', 'commit', 'tag', 'log', 'format', 'gpg', 'push', 'pull', 'rebase', 'merge',
+    'mergetool', 'difftool', 'rerere', 'stash', 'blame', 'grep', 'am', 'apply', 'sendemail', 'gui',
+})
+_OTHER_CONFIG = frozenset({'include.path', 'init.defaultbranch', 'init.templatedir'})
+
+# Paths Git resolves against the work tree (its current directory) when relative: next to the capture
+# source for the proof, next to the scratch target for the replay (at restore, the restore target), so a
+# relative one names a different file in each. Config values (`core.hookspath` is checked through Git
+# itself) and the environment Git finds user-wide files through.
+_PATH_CONFIG = ('core.attributesfile', 'core.excludesfile', 'init.templatedir')
+_PATH_ENV = ('HOME', 'XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_TEMPLATE_DIR')
+
+
+# What `git init` writes into a config itself, any template aside (`Checkpoints._template_inert`).
+_INIT_CONFIG = frozenset({'core.repositoryformatversion', 'core.filemode', 'core.bare', 'core.logallrefupdates',
+                          'core.symlinks', 'core.ignorecase', 'core.precomposeunicode', 'extensions.objectformat'})
+# A submodule's local config keys that no status or diff run in it reads (where its remote is, which
+# remote a branch follows, whether the gitdir is bare or where its worktree is, reflogs), and the sections
+# no command of the proof or the replay reads. Every other key must be the same in the source's gitdir and
+# the replay's (`Checkpoints._same_submodule_view`).
+_SUBMODULE_INERT_SECTIONS = frozenset({'remote', 'branch'}) | _INERT_CONFIG_SECTIONS
+_SUBMODULE_INERT_KEYS = frozenset({'core.bare', 'core.worktree', 'core.logallrefupdates'})
+
+
+def _modelled_config(name: str) -> bool:
+    section = name.split('.', 1)[0]
+    if section in ('core', 'checkout', 'submodule'):
+        return name in _CHECKOUT_CONFIG
+    return section in _INERT_CONFIG_SECTIONS or name in _OTHER_CONFIG
+
+
+def _config_reason(name: str) -> str:
+    """`config <section>.<key>`: the subsection (a URL, a driver name) never goes into a log line."""
+    section, _, rest = name.partition('.')
+    return f"config {section}.{rest.rsplit('.', 1)[-1]}" if rest else f'config {section}'
+
+
+def _git_bool(value: str | None) -> bool | None:
+    """A config value read as Git reads a boolean: no `=` is true, an empty value false; None when it
+    is not a boolean."""
+    if value is None:
+        return True
+    v = value.strip().lower()
+    if v in ('true', 'yes', 'on'):
+        return True
+    if v in ('false', 'no', 'off', ''):
+        return False
+    try:
+        return int(v, 0) != 0
+    except ValueError:
+        return None
+
+
+def _parents(name: str) -> list:
+    parts = name.split('/')
+    return ['/'.join(parts[:i]) for i in range(1, len(parts))]
+
+
+def _blob_digests(repo: Path, oids: list, keep: set, timeout: float = 600, env: dict | None = None) -> dict:
+    """oid -> (size, sha256 of the raw content, the content itself when the oid is in `keep`), read
+    through one `git cat-file --batch`: no file is written and nothing is held in memory but `keep`."""
+    if not oids:
+        return {}
+    proc = subprocess.Popen(['git', '-C', str(repo), 'cat-file', '--batch'], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            env=env if env is not None else dict(os.environ, **_READ_ONLY_GIT))
+    timer = threading.Timer(timeout, proc.kill)     # a killed reader ends the stream: the proof fails
+    timer.daemon = True
+    timer.start()
+
+    def feed():
+        try:
+            for oid in oids:
+                proc.stdin.write(oid.encode('ascii') + b'\n')
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    out = {}
+    try:
+        for oid in oids:
+            header = proc.stdout.readline().split()
+            if len(header) != 3 or header[0].decode('ascii', 'replace') != oid or header[1] != b'blob':
+                raise _NotProvable('object')
+            size = remaining = int(header[2])
+            digest, kept = hashlib.sha256(), [] if oid in keep else None
+            while remaining:
+                chunk = proc.stdout.read(min(remaining, 1 << 20))
+                if not chunk:
+                    raise _NotProvable('object')
+                digest.update(chunk)
+                if kept is not None:
+                    kept.append(chunk)
+                remaining -= len(chunk)
+            if proc.stdout.read(1) != b'\n':
+                raise _NotProvable('object')
+            out[oid] = (size, digest.hexdigest(), b''.join(kept) if kept is not None else None)
+        return out
+    finally:
+        timer.cancel()
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 
@@ -908,7 +1148,7 @@ class Checkpoints:
             ignored = find_ignored(source, excludes)
             excludes += find_large_untracked(source, [*excludes, *ignored], self.max_untracked_bytes)
         before = fingerprint(source, plan, tuple(excludes), tuple(ignored), self.max_nested_bytes)
-        delta = _delta_plan(source, before, excludes, ignored) if slim and not plan else None
+        delta = _delta_plan(source, before, excludes, ignored, plan) if slim else None
         if submodule_plan(source) != plan:
             raise WorkspaceError('checkpoint: source changed during capture; lease retained')
         modules = _modules_dir(source)
@@ -962,7 +1202,10 @@ class Checkpoints:
             branch = git(source, 'symbolic-ref', '--quiet', 'HEAD', check=False) or None
             # `objects` outlives the source when that is a pool slot: a slot shares its base clone's store.
             # `excludes` is written even when empty: its absence marks the oldest format.
-            manifest = {'version': 2 if plan else 1, 'source': str(source), 'metadata': metadata, 'branch': branch,
+            # 3: a delta that holds a populated submodule's part, which an older runner cannot replay
+            # (it never checks a submodule's HEAD out); it refuses the manifest instead of a wrong tree.
+            version = 3 if delta is not None and any(e['populated'] for e in plan) else 2 if plan else 1
+            manifest = {'version': version, 'source': str(source), 'metadata': metadata, 'branch': branch,
                         'base_sha': metadata.get('base_sha', before['head']), 'fingerprint': before,
                         'bytes': size, 'object_bytes': object_size, 'objects': str(objects),
                         'excludes': excludes}
@@ -988,7 +1231,7 @@ class Checkpoints:
             # Other writers can consume space during copying. Recheck before
             # scratch allocation; failure removes only this pending copy.
             self._budget(self.root, size + 2 * object_size, self.capture_min_free_bytes)
-            self.verify(pending)
+            self.verify(pending, in_place=True)
             _mark('source-recheck')
             if submodule_plan(source) != plan or fingerprint(source, plan, tuple(excludes), tuple(ignored), self.max_nested_bytes) != before:
                 raise WorkspaceError('checkpoint: source changed during capture; lease retained')
@@ -1005,7 +1248,7 @@ class Checkpoints:
         except Exception:
             # A partial capture has no authority; source is untouched. Do not accumulate
             # full-tree temporary copies on every poll after a verification failure.
-            shutil.rmtree(pending, ignore_errors=True)
+            _rmtree(pending, ignore_errors=True)
             raise
 
     def _bundle(self, source: Path, pending: Path, refs: list, base_sha: str | None, stash_ref: str | None):
@@ -1073,7 +1316,7 @@ class Checkpoints:
                 os.rename(retired, checkpoint)       # crash between the swap's two renames
         try:
             data = json.loads((checkpoint / 'manifest.json').read_text())
-            if data['version'] not in (1, 2):
+            if data['version'] not in (1, 2, 3):
                 raise ValueError()
             for entry in data.get('submodules', []):
                 if not (_safe_rel(entry['path']) and _safe_rel(entry['name'])
@@ -1099,16 +1342,46 @@ class Checkpoints:
         except (OSError, ValueError, KeyError, TypeError):
             raise WorkspaceError('checkpoint: invalid manifest') from None
 
-    def _prove_bundle(self, bundle: Path, refspecs: list, message: str, reference: Path | None = None) -> None:
-        """`bundle verify` checks only the header; unpack into scratch storage to prove the pack."""
+    def _prove_bundle(self, bundle: Path, refspecs: list, message: str, reference: Path | None = None,
+                      whole_pack: bool = False) -> None:
+        """`bundle verify` checks only the header; unpack into scratch storage to prove the pack.
+
+        A fetch skips the pack when the probe already reaches every tip, as it does through an alternate
+        to the capture source's own store. `whole_pack` indexes the pack itself first (checksum, every
+        object, fsck), so a pack that does not index is refused there too."""
         with tempfile.TemporaryDirectory(prefix='.preflight-', dir=self.root) as scratch:
             probe = Path(scratch) / 'probe'
-            ok = _run(['git', 'init', '--bare', '--quiet', str(probe)], capture_output=True).returncode == 0
+            # No template: the sample hooks are a dozen files written and removed for nothing.
+            ok = _run(['git', 'init', '--bare', '--quiet', '--template=', str(probe)],
+                      capture_output=True).returncode == 0
             if ok and reference is not None:
                 _alternate(probe / 'objects', reference)      # the bundle's prerequisite lives there
+            if ok and whole_pack:
+                # A bundle that cannot be read (gone, unreadable) is refused like a broken one: the
+                # caller's fallback handles a refusal, not an OSError.
+                try:
+                    with open(bundle, 'rb') as header:      # signature, refs, a blank line, the pack
+                        line = header.readline()
+                        if line not in (b'# v2 git bundle\n', b'# v3 git bundle\n'):
+                            raise WorkspaceError('checkpoint: ' + message)
+                        while line not in (b'\n', b''):
+                            line = header.readline()
+                        if line != b'\n':
+                            raise WorkspaceError('checkpoint: ' + message)
+                        offset = header.tell()
+                    # Unbuffered, so the child reads from `offset` (a buffered reader has read ahead of it).
+                    with open(bundle, 'rb', buffering=0) as pack:
+                        pack.seek(offset)
+                        indexed = _run(['git', '--git-dir', str(probe), 'index-pack', '--stdin', '--fix-thin',
+                                        '--strict'], stdin=pack, capture_output=True).returncode == 0
+                except OSError:
+                    raise WorkspaceError('checkpoint: ' + message) from None
+                if not indexed:
+                    raise WorkspaceError('checkpoint: ' + message)
             ok = ok and _run(
-                ['git', '--git-dir', str(probe), '-c', 'transfer.fsckObjects=true', 'fetch', '--quiet',
-                 str(bundle), *refspecs], capture_output=True).returncode == 0
+                # unpackLimit=1: keep the pack whole (a few files), never one loose file per object.
+                ['git', '--git-dir', str(probe), '-c', 'transfer.fsckObjects=true', '-c', 'fetch.unpackLimit=1',
+                 'fetch', '--quiet', str(bundle), *refspecs], capture_output=True).returncode == 0
             if not ok:
                 raise WorkspaceError('checkpoint: ' + message)
 
@@ -1164,8 +1437,12 @@ class Checkpoints:
             git(target, 'checkout', '--quiet', '--force', '--detach', data['fingerprint']['head'])
         _mark('verify-overlay')
         _clear_tree(target)
+        roots = tuple(e['path'] for e in subs if e['populated'])
+        inner = {}
         if delta:
-            self._overlay_delta(checkpoint / 'tree', target, data['fingerprint']['tree'], delta)
+            # A populated submodule's part goes in after its own HEAD is checked out (`_replay_submodule`).
+            outer, inner = _split_delta(delta, roots)
+            self._overlay_delta(checkpoint / 'tree', target, data['fingerprint']['tree'], outer, roots=roots)
         else:
             for child in (checkpoint / 'tree').iterdir():
                 dest = target / child.name
@@ -1188,7 +1465,8 @@ class Checkpoints:
         _sync(index.parent)
         for i, entry in enumerate(subs):
             if entry['gitdir']:
-                self._replay_submodule(checkpoint / 'submodules' / str(i), target, modules, entry, data)
+                self._replay_submodule(checkpoint / 'submodules' / str(i), target, modules, entry, data,
+                                       inner.get(entry['path']), checkpoint / 'tree')
         _mark('verify-refresh')
         git(target, 'update-index', '--really-refresh', check=False)
         for entry in subs:
@@ -1214,9 +1492,17 @@ class Checkpoints:
             raise WorkspaceError('checkpoint: base commit missing in target; target untouched')
 
     @staticmethod
-    def _overlay_delta(tree: Path, target: Path, full: dict, delta: dict) -> None:
-        """HEAD's files from the object store (already fetched), then the delta over them."""
+    def _overlay_delta(tree: Path, target: Path, full: dict, delta: dict, roots: tuple = ()) -> None:
+        """HEAD's files from the object store (already fetched), then the delta over them. `roots`: the
+        populated submodules, empty directories here (their gitlinks); their content comes later."""
         git(target, 'checkout-index', '--all', '--force')
+        Checkpoints._apply_delta(tree, target, full, delta,
+                                 lambda n: not any(n.startswith(r + '/') for r in roots))
+
+    @staticmethod
+    def _apply_delta(tree: Path, target: Path, full: dict, delta: dict, mine) -> None:
+        """The delta over a checkout already in `target`; then the recorded modes of the entries `mine`
+        selects (the checkout's repository: the superproject, or one populated submodule)."""
         root = os.path.realpath(target)
         def inside(name: str) -> Path:
             # Defence in depth behind `read()`: whatever is written or removed lies under the restore root
@@ -1235,7 +1521,7 @@ class Checkpoints:
             out.parent.mkdir(parents=True, exist_ok=True)
             if os.path.lexists(out):
                 if out.is_dir() and not out.is_symlink():
-                    shutil.rmtree(out)
+                    _rmtree(out)
                 else:
                     out.unlink()
             if src.is_symlink():
@@ -1247,7 +1533,8 @@ class Checkpoints:
         # Checkout creates files with this process's umask; the source had its own. Put the recorded
         # modes back (files first, directories deepest-first so a read-only parent is closed last).
         for kind in ('file', 'link', 'dir'):
-            for name in sorted((n for n, v in full.items() if v[0] == kind), key=lambda n: (-len(Path(n).parts), n)):
+            for name in sorted((n for n, v in full.items() if v[0] == kind and mine(n)),
+                               key=lambda n: (-len(Path(n).parts), n)):
                 p = target / name
                 if not os.path.lexists(p) or stat.S_IMODE(p.lstat().st_mode) == full[name][1]:
                     continue
@@ -1375,7 +1662,10 @@ class Checkpoints:
         if differs:
             raise WorkspaceError(f"checkpoint: submodule work in target differs from checkpoint: {entry['path']}; lease retained")
 
-    def _replay_submodule(self, src: Path, target: Path, modules: Path, entry: dict, data: dict) -> None:
+    def _replay_submodule(self, src: Path, target: Path, modules: Path, entry: dict, data: dict,
+                          delta: dict | None = None, tree: Path | None = None) -> None:
+        """The submodule's gitdir from its bundle and index; a populated one gets its pointer back and, in
+        the slim form (`delta`: its part), its worktree: HEAD checked out, then that part over it."""
         gd = modules / entry['name']
         want = data['fingerprint']['submodules'][entry['path']]
         if not os.path.lexists(gd):
@@ -1395,12 +1685,6 @@ class Checkpoints:
             _gitdir(gd, 'config', 'core.worktree', os.path.relpath(os.path.realpath(wt), os.path.realpath(gd)))
         if any(os.path.lexists(gd / lock) for lock in ('index.lock', 'HEAD.lock')):
             raise WorkspaceError(f"checkpoint: active git writer in target submodule {entry['path']}; lease retained")
-        if (src / 'index').is_file():
-            tmp = gd / 'runner-checkpoint-index.tmp'
-            shutil.copy2(src / 'index', tmp)
-            _sync(tmp)
-            os.replace(tmp, gd / 'index')
-            _sync(gd)
         if entry['populated']:
             pointer = target / entry['path'] / '.git'
             if pointer.is_symlink():
@@ -1408,14 +1692,501 @@ class Checkpoints:
             tmp = pointer.with_name('.git.runner-tmp')
             tmp.write_text('gitdir: ' + os.path.relpath(os.path.realpath(gd), os.path.realpath(pointer.parent)) + '\n')
             os.replace(tmp, pointer)
+            if delta is not None:
+                self._checkout_submodule_head(gd, pointer.parent)
+                prefix = entry['path'] + '/'
+                self._apply_delta(tree, target, data['fingerprint']['tree'], delta, lambda n: n.startswith(prefix))
+        # The stored index last: the checkout above goes through a scratch index of HEAD.
+        if (src / 'index').is_file():
+            tmp = gd / 'runner-checkpoint-index.tmp'
+            shutil.copy2(src / 'index', tmp)
+            _sync(tmp)
+            os.replace(tmp, gd / 'index')
+            _sync(gd)
 
-    def verify(self, checkpoint: Path) -> None:
+    @staticmethod
+    def _checkout_submodule_head(gd: Path, wt: Path) -> None:
+        """Write the files of the submodule's HEAD into `wt` (empty: the superproject's checkout made it),
+        through a scratch index, so its own index is not read or written."""
+        scratch = gd / 'runner-checkout-index.tmp'
+        env = dict(os.environ, GIT_INDEX_FILE=str(scratch))
+        env.pop('GIT_DIR', None)
+        env.pop('GIT_WORK_TREE', None)
+        try:
+            for args in (('read-tree', 'HEAD'), ('checkout-index', '--all', '--force')):
+                r = _run(['git', '--git-dir', str(gd), '--work-tree', str(wt), *args], capture_output=True,
+                         text=True, errors='surrogateescape', env=env)
+                if r.returncode:
+                    raise WorkspaceError(f'checkpoint: git {args[0]} failed in a submodule gitdir: '
+                                         f'{r.stderr.strip()[:120]}')
+        finally:
+            scratch.unlink(missing_ok=True)
+
+    def _prove_in_place(self, checkpoint: Path, data: dict) -> None:
+        """Prove a slim snapshot without laying its tree out anywhere.
+
+        The scratch replay checked the whole tree out, applied the delta and compared the fingerprint:
+        every capture wrote and removed the full checkout (tens of thousands of files) in the checkpoint
+        directory. Here the same result is predicted from what the replay is made of and compared with
+        the recorded fingerprint: the tree from HEAD's tree and blobs in the durable object store (the
+        capture source's own store) and the delta tree as stored; Git's view (head, staged, unstaged,
+        status) from a repository made the way the replay makes one, over the capture source. Every
+        Git read runs in that repository, so config and attributes are the replay's, not the source's.
+        Raises `_NotProvable` for anything it does not model exactly (a full snapshot, submodules,
+        config it does not model, a path Git resolves against the work tree, checkout conversions, a
+        changed `.gitattributes`, a deleted symlink, a tracked path under an ignored one, a layout the
+        replay would refuse) and for every mismatch: the caller then runs the scratch replay, which
+        stays the authority. Accepting here implies the replay accepts.
+
+        Capture only: the capture source must still hold the tree just recorded (its writer is stopped,
+        and the capture re-fingerprints it afterwards). The bundle is proven by the caller."""
+        _mark('verify-proof')
+        try:
+            self._predict_replay(checkpoint, data)
+        except _NotProvable:
+            raise
+        except (WorkspaceError, OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            raise _NotProvable(f'error-{type(e).__name__}') from None
+
+    def _predict_replay(self, checkpoint: Path, data: dict) -> None:
+        delta, bundle = data.get('delta'), data.get('bundle')
+        if not isinstance(delta, dict) or not isinstance(bundle, dict):
+            raise _NotProvable('form')
+        source = Path(data['source'])
+        objects = _durable_objects(data)
+        here = base_objects_dir(source) if source.is_dir() else None
+        if objects is None or here is None or os.path.realpath(here) != os.path.realpath(objects):
+            raise _NotProvable('objects')
+        full = data['fingerprint']['tree']
+        skip = {*data.get('excludes', []), *data.get('ignored', [])}
+        # The `.gitattributes` files of the work tree are the source's; the replay's are HEAD's. They
+        # agree unless one is among the changed, deleted, ignored or excluded paths.
+        if any(n.rsplit('/', 1)[-1] == '.gitattributes' for n in (*delta['files'], *delta['deleted'], *skip)):
+            raise _NotProvable('attributes')
+        roots = tuple(e['path'] for e in data.get('submodules') or [] if e['populated'])
+        if inventory(checkpoint / 'tree', roots) != _delta_keep(full, delta):
+            raise _NotProvable('snapshot')
+        with self._replay_repo(checkpoint, data, source, objects) as env:
+            self._predict_in(data, source, env, checkpoint)
+
+    @contextlib.contextmanager
+    def _replay_repo(self, checkpoint: Path, data: dict, source: Path, objects: Path):
+        """The environment of a Git command in a repository made as the replay makes its target, with the
+        capture source as its work tree. `git init` as the replay runs it: the replay's config, template
+        and `info/attributes`, not the source's (its local config, `info/attributes`, `attr.tree`,
+        replace refs); the stored index; HEAD at the recorded commit; objects through the durable store.
+        Nothing is written in the source.
+
+        Without `GIT_CONFIG`: it redirects only the `git config` command (to that one file, includes not
+        followed), while checkout, diff and status read the user-wide, system and repository config. With
+        it the proof's config read would see a file no replay command reads, and could miss a key that
+        steers the replay's checkout (`core.symlinks=false` in the user-wide config behind an empty
+        `GIT_CONFIG`). Without it `git config` reads what every replay command reads."""
+        with tempfile.TemporaryDirectory(prefix='.preflight-', dir=self.root) as scratch:
+            view = Path(scratch) / 'view'
+            view.mkdir()
+            if _run(['git', '-C', str(view), 'init', '--quiet'], capture_output=True).returncode:
+                raise _NotProvable('git-init')
+            gitdir = view / '.git'
+            _alternate(gitdir / 'objects', objects)
+            (gitdir / 'HEAD').write_text(data['fingerprint']['head'] + '\n')
+            shutil.copyfile(checkpoint / 'index', gitdir / 'index')
+            env = {k: v for k, v in os.environ.items() if k != 'GIT_CONFIG'}
+            yield dict(env, GIT_DIR=str(gitdir), GIT_WORK_TREE=str(source), **_READ_ONLY_GIT)
+
+    def _replay_submodules(self, checkpoint: Path | None, data: dict, source: Path, env: dict, check_hooks) -> dict:
+        """Each submodule as the replay restores it into a fresh target (`_replay_submodule`), next to the
+        proof's repository: `git init --bare`, its bundle fetched (proven: fsck, the whole pack kept), HEAD,
+        the stored index. Its recorded state must come out: HEAD, branch and refs; for a populated one
+        its staged, unstaged and status, read with the source's submodule worktree as the work tree (the
+        tree proof shows the replay's holds the same files). Returns {path: environment} of the populated
+        ones, for their HEAD trees and blobs. A submodule without a gitdir stays without one.
+
+        The superproject's own view looks into a populated submodule through the source's pointer, so
+        through the source's gitdir: `_same_submodule_view` requires that gitdir to read like the
+        replay's (config, `info/` files); the content, HEAD and index are what is proven here."""
+        if checkpoint is None:
+            raise _NotProvable('form')
+        base = {k: v for k, v in env.items() if k not in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE')}
+        modules = Path(env['GIT_DIR']) / 'modules'
+        source_modules = _modules_dir(source)
+        recorded = data['fingerprint'].get('submodules') or {}
+        template = [] if not self._template_inert(Path(env['GIT_DIR'])) else ['--template=']
+        out = {}
+        for i, entry in enumerate(data['submodules']):
+            want = recorded.get(entry['path'])
+            if not entry['gitdir']:
+                if want != {'gitdir': False}:
+                    raise _NotProvable('submodule-state')
+                continue
+            part = checkpoint / 'submodules' / str(i)
+            if not isinstance(want, dict) or not (part / 'commits.bundle').is_file() or (
+                    entry['populated'] and not (part / 'index').is_file()):
+                raise _NotProvable('submodule-snapshot')
+            gd = modules / entry['name']
+            gd.parent.mkdir(parents=True, exist_ok=True)
+
+            def run(what: str, *args, gd=gd):
+                if _run(['git', '--git-dir', str(gd), *args], capture_output=True, env=base).returncode:
+                    raise _NotProvable(f'submodule-{what}')
+            if _run(['git', 'init', '--bare', '--quiet', *template, str(gd)], capture_output=True,
+                    env=base).returncode:
+                raise _NotProvable('submodule-init')
+            # The bundle is proven here as the replay's preflight proves it: every object checked.
+            run('bundle', '-c', 'transfer.fsckObjects=true', '-c', 'fetch.unpackLimit=1', 'fetch', '--quiet',
+                '--no-write-fetch-head', str(part / 'commits.bundle'),
+                '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*', '+refs/remotes/*:refs/remotes/*',
+                '+refs/runner-checkpoints/*:refs/runner-checkpoints/*', '+HEAD:refs/runner-replay/HEAD')
+            if want.get('branch'):
+                run('head', 'symbolic-ref', 'HEAD', want['branch'])
+            else:
+                run('head', 'update-ref', '--no-deref', 'HEAD', want.get('head') or '')
+            run('head', 'update-ref', '-d', 'refs/runner-replay/HEAD')
+            run('config', 'config', 'core.bare', 'false')
+            if (part / 'index').is_file():
+                shutil.copyfile(part / 'index', gd / 'index')
+            state = _gitdir_state(gd)
+            if entry['populated']:
+                wt = source / entry['path']
+                where = dict(base, GIT_DIR=str(gd), GIT_WORK_TREE=str(wt))
+                check_hooks(where, wt)
+                self._same_submodule_view(source_modules / entry['name'], gd)
+                # As the replay does before its fingerprint; writes this gitdir's index only.
+                _run(['git', '-C', str(wt), 'update-index', '--really-refresh'], capture_output=True, env=where)
+
+                def raw(*args, where=where, wt=wt):
+                    r = _run(['git', '-C', str(wt), *args], capture_output=True, env=where)
+                    if r.returncode:
+                        raise _NotProvable(f'git-{args[0]}')
+                    return hashlib.sha256(r.stdout).hexdigest()
+                state.update(_worktree_state(raw))
+                out[entry['path']] = where
+            if state != want:
+                raise _NotProvable('submodule-state')
+        return out
+
+    @staticmethod
+    def _template_inert(view: Path) -> bool:
+        """Whether the template `git init` copied into the proof's repository `view` (the replay's `git init`
+        copies the same one into every submodule gitdir it makes) gives a gitdir nothing that its Git reads:
+        only sample hooks, `description` and a comment-only `info/exclude`, and no config key beyond those
+        `git init` writes itself. Then the proof makes its submodule gitdirs without a template: the same
+        Git behaviour, sixteen files fewer per submodule. Anything else (a hook, an attributes file, a
+        template config, another ref store): False, and they are made with the template, as the replay
+        does. Read before the proof writes anything but `index` and the alternate there."""
+        ours = {'HEAD', 'config', 'description', 'index', 'info/exclude', 'objects/info/alternates'}
+        for parent, dirs, files in os.walk(view):
+            for name in files:
+                rel = (Path(parent) / name).relative_to(view).as_posix()
+                if rel not in ours and not (rel.startswith('hooks/') and rel.count('/') == 1
+                                            and rel.endswith('.sample')):
+                    return False
+        try:
+            exclude = (view / 'info' / 'exclude').read_bytes() if (view / 'info' / 'exclude').exists() else b''
+        except OSError:
+            return False
+        if any(ln.strip() and not ln.startswith(b'#') for ln in exclude.splitlines()):
+            return False
+        r = _run(['git', 'config', '--file', str(view / 'config'), '--list', '-z', '--name-only'],
+                 capture_output=True)
+        if r.returncode:
+            return False
+        return all(key in _INIT_CONFIG for key in r.stdout.decode('utf-8', 'surrogateescape').lower().split('\0')
+                   if key)
+
+    @staticmethod
+    def _same_submodule_view(have: Path, made: Path) -> None:
+        """The source's submodule gitdir `have` gives what the replay's `made` gives to the superproject's
+        status and diff (which run Git in the submodule through the source's pointer): the same local
+        config but for keys no such run reads, the same `info/exclude`, `info/attributes` and
+        `info/sparse-checkout` (comment and blank lines aside, the rest byte for byte). Anything else hands
+        over."""
+        def config(gd: Path) -> list:
+            r = _run(['git', 'config', '--file', str(gd / 'config'), '--list', '-z'], capture_output=True)
+            if r.returncode:
+                raise _NotProvable('submodule-config')
+            keys = []
+            for record in r.stdout.split(b'\0'):
+                if not record:
+                    continue
+                name, given, value = record.partition(b'\n')
+                key = name.decode('utf-8', 'surrogateescape').lower()
+                if key.split('.', 1)[0] in _SUBMODULE_INERT_SECTIONS or key in _SUBMODULE_INERT_KEYS:
+                    continue
+                keys.append((key, value if given else None))
+            return sorted(keys)
+
+        def lines(path: Path) -> list:
+            try:
+                text = path.read_bytes()
+            except FileNotFoundError:
+                return []
+            except OSError:
+                raise _NotProvable('submodule-info') from None
+            return [ln for ln in text.splitlines() if ln.strip() and not ln.startswith(b'#')]
+        if config(have) != config(made):
+            raise _NotProvable('submodule-config')
+        if any(lines(have / name) != lines(made / name)
+               for name in ('info/exclude', 'info/attributes', 'info/sparse-checkout')):
+            raise _NotProvable('submodule-info')
+
+    def _predict_in(self, data: dict, source: Path, env: dict, checkpoint: Path | None = None) -> None:
+        """Predict the replay's result from inside its repository (`env`, from `_replay_repo`) and
+        compare it with the fingerprint; `_NotProvable` names the first thing that is not decided.
+        Submodules (their stored parts under `checkpoint`): see `_replay_submodules`."""
+        delta, bundle = data['delta'], data['bundle']
+        full = data['fingerprint']['tree']
+        head = data['fingerprint']['head']
+        skip = {*data.get('excludes', []), *data.get('ignored', [])}
+
+        def run_in(where: dict, cwd: Path, *args, feed=None, ok=(0,)):
+            r = _run(['git', '-C', str(cwd), *args], capture_output=True, env=where, input=feed)
+            if r.returncode not in ok:
+                raise _NotProvable(f'git-{args[0]}')
+            return r
+
+        def run(*args, feed=None, ok=(0,)):
+            return run_in(env, source, *args, feed=feed, ok=ok)
+
+        def has_commit(sha: str) -> bool:
+            return run('cat-file', '-e', f'{sha}^{{commit}}', ok=(0, 1, 128)).returncode == 0
+
+        # Where Git finds the user-wide config, attributes, excludes and template: relative, it names a
+        # file next to the source here and next to the scratch target in the replay.
+        for var in _PATH_ENV:
+            if env.get(var) and not os.path.isabs(env[var]):
+                raise _NotProvable(f'relative {var}')
+        # Config, read here once from the replay's own config (user-wide, system and command line; the
+        # source's local config never) and decided before the first index read. The same config gives
+        # the same result here and in the replay only for what does not depend on where Git runs or on
+        # a command only the replay runs: a key passes only when the proof models it (`_modelled_config`;
+        # in the sections that steer a checkout, `_CHECKOUT_CONFIG` with the modelled value) and a path
+        # it names is absolute. Any other key hands over by name, so a key not thought of costs a
+        # replay, never a wrong acceptance.
+        config = {}
+        for record in run('config', '--list', '-z').stdout.split(b'\0'):
+            if record:
+                name, given, value = record.partition(b'\n')
+                config[name.decode('utf-8', 'surrogateescape').lower()] = (
+                    value.decode('utf-8', 'surrogateescape') if given else None)
+        # A conditional include resolves by the repository that reads it: `onbranch` by its HEAD (the
+        # replay checks out with HEAD on the unborn default branch of `git init` and fingerprints on the
+        # recorded branch; this repository is detached), `gitdir` by its directory, `hasconfig` by its
+        # remotes. Config is the same here and in the replay only without one, so any `includeIf`
+        # reachable from this repository's config (through plain includes too) hands over.
+        if any(name.startswith('includeif.') for name in config):
+            raise _NotProvable('conditional-config')
+        for name in config:
+            if not _modelled_config(name):
+                raise _NotProvable(_config_reason(name))
+        # A relative path resolves against the work tree, the source's here and the scratch target's in
+        # the replay. Git expands it (`~`), so the check sees the path Git opens; the last value counts.
+        for name in _PATH_CONFIG:
+            if name in config and not os.path.isabs(os.fsdecode(
+                    run('config', '--type=path', '--get', name).stdout.rstrip(b'\n'))):
+                raise _NotProvable(f'relative {name}')
+        # Checkout conversions the proof does not model.
+        crlf, eol = config.get('core.autocrlf', 'false'), config.get('core.eol', 'native')
+        if ((crlf or '').strip().lower() != 'input' and _git_bool(crlf) is not False) or \
+                eol is None or eol.strip().lower() not in ('lf', 'native'):
+            raise _NotProvable('conversion')
+        # Without symlinks the checkout writes a link as a file holding its target.
+        if 'core.symlinks' in config and _git_bool(config['core.symlinks']) is not True:
+            raise _NotProvable('symlinks')
+        # Programs Git starts from configuration run in the work tree, here the source, and may change
+        # what the replay sees: an fsmonitor is queried on every index read, a hook by the commands the
+        # replay runs (its checkout, its fetch, the index refresh, which this proof runs too). None of
+        # them starts here; a relative hooks path resolves against the work tree, the source's here and
+        # the scratch target's in the replay.
+        if 'core.fsmonitor' in config and _git_bool(config['core.fsmonitor']) is not False:
+            raise _NotProvable('fsmonitor')
+        def check_hooks(where: dict, cwd: Path) -> None:
+            hooks = Path(os.fsdecode(run_in(where, cwd, 'rev-parse', '--git-path', 'hooks').stdout.rstrip(b'\n')))
+            if not hooks.is_absolute() or any(
+                    os.access(hooks / name, os.X_OK) and (hooks / name).is_file()
+                    for name in ('post-checkout', 'post-index-change', 'reference-transaction', 'pre-auto-gc')):
+                raise _NotProvable('hooks')
+        check_hooks(env, source)
+        # Submodules: their gitdirs made as the replay makes them, their recorded state compared; the
+        # populated ones' environments read their HEAD trees below.
+        inner = self._replay_submodules(checkpoint, data, source, env, check_hooks) \
+            if data.get('submodules') else {}
+
+        # Objects: the base and (no bundle) HEAD in the durable store, which the replay reaches too.
+        if not has_commit(bundle['base']):
+            raise _NotProvable('base')
+        if bundle['mode'] == 'none' and not has_commit(head):
+            raise _NotProvable('head')
+        # A tracked path under an excluded or ignored one is restored from HEAD, not from the source, and
+        # left out of the tree fingerprint: only the replay's `diff` can tell whether that agrees.
+        if skip:
+            for raw_name in run('ls-files', '-z').stdout.split(b'\0'):
+                name = raw_name.decode('utf-8', 'surrogateescape')
+                if name and any(p in skip for p in (*_parents(name), name)):
+                    raise _NotProvable('skip-tracked')
+        # The replay's tree: checkout of HEAD, minus `deleted` (files and links), then the delta files
+        # over it (a directory in the way is removed whole), then the empty directories. Same steps,
+        # same order as `_replay` / `_overlay_delta`; then each populated submodule the same way, from
+        # its own HEAD and its own part of the delta (`_replay_submodule`), inside its gitlink's directory.
+        outer, parts = _split_delta(delta, inner)
+        pred = {}       # name -> ('dir',) | ('blob', mode, oid, repository) | ('delta',)
+
+        def add_dir(name: str) -> None:
+            for p in (*_parents(name), name):
+                kind = pred.setdefault(p, ('dir',))[0]
+                if kind != 'dir':
+                    raise _NotProvable('layout')        # the replay's mkdir would fail or follow a link
+
+        def lay_out(listing: bytes, part: dict, prefix: str = '') -> None:
+            pre = prefix + '/' if prefix else ''
+            for record in listing.split(b'\0'):
+                if not record:
+                    continue
+                meta, _, raw = record.partition(b'\t')
+                mode, kind, oid = meta.decode('ascii').split()
+                name = pre + raw.decode('utf-8', 'surrogateescape')
+                if '/' in name:
+                    add_dir(name.rsplit('/', 1)[0])
+                if mode == '160000' and not prefix:
+                    pred[name] = ('dir',)               # a placeholder: checkout makes it an empty directory
+                elif kind == 'blob' and mode in ('100644', '100755', '120000'):
+                    pred[name] = ('blob', mode, oid, prefix)
+                else:
+                    raise _NotProvable('mode')
+            for name in part['deleted']:
+                if any(pred.get(p, ('dir',))[0] != 'dir' for p in _parents(name)):
+                    raise _NotProvable('layout')
+                have = pred.get(name)
+                if have is None or have[0] == 'dir':
+                    continue                             # the replay unlinks only what is not a directory
+                if have[1] == '120000':
+                    raise _NotProvable('deleted-link')   # kept or removed depending on where it points
+                del pred[name]
+            for name in sorted(part['files']):
+                if '/' in name:
+                    add_dir(name.rsplit('/', 1)[0])
+                if pred.get(name, ('',))[0] == 'dir':
+                    for k in [k for k in pred if k.startswith(name + '/')]:
+                        del pred[k]
+                pred[name] = ('delta',)
+            for name in part['dirs']:
+                add_dir(name)
+
+        lay_out(run('ls-tree', '-r', '-z', '--full-tree', head).stdout, outer)
+        for root, where in inner.items():
+            if pred.get(root) != ('dir',):
+                raise _NotProvable('layout')
+            lay_out(run_in(where, source / root, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD').stdout,
+                    parts[root], root)
+
+        def skipped(name: str) -> bool:
+            return any(p in skip for p in (*_parents(name), name))
+        pred = {k: v for k, v in pred.items() if not skipped(k)}
+        if set(pred) != set(full):
+            raise _NotProvable('layout')
+        def marked(entry) -> bool:
+            return isinstance(entry, list) and len(entry) > 2 and entry[0] == 'dir' and entry[2] == NESTED
+        files, links = {}, {}
+        for name, want in full.items():
+            have = pred[name]
+            if have[0] == 'delta':
+                if want[0] not in ('file', 'link'):
+                    raise _NotProvable('layout')
+                continue                                 # the delta tree inventory above matched it
+            if have[0] == 'dir':
+                if want[0] != 'dir':
+                    raise _NotProvable('layout')
+                # `inventory` marks a nested repository by its `.git`, outside any other one only.
+                nested = f'{name}/.git' in pred and not any(marked(full.get(p)) for p in _parents(name))
+                if nested != marked(want):
+                    raise _NotProvable('layout')
+                continue
+            _, mode, oid, repo = have
+            if (mode == '120000') != (want[0] == 'link') or want[0] not in ('file', 'link'):
+                raise _NotProvable('layout')
+            (links if mode == '120000' else files).setdefault((repo, oid), []).append(name)
+        for repo in sorted({r for r, _ in (*files, *links)}):
+            where, cwd = (inner[repo], source / repo) if repo else (env, source)
+            cut = len(repo) + 1 if repo else 0          # a submodule's git names its paths from its root
+            mine = {oid: names for (r, oid), names in files.items() if r == repo}
+            if mine:
+                # The attributes the replay's checkout applies: HEAD's `.gitattributes` (the work tree's
+                # agree, see above), the user's attributes file, the replay repository's `info/attributes`.
+                fields = run_in(where, cwd, 'check-attr', '-z', '--stdin', 'filter', 'ident',
+                                'working-tree-encoding', 'eol',
+                                feed=b''.join(n[cut:].encode('utf-8', 'surrogateescape') + b'\0'
+                                              for names in mine.values() for n in names)).stdout.split(b'\0')
+                for attr, value in zip(fields[1::3], fields[2::3]):
+                    if (attr == b'eol' and value == b'crlf') or (
+                            attr != b'eol' and value not in (b'unspecified', b'unset')):
+                        raise _NotProvable('conversion')
+            # Content: every HEAD blob the replay writes must hash to what the capture recorded there.
+            kept = {oid: names for (r, oid), names in links.items() if r == repo}
+            digests = _blob_digests(cwd, sorted({*mine, *kept}), set(kept), env=where)
+            for oid, names in mine.items():
+                size, sha, _ = digests[oid]
+                if any(full[n][2] != size or full[n][3] != sha for n in names):
+                    raise _NotProvable('content')
+            for oid, names in kept.items():
+                target = os.fsdecode(digests[oid][2])
+                if any(full[n][2] != target for n in names):
+                    raise _NotProvable('content')
+        if self._replay_view(data, source, env) != {
+                k: data['fingerprint'][k] for k in ('head', 'staged', 'unstaged', 'status')}:
+            raise _NotProvable('git-view')
+
+    @staticmethod
+    def _replay_view(data: dict, source: Path, env: dict) -> dict:
+        """head, staged, unstaged and status as `fingerprint` computes them on the replay's target, without
+        the target: in the replay's repository (`_replay_repo`), the stored index refreshed as the replay
+        refreshes it. The source holds the same files as the target (the tree proof); what the replay
+        leaves out (ignored and excluded paths) is left out here by pathspec."""
+        excludes, ignored = tuple(data.get('excludes', [])), tuple(data.get('ignored', []))
+
+        def raw(*args):
+            r = _run(['git', '-C', str(source), *args], capture_output=True, env=env)
+            if r.returncode:
+                raise _NotProvable(f'git-{args[0]}')
+            return r.stdout
+        # As the replay does before its fingerprint; writes the probe's copy of the index only.
+        _run(['git', '-C', str(source), 'update-index', '--really-refresh'], capture_output=True, env=env)
+        left_out = (*excludes, *ignored)
+        spec = ['--', '.', *(f':(exclude,literal){e}' for e in left_out)] if left_out else []
+        return {'head': raw('rev-parse', 'HEAD').decode('ascii').strip(),
+                'staged': hashlib.sha256(raw('diff', '--cached', '--binary', '--no-ext-diff')).hexdigest(),
+                'unstaged': hashlib.sha256(raw('diff', '--binary', '--no-ext-diff')).hexdigest(),
+                'status': hashlib.sha256(raw('status', '--porcelain=v1', '-z', '--untracked-files=all',
+                                             *spec)).hexdigest()}
+
+    def verify(self, checkpoint: Path, in_place: bool = False) -> None:
         with _IO_LOCK:
-            self._verify(checkpoint)
+            self._verify(checkpoint, in_place)
 
-    def _verify(self, checkpoint: Path) -> None:
+    def _verify(self, checkpoint: Path, in_place: bool = False) -> None:
+        """Prove the snapshot restores to its fingerprint by replaying it into scratch: a checkout of the
+        whole tree, removed after. `in_place` (the capture's own check, while its source still holds the
+        recorded tree) first tries `_prove_in_place`, which lays no tree out, and replays only what that
+        cannot decide. On every path a slim bundle's pack is indexed onto the durable store first: the
+        replay's fetch reads no pack whose tips that store already holds."""
         _mark('verify-setup')
         data = self.read(checkpoint)
+        bundle = data.get('bundle')
+        if bundle and bundle.get('mode') != 'none':
+            objects = _durable_objects(data)
+            if objects is None:
+                raise WorkspaceError('checkpoint: bundle base unavailable')
+            _mark('verify-pack')
+            self._prove_bundle(checkpoint / 'commits.bundle',
+                               ['+refs/*:refs/runner-replay/*', *(['HEAD'] if bundle['has_head'] else [])],
+                               'bundle invalid', reference=objects, whole_pack=True)
+        if in_place:
+            try:
+                self._prove_in_place(checkpoint, data)
+                return
+            except _NotProvable as e:
+                log.info("checkpoint %s: proof in place not decided (%s); scratch replay", checkpoint.name[:40],
+                         e.reason)
+            _mark('verify-setup')
         self._budget(self.root, data['bytes'] + 2 * data['object_bytes'])
         with tempfile.TemporaryDirectory(prefix='.verify-', dir=self.root) as name:
             target = Path(name)
@@ -1505,11 +2276,11 @@ class Checkpoints:
                 os.rename(retired, checkpoint)      # never leave the only copy under .retired-
                 raise
             _sync(self.root)
-            shutil.rmtree(retired, ignore_errors=True)
+            _rmtree(retired, ignore_errors=True)
             return {'compacted': True, 'before': before, 'after': _du(checkpoint)}
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
-            shutil.rmtree(created, ignore_errors=True)
+            _rmtree(scratch, ignore_errors=True)
+            _rmtree(created, ignore_errors=True)
 
     @staticmethod
     def _marker(target: Path) -> Path:

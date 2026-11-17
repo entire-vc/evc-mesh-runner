@@ -42,6 +42,15 @@ class RecoverOtherSessions(unittest.TestCase):
             store=self.store, life=lifecycle.AttemptStateMachine(self.store), _tmux=object(),
             _turn_over=lambda a: True,
             emit=lambda kind, a: self.events.append(kind))
+        # the real checks whether the Runner itself stopped this turn, for a lost lock or at its limits
+        # (it did neither here)
+        self.host._lock_loss_stop = lambda a: AgentRunner._lock_loss_stop(self.host, a)
+        self.host._end_after_own_lock_stop = (
+            lambda a, intent, resolution: AgentRunner._end_after_own_lock_stop(self.host, a, intent, resolution))
+        self.host.OWN_CUTS = AgentRunner.OWN_CUTS
+        self.host._own_cut = lambda a: AgentRunner._own_cut(self.host, a)
+        self.host._end_after_own_cut = (
+            lambda a, intent, resolution: AgentRunner._end_after_own_cut(self.host, a, intent, resolution))
         self.row = self.legacy_row()
 
     def legacy_row(self):

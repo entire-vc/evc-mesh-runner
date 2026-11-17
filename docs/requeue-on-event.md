@@ -40,7 +40,11 @@ consecutive turns without progress; see the README) and COMPACTION CAP
 5. `RUNNER GAVE UP` (harness errors, turn limit) is mechanics, not work, and still goes to the lead.
    Turns without a readable outcome use the same wait: the second in a row puts the task back in todo
    with the same lane (`🔁 NO OUTCOME`, no peer reassignment) until its inputs change; the
-   third in a row (reset by any readable outcome) goes to the lead.
+   third in a row (reset by any readable outcome) goes to the lead. An agent that ends its escalation
+   chain (no lead, or the project's lead is the agent itself) has nobody to hand it to and nobody due
+   to write on it: the card starts again at once in a fresh session whose first prompt says the
+   previous one gave up, once per card and UTC day. A second give-up the same day waits in todo for a
+   comment or the next UTC day.
 
 When the requeue cannot be done safely (the inputs are unreadable, or Mesh refuses the move to
 `todo`) the cap takes the older path: the task goes to the lead, or stays with the agent until the

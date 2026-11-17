@@ -365,8 +365,8 @@ class NoOutcomeRun(CapBench):
         self.silent(t)
         r = self.runner(mesh)
         self.two_misses(r)
-        self.assertEqual(self.states(r)[t["id"][:8]], "failed")
-        self.assertEqual(r.store.events_since_readable(t["id"], "no_outcome_routed"), 0)
+        self.assertEqual(self.states(r)[t["id"][:8]], "completed")     # started again (test_gave_up_no_lead)
+        self.assertEqual(r.store.events_on_task(t["id"], "no_outcome_routed"), 0)
 
     def test_the_routed_marker_survives_a_readable_outcome(self):
         t = task(1)

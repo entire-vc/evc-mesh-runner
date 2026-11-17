@@ -57,7 +57,7 @@ class MergeWaitOnBlockedMR(Bench):
     # -- red head -------------------------------------------------------------------------
 
     def test_rearmed_merge_wait_after_the_delivered_red_notice_is_sent_back(self):
-        for status, linked in (('failed', True), ('canceled', True), ('failed', False)):
+        for status, linked in (('failed', True), ('canceled', True)):
             with self.subTest(status=status, linked=linked):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(mr_row(status), linked=linked)
@@ -72,6 +72,20 @@ class MergeWaitOnBlockedMR(Bench):
                 self.assert_sent_back(a, f'pipeline 14845 finished: {status}', 'you were already told',
                                       'open the failed job', 'proven flake')
                 r.store.db.close()
+
+    def test_rearmed_merge_wait_on_someone_elses_red_mr_stands(self):
+        # not linked, not named, not authored by the lane: its owner pushes the new head, so the
+        # waiter is told whose MR it is (no push instruction) and its wait declared again stands
+        r, t, gl = self.flow(mr_row('failed'), linked=False)
+        a = self.turn(r, t, merged_line())
+        self.assertEqual(a.state, 'waiting')
+        r._wake_one(a)
+        a = r.store.get(a.id)
+        self.assertEqual(a.state, 'ready')
+        self.assertIn("This MR is not this task's", a.wake_text)
+        self.assertNotIn('fix the cause and push', a.wake_text)
+        a = self.turn(r, t, merged_line(), first=False)
+        self.assertEqual(a.state, 'waiting')
 
     def test_red_head_not_yet_delivered_is_accepted(self):
         for status in ('failed', 'canceled', 'cancelled', 'skipped'):
@@ -89,11 +103,17 @@ class MergeWaitOnBlockedMR(Bench):
                 self.tearDown(), self.setUp()
                 if gate:                       # a skipped head is red only behind a merge gate
                     self.cfg.merge_command = ('merge-gate', '{iid}', '{project}', '{sha}')
-                r, t, gl = self.flow(mr_row(status), linked=False)
+                r, t, gl = self.flow(mr_row(status))
                 r.store.mark(self.agent.name, t['id'], ci_delivery_key(MR, 14845), f'{SHA}:14845:{status}')
                 a = self.turn(r, t, merged_line())
                 self.assert_sent_back(a, f'finished: {status}')
                 r.store.db.close()
+
+    def test_red_head_of_someone_elses_mr_told_by_a_change_observation_is_accepted(self):
+        r, t, gl = self.flow(mr_row('failed'), linked=False)
+        r.store.mark(self.agent.name, t['id'], ci_delivery_key(MR, 14845), f'{SHA}:14845:failed')
+        a = self.turn(r, t, merged_line())
+        self.assertEqual(a.state, 'waiting')
 
     def test_a_told_skipped_head_without_a_merge_gate_is_accepted(self):
         r, t, gl = self.flow(mr_row('skipped'), linked=False)
@@ -110,7 +130,7 @@ class MergeWaitOnBlockedMR(Bench):
 
     # -- merge conflict -------------------------------------------------------------------
 
-    def test_conflicting_mr_is_sent_back_regardless_of_delivery_owner_or_head(self):
+    def test_conflicting_own_mr_is_sent_back_regardless_of_delivery_or_head(self):
         cases = {
             'has_conflicts': (mr_row('success', has_conflicts=True), 'has a merge conflict'),
             'detailed_conflict': (mr_row('success', detailed_merge_status='conflict'), 'has a merge conflict'),
@@ -122,11 +142,28 @@ class MergeWaitOnBlockedMR(Bench):
         for name, (mr, needle) in cases.items():
             with self.subTest(name=name):
                 self.tearDown(), self.setUp()
-                r, t, gl = self.flow(mr, linked=False)
+                r, t, gl = self.flow(mr)
                 a = self.turn(r, t, merged_line())
                 self.assert_sent_back(a, needle, 'merge the target branch into the MR branch',
                                       'cover the merge delta')
                 self.assertNotIn('rebase the branch onto', a.wake_text)
+                r.store.db.close()
+
+    def test_conflicting_mr_of_someone_else_keeps_the_wait_and_tells_once(self):
+        for name, mr in (('has_conflicts', mr_row('success', has_conflicts=True)),
+                         ('need_rebase', mr_row('success', detailed_merge_status='need_rebase'))):
+            with self.subTest(name=name):
+                self.tearDown(), self.setUp()
+                r, t, gl = self.flow(mr, linked=False)
+                a = self.turn(r, t, merged_line())
+                self.assertEqual(a.state, 'waiting')
+                r._wake_one(a)
+                a = r.store.get(a.id)
+                self.assertEqual(a.state, 'ready')
+                self.assertIn("This MR is not this task's", a.wake_text)
+                self.assertNotIn('merge the target branch into the MR branch', a.wake_text)
+                a = self.turn(r, t, merged_line(), first=False)
+                self.assertEqual(a.state, 'waiting')
                 r.store.db.close()
 
     def test_green_mr_without_conflict_is_accepted(self):
@@ -216,7 +253,7 @@ class SuccessWaitOnRedMR(MergeWaitOnBlockedMR):
     itself, so it is sent back like ``until=merged``; told once first by the owner notice."""
 
     def test_redeclared_success_wait_after_the_red_notice_is_sent_back(self):
-        for status, linked in (('failed', True), ('canceled', True), ('failed', False)):
+        for status, linked in (('failed', True), ('canceled', True)):
             with self.subTest(status=status, linked=linked):
                 self.tearDown(), self.setUp()
                 r, t, gl = self.flow(mr_row(status), linked=linked)
@@ -232,6 +269,18 @@ class SuccessWaitOnRedMR(MergeWaitOnBlockedMR):
                                'was sent back', 'open the failed job'):
                     self.assertIn(needle, a.wake_text)
                 r.store.db.close()
+
+    def test_redeclared_success_wait_on_someone_elses_red_mr_stands(self):
+        r, t, gl = self.flow(mr_row('failed'), linked=False)
+        a = self.turn(r, t, success_line())
+        self.assertEqual(a.state, 'waiting')
+        r._wake_one(a)
+        a = r.store.get(a.id)
+        self.assertEqual(a.state, 'ready')
+        self.assertIn("This MR is not this task's", a.wake_text)
+        self.assertNotIn('push a fix', a.wake_text)
+        a = self.turn(r, t, success_line(), first=False)
+        self.assertEqual(a.state, 'waiting')
 
     def test_success_wait_on_a_running_or_new_red_head_is_accepted(self):
         for mr, line in ((mr_row('running'), success_line(status='running')),

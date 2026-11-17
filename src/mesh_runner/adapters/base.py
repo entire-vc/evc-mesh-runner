@@ -38,6 +38,13 @@ class TurnResult:
     auth_only: bool = False         # no assistant/tool work preceded that banner
     verification_required: bool = False  # the exact terminal provider envelope `verification_required`
     upgrade_required: bool = False  # the provider refused this harness version (harness_hold)
+    # Claude stream-json ``rate_limit_event``: the provider's own account-window verdict for this turn.
+    # ``rate_limit`` is the last event (numbers and enums only), ``rate_limit_rejected`` = any event of
+    # the turn said ``rejected``: the account cannot run, whatever text the turn ended with.
+    rate_limit: dict = field(default_factory=dict)
+    rate_limit_rejected: bool = False
+    # Claude stream-json ``system/init`` ``apiKeySource``: "none" = the subscription login, else the key's origin
+    api_key_source: str = ""
 
 
 @dataclass

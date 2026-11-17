@@ -110,6 +110,50 @@ def at(minutes):
     return (NOW + dt.timedelta(minutes=minutes)).isoformat()
 
 
+class BoundTelegramManual(unittest.TestCase):
+    """External input delivered by the real bridge's own Mesh service identity."""
+    def comment(self, **changes):
+        return {"id": "reply", "author_id": "agent-1", "author_type": "agent", "created_at": at(1),
+                "body": "Ответ User в Telegram (message_id 100, reply на 86):\n\n> Да, вижу статистику",
+                "metadata": {"telegram_binding_key": "0123456789abcdef:42:100"}, **changes}
+
+    def run_wait(self, comment, kind="manual", **kw):
+        wait = {"kind": kind, "since": at(0)}
+        out = check(None, None, None, {"human_gate": True}, wait, "agent-1", [comment],
+                    NOW + dt.timedelta(minutes=2), **kw)
+        self.assertFalse(wait.get("met"), "external input is not a gate/decision verdict")
+        return out
+
+    def test_own_bound_reply_resumes_manual_wait_in_both_comment_modes(self):
+        for mode in ("all", "addressed"):
+            for reply in (True, False):
+                with self.subTest(mode=mode, reply=reply):
+                    comment = self.comment()
+                    if not reply:
+                        comment['body'] = comment['body'].replace(', reply на 86', '')
+                    out = self.run_wait(comment, comment_wake=mode)
+                    self.assertIn("bound Telegram reply", out)
+                    self.assertIn("Да, вижу статистику", out)
+
+    def test_ordinary_own_notes_and_bad_or_stale_receipts_stay_asleep(self):
+        for change in ({"metadata": {}}, {"metadata": None}, {"body": "own progress"},
+                       {"created_at": at(0)}, {"created_at": at(-1)}, {"auto_summary": True},
+                       {"author_type": "system"},
+                       {"body": None}, {"body": 123}, {"body": ["Ответ User в Telegram (message_id 100):"]},
+                       {"body": {"text": "Ответ User в Telegram (message_id 100):"}},
+                       {"metadata": {"telegram_binding_key": "42:100"}},
+                       {"metadata": {"telegram_binding_key": "0123456789abcdef:42:0"}},
+                       {"metadata": {"telegram_binding_key": "0123456789abcdef:42:101"}},
+                       {"metadata": {"telegram_binding_key": ["0123456789abcdef:42:100"]}}):
+            with self.subTest(change=change):
+                self.assertEqual(self.run_wait(self.comment(**change)), "")
+
+    def test_bound_reply_does_not_lift_blocking_gate_or_answer_decision(self):
+        for kind in ("blocking", "decision"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.run_wait(self.comment(), kind=kind), "")
+
+
 class ChangesSince(unittest.TestCase):
     """Events after the agent's last turn, read from timestamps: no baseline needed."""
     ECHO = dt.timedelta(minutes=2)

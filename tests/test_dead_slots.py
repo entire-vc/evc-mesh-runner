@@ -309,7 +309,7 @@ class DeadSlots(Bench):
             if note:
                 r.pool.store.db.execute("UPDATE slots SET note=? WHERE path=?", (note[0], str(slot)))
             workspace._COMMON_DIRS.clear()                                       # a cold lock lookup would run git
-            with patch.object(workspace.subprocess, "run") as run, patch.object(workspace, "base_lock") as lock:
+            with patch.object(workspace, "_run_git") as run, patch.object(workspace, "base_lock") as lock:
                 with self.assertRaises(WorkspaceError):
                     r.pool.archive_and_free(path, expect_attempt=expect)
             run.assert_not_called()

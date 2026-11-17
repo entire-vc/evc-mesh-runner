@@ -13,6 +13,7 @@ from pathlib import Path
 
 from mesh_runner import delivery_recovery, interactive
 from mesh_runner.adapters.base import read_events
+from mesh_runner.adapters.codex import CodexAdapter
 from tmux_support import needs_tmux
 
 PROMPT = "Task #0f1e2d3c: continue the card.\nUse only these physical paths: [\"/w/slot-1\"]."
@@ -78,18 +79,20 @@ class CodexFailedTurn(unittest.TestCase):
     def acks(self):
         return [e for e in read_events(self.log) if e.get("type") == "mesh_runner.prompt_ack"]
 
-    def test_refused_turn_with_exact_prompt_is_a_delivered_turn_without_output(self):
+    def test_refused_turn_with_exact_prompt_preserves_the_terminal_error(self):
         self.build(self.turn())
         self.assertEqual(self.recover(), "completed")
         events = read_events(self.log)
         self.assertEqual([(a["token"], a["sha256"], a["recovered_from"]) for a in self.acks()],
                          [(self.token, self.sha, "codex.session-rollout-failed-turn")])
-        done = [e for e in events if e.get("type") == "turn.completed"]
+        done = [e for e in events if e.get("type") == "turn.failed"]
         self.assertEqual(len(done), 1)
-        self.assertIn("no model output", done[0]["no_reply"])
-        self.assertIn("newer version of Codex", done[0]["no_reply"])
+        self.assertIn("newer version of Codex", done[0]["error"]["message"])
+        result = CodexAdapter().parse(self.log)
+        self.assertTrue(result.is_error)
+        self.assertTrue(result.upgrade_required)
         print("CODEX_FAILED_TURN_RECEIPT: no notify + bound rollout (verified cursor, one task, exact prompt, "
-              "typed error, no model output) -> completed with prompt_ack; turn has no final message", flush=True)
+              "typed error, no model output) -> turn.failed with prompt_ack; provider error preserved", flush=True)
 
     def test_anything_short_of_that_record_stays_unproven(self):
         other = rec("response_item", {"type": "message", "role": "user",
@@ -118,6 +121,16 @@ class CodexFailedTurn(unittest.TestCase):
                 self.build(after)
                 self.assertEqual(self.recover(), "codex-acceptance-unproven")
                 self.assertEqual(self.acks(), [])
+
+    def test_recovered_policy_refusal_reaches_the_adapter_as_an_error(self):
+        self.build(self.turn(error={"codex_error_info": "cyber_policy",
+                                    "message": "This content was flagged for possible cybersecurity risk."}))
+        self.assertEqual(self.recover(), "completed")
+        result = CodexAdapter().parse(self.log)
+        self.assertTrue(result.is_error)
+        self.assertIn("cyber_policy", result.error)
+        self.assertIn("flagged for possible cybersecurity risk", result.error)
+        self.assertEqual(len(self.acks()), 1)
 
     def test_a_moved_cursor_or_a_present_foreign_rollout_proves_nothing(self):
         self.build(self.turn())

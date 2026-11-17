@@ -95,6 +95,7 @@ class GraphTest(unittest.TestCase):
         radar = wait_roots.build(open_, self.reader({}), OURS, NOW)
         self.assertEqual(sorted(r.kind for r in radar.roots), ["cycle", "cycle", "unknown-target"])
         self.assertEqual(radar.weights(), {})
+        self.assertEqual(radar.behind(), {}, "a woken card of a broken chain weighs nothing either")
 
     def test_unread_card_is_never_ready(self):
         open_ = {tid(1): [waiting("A", tid(2))]}
@@ -423,6 +424,57 @@ class RampAcrossLanesTest(Bench):
         self.now[0] += 1
         self.light_lane.tick()
         self.assertEqual(self.started(self.light_lane), [self.light["id"]], "a held root claims nothing")
+
+    def test_a_root_woken_inside_the_radar_window_claims_the_next_slot(self):
+        """The root's own attempt waited on a pipeline when the radar last looked
+        (kind ``pipeline``, not startable) and was woken inside the ramp, before the next pass. Its lane
+        claimed nothing, so three cards nobody waits on took the next slots before it."""
+        light2 = mesh_task(4)
+        self.light_lane.mesh.tasks[light2["id"]] = light2
+        self.light_lane.mesh.max_concurrent = 2
+        self.light_lane.refresh_me()
+        store = Store(self.root / "state" / "r.sqlite")
+        a = store.create("Steward", self.root_card["id"], "claude", "root")
+        store.update(a, state="waiting", wait={"kind": "pipeline", "target": "g/app#77",
+                                               "since": "2026-11-14T22:00:00Z"})
+        self.root_lane.roots.refresh()
+        kinds = {x.task_id: (x.kind, x.behind) for x in self.root_lane.roots.radar.roots}
+        self.assertEqual(kinds, {self.root_card["id"]: ("pipeline", 6)}, "the radar knows the root, waiting")
+        self.assertEqual(self.root_lane.roots.startable_for("Steward"), {})
+        for r in (self.light_lane, self.root_lane):    # the hold
+            r.tick()
+        self.gate.holding, self.gate.released_at = False, self.now[0]
+        self.now[0] += 1
+        self.light_lane.tick()                          # nothing claims the first slot: the light card takes it
+        self.assertEqual(self.started(self.light_lane), [self.light["id"]])
+        self.now[0] += 4
+        store.update(store.get(a.id), state="ready", wait={})    # the root wakes inside the ramp, no new pass
+        self.root_lane.tick()                           # the slot is spaced: no resume yet, the lane claims
+        self.assertEqual(self.started(self.root_lane), [])
+        self.now[0] += 21                               # the next slot
+        self.light_lane.tick()                          # the lighter lane asks first again
+        self.assertNotIn(light2["id"], self.started(self.light_lane), "the slot is kept for the woken root")
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            self.root_lane.tick()
+        self.assertEqual(self.started(self.root_lane), [self.root_card["id"]])
+        self.assertTrue(any("host ramp: start #%s goes first: a wait root with 6 waiting" % self.root_card["id"][:8]
+                            in m for m in logs.output), logs.output)
+
+    def test_a_ready_root_whose_card_waits_for_a_person_claims_nothing(self):
+        """A lane's ready root had human_gate on its card; the ramp kept the
+        slot for it twice and the gate refused its resume each time."""
+        self.root_lane.mesh.tasks[self.root_card["id"]]["human_gate"] = True
+        store = Store(self.root / "state" / "r.sqlite")
+        a = store.create("Steward", self.root_card["id"], "claude", "root")
+        store.update(a, state="ready")
+        self.root_lane.roots.refresh()
+        self.assertEqual(self.root_lane.roots.startable_for("Steward"), {self.root_card["id"]: 6})
+        for r in (self.light_lane, self.root_lane):    # the hold: the root's lane would claim it here
+            r.tick()
+        self.gate.holding, self.gate.released_at = False, self.now[0]
+        self.now[0] += 1
+        self.light_lane.tick()
+        self.assertEqual(self.started(self.light_lane), [self.light["id"]], "a gated ready root claims nothing")
 
     def test_a_paused_lane_claims_nothing(self):
         self.root_lane.agent.paused = True               # positive control: the root's lane cannot start it

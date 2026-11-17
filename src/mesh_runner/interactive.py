@@ -1,7 +1,8 @@
 """Interactive launch mode: every turn goes into a live interactive harness session.
 
-A subscription covers the interactive terminal programs (Claude Code, Codex TUI);
-their non-interactive modes (``claude -p``, ``codex exec``) are billed per token. In
+Both modes run on the same subscription windows: a headless turn (``claude -p``,
+``codex exec``) logged in with a subscription draws on the account's 5-hour and weekly
+windows like an interactive one, without overage. Interactive is the default. In
 the interactive mode the runner keeps the model it always had: one native session per
 task, resumed by id, several tasks of an agent in parallel. Only the process changes:
 
@@ -14,8 +15,9 @@ task, resumed by id, several tasks of an agent in parallel. Only the process cha
 - the window outlives the turn, so the next turn of the task goes into a warm session.
   ``reap`` closes windows whose attempt is gone, idle too long, or waiting long.
 
-The headless mode stays available: ``launch_mode`` in ``[runner]`` (default
-``interactive``) and an optional per-agent ``launch_mode`` choose between them.
+The headless mode is a full launch mode of its own: a per-agent ``launch_mode`` chooses it.
+It needs no terminal, and its stream carries the provider's ``rate_limit_event``: the account
+switch reads the limit from that typed verdict, not from a screen.
 """
 from __future__ import annotations
 
@@ -43,6 +45,10 @@ GUARD = Path(__file__).with_name("path_guard.py")
 PATH_GUARD_ENV = "_MESH_RUNNER_PATH_GUARD"
 REAP_EVERY_SECONDS = 60
 CHAT_PREFIX = "chat-"                  # windows of chat sessions (see chat_delivery.window_key)
+# the driver's record of a window start that found no room on the host (the cap or the memory floor):
+# ``state`` waiting (the first refusal), room (the window started after waiting) or timeout (it gave up;
+# nothing was started or pasted). Readers of the driver output that do not know it skip it.
+HOST_WAIT_EVENT = "mesh_runner.host_wait"
 # how long a turn's prompt waits for the session's running background agents (see tui_driver)
 BACKGROUND_WAIT_MINUTES = 45.0
 # waits a warm session is not kept for: someone else's decision, a human, a timer

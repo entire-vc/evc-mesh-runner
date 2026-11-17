@@ -8,8 +8,10 @@ import http.client
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -292,7 +294,7 @@ class Lifecycle(Rig):
         old = self.svc.editor
         self.section["allowed_shas"] = [SHA, "c" * 40]
         status, res = self.call("reconfigure", **self.bind())
-        self.assertEqual(status, 200, res)
+        self.assertEqual(status, 200, dict(res, residue=old.residue()))
         t.join(5)
         self.assertIn(out["r"][1]["status"], ("cancelled", "failed"))
         for _ in range(100):
@@ -344,6 +346,50 @@ class Lifecycle(Rig):
 
     def test_rollback_without_a_previous_config_is_refused(self):
         self.assertEqual(self.call("rollback", **self.bind())[1]["error"], "no_previous_config")
+
+
+class DelayedReaping(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "Linux orphan adoption")
+    def test_reconfigure_waits_for_the_killed_group_to_be_reaped(self):
+        # A separate subreaper controls the real OS boundary without changing this test process
+        # or replacing the executor, bridge, controller, ledger or host lease.
+        code = textwrap.dedent("""
+            import ctypes, os, threading, time, unittest
+            from pathlib import Path
+            from test_editor_control import Lifecycle
+
+            # Linux UAPI: include/uapi/linux/prctl.h, PR_SET_CHILD_SUBREAPER = 36.
+            assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+            reaped = threading.Event()
+
+            class DelayedReaper(Lifecycle):
+                def run_hanging_job(self):
+                    t, out, pid = super().run_hanging_job()
+
+                    def reap():
+                        end = time.monotonic() + 5
+                        while time.monotonic() < end:
+                            row = Path(f"/proc/{pid}/stat").read_text().rpartition(") ")[2].split()
+                            if row[0] == "Z" and int(row[1]) == os.getpid():
+                                time.sleep(0.2)  # the leader is gone; its group still has a real zombie
+                                os.waitpid(pid, 0)
+                                reaped.set()
+                                return
+                            time.sleep(0.01)
+
+                    reaper = threading.Thread(target=reap, daemon=True)
+                    reaper.start()
+                    self.addCleanup(reaper.join, 6)
+                    return t, out, pid
+
+            suite = unittest.TestSuite([DelayedReaper(
+                "test_a_running_job_is_killed_and_drained_before_the_swap_with_no_late_success")])
+            result = unittest.TextTestRunner(verbosity=2).run(suite)
+            assert reaped.is_set(), "the real orphan was not reaped"
+            raise SystemExit(not result.wasSuccessful())
+        """)
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class FailClosed(Rig):

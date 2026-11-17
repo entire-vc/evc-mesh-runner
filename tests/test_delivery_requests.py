@@ -198,7 +198,8 @@ class UnprovenIsolation(DeliveryRecheck):
         self.completed_native()
         path = Path(self.intent['log_path'])
         line = path.read_text()
-        path.write_text(line + line)                           # two terminals: conflicting evidence
+        # two terminals, one of another session: conflicting evidence (two of this session acknowledge)
+        path.write_text(line.replace(self.intent['session_id'], str(uuid.uuid4())) + line)
         self.assertTrue(self.consume(self.submit()).startswith('unresolved:'))
         path.write_text(line.replace(self.intent['session_id'], str(uuid.uuid4())))  # foreign session
         self.assertTrue(self.consume(self.submit()).startswith('unresolved:'))

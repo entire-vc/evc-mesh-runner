@@ -18,6 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import progress
 from .checkpoint import SCRATCH_PREFIXES, CheckpointBaseMissing, base_objects_dir, manifest_digest
 from .store import Store, iso
 from .workspace import (POOL_ADMIN_HOLD_NOTE, POOL_EVICTION_HOLD_NOTE, POOL_INDEX_FLAGS_HOLD_NOTE,
@@ -269,6 +270,7 @@ def _bounded_rmtree(target: Path, deadline: float, anchor: Path | None = None) -
         opened.append(stack[0][1])
         while stack:
             _budget(deadline, 1)
+            progress.beat()
             name, fd = stack[-1]
             # Captured directory modes may be readonly. Change only the opened,
             # owned directory; never chmod through a path that could be a symlink.

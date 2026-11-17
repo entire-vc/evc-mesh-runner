@@ -1609,9 +1609,10 @@ class Effects:
     DEFINITE_REFUSALS = frozenset({400, 401, 403, 404, 409, 410, 422})   # a definite answer; any other may pass
     ORDER_LOOKUP_PASSES = 30                # passes an unread named card is read again (~10 min at a 20 s tick)
 
-    # Mesh wait kinds an ``@addressee`` comment on the card does not end: a registered observer (queue, receipt,
-    # gmail, lifecycle, stall, recovery, native) wakes on its own event only, and a person's ask on the answer or
-    # the lifted gate. A question delivered on such a card sleeps until that event.
+    # Mesh wait kinds a question is not delivered on: a registered observer (queue, stall, native) wakes on its
+    # own event only, and a person's ask on the answer or the lifted gate. A gmail, receipt, lifecycle or recovery
+    # wait does wake on a line-opening ``@<lane>`` (runner ``_wake_registered_on_address``), but Mesh records them
+    # all as ``registered``, so a question to any of them takes a request card.
     ORDER_DEAF_WAITS = frozenset({"registered", "human"})
 
     def _addressee_wait(self, task_id: str, agent_id: str) -> dict | None:

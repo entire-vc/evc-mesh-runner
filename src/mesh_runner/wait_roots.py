@@ -41,6 +41,7 @@ BOOST = "ready"
 QUEUED = "queued"          # the root's own attempt here is ready to resume
 ACTIVE_STATES = ("running", "starting")
 HUMAN = "human"
+UNWEIGHTED = ("cycle", "unknown-target")   # broken chains: shown, never a weight
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,16 @@ class Radar:
             if r.kind in (BOOST, QUEUED) and r.holder:
                 lane = out.setdefault(r.holder, {})
                 lane[r.task_id] = lane.get(r.task_id, 0) + r.behind
+        return out
+
+    def behind(self) -> dict[str, int]:
+        """root -> waiting cards behind it, whatever held the root at this pass (every kind but the
+        broken chains). A root whose own attempt here turns ready between two passes is ``queued`` only
+        at the next one; until then its lane resumes it with this weight (``AgentRunner._ramp_weight``)."""
+        out: dict[str, int] = {}
+        for r in self.roots:
+            if r.kind not in UNWEIGHTED:
+                out[r.task_id] = out.get(r.task_id, 0) + r.behind
         return out
 
     def kinds(self) -> dict[str, int]:
@@ -327,6 +338,7 @@ class RootRadar:
         self.radar: Radar | None = None
         self._weights: dict[str, int] = {}
         self._startable: dict[str, dict[str, int]] = {}
+        self._behind: dict[str, int] = {}
         self._next = 0.0
         self._worker: threading.Thread | None = None
         self._failing = False
@@ -337,6 +349,10 @@ class RootRadar:
     def startable_for(self, lane: str) -> dict[str, int]:
         """The roots ``lane`` would start or resume now, with the waiting cards behind each (Radar.startable)."""
         return dict(self._startable.get(lane, {}))
+
+    def behind(self, task_id: str) -> int:
+        """Waiting cards behind ``task_id`` as a root of any kind at the last pass (Radar.behind)."""
+        return self._behind.get(task_id, 0)
 
     def refresh(self) -> Radar | None:
         try:
@@ -351,7 +367,8 @@ class RootRadar:
         if self._failing:
             self._failing = False
             log.info("wait roots: refresh recovered")
-        self.radar, self._weights, self._startable = radar, radar.weights(), radar.startable()
+        self.radar, self._weights, self._startable, self._behind = (
+            radar, radar.weights(), radar.startable(), radar.behind())
         return radar
 
     def refresh_if_due(self) -> None:
