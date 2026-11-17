@@ -761,8 +761,8 @@ class Checkpoint(unittest.TestCase):
     def test_gitlink_populated_during_verification_retains_source_and_lease(self):
         path = self.add_gitlink(); path.mkdir(parents=True)
         verify = Checkpoints.verify
-        def mutate_after_verify(checkpoints, checkpoint):
-            verify(checkpoints, checkpoint)
+        def mutate_after_verify(checkpoints, checkpoint, *args, **kwargs):
+            verify(checkpoints, checkpoint, *args, **kwargs)
             (path / 'late-untracked').write_text('valuable late data')
         with patch.object(Checkpoints, 'verify', mutate_after_verify):
             with self.assertRaisesRegex(WorkspaceError, 'populated submodule'):
@@ -833,7 +833,8 @@ class Checkpoint(unittest.TestCase):
         paths, manifests = self.restart().restore('attempt')
         restored = Path(paths[0])
         self.assertEqual(fingerprint(restored, plan), expected)
-        self.assertEqual(manifests[0]['version'], 2)
+        self.assertEqual(manifests[0]['version'], 3)               # slim, with the submodule's part
+        self.assertIn('delta', manifests[0])
         self.assertEqual((restored / 'materialized' / 'untracked').read_text(), 'untracked data')
         self.assertEqual((restored / 'materialized' / 'cache' / 'ignored').read_text(), 'ignored data')
         self.assertEqual((restored / 'materialized' / 'README').read_text(), 'unstaged in submodule')

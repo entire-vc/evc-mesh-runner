@@ -156,8 +156,8 @@ SLEEPER = textwrap.dedent("""\
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         sys.exit(3)
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))  # before the pid file: the tests read it as "handler set"
     open(os.path.join(d, name + ".pid"), "w").write(json.dumps({"pid": os.getpid(), "started_at": time.time()}))
-    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     if code >= 0:
         sys.exit(code)
     while True:

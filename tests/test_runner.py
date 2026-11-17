@@ -2,6 +2,7 @@
 import sqlite3
 import datetime as dt
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -78,12 +79,13 @@ class Bench(unittest.TestCase):
 
         A turn the test left running (killed turns, SLEEP replies) still writes under state/
         (journals, receipts, logs); the groups must be gone before the tree is removed, or rmtree
-        races a writer: "Directory not empty: .../state/interactive"."""
+        races a writer: "Directory not empty: .../state/interactive". Each runner's own agent counts:
+        a second lane's turn writes under the same state/ as the bench agent's."""
         runners, self._runners = getattr(self, "_runners", []), []
         stuck = []
         for r in runners:
             try:
-                live = r.store.by_state(self.agent.name, ("starting", "running", "unknown", "ready", "waiting"))
+                live = r.store.by_state(r.agent.name, ("starting", "running", "unknown", "ready", "waiting"))
             except sqlite3.ProgrammingError:
                 continue                    # the test closed this store itself: nothing of it can still write
             for a in live:
@@ -502,8 +504,11 @@ class Loop(Bench):
         mesh.add_comment(t["id"], "try again with the new spec", author="lead")
         r.tick()                                   # a new comment from someone else re-opens it
         self.assertEqual(len(r.store.by_state("builder", ("running", "starting"))), 1)
-        # the third turn in a row without a readable outcome (no lead above: released again)
-        self.assertEqual(self.finish_turn(r).state, "failed")
+        # the third turn in a row without a readable outcome: no lead above, so it starts again once in a
+        # fresh session instead of waiting for a comment nobody is due to write (test_gave_up_no_lead)
+        ended = self.finish_turn(r)
+        self.assertEqual(ended.state, "completed")
+        self.assertTrue(ended.note.startswith("gave up: started again in a fresh session"), ended.note)
 
     def test_checkout_refused_aborts_without_spawning(self):
         t = task(1)
@@ -1480,6 +1485,46 @@ class MeshEffects(Bench):
         r.deliver_mentions()
         self.assertEqual([t for t in mesh.created if "mention-request" in (t.get("labels") or [])], [])
 
+    def mention_after_own_comment(self, body, metadata=None):
+        """A lead's ``@builder …`` line on a foreign card where builder's key wrote ``body`` first;
+        -> (request cards filed, runner log lines)."""
+        theirs = task(2, assignee_id="agent-lead")
+        mesh = FakeMesh([theirs], max_concurrent=1)
+        mine = mesh.add_comment(theirs["id"], body, author=AGENT_ID)
+        if metadata is not None:
+            mine["metadata"] = metadata
+        mesh.mention_rows = [{"comment_id": f"c-{mine['id']}", "task_id": theirs["id"], "author_id": "agent-lead",
+                              "author_name": "lead", "comment_body": "@builder signal: two sessions on one card",
+                              "extracted_at": "2099-01-01T00:00:00Z", "mentioned_slug": "builder"}]
+        r = self.runner(mesh)
+        r.refresh_me()
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            r.deliver_mentions()
+            logging.getLogger("mesh_runner").info("end")      # assertLogs needs one line
+        return [t for t in mesh.created if "mention-request" in (t.get("labels") or [])], logs.output
+
+    def test_an_automation_comment_under_the_agents_key_is_not_its_conversation(self):
+        # A daily report script posts its digest with the ops agent's key; a lead's @ops line under
+        # it was dropped as "ops already in the conversation" and reached nobody.
+        digest = "@owner daily digest: expensive cards #00000003. See the «owner» section of this digest."
+        for body, metadata in ((digest, {"source": "daily-digest"}),
+                               (digest, {"source": " Daily-Digest "}),
+                               ("[runner] ✅ completed in ~3m", {"source": "mesh-runner"}),
+                               ("[runner] ✅ completed in ~3m", None)):
+            with self.subTest(body=body[:20], metadata=metadata):
+                made, logs = self.mention_after_own_comment(body, metadata)
+                self.assertEqual(len(made), 1)
+                self.assertIn("@builder signal", made[0]["description"])
+                self.assertTrue(any("mention by lead on #" in line and "→ request #" in line for line in logs))
+
+    def test_an_actor_labelled_own_comment_still_keeps_the_conversation(self):
+        for metadata in (None, {}, {"source": "mcp"}, {"source": "API"}, {"command": "finish_task"},
+                         {"informational": True}, {"source": 7}):
+            with self.subTest(metadata=metadata):
+                made, logs = self.mention_after_own_comment("@reviewer: could you check?", metadata)
+                self.assertEqual(made, [])
+                self.assertTrue(any("not filed: already in the conversation" in line for line in logs))
+
     def test_effort_label_reaches_the_session(self):
         t = task(1, labels=["effort:low"])
         mesh = FakeMesh([t], max_concurrent=1)
@@ -2366,7 +2411,9 @@ class Hardening(Bench):
             mesh.tasks[t["id"]]["assignee_id"] = AGENT_ID
             mesh.add_comment(t["id"], "again", author="someone")
             r._task_backoff.clear()
-        self.assertEqual(r.store.starts_today("builder", t["id"]), 3)
+        # three answers, plus the one fresh start after the first RUNNER GAVE UP with no lead above
+        # (the "handed on" turns carry no outcome; test_gave_up_no_lead)
+        self.assertEqual(r.store.starts_today("builder", t["id"]), 4)
         self.assertFalse(any("START CAP" in c["body"] for c in mesh.comment_log[t["id"]]))
 
     def test_compaction_cap_stops_the_task(self):
@@ -3291,11 +3338,12 @@ class ReviewWithoutVerdict(Bench):
         t = task(1, cat="review")
         r = self.runner(FakeMesh([t], max_concurrent=1))
         self.cfg.daily_start_cap = 2
-        self.fed_review(r, t, "failed", ended_minutes_ago=90)
+        # counted: attempts that held a round (a turn read to its end), here a turn without an outcome
+        self.fed_review(r, t, "failed", ("no_outcome",), ended_minutes_ago=90)
         self.assertEqual(self.hold(r, t), "")
-        self.fed_review(r, t, "failed", ended_minutes_ago=40)
-        self.assertEqual(self.hold(r, t),
-                         "review: the review attempts ended without a verdict; daily start cap reached")
+        self.fed_review(r, t, "failed", ("no_outcome",), ended_minutes_ago=40)
+        self.assertEqual(self.hold(r, t), "review: 2 review attempts ended without a verdict; handed to nobody, "
+                                          "waits for a comment on the card or rearm-review")
 
 
 class SkipStates(Bench):

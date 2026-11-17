@@ -545,6 +545,7 @@ class ProcessExecutor:
             shutil.rmtree(work, ignore_errors=True)
 
     def _kill(self, proc) -> None:
+        end = time.monotonic() + 2
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -553,7 +554,13 @@ class ProcessExecutor:
             proc.wait(2)
         except subprocess.TimeoutExpired:
             pass
-        self.residue()                                        # forgets the group once it is really gone
+        # wait() reaps only the leader. Killed descendants can still be awaiting their
+        # parent's/init's reap, so give the whole group the same bounded cleanup window.
+        while True:
+            self.residue()                                    # forgets the group only once it is really gone
+            if proc.pid not in self.groups or time.monotonic() >= end:
+                break                                         # a remaining group still fails the controller's residue check
+            time.sleep(0.01)
 
 
 # ----------------------------------------------------------------------------------------------------- bridge

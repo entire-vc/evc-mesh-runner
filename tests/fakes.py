@@ -336,6 +336,11 @@ class FakeMesh:
         self.recorded_turns(tid)
         return list(self.comment_log.get(tid, []))
 
+    def comments_since(self, tid, since):
+        cutoff = dt.datetime.fromisoformat(since.replace("Z", "+00:00"))
+        return [c for c in self.comments_all(tid)
+                if dt.datetime.fromisoformat(c["created_at"].replace("Z", "+00:00")) >= cutoff]
+
     def add_comment(self, tid, body, author=AGENT_ID, at=None, key=""):
         c = {"id": str(uuid.uuid4()), "author_id": author, "author_name": author, "body": body,
              "created_at": (at or dt.datetime.now(dt.timezone.utc)).isoformat()}
@@ -709,6 +714,11 @@ if reply.startswith("SLEEP:"):
 if reply.startswith("DIE:"):                     # the harness refuses before its stream starts
     sys.stderr.write(reply[4:] + "\n")
     sys.exit(1)
+if reply.startswith("JOURNAL:"):                 # replay a recorded turn log of the native CLI, then fail
+    for line in open(reply[8:], encoding="utf-8"):
+        print(line.rstrip("\n").replace("SESSION_ID", sid))
+    open(os.environ["FAKE_CALLS"], "a").write(json.dumps({"task": key, "sid": sid, "resume": "--resume" in args}) + "\n")
+    sys.exit(1)
 if reply.startswith("ERROR:"):
     print(json.dumps({"type": "system", "subtype": "init", "session_id": sid}))
     print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
@@ -738,7 +748,10 @@ open(os.environ["FAKE_CALLS"], "a").write(json.dumps({"task": key, "sid": sid, "
                                                       "model": args[args.index("--model") + 1]
                                                       if "--model" in args else "",
                                                       "effort": args[args.index("--effort") + 1]
-                                                      if "--effort" in args else ""}) + "\n")
+                                                      if "--effort" in args else "",
+                                                      "api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
+                                                      "max_budget": args[args.index("--max-budget-usd") + 1]
+                                                      if "--max-budget-usd" in args else ""}) + "\n")
 if turn_command is not None and os.environ.get("FAKE_OUTCOMES"):
     import datetime, uuid
     cmd = dict(turn_command)
@@ -768,11 +781,13 @@ if turn_command is not None and os.environ.get("FAKE_OUTCOMES"):
         row["wait_id"] = wid
     rec = {"task8": key, "row": row, "wait": wait, "to": cmd.get("to", "")}
     open(os.environ["FAKE_OUTCOMES"], "a").write(json.dumps(rec) + "\n")
-print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "model": "fake-model"}))
+# like the CLI: an environment key is the turn's credential in print mode, else the login ("none")
+print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "model": "fake-model",
+                  "apiKeySource": "ANTHROPIC_API_KEY" if os.environ.get("ANTHROPIC_API_KEY") else "none"}))
 for _ in range(compactions):
     print(json.dumps({"type": "system", "subtype": "compact_boundary", "session_id": sid}))
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": reply, "session_id": sid,
-                  "total_cost_usd": 0.01, "usage": {"input_tokens": 10, "cache_read_input_tokens": 90,
+                  "total_cost_usd": float(os.environ.get("FAKE_COST", "0.01")), "usage": {"input_tokens": 10, "cache_read_input_tokens": 90,
                                                     "output_tokens": 5}}))
 '''
 

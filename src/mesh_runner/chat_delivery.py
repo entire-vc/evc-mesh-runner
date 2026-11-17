@@ -21,10 +21,13 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
 from . import chat_diag
-from .interactive import CHAT_PREFIX
+from .interactive import CHAT_PREFIX, HOST_WAIT_EVENT
 
 log = logging.getLogger(__name__)
 LABEL_MAX = 120
+# turn[HOST_WAIT]: where the turn's window start stands when the host had no room for it (see DriverDelivery)
+HOST_WAIT = "_host_wait"
+HOST_BUSY = "host_busy"          # the error code of a turn handed back unstarted (wait_for_room=False)
 
 
 def window_key(thread_id: str) -> str:
@@ -142,12 +145,21 @@ def _withheld(msg: str) -> str:
 
 class DriverDelivery:
     """``plan(turn)`` returns ``(argv, cwd, env, prompt)`` for the driver (the service builds it
-    from the agent's adapter, routing environment and the chat's session id)."""
+    from the agent's adapter, routing environment and the chat's session id).
+
+    No room on the host: the driver waits for a slot of the host cap (or the memory floor) and gives up
+    after its own wait, having started and pasted nothing. With ``wait_for_room`` (a chat: Mesh holds the
+    turn, started, and a started turn cannot be handed back) the same turn is driven again, once at a time,
+    until a slot frees or the turn is cancelled; the lease goes on meanwhile. Without it (the answer desk,
+    which keeps its own queue) the turn ends with the error ``host_busy`` and the caller queues it again.
+    ``turn[HOST_WAIT]`` says where the window start stands: ``waiting`` (no room yet), ``room`` (the window
+    started) or ``cancelled`` (cancelled before any window started: the chat holds no session)."""
 
     def __init__(self, harness: str, plan: Callable[[dict], tuple[list[str], Path, dict, str]],
-                 log_dir: Path, poll: float = 0.2, term_wait: float = 20.0):
+                 log_dir: Path, poll: float = 0.2, term_wait: float = 20.0, wait_for_room: bool = True):
         self.harness, self.plan, self.log_dir = harness, plan, Path(log_dir)
         self.poll, self.term_wait = poll, term_wait
+        self.wait_for_room = wait_for_room
         self.diag_dir = self.log_dir.parent
 
     def run(self, turn: dict, cancelled: Callable[[], bool]) -> Iterator[dict]:
@@ -162,23 +174,46 @@ class DriverDelivery:
             logging.getLogger(__name__).info("chat turn %s plan=%.1f", tid[:8], time.monotonic() - t_plan)
         harness = rest[0] if rest else self.harness       # a plan may name the harness it routed to
         # one directory per chat: deleting the chat removes whatever a crash left in it
+        logs = self.log_dir / window_key(str(turn.get("thread_id") or "none"))
+        waits = 0
+        t_wait = time.monotonic()
         try:
-            logs = self.log_dir / window_key(str(turn.get("thread_id") or "none"))
-            logs.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd, name = tempfile.mkstemp(dir=logs, prefix=turn["turn_id"][:8] + ".", suffix=".jsonl")
-        except Exception as e:
-            chat_diag.record("prepare", e, tid, diag_dir)
-            raise
-        log = Path(name)
-        errlog = log.with_suffix(".stderr")
-        try:
-            yield from self._drive(argv, cwd, env, prompt, cancelled, fd, log, errlog, harness)
-        finally:                                        # the answer text must not outlive the turn on disk
-            for f in (log, errlog):
+            while True:
                 try:
-                    f.unlink()
-                except OSError:
-                    pass
+                    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    fd, name = tempfile.mkstemp(dir=logs, prefix=turn["turn_id"][:8] + ".", suffix=".jsonl")
+                except Exception as e:
+                    chat_diag.record("prepare", e, tid, diag_dir)
+                    raise
+                log = Path(name)
+                errlog = log.with_suffix(".stderr")
+                try:
+                    busy = yield from self._drive(argv, cwd, env, prompt, cancelled, fd, log, errlog, turn, harness)
+                finally:                                # the answer text must not outlive the turn on disk
+                    for f in (log, errlog):
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+                if not busy:
+                    if waits and turn.get(HOST_WAIT) == "room":
+                        logging.getLogger(__name__).info("chat turn %s: host room after %.0fs", tid[:8],
+                                                         time.monotonic() - t_wait)
+                    return
+                waits += 1
+                if not self.wait_for_room:
+                    yield {"type": "error", "code": HOST_BUSY, "retryable": True,
+                           "message": "no free session slot on the host; the message was not delivered"}
+                    return
+                if waits == 1:                          # one line per waiting turn, not one per driver run
+                    logging.getLogger(__name__).warning(
+                        "chat turn %s: %s; the turn waits for a free slot", tid[:8], busy)
+                if cancelled():
+                    turn[HOST_WAIT] = "cancelled"
+                    yield {"type": "final", "stop_reason": "cancelled"}
+                    return
+                time.sleep(self.poll)
+        finally:
             try:
                 logs.rmdir()
             except OSError:
@@ -200,7 +235,11 @@ class DriverDelivery:
         except OSError:
             pass
 
-    def _drive(self, argv, cwd, env, prompt, cancelled, fd, log, errlog, harness) -> Iterator[dict]:
+    def _drive(self, argv, cwd, env, prompt, cancelled, fd, log, errlog, turn, harness):
+        """One driver run. Returns '' when the turn ended (its events yielded), or why the host had no room
+        when the driver gave up its wait for a window (nothing was started or pasted; that run's own
+        error events are not yielded)."""
+        turn = {} if turn is None else turn
         with os.fdopen(fd, "ab") as out, open(os.open(errlog, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab") as err:
             proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=out, stderr=err,
                                     start_new_session=True)
@@ -257,9 +296,27 @@ class DriverDelivery:
             proc.wait()
             self._log_driver(errlog)
 
+        def watch(lines: Iterable[dict]) -> Iterator[dict]:
+            """The driver's own record of a window start without room on the host, kept on the turn."""
+            for ev in lines:
+                if ev.get("type") == HOST_WAIT_EVENT:
+                    turn[HOST_WAIT] = str(ev.get("state") or "")
+                    if ev.get("state") == "timeout":
+                        state["busy"] = ("host short of memory" if ev.get("reason") == "memory"
+                                         else "host session cap reached")
+                    continue
+                yield ev
+
         events = follow()
         try:
-            for ev in translate(events, harness):
+            for ev in translate(watch(events), harness):
+                if state.get("busy"):
+                    # the driver gave up waiting for room: what follows is its own error, nothing reached
+                    # the session; the caller drives the turn again or hands it back
+                    if ev["type"] in ("final", "error"):
+                        finish()
+                        return state["busy"]
+                    continue
                 if ev["type"] in ("final", "error"):
                     if state["interrupted"]:
                         break
@@ -271,9 +328,14 @@ class DriverDelivery:
                             "chat turn failed: %s: %s", ev.get("code"),
                             msg[:300] if re.match(r"\w+ exited during start-up \d+ times: ", msg) else _withheld(msg))
                     yield ev
-                    return
+                    return ""
                 yield ev
         finally:
             events.close()
         finish()
+        if state.get("busy") and not state["interrupted"]:
+            return state["busy"]                         # gave up waiting and wrote no result after the marker
+        if turn.get(HOST_WAIT) in ("waiting", "timeout"):   # stopped before any window started: no session exists
+            turn[HOST_WAIT] = "cancelled"
         yield {"type": "final", "stop_reason": "cancelled"}
+        return ""

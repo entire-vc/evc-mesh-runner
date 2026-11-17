@@ -10,9 +10,8 @@ starts with a dash a value). Print mode never asks for approval (the CLI's "auto
 deny rules of the account's ``config.toml`` still apply.
 
 The adapter has no ``interactive_argv``: ``interactive.wrap`` keeps it headless in every launch mode.
-The interactive mode exists because two other providers bill their non-interactive programs per
-token; Kimi's print mode draws on the same membership quota as its TUI, so a headless turn costs
-the same and needs no terminal.
+Kimi's print mode draws on the same membership quota as its TUI, so a headless turn costs the
+same and needs no terminal.
 
 Stream (one JSON object per stdout line):
     {"role": "meta", "type": "system.version", "version": "2.6.1"}

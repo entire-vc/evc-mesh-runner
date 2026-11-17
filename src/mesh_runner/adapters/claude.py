@@ -17,6 +17,37 @@ from .base import Adapter, TurnResult, read_events
 from ..auth import is_auth_banner, is_verification_required
 
 
+RATE_LIMIT_STATUSES = ("allowed", "allowed_warning", "rejected")
+
+
+def _epoch(value) -> int | None:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0 else None
+
+
+def _fraction(value) -> float | None:
+    ok = isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 10
+    return round(float(value), 4) if ok else None
+
+
+def rate_limit_info(raw) -> dict:
+    """The provider's account-window verdict from a ``rate_limit_event`` (``claude -p`` stream-json),
+    reduced to numbers and enums: ``status``, ``resets_at`` (epoch), ``rate_limit_type``,
+    ``is_using_overage`` and ``windows`` ({window: {utilization, resets_at}} from ``unifiedWindows``).
+    An event without a known status is no evidence: {}."""
+    if not isinstance(raw, dict) or raw.get("status") not in RATE_LIMIT_STATUSES:
+        return {}
+    kind = raw.get("rateLimitType")
+    windows = {}
+    for name, w in (raw.get("unifiedWindows") or {}).items() if isinstance(raw.get("unifiedWindows"), dict) else ():
+        if isinstance(name, str) and len(name) <= 32 and isinstance(w, dict):
+            windows[name] = {"utilization": _fraction(w.get("utilization")), "resets_at": _epoch(w.get("resetsAt"))}
+    if isinstance(kind, str) and kind not in windows and _fraction(raw.get("utilization")) is not None:
+        windows[kind[:32]] = {"utilization": _fraction(raw.get("utilization")), "resets_at": _epoch(raw.get("resetsAt"))}
+    return {"status": raw["status"], "resets_at": _epoch(raw.get("resetsAt")),
+            "rate_limit_type": kind[:32] if isinstance(kind, str) else "",
+            "is_using_overage": raw.get("isUsingOverage") is True, "windows": windows}
+
+
 class ClaudeAdapter(Adapter):
     name = "claude"
 
@@ -158,8 +189,15 @@ class ClaudeAdapter(Adapter):
                 r.session_id = sid
             if ev.get("type") == "system" and ev.get("model"):
                 r.model = str(ev["model"])
+            if ev.get("type") == "system" and ev.get("subtype") == "init" and isinstance(ev.get("apiKeySource"), str):
+                r.api_key_source = ev["apiKeySource"][:40]
             if ev.get("type") == "system" and ev.get("subtype") == "compact_boundary":
                 r.compactions += 1
+            if ev.get("type") == "rate_limit_event":
+                info = rate_limit_info(ev.get("rate_limit_info"))
+                if info:
+                    r.rate_limit = info
+                    r.rate_limit_rejected = r.rate_limit_rejected or info["status"] == "rejected"
             if ev.get("type") == "assistant":
                 # The CLI can repeat its auth banner as an assistant text event
                 # (zero tokens, no tools) before the identical terminal result.

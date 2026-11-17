@@ -455,7 +455,8 @@ class OwnPlay(TypedCI):
         gl.mr_rows['g/app!56'] = row(status='running')
         r._wake_one(a)
         self.assertEqual(r.store.get(a.id).state, 'waiting')
-        gl.mr_rows['g/app!56'] = row(status='failed')
+        # the owner notice goes to the MR's own task only: this MR's branch names the task
+        gl.mr_rows['g/app!56'] = dict(row(status='failed'), source_branch=f"fix/{t['id'][:8]}-play")
         r._wake_one(a)
         got = r.store.get(a.id)
         self.assertEqual(got.state, 'ready')

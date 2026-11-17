@@ -34,33 +34,47 @@ next writer. See [docs/architecture.md](docs/architecture.md).
 
 ## Outcome contract
 
-The agent ends each turn with a comment on the task whose last line is one of:
+The agent ends each turn by calling exactly one Mesh turn command (a Mesh MCP tool, `task_id` =
+the card). Mesh records the outcome as a typed row, writes the comment and keeps or releases the
+checkout; a refused command writes nothing. The runner reads only these typed records: a marker
+line in a comment or in the final message (`⏳ WAIT`, `↻ NEXT`, `❓ Blocking`) ends nothing, see
+CHANGELOG for the release that stopped reading them.
 
 ```
-⏳ WAIT pipeline:<group>/<project>#<id>     ⏳ WAIT mr:<group>/<project>!<iid>
-⏳ WAIT card:#<8hex>                        ⏳ WAIT decision:@<handle>
-⏳ WAIT merge:<group>/<project>!<iid> after=<sha>   (opt-in, see Merge waits)
-⏳ WAIT <absoluteISO-with-timezone>: external=<stable-reference> source=<https-url|card:#8hex> <why>
-↻ NEXT
-❓ Blocking @<human>: <question>
+wait_for on=card target_task_id=<card> [target_condition=shipped|deployed|accepted|artifact_published criterion=<result>]
+wait_for on=mr project_path=<group>/<project> mr_iid=<iid> until=merged|green|changed [after_sha=… after_pipeline_id=… after_status=…]
+wait_for on=pipeline project_path=<group>/<project> pipeline_id=<id> until=finished|green|changed
+wait_for on=merge project_path=<group>/<project> mr_iid=<iid> after_sha=<full head sha>   (opt-in, see Merge waits)
+wait_for on=registered registration=queue
+wait_for on=time until_at=<RFC3339 with offset> event_ref=<stable reference> source=<https-url|comment:<uuid>|artifact:<uuid>> why=<…>
+ask_agent to=<agent> question=<question>
+ask_human to=<username> question=<one question, with the recommended default>
+continue_next note=<what was done, what is next>
+finish_task result_kind=change|defect|research|content|ops evidence=<proof> [to=review]
+hand_off to=<agent> why=<what they must do, what is done>
 ```
 
-Time WAIT requires a specific external event with a known, future timestamp from the cited
-source: a scheduled job/window, an approved measurement endpoint, or a provider Retry-After/quota
-reset. Explain why that time and the cancellation condition in the comment. The runner validates
-structure, not the truth of the cited evidence. Bare dates, relative intervals and `poll:` are
-rejected; MR/CI/card/decision dependencies use their event marker. Missing GitLab configuration
+The full grammar the agent sees each turn is `outcome.contract()`. Waits declared before this
+contract (persisted with their `kind`/`target`) keep working: the runner evaluates the stored
+fields and never re-reads the old line.
+
+A time wait (`on=time`) requires a specific external event with a known, future timestamp from the
+cited source: a scheduled job/window or an approved measurement endpoint. Provider quotas,
+account resets and Retry-After are account routing, never a task wait. Explain why that time and
+the cancellation condition in `why`. The runner validates structure, not the truth of the cited
+evidence. Bare dates, relative intervals and polls are rejected; MR/CI/card/question dependencies
+use their own `wait_for` kind or `ask_agent`/`ask_human`. Missing GitLab configuration
 retains a visible integration-blocked event wait, without manufacturing a retry deadline.
 Internal transport retries/backoff stay internal and never become task `start_after`.
 
 Invalid declarations get the normal bounded correction turn, then a visible failed attempt
 with a repair owner and action. That correction hold survives restart, cooldown and the next
 UTC day; another author's correction comment or the same identity's explicit newer
-`↻ NEXT: <what was corrected>` releases it. Ordinary own comments, old NEXT declarations and
+`continue_next note=<what was corrected>` releases it. Ordinary own comments, older `continue_next` outcomes and
 runner notices cannot release it. It never writes task `start_after`.
 Existing persisted time waits are not retroactively guessed invalid: preserve them until an
 explicit audit records the source and either confirms the external deadline or posts a
-correction and clears that specific wait. This parser alone does not migrate old waits.
+correction and clears that specific wait. The runner does not migrate old waits by itself.
 The fields enforce an evidence contract; they do not prove the external source is truthful.
 
 Or moves the task to its review/done status. No outcome → the runner asks once
@@ -74,13 +88,13 @@ for this reason is only ever kept by the lead that receives it, never handed fur
 
 Observable waits are polled without starting the agent while their target is healthy
 and unchanged; time waits wake at their deadline. Age re-checks apply to unreadable
-or unavailable targets and human gates, first after 2 hours, then every 6 hours, without counting against the daily wait budget. A `❓ Blocking`
-ask to a person retains its separate one-day re-check. A pipeline or MR wait with no
+or unavailable targets and human gates, first after 2 hours, then every 6 hours, without counting against the daily wait budget. An `ask_human`
+question to a person retains its separate one-day re-check. A pipeline or MR wait with no
 GitLab/GitHub observer is not re-checked by age: it stays integration-blocked until the
-observer is restored. A `card:` wait whose card is itself waiting on this agent is woken as a cycle.
+observer is restored. An `on=card` wait whose card is itself waiting on this agent is woken as a cycle.
 
-A parked typed refill can adopt queue
-WAIT without a turn. The newest machine timestamp selects the source; its typed
+A parked typed refill can adopt a queue
+wait without a turn. The newest machine timestamp selects the source; its typed
 contract must be strictly valid and all sources at that timestamp must agree.
 A newer integer source can supersede an older malformed contract without editing
 history. A typed source missing its machine timestamp remains UNKNOWN. Adoption
@@ -88,49 +102,48 @@ preserves an existing future time deadline and the card's fresh `start_after`:
 it waits until both have passed before removing the old schedule. Markerless
 legacy cards are not inferred from their title or automatically migrated.
 
-After observing a known CI result, declare a typed change wait rather than
+After observing a known CI result, declare a wait with that baseline rather than
 waiting for that same result again:
 
 ```
-⏳ WAIT mr:group/project!56 until=change after=<full-head-sha>:14845:failed
-⏳ WAIT mr:group/project!56 until=success after=<full-head-sha>:14845:failed
+wait_for on=mr project_path=group/project mr_iid=56 until=changed after_sha=<full-head-sha> after_pipeline_id=14845 after_status=failed
+wait_for on=mr project_path=group/project mr_iid=56 until=green after_sha=<full-head-sha> after_pipeline_id=14845 after_status=failed
 ```
 
 The baseline is explicit machine metadata, never inferred from the explanation.
-`change` accepts a different head/pipeline/status observation; `success` requires a
+`changed` accepts a different head/pipeline/status observation; `green` requires a
 changed successful pipeline on the current head. A pending pipeline does not
-satisfy `success`. `pipeline:group/project#14845` supports the same fields for
+satisfy `green`. `on=pipeline pipeline_id=14845` takes the same fields for
 retries of that exact pipeline (the baseline ID must match). Missing/malformed CI
-observations remain UNKNOWN and do not acknowledge a result. Ordinary WAIT syntax
+observations remain UNKNOWN and do not acknowledge a result. A wait without a baseline
 keeps its existing behavior, including an immediate wake on an already failed CI.
 
-`after=` may be left out: `⏳ WAIT pipeline:group/project#14845 until=success` (also
-`until=change`, and `mr:group/project!56` with `until=success|change|merged`) takes the
+The `after_*` fields may be left out: `wait_for on=pipeline project_path=group/project pipeline_id=14845 until=green`
+(also `until=changed`, and `on=mr` with `until=green|changed|merged`) takes the
 CI/MR state read at the moment the wait is declared as its baseline. A target that is
 already final (a pipeline in any terminal status, a merge request merged or closed), or that
 cannot be read, leaves the plain wait; only a non-final target keeps a typed baseline.
 
-A typed wait can name the jobs it is about: append `jobs=[<job>,<job>]` (GitLab job
-names) to `until=change|success`, with or without `after=`:
+A wait can name the jobs it is about: add `required_jobs=[<job>,<job>]` (GitLab job
+names) to `until=changed|green`, with or without the baseline:
 
 ```
-⏳ WAIT pipeline:group/project#22634 until=success after=<full-head-sha>:22634:manual jobs=[browser-tests]
-⏳ WAIT mr:group/project!56 until=success jobs=[e2e]
+wait_for on=pipeline project_path=group/project pipeline_id=22634 until=green after_sha=<full-head-sha> after_pipeline_id=22634 after_status=manual required_jobs=[browser-tests]
+wait_for on=mr project_path=group/project mr_iid=56 until=green required_jobs=[e2e]
 ```
 
 The predicate is then read from those jobs (the latest try of each), not from the
-pipeline status: once every named job is final the wait wakes, `until=change` on any
-final result and `until=success` when all of them succeeded; a failed, canceled,
-skipped or manual named job under `until=success` wakes once with an action-required
+pipeline status: once every named job is final the wait wakes, `until=changed` on any
+final result and `until=green` when all of them succeeded; a failed, canceled,
+skipped or manual named job under `until=green` wakes once with an action-required
 notice. Jobs outside the list are ignored, so a pipeline left `manual` by unstarted
 sibling jobs no longer holds back a target job that has finished. A retried job is a new
-observation. An `mr:` wait reads the jobs of the MR's current head pipeline. A name the
-pipeline has no job for, `jobs=[]`, a GitHub run, or a result already delivered to the
-agent is sent back at declaration. The older spelling `⏳ WAIT pipeline:<proj>#<id>
-jobs=[...]` is read as `until=change jobs=[...]` with the state of the moment as its
-baseline. Sibling jobs are never started and no timer replaces the event.
+observation. An `on=mr` wait reads the jobs of the MR's current head pipeline. A name the
+pipeline has no job for, `required_jobs=[]`, a GitHub run, or a result already delivered to the
+agent is sent back at declaration. On a pipeline, `required_jobs` with `until=finished` (the
+default) is read as `until=changed` with the state of the moment as its baseline. Sibling jobs are never started and no timer replaces the event.
 
-An ordinary typed `pipeline:... until=success after=...` wait also gives one
+An ordinary `on=pipeline until=green` wait with a baseline also gives one
 action-required notice when that exact pipeline and SHA have finished with
 `failed`, `canceled`/`cancelled`, or `skipped`, or are blocked in aggregate `manual`
 status. Optional manual jobs in a running or successful pipeline do not
@@ -149,8 +162,8 @@ action path.
 
 A typed wait that nobody will bring about is sent back at declaration instead of
 being parked, and counts against the daily wait budget like any idle wait:
-`pipeline:... until=success` on a pipeline that is already `manual`, `failed` or
-`canceled`, and `mr:... until=merged` or `until=change` on the task's own open merge
+`on=pipeline until=green` on a pipeline that is already `manual`, `failed` or
+`canceled`, and `on=mr until=merged` or `until=changed` on the task's own open merge
 request whose head pipeline is `success` or `manual` and which has no label starting
 with `verified-by:`. The merge
 request is the task's own when it is linked to the task, names the task id in its
@@ -161,27 +174,36 @@ task's own unless it is linked or names the task. The returned turn says what wi
 and the merge, or fix/retry and wait on the new result). A target that cannot be read
 keeps the wait as before.
 
-`mr:... until=merged` on any open merge request that will not merge as is is sent back
+An `on=mr until=merged` wait on any open merge request that will not merge as is is sent back
 too: one that GitLab reports in conflict with its target (`has_conflicts`, or
 `detailed_merge_status` `conflict` / `need_rebase`), and one whose head pipeline is
 `failed`, `canceled` or `skipped` once that result was already delivered to the agent
 (a red head not yet delivered is accepted once, so the owner notice reaches it). The
 turn names the way out: fix and push (or merge the target branch into the MR branch and push;
 never rebase or force-push a pushed branch), get the review verdict on
-the new head, then `⏳ WAIT merge:...` when a merge gate is configured. While such a
+the new head, then `wait_for on=merge` when a merge gate is configured. While such a
 wait is parked, the owner is told once per head when the MR enters a merge conflict.
 
-A typed `pipeline:...` wait (`until=change` or `until=success`) on a pipeline in the
+These owner notices and send-backs (red head, conflict, behind, failed named jobs) go only to the
+MR's own task, by the rule above. A task that waits on someone else's MR is not asked to push into
+it: it is told once per head and cause whose MR it is (the card the MR is linked to in Mesh, found by
+the ids the MR names and the agent's other open cards) with a ready
+`wait_for on=card target_task_id=<card>`, and a merge or success wait it declares again on that MR
+stands. An `until=changed` wait on its already red head is still sent back, with the same owner text
+and no push instruction; one woken by a new red result carries that owner text too. Two sessions pushing the same fix into one branch is the failure this
+prevents.
+
+An `on=pipeline` wait (`until=changed` or `until=green`) on a pipeline in the
 terminal `canceled` or `skipped` state with no queued or running job is sent back once
 per target and status: no retry is coming, so nothing will change it. The turn names the
-newer pipeline of the same ref when GitLab has one, with a ready `⏳ WAIT` line for it.
+newer pipeline of the same ref when GitLab has one, with a ready `wait_for on=pipeline` for it.
 If the agent declares the same dead wait again, it is kept as an ordinary wait and the
 runner records a `dead_pipeline_rewait` mark instead of bouncing again.
 
 To wait for the merge itself rather than CI, declare an explicit MR-state wait:
 
 ```
-⏳ WAIT mr:group/project!56 until=merged after=<full-head-sha>:opened
+wait_for on=mr project_path=group/project mr_iid=56 until=merged after_sha=<full-head-sha> after_status=opened
 ```
 
 Copy the observed opened MR's SHA; it records the baseline and is **not an approval
@@ -199,18 +221,18 @@ MR-state delivery uses the existing atomic receipt transition, scoped to agent,
 source task and exact MR target. State plus terminal timestamp suppresses the same
 terminal event across replacement attempts/review/restart; reopening and closing
 again with a new timestamp is a new event. No additional poller or schema is added.
-This is opt-in too: the current owner adopts the marker on a normal turn after
+This is opt-in too: the current owner declares it on a normal turn after
 checking the actual MR. Existing legacy or typed CI waits are not rewritten.
 
 #### Merge waits (`merge_command`)
 
 Once a review verdict covers the MR head, the only thing left is often a deterministic merge
-script that may answer "queued behind pipeline N" several times. `merge:` hands that loop
+script that may answer "queued behind pipeline N" several times. `wait_for on=merge` hands that loop
 to the runner so no model turn is spent on it. It is off unless `[runner] merge_command` is set
 (and a `[gitlab]` section exists); otherwise the declaration is sent back with a clear message.
 
 ```
-⏳ WAIT merge:group/project!56 after=<full-head-sha>
+wait_for on=merge project_path=group/project mr_iid=56 after_sha=<full-head-sha>
 ```
 
 While the wait is open the runner runs `merge_command` (an argv template, no shell; placeholders
@@ -219,7 +241,8 @@ that agent's sessions (so it acts under the lane's identity), and judges the res
 the merge request, never by the command's text:
 
 - MR state `merged`: the agent is woken once ("MR !56 merged at `<sha>`: deploy / verify ...").
-- The command's last output line is `⏳ WAIT pipeline:<project>#<id> ...` (queued): the agent stays
+- The command's last output line is `⏳ WAIT pipeline:<project>#<id> ...` (the merge script's own
+  output protocol, not an agent outcome; queued): the agent stays
   asleep. The command is run again when that pipeline or the MR's head pipeline reaches a final
   status, and in any case every `merge_rerun_minutes`; once the wait has been
   queued for 24 hours the agent is woken with the run history.
@@ -230,7 +253,7 @@ the merge request, never by the command's text:
   asleep and is woken when the MR is merged, closed or moved, or when that card closes without the
   merge, or when the lead's own gate on that card ends with the same line (the lead may not merge
   either). No such lead: the agent is woken with the reason.
-- MR head differs from `after=`, MR closed, a non-zero exit, a refusal, a timeout, or any other
+- MR head differs from `after_sha`, MR closed, a non-zero exit, a refusal, a timeout, or any other
   output: the agent is woken with the tail (last 40 lines) of the command's output.
 
 | key (`[runner]`) | default | meaning |
@@ -241,12 +264,12 @@ the merge request, never by the command's text:
 
 One run of the command is killed (with its process group) after 15 minutes.
 
-This is an explicit opt-in contract, not a migration of existing stored waits. Legacy
-`WAIT pipeline:` / `WAIT mr:` declarations retain their current completion semantics;
+This is an explicit opt-in contract, not a migration of existing stored waits. Stored
+pipeline / MR waits declared without a baseline retain their current completion semantics;
 switching those untyped aliases can still repeat an already known failed result.
 For a live affected task, its current authorized owner should read the exact current
-MR head/pipeline/status and, on its next normal turn, declare `until=change` or
-`until=success` with that baseline. Do not rewrite other tasks, mutate Runner state,
+MR head/pipeline/status and, on its next normal turn, declare `until=changed` or
+`until=green` with that baseline. Do not rewrite other tasks, mutate Runner state,
 force a wake, or substitute a guessed baseline. Updated instructions reach existing
 sessions only when the normal harness/prompt lifecycle supplies them; an operator
 may give the specific owner a scoped migration note, respecting human/ownership gates.
@@ -276,7 +299,7 @@ step. Each pipeline identity counts once per agent/task, shared across MR/pipeli
 spellings; status flapping cannot reset it again. Already-final seeds, timers,
 comments, card/decision steps and unknown observations do not reset idle waits.
 Previously recorded outcomes have no CI receipt and are not reclassified. The daily
-NEXT and step caps still apply; UTC midnight starts a new daily budget.
+`continue_next` and step caps still apply; UTC midnight starts a new daily budget.
 
 By default any comment by someone other than the agent wakes a waiting session
 (`comment_wake = "all"`). With `[runner] comment_wake = "addressed"` a comment written by
@@ -287,7 +310,7 @@ marker. A comment that opens with an FYI marker (`FYI`, `**FYI`, `[FYI]`, `fyi:`
 bold or heading line with `(FYI`) does not wake by authorship alone, so an `always_from`
 author's cross-posted note stays quiet unless it @-mentions the waiting agent. A person's
 comment always wakes, and so does any comment whose author kind the API does not state.
-`❓ Blocking` waits are not filtered; card and merge waits still end on their own event (the
+`ask_human` waits are not filtered; card and merge waits still end on their own event (the
 awaited card closing or shipping, the MR merging or closing). A held-back comment is
 not lost: the session reads every comment since its previous turn when the wait ends for
 its own reason. Measured on one fleet over a week, such a wake ended in an unchanged
@@ -343,7 +366,7 @@ switches for them are retired, see [Retired options](#retired-options)):
   `proposed:`, `if no objection`, `дефолт:`, `по умолчанию:`, `предлагаю`, `рекомендую`) and no
   hard rule (the built-in keyword and label lists in `asks.py`) matches it. The runner posts the question on
   the asking task, @-mentioning the addressee, which may object there, and the asker continues
-  with its default at once (counted like a `↻ NEXT`). Hard questions and questions to people are
+  with its default at once (counted like a `continue_next`). Hard questions and questions to people are
   asked as before.
 
 Each is logged in `runner.log` and recorded as an attempt event (`decision_to_card_wait`,
@@ -472,8 +495,11 @@ session keyed by the asking card, that answers with `answer_decision` on the ask
 open after that turn gets one reminder turn. The asker files the request card as before when the desk
 fails the request, when 20 minutes pass, when the addressee is paused or no longer listed, when Mesh has
 no such list (404: the desk is off for 10 minutes) or when the asking card is not in the addressee's
-workspace. `status.json` shows an `answer_desk` block per listed lane; `events.jsonl` has
-`answer_started`, `answer_done` and `answer_failed`.
+workspace. A turn that finds no room on the host (every slot of `interactive_max_sessions` busy, or
+the memory floor) for the whole start wait is not an answer and spends nothing: the request stays
+queued and the desk asks again on a later pass; the 20-minute fallback is unchanged. `status.json`
+shows an `answer_desk` block per listed lane; `events.jsonl` has `answer_started`, `answer_done` and
+`answer_failed`.
 
 `native_result_dir` and `native_result_channels_dir` are also read from `[runner]`, but they are
 not ordinary options: the native-result adoption protocol checks them in the file itself
@@ -544,6 +570,14 @@ Optional hooks per agent:
   for the session (identity, the account the agent is routed to now). A failure
   stops the start. `MESH_RUNNER_PROFILE=<name>` is taken out of the env and
   becomes the harness profile (`codex --profile`) for that spawn.
+  `MESH_RUNNER_API_PROFILE=<account>/api` is taken out too: it routes the turn
+  to API mode (below), never reaches the session env.
+- `api_optin = true`, `api_primary_profile = "<account>/api"`,
+  `api_reserve_providers = ["anthropic"]`: API mode. A headless Claude turn runs
+  under the key of the account's `credential_ref` (`[api.credentials]`) within its
+  spend pool's cap (`[api.pools]`, `cap_usd` / `run_usd`); without `api_optin` the
+  lane stays on its subscription. Details: `docs/architecture.md` "API mode";
+  `mesh-runner api-budget --config runner.toml` shows the pools.
 - `on_limit_command = ["..."]` runs when the harness reports a usage limit;
   exit 0 means it moved the agent to another account and the turn is retried.
 
@@ -672,10 +706,14 @@ held meanwhile do not all start at once.
 The ramp's slots go to wait roots first, across lanes. While the host holds or ramps, each lane
 tells the ramp which roots it would start or resume now (a card of the lane, or its attempt
 ready to resume, with other cards' `WAIT card:` chains ending there) and how many cards wait
-behind each. A start lighter than the heaviest such root is refused until that root starts
+behind each. The radar recounts the chains every three minutes; an attempt of the lane that
+turned ready in between claims at once if the last count knew its card as a root of any kind
+(it waited on a pipeline, a merge request or another card), with the cards counted behind it.
+A start lighter than the heaviest such root is refused until that root starts
 (`host ramp: next start kept for wait root #… (N waiting behind it, lane …)`, then
 `host ramp: start #… goes first: a wait root with N waiting behind it`). A lane that is paused or
-full, or whose root a local hold stops, claims nothing; a claim not renewed for three intervals
+full, or whose root a local hold stops, claims nothing; neither does a ready attempt whose card
+has `human_gate` (the start gate would refuse its resume). A claim not renewed for three intervals
 lapses, and a root that keeps a free slot that long without starting is passed for the rest of
 that ramp (`... did not start within 60s; the slot goes on`).
 
@@ -796,7 +834,9 @@ never on a timer. Details: `docs/requeue-on-event.md`.
   head commit, a closed dependency, a new assignee). A free peer of the agent's pool (`pool` in the
   agent block; without it, another agent with the same repos and the same `lead`) takes it at once
   for a fresh start. `RUNNER GAVE UP` still goes to the lead. A capped task of an agent without a
-  lead also restarts on the next UTC day.
+  lead also restarts on the next UTC day. A give-up for missing outcomes on a card of an agent that
+  ends its escalation chain (no lead, or it leads the project itself) starts again once a day in a
+  fresh session, told the previous one gave up, instead of waiting for a comment.
 - A work attempt that reaches the turn cap (30 turns) but kept
   making progress (at least 3 of its last 10 declared outcomes are
   `step` or `next`) ends as `turn cap: continued in a fresh session` and the same agent starts the
@@ -1234,6 +1274,35 @@ authentication, human, dependency, WAIT and turn-budget admission checks still
 run. Holds before attempt reservation leave it pending; later refusal, including
 authentication at launch, spends it without bypassing the hold. A changed cap invalidates
 it. This command never edits Mesh or clears other holds.
+
+### Review attempts without a verdict: hand-up and `rearm-review`
+
+A review attempt that ended without a verdict is fed to the reviewer again, at most
+`daily_start_cap` attempts per card since UTC midnight. Only attempts that held a round count: a
+turn the runner read to its end (a readable outcome, or a turn that ended without one). An attempt
+the infrastructure stopped first (a quota or limit switch, a harness error, a spawn failure, a
+prompt never proven delivered) is not counted.
+
+At the cap the card is not held silently until midnight. The runner writes a `REVIEW CAP` note on
+the card (each attempt and how it ended, the open merge requests with their head, the reviewer)
+and files a request card for the next lead up the agent's chain (`lead`, its `lead`, then the
+project lead). The card stays in review with the same reviewer. The count starts again from:
+
+- a comment on the card after the hand-up from anyone but the reviewer (runner notes do not count);
+- assigning the card to another reviewer (each reviewer has its own count);
+- an operator's `rearm-review`;
+- the next UTC midnight.
+
+Two hand-ups in a row without a verdict and the next one goes one level up the chain; a verdict
+ends the run. Each reset is stored with its author and reason (marks `review_cap_reset` and
+`review_cap_reset_audit:<id>`).
+
+```
+mesh-runner rearm-review --config runner.toml --agent my-reviewer --task <full-task-uuid> --reason "account restored"
+```
+
+Without `--apply` it is a preview and writes nothing. It is refused when the agent has an open
+attempt on the task or there is nothing to reset. Normal admission still runs at the next start.
 
 ## Optional start order (`queue_order_command`)
 

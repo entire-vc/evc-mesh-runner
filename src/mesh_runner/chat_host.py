@@ -3,7 +3,7 @@
 The plan reuses the agent's own routing (``_fresh_env``: account, profile, identity) and its
 interactive adapter, so a chat lands in the same profile (CLAUDE.md, skills, .mcp.json) as the
 agent's cards. A chat never runs headless: without an interactive adapter the turn fails with
-a stable error instead of being billed per token.
+a stable error: a chat needs a live session a person can follow, not one process per turn.
 
 chat_workspace: ``none`` and ``read`` run in the agent's profile directory with no repository
 checkout. ``write`` leases a slot of the agent's card worktree pool (its first configured repo)

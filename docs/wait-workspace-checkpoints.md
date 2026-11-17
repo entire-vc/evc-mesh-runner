@@ -107,9 +107,69 @@ A snapshot stores only what the repository cannot give back:
   a clone that lacks it fetches that ref from the capture source. The manifest records the object
   store the base lives in (`objects`): for a pool slot that is the base clone's, which outlives the
   slot, so verification does not need the slot.
-- Capture replays the result into scratch before publishing. If the compact form does not reproduce
+- Capture proves the result before publishing. Every check of a slim snapshot first reads the
+  whole pack in `commits.bundle` into a small `.preflight-*` probe (`git index-pack --strict`
+  against the durable object store), so a truncated, corrupt or unreadable (missing) bundle is
+  refused even when the store already holds every commit it names. At capture, while the source still holds the recorded
+  state, the snapshot is then proven in place, without laying a tree out: HEAD's tree and blobs are
+  read from the durable object store (`git cat-file --batch`, nothing written) and each blob's
+  SHA-256 is compared with what the fingerprint recorded at that path; the replay's layout
+  (checkout of HEAD, `delta.deleted`, the delta files over it, the empty directories, ignored and
+  excluded paths left out) is predicted and compared name for name; Git's view (HEAD, staged and
+  unstaged diff, status) is computed the way the replay computes it, from a freshly initialised
+  repository with the stored index over the source tree. Every Git read of the proof (HEAD's tree
+  and blobs, config, attributes, the view) runs in that repository, so what only the source
+  repository has (`core.filemode=false`, a local `core.autocrlf`, `.git/info/attributes`, for
+  example) can neither hide a difference the replay would see nor invent one. The proof reads
+  config without `GIT_CONFIG`: that variable redirects only the `git config` command, never the
+  replay's checkout, diff or status, so a file named there could hide a user-wide key such as
+  `core.symlinks=false` from the proof. What the proof
+  does not model is replayed into `.verify-*` scratch as before (a full checkout, removed after):
+  a checkout conversion (`core.autocrlf=true`, `core.eol=crlf`, an `eol=crlf`,
+  `filter`, `ident` or `working-tree-encoding` attribute), `core.symlinks=false` (links are
+  written as files), any config key the proof does not model (allowed by name only: in the
+  `core`, `checkout` and `submodule` sections the keys `_CHECKOUT_CONFIG` lists, which are what
+  `git init` writes, keys that change no file written, and the few whose values are checked;
+  elsewhere the sections no command of the proof or the replay reads, such as `user`,
+  `credential` or `safe`, and `include.path`, `init.defaultBranch`, `init.templateDir`. A key in
+  `diff`, `filter`, `fetch`, `url` or a section not thought of costs a replay, never a wrong
+  acceptance; the log names section and key without the subsection, which may hold a URL:
+  `not decided (config core.sparsecheckout)`, `not decided (config url.insteadof)`), a relative
+  path Git resolves against the work tree, which is the source for the proof and the scratch or
+  restore target for the replay (`core.attributesFile`, `core.excludesFile`,
+  `init.templateDir`, and `HOME`, `XDG_CONFIG_HOME`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`,
+  `GIT_TEMPLATE_DIR` in the environment: `not decided (relative core.attributesfile)`), any
+  conditional include (`includeIf`:
+  `onbranch`, `gitdir` and `hasconfig` resolve by the repository that reads the config, and the
+  replay's checkout, its fingerprint and the proof read it in different states), a configured
+  fsmonitor or an executable `post-checkout`, `post-index-change`, `reference-transaction` or
+  `pre-auto-gc` hook (or a relative `core.hooksPath`: these run in the work tree, which for the
+  proof is the source, so the proof decides them before its first index read), a changed,
+  deleted or ignored `.gitattributes`, a deleted symlink, a tracked path under an ignored or excluded one, a layout
+  the replay would refuse, and any mismatch. The replay stays the authority: the proof accepts only
+  what the replay accepts, and the runner log says `proof in place not decided (<reason>); scratch
+  replay` when it hands over. Submodules are modelled too: the proof makes each submodule gitdir in
+  its scratch as the replay makes it (`git init --bare`, the stored bundle fetched with every object
+  checked, HEAD, the stored index) and requires the recorded HEAD, branch and refs, and for a
+  populated one its staged, unstaged and status read over the source's submodule worktree. The
+  superproject's status and diff look into a populated submodule through the source's own submodule
+  gitdir, so that gitdir must read like the replay's: the same local config but for `remote`,
+  `branch` and keys no status or diff reads, the same `info/exclude`, `info/attributes` and
+  `info/sparse-checkout` (`not decided (submodule-config)`, `(submodule-info)`, `(submodule-state)`,
+  `(submodule-bundle)`). When the template `git init` copies gives a gitdir nothing Git reads
+  (sample hooks, `description`, a comment-only `info/exclude`, no config key of its own), the proof
+  makes its submodule gitdirs without it; any other template is copied, as the replay copies it.
+  Re-verifying a published checkpoint, compaction and restore always replay. Before this, every capture checked the whole tree out and removed it in the checkpoint
+  directory, tens of thousands of file events per suspension of a large repository.
+  If the compact form does not reproduce
   the state (clean/smudge filters, `skip-worktree`, a missing base) the full form is kept and the
-  manifest says `slim_failed`. Submodule repositories always use the full form. The full form is
+  manifest says `slim_failed`. A repository with configured submodules takes the slim form too: the
+  superproject's delta over its HEAD, and for each populated submodule its own part over that
+  submodule's HEAD, which the replay checks out from the submodule's bundle before laying the part
+  over it (its git-ignored files included, as before); the manifest is then version 3, which an
+  earlier runner refuses instead of replaying. With only empty submodules it stays version 2. Before
+  this every such capture copied the whole worktree and replayed it in scratch (thousands of file
+  events per suspension, a clean submodule included). The full form is
   only taken where the worktree can be cloned into the checkpoint directory (same filesystem):
   when the slot lives on another volume a full form would be a real copy of the whole worktree on
   every failure, so the capture fails with `lease retained` instead and the next suspend pass
@@ -251,7 +311,7 @@ receipts for existing restore obligations.
 `pool --prune-checkpoints` and `pool --compact-checkpoints` accept repeatable
 `--checkpoint-pin ID:SHA256` arguments. SHA256 is the digest of the exact
 `manifest.json` bytes, obtained during the dry run/inventory. Pins restrict the
-existing candidate policy; they never override grace periods or safety checks.
+existing candidate policy; grace periods and safety checks still apply in full.
 Use the same pins for dry run and `--apply` (with the Runner stopped and its lock
 available). A compacted checkpoint has a new manifest and needs a fresh inventory
 before another operation.
@@ -273,10 +333,10 @@ without a child process per file; unsupported filesystems use `copy2`. A slim
 capture that falls back to a full snapshot retains `slim_failed: true` and adds
 `slim_failure_reason`, `slim_failure_stage` and, when a git command failed,
 `slim_failure_git`. The stage is where the slim attempt stopped (`capture-plan`,
-`capture-copy`, `capture-stash`, `capture-refs`, `capture-bundle`, `verify-setup`,
-`verify-snapshot`, `verify-base`, `verify-fetch`, `verify-checkout`, `verify-overlay`,
+`capture-copy`, `capture-stash`, `capture-refs`, `capture-bundle`, `verify-setup`, `verify-pack`,
+`verify-proof`, `verify-snapshot`, `verify-base`, `verify-fetch`, `verify-checkout`, `verify-overlay`,
 `verify-index`, `verify-refresh`, `verify-fingerprint`, `source-recheck`, …); the reason
-is a fixed class (`replay-mismatch`, `snapshot-mismatch`, `base-commit-missing`,
+is a fixed class (`replay-mismatch`, `snapshot-mismatch`, `bundle-invalid`, `base-commit-missing`,
 `bundle-base-unavailable`, `git-lock`, `git-object-unreadable`, `git-timeout`, `git-other`,
 `other`, …, see `SLIM_REASONS`); the git field is the failing subcommand from an allowlist.
 Values come from allowlists only and never include exception text, filesystem paths or

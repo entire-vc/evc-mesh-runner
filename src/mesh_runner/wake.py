@@ -883,6 +883,32 @@ def blocked_mr_next_step(target: str, cause: str, merge_gate: bool, sha: str = "
     return f"Next step: {fix}; {then} Do not wait for this MR to merge again until it has a new head."
 
 
+def foreign_mr_notice(target: str, what: str, card: str) -> str:
+    """Owner notice for a task that only waits on MR ``target``, which belongs to another card
+    (``card``: its 8-hex id, '' when the runner found none). ``what`` names the state (a red head, a
+    conflict, failed named jobs). The owner's notice says push a fix; told to a waiter as well, it made
+    a second session push the same fix into the owner's branch while the owner pushed its own. This
+    one names the owner and the wait that follows it, and never asks for a push: the owner makes the
+    new head, and a merge wait on the MR declared again after it stands."""
+    return f"action required: MR {target} {what}; it will not merge as is. " + foreign_mr_next_step(card)
+
+
+def foreign_mr_next_step(card: str) -> str:
+    """Whose MR it is and what a task that only waits on it does next (see ``foreign_mr_notice``);
+    also the tail of a declaration send-back on someone else's MR."""
+    if card:
+        owner = f"it is the MR of card #{card}"
+        step = (f"wait on that card (`wait_for on=card target_task_id={card}`), or keep waiting for "
+                "this MR to merge; work on what does not need it meanwhile")
+    else:
+        owner = "it is not linked to this card and does not name it"
+        step = ("if it is in fact this card's MR, link it to this card (`add_vcs_link`) and declare the "
+                "wait again; otherwise ask its owner (`ask_agent`) and wait on their card, or keep waiting "
+                "for this MR to merge")
+    return (f"This MR is not this task's: {owner}. Its owner makes the new head: do not push, merge or "
+            f"rebase its branch from this task. Next step: {step}.")
+
+
 def manual_pipeline_text(target: str, sha: str, pid: int, row: dict | None, merge_gate: bool,
                          sent_back: bool = False) -> str:
     """Owner notice (``sent_back=False``) or declaration send-back for a wait on pipeline ``target``
@@ -906,17 +932,19 @@ def owner_action_delivered(target: str, sha: str, pid: int, status: str, deliver
 
 def ci_change_event(gitlab, kind: str, target: str, contract: dict,
                     delivered: str = "", observation: dict | None = None,
-                    allow_action_required: bool = False, merge_gate: bool = False) -> str:
+                    allow_action_required: bool = False, merge_gate: bool = False,
+                    foreign_mr=None) -> str:
     """Evaluate an explicit baseline without acknowledging or mutating it.
 
     Unknown/malformed observations raise; callers retain the contract. Only
     bounded identity/status metadata is included in event text. ``merge_gate``: the runner
-    runs a merge gate for ``merge:`` waits, so owner notices may point at one.
+    runs a merge gate for ``merge:`` waits, so owner notices may point at one. ``foreign_mr``:
+    see ``typed_event``; called with no row here.
     """
     sha, pid, status, generation = ci_observation_gen(gitlab, kind, target)
     if contract.get("jobs"):
         return _jobs_event(gitlab, kind, target, contract, sha, pid, delivered, observation,
-                           allow_action_required, status)
+                           allow_action_required, status, foreign_mr)
     if allow_action_required and kind == "pipeline" and contract["predicate"] == "success":
         # A pipeline ID is immutable: a different SHA is not evidence about the
         # exact requested pipeline. Never diagnose an unbound/stale observation.
@@ -945,6 +973,10 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
         notice = _owner_action_once(target, sha, pid, status, delivered, observation, generation)
         if notice is None:
             return ""
+        card = foreign_mr(target, None) if foreign_mr else None
+        if card is not None:
+            what = ("is blocked on manual jobs" if status == "manual" else f"finished: {status}")
+            return foreign_mr_notice(target, f"head {sha[:8]} pipeline {pid} {what}", card)
         if status == "manual":
             return (f"action required: MR {target} head {sha[:8]} pipeline {pid} is blocked on "
                     "manual jobs; the success predicate is not met before review and the pipeline "
@@ -968,19 +1000,33 @@ def ci_change_event(gitlab, kind: str, target: str, contract: dict,
         return ""
     if contract["predicate"] == "success" and status != "success":
         return ""
+    tail = _foreign_red_tail(kind, target, status, foreign_mr)
     if observation is not None:
         observation.update(key=key, value=fingerprint)
-    return f"{kind} {target}: changed CI {sha[:8]} pipeline {pid} {status} ({contract['predicate']})"
+    return f"{kind} {target}: changed CI {sha[:8]} pipeline {pid} {status} ({contract['predicate']})" + tail
+
+
+def _foreign_red_tail(kind: str, target: str, status: str, foreign_mr) -> str:
+    """For a red result of someone else's MR that wakes an until=change wait: whose MR it is and
+    the wait that follows (``foreign_mr_next_step``), so the waiter neither pushes into it nor has
+    to look the owner up. '' for the task's own MR, any other kind or status, or no ``foreign_mr``."""
+    if kind != "mr" or not foreign_mr or status not in ("failed", "canceled", "cancelled", "skipped"):
+        return ""
+    card = foreign_mr(target, None)
+    return "" if card is None else ". " + foreign_mr_next_step(card)
 
 
 def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: int, delivered,
-                observation, allow_action_required: bool, pipeline_status: str | None = None) -> str:
+                observation, allow_action_required: bool, pipeline_status: str | None = None,
+                foreign_mr=None) -> str:
     """``ci_change_event`` for a wait on named jobs (``jobs=[...]``): the predicate is read from
     those jobs, never from the aggregate pipeline status, so a pipeline left ``manual`` by an
     unstarted sibling does not hold back a target job that has finished. Once every named job is
     final the wait wakes: ``until=change`` on any final result, ``until=success`` when all
     succeeded; a non-success result under ``until=success`` wakes once as an owner notice. A
-    retried job (new id) is a new observation. An MR wait reads the jobs of its current head."""
+    retried job (new id) is a new observation. An MR wait reads the jobs of its current head; on
+    someone else's MR (``foreign_mr``, see ``typed_event``) that notice names the MR's owner instead
+    of asking for a fix."""
     if kind == "pipeline" and (sha != contract["sha"] or pid != contract["pipeline"]):
         raise ValueError("CI pipeline baseline identity mismatch")
     jobs = tuple(contract["jobs"])
@@ -1000,6 +1046,10 @@ def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: i
         if not allow_action_required or _owner_action_once(
                 target, sha, pid, f"jobs[{names}]:{status}", delivered, observation, identity) is None:
             return ""
+        card = foreign_mr(target, None) if kind == "mr" and foreign_mr else None
+        if card is not None:
+            what = (jobs_manual_text(named) if status == "manual" else f"job(s) {names} finished: {status}")
+            return foreign_mr_notice(target, f"head {sha[:8]} pipeline {pid}: {what}", card)
         if status == "manual":
             return (f"action required: {kind} {target} pipeline {pid} on {sha[:8]}: {jobs_manual_text(named)}; "
                     "they start only by hand, so the success predicate will not be met by itself. Take the "
@@ -1015,13 +1065,14 @@ def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: i
     previous = delivered(key) if callable(delivered) else delivered
     if fingerprint == previous:
         return ""
+    tail = _foreign_red_tail(kind, target, status, foreign_mr)
     if observation is not None:
         observation.update(key=key, value=fingerprint)
     if status == "manual" and "created" in named.values():
         return (f"{kind} {target}: {jobs_manual_text(named)}; they start only by hand (pipeline {pid}, "
                 f"{sha[:8]}, {contract['predicate']}); other jobs of the pipeline were not considered")
     return (f"{kind} {target}: job(s) {names} finished: {status} (pipeline {pid}, {sha[:8]}, "
-            f"{contract['predicate']}); other jobs of the pipeline were not considered")
+            f"{contract['predicate']}); other jobs of the pipeline were not considered" + tail)
 
 
 def _owner_action_once(target: str, sha: str, pid: int, status: str, delivered, observation,
@@ -1074,11 +1125,17 @@ _MR_TERMINAL_TIME = re.compile(
 
 
 def typed_event(gitlab, kind: str, target: str, wait: dict, delivered="", observation=None,
-                allow_action_required=False, merge_gate=False) -> str:
-    """Shared evaluator; receipt acknowledgement belongs to the state transition."""
+                allow_action_required=False, merge_gate=False, foreign_mr=None) -> str:
+    """Shared evaluator; receipt acknowledgement belongs to the state transition.
+
+    ``foreign_mr(target, row)``: None when the MR is the waiting task's own, else the 8-hex id of the
+    card it belongs to ('' unknown). An owner notice about an MR that is not the task's own becomes
+    ``foreign_mr_notice``. Asked only when a notice is due (once per head), so a lookup per tick is
+    never paid. Absent: every waiter is the owner."""
     if not wait.get("mr_state"):
         return ci_change_event(gitlab, kind, target, wait["ci_change"], delivered, observation,
-                               allow_action_required=allow_action_required, merge_gate=merge_gate)
+                               allow_action_required=allow_action_required, merge_gate=merge_gate,
+                               foreign_mr=foreign_mr)
     contract = wait["mr_state"]
     if kind != "mr" or contract.get("predicate") != "merged" or contract.get("state") != "opened":
         raise ValueError("invalid MR state contract")
@@ -1095,6 +1152,9 @@ def typed_event(gitlab, kind: str, target: str, wait: dict, delivered="", observ
             status, pid = head["status"], head["id"]
             if _owner_action_once(target, sha, pid, status, delivered, observation,
                                   _terminal_generation(head)) is not None:
+                card = foreign_mr(target, row) if foreign_mr else None
+                if card is not None:
+                    return foreign_mr_notice(target, f"head {sha[:8]} pipeline {pid} finished: {status}", card)
                 return (f"action required: MR {target} head {sha[:8]} pipeline {pid} finished: "
                         f"{status}; it will not merge as is. The owner must push a fix or take "
                         "the next authorized step rather than wait for the merge. "
@@ -1108,6 +1168,9 @@ def typed_event(gitlab, kind: str, target: str, wait: dict, delivered="", observ
             # One notice per head and cause: a new head (the catch-up merge) is judged afresh.
             what = ("has a merge conflict with its target branch" if cause == "conflict"
                     else "is behind its target branch, which merges fast-forward or semi-linear only")
+            card = foreign_mr(target, row) if foreign_mr else None
+            if card is not None:
+                return foreign_mr_notice(target, f"head {sha[:8]} {what}", card)
             return (f"action required: MR {target} head {sha[:8]} {what}; it will not merge as is. "
                     + blocked_mr_next_step(target, cause, merge_gate))
         return ""
@@ -1211,7 +1274,8 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
           max_wait: dt.timedelta = dt.timedelta(hours=6), max_errors: int = 5,
           first_recheck: dt.timedelta | None = None, delivery_reader=None,
           allow_action_required: bool = False, comment_wake: str = "all", agent_name="",
-          comment_wake_always_from=(), decision_wake: str = "any", merge_gate: bool = False) -> str:
+          comment_wake_always_from=(), decision_wake: str = "any", merge_gate: bool = False,
+          foreign_mr=None) -> str:
     """Wake event text, or '' while the wait holds. Mutates ``wait`` bookkeeping
     (seen pipeline, consecutive check errors; ``recheck_due`` when the wake is a re-check;
     ``met`` when the awaited thing itself happened: the time came, the card closed, the
@@ -1301,6 +1365,23 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
     if kind == "manual":
         # A lead-decided passive wait: nothing to observe and no age re-check. Only the comment
         # (above) or the owner's own NEXT ends it.
+        # The paired-user bridge posts through the lane's own service identity. Its durable
+        # delivery marker distinguishes this external input from an agent's ordinary own note.
+        # Only manual waits accept it: it cannot answer a decision or lift a human gate.
+        for c in reversed(comments):
+            at = parse_time(c.get("created_at"))
+            meta = c.get("metadata")
+            key = meta.get("telegram_binding_key") if isinstance(meta, dict) else None
+            body = c.get("body")
+            author = c.get("author_id") or (c.get("author") or {}).get("id")
+            if (at is not None and at > since and author == agent_id
+                    and c.get("author_type") == "agent" and not c.get("auto_summary")
+                    and isinstance(body, str)
+                    and isinstance(key, str) and re.fullmatch(r"[0-9a-f]{16}:-?[0-9]+:[1-9][0-9]*", key)
+                    and re.fullmatch(r"Ответ .+ в Telegram \(message_id " + key.rsplit(':', 1)[-1]
+                                     + r"(?:, reply на [1-9][0-9]*)?\):",
+                                     body.split("\n", 1)[0])):
+                return f"bound Telegram reply: {body[:300]}"
         return ""
     if kind == "time":
         until = parse_time(wait.get("until"))
@@ -1409,7 +1490,8 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
                 observation = {}
                 event = typed_event(gitlab, kind, wait["target"], wait,
                                     delivery_reader or "", observation,
-                                    allow_action_required=allow_action_required, merge_gate=merge_gate)
+                                    allow_action_required=allow_action_required, merge_gate=merge_gate,
+                                    foreign_mr=foreign_mr)
                 wait["observation_state"] = "changed" if event else "unchanged"
                 if event:
                     action_required = bool(observation.pop("action_required", False))

@@ -1,5 +1,245 @@
 # Changelog
 
+## 0.2.79 — 2026-11-16
+
+- **A turn the Runner cut at its own limit after the session took the prompt no longer goes to `unknown`.**
+  A turn stopped at `max_turn_minutes` (or by the turn watchdog) leaves an idle-looking window; the next
+  start on the host closed it to make room, its hook events were dropped, and recovery read
+  `cursor-mismatch`: the card was held 15 minutes and the operator got an alert. When the driver's
+  journal shows the session took this prompt (`accepted`), the end of such a turn is known: the
+  attempt ends at once the way the quiet rule ends a held one (prompt archived in a mark, never
+  replayed; window closed; the card starts in a new attempt), with one card comment naming the
+  limit and event `prompt_ended_by_own_cut`, without the hold and the alert. A cut turn whose
+  journal never reached `accepted` still goes to `unknown`.
+
+## 0.2.78 — 2026-11-16
+
+- **A repository with submodules is captured in the slim form and proven in place.** Before, any
+  configured submodule sent the capture to the full form: the whole worktree copied into the
+  checkpoint and, since the proof in place refused it, the whole checkout laid out again in scratch
+  (thousands of file events per suspension, a clean submodule included). Now the
+  superproject is stored as a delta over HEAD and each populated submodule as a delta over its own
+  HEAD; the proof models the submodule gitdirs and hands over to the scratch replay only when the
+  source's submodule gitdir reads differently (`not decided (submodule-config)`, `submodule-info`,
+  `submodule-state`, `submodule-bundle`). Such a manifest is version 3, which an earlier runner
+  refuses rather than replays; see `docs/wait-workspace-checkpoints.md`.
+
+## 0.2.77 — 2026-11-16
+
+- **A review that keeps ending without a verdict goes to the lead instead of standing until UTC
+  midnight.** Review attempts the infrastructure stopped before their first round (a quota or limit
+  switch, a harness error, a spawn failure, a prompt never proven delivered) no longer count toward
+  `daily_start_cap`. At the cap the runner writes a `REVIEW CAP` note on the card (the attempts and
+  how each ended, the merge request head, the reviewer) and files a request card for the next lead
+  up the agent's chain, where before the card was held silently with `daily start cap reached`. A
+  comment on the card after the hand-up from anyone but the reviewer, a new reviewer, or the new
+  operator command `mesh-runner rearm-review --agent --task --reason [--apply]` starts the count
+  again; each reset is kept with its author and reason. Two hand-ups in a row without a verdict go
+  one level further up; a verdict ends the run. README: "Review attempts without a verdict".
+
+## 0.2.76 — 2026-11-16
+
+- **A routine WAIT capture no longer checks the whole tree out to verify it.** At capture a slim
+  snapshot is now proven in place: HEAD's blobs are read from the object store and hashed against
+  the recorded fingerprint, the replay's layout is predicted, and Git's view (staged and unstaged
+  diff, status) is computed from a fresh repository with the stored index over the source tree, as
+  the replay computes it; every Git read of the proof (config and attributes included) runs in
+  that repository, never with the source's own settings, and reads config as the replay's
+  commands read it (`GIT_CONFIG`, which redirects only `git config`, is not passed to it). Before, every capture wrote and removed
+  the full checkout under `.verify-*` in the checkpoint directory (tens of thousands of files per
+  suspension of a large repository), a major source of file-system events on the host. What the proof does not model
+  (submodules, checkout conversions, `core.symlinks=false`, any config key not on the proof's
+  allow list, a relative path Git resolves against the work tree (`core.attributesFile`,
+  `core.excludesFile`, `init.templateDir`, `HOME` and the other variables Git finds user-wide
+  files through), a conditional `includeIf` in the config,
+  an fsmonitor or a hook the replay runs, which would otherwise start in the source, a changed
+  `.gitattributes`, a deleted symlink, any mismatch)
+  still goes through the scratch replay, which stays the authority; re-verification, compaction
+  and restore keep the replay.
+- **A truncated, corrupt or missing checkpoint bundle is refused on every verification path.** The whole
+  pack is read with `git index-pack --strict` before the proof or the replay; before, a bundle
+  whose commits the object store already held passed unread. A capture whose bundle fails falls
+  back to the full form with `slim_failure_reason: bundle-invalid` (stage `verify-pack`). See
+  `docs/wait-workspace-checkpoints.md`.
+
+## 0.2.75 — 2026-11-16
+
+- **A Claude turn held for its background check is no longer cut off while the session keeps
+  working.** The hold that waits for a background task counted `background_wait_minutes` (45) from
+  the turn's first Stop. A session that ran its checks one after another (each notification turn
+  starting the next check and ending on text again) was ended mid-work after 45 minutes and counted
+  as "no outcome"; the correction pasted then got a turn command within seconds. The wait now counts
+  from the last Stop the session went on to; `turn_idle_minutes` and `max_turn_minutes` still bound
+  the turn. The driver's stderr names each further hold ("stopped again with N background task(s)")
+  and a hold that runs out ("did not go on within N min").
+
+## 0.2.74 — 2026-11-16
+
+- **Only the MR's own task is told to push a fix.** A task that waits for the merge of another
+  card's merge request is no longer woken with the owner notice of a red head, a merge conflict or
+  failed named jobs ("the owner must push a fix", "merge the target branch into the MR branch",
+  "fix and push or retry it"). Told to every waiter,
+  that notice made a second session of the same lane push the same fix into the owner's branch while
+  the owner pushed its own. Such a waiter now hears once per head that the MR belongs to another
+  card, with a ready `wait_for on=card` for it and no push instruction; a merge or success wait it
+  declares again on that MR stands instead of being sent back, and an `until=changed` wait on its red
+  head is sent back with the same owner text instead of "fix the cause and push"; a new red result
+  that wakes such a wait carries the owner text as well. The task's own MR (linked, named, or authored by the
+  lane and linked nowhere else) keeps every notice and send-back as before.
+
+## 0.2.73 — 2026-11-16
+
+- **Preserve terminal Codex errors in interactive turns.** A provider refusal or API failure that ends
+  a Codex turn before any model output now reaches the runner as a failed turn, including after
+  delivery recovery, instead of triggering a misleading missing-outcome correction. An error after
+  model work and an interrupted turn still end as a turn without a final message, so an outcome the
+  turn already recorded is read first. Failed turns retain their reported token usage.
+- **A lane's status row stays fresh during a long tick.** `tick_at` used to be written only when
+  a lane's whole tick returned, so a lane busy checkpointing many worktrees or starting several
+  sessions published a row ten to fifteen minutes old and status readers took it for an unknown
+  state. The lane now republishes its row at most every 30 s from progress beats inside the tick
+  (Mesh requests; files and chunks of large files copied, hashed or compared; directories walked
+  or removed; every 10 s of a git command, start gate, subprocess or repository-lock wait); the
+  row adds `tick_running_since`, `tick_step` and `tick_done_at`. A wedged lane is still reported
+  after 900 s without progress, and a tick over 120 s is logged with its slowest phases
+  (`docs/architecture.md`).
+- **A comment a program wrote under an agent's key no longer hides addresses to that agent.** An
+  `@agent` line on someone else's task is not filed as a request when the agent itself commented
+  there in the last day (a reply to its own ask). Comments labelled as automation (a `[runner]` note,
+  or `metadata.source` other than `api`, `ui` or `mcp`, such as a report script posting under the
+  agent's key) no longer count as the agent taking part, so a reply under a scripted digest becomes a
+  request. A dropped address now leaves a log line naming the agent's own comment.
+
+## 0.2.72 — 2026-11-15
+
+- Manual waits resume when a paired Telegram user's reply is delivered by the lane's
+  own Mesh service identity. Ordinary own comments remain ignored; the delivery
+  marker does not answer a decision or lift a human gate.
+
+## 0.2.71 — 2026-11-15
+
+- **A card whose agent ends its escalation chain no longer dies after `RUNNER GAVE UP`.** When the
+  session ended without a readable outcome three turns in a row and nobody is above the agent (no
+  lead, or the project's lead is the agent itself), the card used to wait in todo for a comment
+  nobody was due to write. It now starts again at once in a fresh session, told that the previous
+  one gave up, once per card and UTC day; a second give-up the same day waits for a comment or the
+  next UTC day. A lane with a lead still hands the card to the lead.
+
+## 0.2.70 — 2026-11-15
+
+- **A question a desk session asks another agent with `ask_agent` is delivered.** Mesh opens such
+  a request and delivers it to nobody, and no lane filed its request card, because a desk turn
+  holds no card: the question sat open and unseen while its asker took it as asked. After every
+  desk turn the answer desk now reads the asking card for the questions the session asked during
+  it and puts each on its addressee's desk queue (the answer lands on the asking card, where its
+  owner reads it). A question that cannot go there (the addressee is not a lane of this runner,
+  has no desk, is headless or paused) or that the addressee's desk then fails is refused visibly:
+  a comment on the asking card addressed to its owner names the request and the route (ask from
+  that card with `ask_agent`, which files the request card); a refusal Mesh does not take is
+  written again. A routed question no desk takes (the addressee's desk is switched off, or it is
+  still queued after 20 minutes) is refused the same way. The card is read back from its newest
+  comment to the turn's start, however long its history, and the read is owed from the turn's
+  start: one that fails, or that a runner restart cut off, is done again until it succeeds or the
+  card is gone, the pause doubling up to an hour. The
+  log line of a request answered in the reminder turn no longer carries the first turn's «still
+  open» reason.
+
+## 0.2.69 — 2026-11-15
+
+- **A turn whose end is known no longer goes to `unknown`.** A turn the Runner itself stopped for a
+  lost lock (reassigned, released or expired) used to read an empty native stream (the stop closes the
+  window and drops its hook events), report `cursor-mismatch`, hold the card 15 min and alert the
+  operator that "the session did not confirm it took the prompt". It now ends as a lock-lost turn
+  (`failed`, `checkout lost: …`, event `prompt_ended_by_lock_loss`); its prompt is archived in the
+  mark `lock_lost_intent:<attempt>`, never consumed or replayed, and pending wakes stay undelivered.
+  A headless Claude turn with several `result` records of its own session (a background task's
+  notification adds one) is acknowledged; a `result` of any other session is still a mismatch. An
+  `unknown` whose driver journal is at `accepted` now says the session took the prompt and the end
+  of its turn could not be read, instead of "did not confirm".
+- **API mode: a lane turn runs under an API key within its spend pool's budget.** A Claude
+  turn whose route is the profile `<account>/api` (the lane's `api_primary_profile`, or
+  `MESH_RUNNER_API_PROFILE` from its env command when the account's provider is in
+  `api_reserve_providers`) runs on the key of the account's `credential_ref` only when the lane
+  has `api_optin = true` (otherwise the subscription, as before), the launch is headless and the
+  pool has a cap in `[api.pools]`. The key reaches only the turn process's environment; each turn
+  reserves `run_usd` before it starts (`--max-budget-usd`), is refused with `budget_exhausted`
+  over `cap_usd`, and is charged its `total_cost_usd`. `mesh-runner api-budget` shows the pools
+  (`docs/architecture.md`, "API mode").
+
+## 0.2.68 — 2026-11-15
+
+- **A chat turn or an answer-desk question that finds the host full waits for a slot instead of
+  failing.** With every slot of `interactive_max_sessions` busy (or the memory floor reached) for the
+  whole start wait, the interactive driver gave up and the chat turn failed for good, while the answer
+  desk spent its question turn, then its reminder, failed the request and the asker filed a request
+  card. Nothing had been started or pasted, so the turn is now driven again: a chat turn stays
+  streaming in Mesh (its lease renewed) and runs exactly once when a slot frees; Stop while it waits
+  ends it cancelled and gives its chat slot back at once, other chats running on. The answer desk keeps
+  such a request queued and unspent and asks again on a later pass; a request carded meanwhile stays
+  carded and its waiting turn is stopped. The desk's own writes of a request (its claim, the turn count,
+  the requeue, the result) and the asker's card fallback now check and write under one lock, so a
+  request carded at any moment is neither brought back to the queue nor reminded next to its card. The driver marks the wait in its output
+  (`mesh_runner.host_wait`: `waiting`, `room`, `timeout`); card turns end as before. The cap and the
+  eviction of idle windows are unchanged. The log says `the turn waits for a free slot` and
+  `no free session slot on the host; stays queued`.
+
+## 0.2.67 — 2026-11-15
+
+- **A window just started is never closed as the one idle longest.** The window's metadata got its
+  start and last-turn times only after the host start lock was released, so for a moment it read as
+  idle since the epoch; a parallel start that needed room and saw no live busy claim on it closed that
+  window, and its own start failed. The times are now written together with the busy claim, before
+  the lock lets another start count the window.
+- **A turn-cap continuation goes on in the card's own working copies, a dirty one included.** An
+  attempt that reached `max_turns` while still making progress ends and the card restarts in a fresh
+  session; its slots were released, a slot with uncommitted work (an unfinished merge, staged or
+  unstaged edits, ignored state) was held under the old attempt, and the fresh session got a clean
+  slot on the remote branch while the card's work sat in a slot it could no longer write to (and that
+  the dead-slot pass archived after a day). The continuation now records the attempt's paths; the
+  next start of the same card leases them again, and a slot held only for uncommitted changes is
+  leased to it as it is, nothing in the working tree touched. A full pool no longer holds such a start.
+  A card closed in between is not started and its slot is archived by the dead-slot pass as before;
+  no other card ever gets the slot. The log says `turn-cap continuation goes on in its own held
+  worktree(s)`.
+- **Editor reconfiguration waits for killed descendants to be reaped.** A cancelled job's process group gets a bounded cleanup window before the configuration swap; any remaining group still refuses the swap.
+
+## 0.2.66 — 2026-11-15
+
+- **The start ramp after a host hold now sees a wait root that wakes between two radar passes,
+  and no longer keeps a slot for a root whose card waits for a person.** A lane's ready attempt on a
+  root the radar last saw waiting (on a pipeline, a merge request, another card) claims the next
+  slot with the waiting cards behind it at once, instead of after the next pass up to three minutes
+  later, and is held for the ramp interval rather than the 120 s gate hold when the slot is spaced.
+  A ready attempt whose card carries `human_gate` claims nothing: the start gate would refuse its
+  resume, and the slot went to nobody for up to a minute.
+- **Headless lanes switch accounts on the provider's `rate_limit_event`.** A `claude -p` turn that
+  ends after `status: rejected` takes the provider-limit path whatever its closing text says; the
+  on-limit command gets `MESH_RUNNER_LIMIT_SOURCE`, `MESH_RUNNER_LIMIT_WINDOW` and
+  `MESH_RUNNER_LIMIT_RESETS_AT`. Each turn's windows (`unifiedWindows`) go to
+  `<state_dir>/rate-limits/<agent>.json` (`lane-rate-limit/v1`) for the host's quota observations,
+  `status.json` names each agent's `launch_mode` and its active harness pids, and each turn's
+  `launch` event names its `launch_mode`. The docs now state
+  that both modes draw on the same subscription windows
+  (`docs/architecture.md`, "Launch modes").
+- **An `@lane` comment on a card waiting on a gmail, receipt, lifecycle or recovery registration wakes it.**
+  These waits ended only on their registration's event, and a request card is filed only for a mention on
+  someone else's card: a lead's questions on the owner's own card slept for days behind a gmail wait. A
+  comment whose line opens with an address of the lane (its runner name, Mesh agent name or slug) now wakes
+  the session after that wait's own event is checked; a mention inside a sentence, the lane's own note and a
+  runner note do not. The registration is not touched: an event that lands meanwhile stays pending, and the
+  wake text tells the session to declare the same wait again, which binds to it. Stall, queue and native
+  waits keep their own predicate only.
+- **An interactive Claude turn that ends on text while its background check still runs is no longer
+  counted as "no outcome".** Claude Code reports the tasks still running in its Stop hook
+  (`background_tasks`) and goes on by itself when one finishes; the driver now holds such a turn
+  (up to `background_wait_minutes`, 45) and ends it with the Stop of the turn that the task's
+  notification started, so the turn command given there is read and no correction prompt is pasted
+  into a session that is about to resume. A turn that already called a Mesh turn command is not held.
+- **`python -m mesh_runner.no_outcome_classes`** sorts the window's Claude `no_outcome` events by
+  what the session transcript shows (text with a background task running, text without a turn
+  command, command accepted or refused, no activity, no transcript) per class and per lane. It
+  opens the runner database read-only.
+
 ## 0.2.65 — 2026-11-14
 
 - **`[runner] completion_comment` is an option again (default `true`).** Set it to `false` on a runner

@@ -3,6 +3,7 @@ is filed after all whenever the desk cannot answer (never a lost question)."""
 import datetime as dt
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -232,8 +233,8 @@ class Drive(unittest.TestCase):
         seen = {}
 
         class FakeDelivery:
-            def __init__(self, harness, plan, log_dir):
-                seen.update(harness=harness, plan=plan, log_dir=log_dir)
+            def __init__(self, harness, plan, log_dir, **kw):
+                seen.update(harness=harness, plan=plan, log_dir=log_dir, **kw)
 
             def run(self, turn, cancelled):
                 seen.update(turn=turn, cancelled=cancelled())
@@ -251,6 +252,7 @@ class Drive(unittest.TestCase):
         self.assertEqual(seen["turn"]["thread_id"], thread_of(card))
         self.assertFalse(seen["cancelled"])
         self.assertEqual(seen["log_dir"], state / "answer_desk" / "logs")
+        self.assertIs(seen["wait_for_room"], False)          # the desk queues a turn without room itself
 
 
 class Unanswered(Desk):
@@ -490,6 +492,496 @@ class Order(Restart):
             self.clock.advance(1)
         self.assertEqual(self.turns, [])
         self.assertEqual(desk.hold("reviewer"), "not listed")
+
+
+class HostCap(Desk):
+    """the host cap full of busy sessions for the driver's whole wait reached nobody. The request is
+    not failed and no turn is spent: it stays queued, and once a slot frees exactly one turn asks the question."""
+
+    def test_a_full_host_keeps_the_request_queued_and_one_turn_answers_it_when_a_slot_frees(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        room = {"free": False}
+        base = desk.run_turn
+
+        def run_turn(ar, rid, task_id, text):
+            if not room["free"]:
+                self.turns.append(("no room", rid, task_id, text))
+                return "host_busy"
+            return base(ar, rid, task_id, text)
+        desk.run_turn = run_turn
+        desk.step()
+        self.assertEqual(len(self.turns), 1)                          # no reminder after a turn that never ran
+        self.assertEqual(desk.state("lead", REQUEST), "queued")       # not failed
+        self.assertEqual(desk._get("lead", REQUEST).get("turns"), None)
+        self.assertEqual(desk._scan_get("lead", REQUEST), {})         # nothing reached it: no card read owed
+        self.assertNotIn("answer_failed", [k for k, _ in lead.events])
+        r.tick()
+        self.assertEqual(mesh.created, [])                            # the asker still waits on the desk
+        desk.step()                                                   # still no room: queued again
+        self.assertEqual((len(self.turns), desk.state("lead", REQUEST)), (2, "queued"))
+        room["free"] = True                                           # one slot frees
+        desk.step()
+        self.assertEqual(len(self.turns), 3)
+        lane, rid, task_id, text = self.turns[2]
+        self.assertEqual((lane, rid), ("lead", REQUEST))
+        self.assertIn(QUESTION, text)                                 # the question itself, not the reminder
+        self.assertNotIn("still open", text)
+        self.assertEqual(desk.state("lead", REQUEST), "answered")
+        self.assertEqual([k for k, _ in lead.events], ["answer_started", "answer_done"])
+        desk.step()
+        r.tick()
+        self.assertEqual((len(self.turns), mesh.created), (3, []))   # exactly one answering turn, no card
+
+    def test_a_request_carded_while_it_waited_for_room_stays_with_its_card(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+
+        def run_turn(ar, rid, task_id, text):
+            self.turns.append(text)
+            desk.carded("lead", rid, "not answered within 20 minutes")   # the asker's fallback meanwhile
+            return "host_busy"
+        desk.run_turn = run_turn
+        desk.step()
+        self.assertEqual(desk.state("lead", REQUEST), "carded")
+        self.clock.advance(1)
+        desk.step()
+        self.assertEqual(len(self.turns), 1)                          # never asked again
+
+    def test_a_turn_waiting_for_room_is_stopped_when_its_request_is_carded(self):
+        from unittest import mock
+        seen = {}
+
+        class Waiting:
+            def __init__(self, harness, plan, log_dir, **kw):
+                pass
+
+            def run(self, turn, cancelled):
+                turn["_host_wait"] = "waiting"
+                for _ in range(500):
+                    if cancelled():
+                        seen["cancelled"] = True
+                        turn["_host_wait"] = "cancelled"
+                        yield {"type": "final", "stop_reason": "cancelled"}
+                        return
+                    time.sleep(0.01)
+                yield {"type": "final", "stop_reason": "end_turn"}
+        t = task(1)
+        mesh = FakeMesh([t])
+        lead = lead_lane(mesh)
+        lead.routed_harness = "claude"
+        desk = AnswerDesk(self.cfg, [lead], Store(self.root / "d.sqlite"), clock=self.clock)
+        desk._set("lead", REQUEST, {"state": "carded", "at": "x", "since": "x", "task": t["id"], "from": "builder"})
+        with mock.patch("mesh_runner.chat_delivery.DriverDelivery", Waiting), \
+                mock.patch.object(answer_desk, "GONE_CHECK_SECONDS", 0.0), \
+                mock.patch("mesh_runner.chat_lane.lane_of", lambda ar: ar):
+            ended = desk._drive(lead, REQUEST, t["id"], "the question")
+        self.assertTrue(seen.get("cancelled"))
+        self.assertEqual(ended, "host_busy")
+
+    def test_the_delivery_host_busy_error_is_the_desk_host_busy(self):
+        from unittest import mock
+
+        class NoRoom:
+            def __init__(self, harness, plan, log_dir, **kw):
+                pass
+
+            def run(self, turn, cancelled):
+                yield {"type": "error", "code": "host_busy", "retryable": True, "message": "x"}
+        t = task(1)
+        lead = lead_lane(FakeMesh([t]))
+        lead.routed_harness = "claude"
+        desk = AnswerDesk(self.cfg, [lead], Store(self.root / "d.sqlite"), clock=self.clock)
+        with mock.patch("mesh_runner.chat_delivery.DriverDelivery", NoRoom), \
+                mock.patch("mesh_runner.chat_lane.lane_of", lambda ar: ar):
+            self.assertEqual(desk._drive(lead, REQUEST, t["id"], "q"), "host_busy")
+
+
+
+class CardedRace(Desk):
+    """The asker's fallback (``carded``, on the runner's tick) and the desk's own writes (its pass and its turn
+    thread) meet on one mark. Whatever the interleaving a carded request stays carded: a desk write from an
+    older read must not bring it back to queued or running, or the desk asks the question a second time next to
+    its card."""
+
+    def test_carded_between_the_requeue_read_and_its_write_stays_carded(self):
+        worker, racers = {}, []
+        lead = lead_lane(FakeMesh([task(1)]))
+
+        class Racing(AnswerDesk):
+            def state(self, lane, rid):
+                seen = super().state(lane, rid)
+                if threading.current_thread() is worker.get("thread") and not racers:
+                    # the asker's fallback cards the request right after the desk read it; unguarded the card
+                    # lands now, under the desk's lock it lands after the desk's write
+                    racer = threading.Thread(target=self.carded, args=(lane, rid, "not answered within 20 minutes"))
+                    racers.append(racer)
+                    racer.start()
+                    racer.join(0.5)
+                return seen
+        # the real SQLite store; the turn is the external boundary: a driver that found no room on the host
+        desk = Racing(self.cfg, [lead], Store(self.root / "race.sqlite"), clock=self.clock,
+                      run_turn=lambda *args: "host_busy")
+        desk._set("lead", REQUEST, {"state": "running", "at": "x", "since": "x", "task": "task-1", "from": "builder"})
+        thread = threading.Thread(target=desk._answer, args=(lead, {"id": REQUEST, "task_id": "task-1"}))
+        worker["thread"] = thread
+        thread.start()
+        thread.join(5)
+        self.assertEqual(len(racers), 1)                              # the race was staged
+        racers[0].join(5)
+        self.assertFalse(thread.is_alive() or racers[0].is_alive())
+        self.assertEqual(desk.state("lead", REQUEST), "carded")
+        self.assertFalse(desk._due(desk._get("lead", REQUEST), self.clock()))   # never delivered again
+
+    def test_carded_during_a_turn_is_not_reminded_and_stays_carded(self):
+        self.answer = False
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        base = desk.run_turn
+
+        def run_turn(ar, rid, task_id, text):
+            ended = base(ar, rid, task_id, text)
+            if len(self.turns) == 1:
+                self.clock.advance(21)                            # the first turn outlived the fallback
+                r.tick()                                          # the asker files the card meanwhile
+            return ended
+        desk.run_turn = run_turn
+        desk.step()
+        self.assertEqual(len(mesh.created), 1)
+        self.assertEqual(len(self.turns), 1)                          # no reminder next to the card
+        self.assertEqual(desk.state("lead", REQUEST), "carded")
+        desk.step()
+        r.tick()
+        self.assertEqual((len(self.turns), len(mesh.created)), (1, 1))
+
+    def test_carded_between_the_pass_read_and_its_claim_is_not_driven(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        read, staged = desk._marks, []
+
+        def marks(lane):
+            out = read(lane)
+            if lane == "lead" and not staged:
+                staged.append(1)
+                desk.carded("lead", REQUEST, "the addressee is paused")   # the asker's pass, right after the read
+            return out
+        desk._marks = marks
+        desk.step()
+        self.assertTrue(staged)
+        self.assertEqual(self.turns, [])
+        self.assertEqual(desk.state("lead", REQUEST), "carded")
+        self.assertNotIn("answer_started", [k for k, _ in lead.events])
+
+
+class AskedFromTheDesk(Desk):
+    """A desk session that asks a third agent with ``ask_agent``: Mesh opens the request on the asking
+    card and delivers it to nobody, and no lane files its request card. The desk delivers it to the addressee's
+    desk queue, or refuses it visibly on the card with the route; it is never left open and unseen."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg.cardless_question_lanes = ["lead", "expert", "expert-VC"]
+        self.ask_to = "expert"            # the directory name Mesh writes in the ask comment
+        self.lead_asks = 1                # lead asks once, in its first desk turn
+        self.expert_answers = True
+        self.asked_at_offset = 0.0        # seconds from the turn's start the ask comment is stamped
+        self.chatter = 0                  # comments written on the card after the ask, during the turn
+
+    def lanes(self, expert_name="expert", expert_me_name=None):
+        t = task(1)
+        self.mesh = mesh = FakeMesh([t], max_concurrent=1)
+        r = self.run_turn(mesh, t)
+        lead = lead_lane(mesh)
+        expert = lead_lane(mesh, name=expert_name, agent_id="agent-expert")
+        if expert_me_name:
+            expert.me["name"] = expert_me_name
+        desk = AnswerDesk(self.cfg, [r, lead, expert], Store(self.root / "state" / "desk.sqlite"), clock=self.clock,
+                          spawn=lambda fn: fn(), run_turn=self.turn,
+                          tmux=SimpleNamespace(all_windows=lambda: [], kill_window=lambda s, w: None)).attach()
+        desk.step()                                       # the probes: every desk is live on this Mesh
+        self.ask(mesh, t)
+        a = self.finish_turn(r)
+        self.assertEqual(a.wait.get("cardless", {}).get("lane"), "lead")
+        self.clock.advance(1)
+        return t, r, lead, expert, desk, a
+
+    def turn(self, ar, rid, task_id, text):
+        self.turns.append((ar.agent.name, rid, task_id, text))
+        mesh = self.mesh
+        if ar.agent.name == "lead" and self.lead_asks:
+            self.lead_asks -= 1
+            at = dt.datetime.fromtimestamp(self.clock() + self.asked_at_offset, dt.timezone.utc).isoformat()
+            mesh.open_decision(OTHER, task_id, "is the role table right?", to="agent-expert",
+                               sender=("agent-lead", "lead"))
+            mesh.comment_log.setdefault(task_id, []).append({
+                "id": "c-" + OTHER[:8], "author_id": "agent-lead", "author_name": "lead", "author_type": "agent",
+                "body": f"❔ **Question to {self.ask_to}** · request `{OTHER}`\n\nis the role table right?",
+                "metadata": {"wakes": False, "command": "ask_agent", "decision_request_id": OTHER},
+                "created_at": at})
+            for n in range(self.chatter):
+                mesh.comment_log[task_id].append({"id": f"c-chatter-{n}", "author_id": "agent-builder",
+                                                  "author_name": "builder", "body": f"progress {n}",
+                                                  "created_at": at})
+            mesh.answer_decision(rid, "asked expert about the role table", author="agent-lead")
+        elif ar.agent.name.startswith("expert") and self.expert_answers:
+            mesh.answer_decision(rid, "the role table is right", author="agent-expert")
+        return "end_turn"
+
+    def refusals(self, t):
+        return [c for c in self.mesh.comment_log.get(t["id"], []) if "answer desk turn on this card" in c["body"]]
+
+    def test_the_question_goes_to_the_addressees_desk_and_is_answered_on_the_card(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        desk.step()                                       # lead's desk turn: answers, and asks expert
+        self.assertEqual([x[:2] for x in self.turns], [("lead", REQUEST)])
+        mark = desk._get("expert", OTHER)
+        self.assertEqual((mark.get("state"), mark.get("via"), mark.get("from"), mark.get("owner"), mark.get("task")),
+                         ("queued", "desk", "lead", "builder", t["id"]))
+        self.clock.advance(1)                             # past expert's poll interval
+        desk.step()
+        self.assertEqual([x[:2] for x in self.turns], [("lead", REQUEST), ("expert", OTHER)])
+        text = self.turns[1][3]
+        for part in ("is the role table right?", OTHER, f"#{t['id'][:8]}", "answer_decision",
+                     "where builder (its owner) and lead read it"):
+            self.assertIn(part, text)
+        self.assertNotIn("resumes lead", text)
+        self.assertEqual(desk.state("expert", OTHER), "answered")
+        self.assertTrue(any("the role table is right" in c["body"] for c in self.mesh.comment_log[t["id"]]))
+        self.assertEqual(self.refusals(t), [])
+        self.assertEqual(self.mesh.created, [])
+        self.assertEqual((desk._scan_get("lead", REQUEST), desk._scan_get("expert", OTHER)), ({}, {}))
+        desk.step()
+        self.clock.advance(2)
+        desk.step()
+        self.assertEqual(len(self.turns), 2)              # routed once
+
+    def test_an_agent_named_otherwise_than_its_lane_is_found_by_its_mesh_name(self):
+        """Lane ``expert-VC`` runs Mesh agent ``expert``: the ask comment names ``expert``."""
+        t, r, lead, expert, desk, a = self.lanes(expert_name="expert-VC", expert_me_name="expert")
+        desk.step()
+        self.assertEqual(desk._get("expert-VC", OTHER).get("via"), "desk")
+        self.assertEqual(self.refusals(t), [])
+
+    def test_an_addressee_that_is_no_lane_here_is_refused_on_the_card_with_the_route(self):
+        self.ask_to = "outsider"
+        t, r, lead, expert, desk, a = self.lanes()
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            desk.step()
+        self.assertTrue(any(OTHER[:8] in line and "not delivered" in line for line in logs.output))
+        self.assertEqual(desk._get("expert", OTHER), {})
+        [refusal] = self.refusals(t)
+        body = refusal["body"]
+        self.assertTrue(body.startswith("@builder "))     # wakes the card's owner
+        for part in ("lead asked outsider", OTHER, "not a lane of this runner", "ask it from this card",
+                     "`ask_agent`"):
+            self.assertIn(part, body)
+        self.assertFalse(body.startswith("[runner]"))     # a runner note wakes nobody
+        self.assertEqual(desk._asked("lead", OTHER)["state"], "refused")
+        self.clock.advance(5)
+        desk.step()
+        self.assertEqual(len(self.refusals(t)), 1)        # refused once
+
+    def test_a_paused_addressee_is_refused_on_the_card(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        expert.is_paused = True
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual(desk._get("expert", OTHER), {})
+        [refusal] = self.refusals(t)
+        self.assertIn("paused", refusal["body"])
+
+    def test_a_routed_question_the_addressees_desk_fails_is_refused_on_the_card(self):
+        self.expert_answers = False
+        t, r, lead, expert, desk, a = self.lanes()
+        desk.step()
+        self.clock.advance(1)
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual(desk.state("expert", OTHER), "failed")
+        [refusal] = self.refusals(t)
+        for part in ("@builder", "lead asked expert", OTHER, "expert's answer desk could not answer it",
+                     "ask it from this card"):
+            self.assertIn(part, refusal["body"])
+        self.assertEqual(self.mesh.created, [])
+
+    def test_a_refusal_mesh_did_not_take_is_written_again(self):
+        self.ask_to = "outsider"
+        t, r, lead, expert, desk, a = self.lanes()
+        real, failures = self.mesh.add_comment, []
+
+        def add_comment(tid, body, **kw):
+            if "answer desk turn on this card" in body and not failures:
+                failures.append(1)
+                raise MeshError(503, "unavailable")
+            return real(tid, body, **kw)
+        self.mesh.add_comment = add_comment
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual((failures, self.refusals(t)), ([1], []))
+        self.assertEqual(desk._asked("lead", OTHER)["state"], "refusing")
+        self.clock.advance(2)
+        desk.step()
+        self.assertEqual(len(self.refusals(t)), 1)
+        self.assertEqual(desk._asked("lead", OTHER)["state"], "refused")
+
+    def failing_reads(self, lane, status, times):
+        real, failed = lane.mesh.comments_since, []
+
+        def comments_since(tid, since, **kw):
+            if len(failed) < times:
+                failed.append(status)
+                raise MeshError(status, "unavailable")
+            return real(tid, since, **kw)
+        lane.mesh.comments_since = comments_since
+        return failed
+
+    def test_a_card_read_that_failed_is_read_again_and_the_question_delivered(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        failed = self.failing_reads(lead, 503, 1)
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            desk.step()                                   # lead's desk turn asks; reading the card fails
+        self.assertEqual(failed, [503])
+        self.assertEqual(desk._get("expert", OTHER), {})
+        self.assertEqual(desk.state("lead", REQUEST), "answered")    # the turn's own result stands
+        self.clock.advance(2)
+        desk.step()                                       # the owed read: the question reaches expert
+        self.assertEqual(desk._get("expert", OTHER).get("via"), "desk")
+        self.assertEqual(desk._asked("lead", OTHER)["state"], "routed")
+        self.assertTrue(any("read again later" in line for line in logs.output))
+        self.assertEqual(desk._scan_get("lead", REQUEST), {})
+        self.clock.advance(1)
+        desk.step()
+        self.assertEqual([x[:2] for x in self.turns], [("lead", REQUEST), ("expert", OTHER)])
+        self.assertEqual(desk.state("expert", OTHER), "answered")
+        self.assertEqual(self.refusals(t), [])
+
+    def test_a_card_read_failing_for_more_than_a_week_stays_owed_and_delivers_when_mesh_recovers(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        self.failing_reads(lead, 503, 10 ** 6)
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual(desk._scan_get("lead", REQUEST)["state"], "retry")
+        desk.idle.clear()                                 # no session window to reap in this test
+        self.clock.advance(8 * 24 * 60)                   # eight days on, the prune runs as well
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual(desk._scan_get("lead", REQUEST).get("state"), "retry")            # not given up
+        del lead.mesh.comments_since                          # Mesh recovers
+        self.clock.advance(61)
+        desk.step()
+        self.assertEqual(desk._get("expert", OTHER).get("via"), "desk")
+        self.assertEqual(desk._scan_get("lead", REQUEST), {})
+
+    def test_the_pause_between_failing_card_reads_doubles_up_to_an_hour(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        self.failing_reads(lead, 503, 10 ** 6)
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        first = desk._scan_get("lead", REQUEST)
+        self.assertEqual((first["tries"], first["next"] - self.clock()), (1, 60.0))
+        self.clock.advance(2)
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        second = desk._scan_get("lead", REQUEST)
+        self.assertEqual((second["tries"], second["next"] - self.clock()), (2, 120.0))
+        desk._scan_set("lead", REQUEST, dict(second, tries=30, next=0.0))
+        with self.assertLogs("mesh_runner", "WARNING"):
+            self.assertFalse(desk._scan_close(lead, REQUEST))
+        self.assertEqual(desk._scan_get("lead", REQUEST)["next"] - self.clock(), 3600.0)
+
+    def test_an_ask_buried_under_more_than_a_hundred_comments_is_still_delivered(self):
+        self.chatter = 150
+        t, r, lead, expert, desk, a = self.lanes()
+        desk.step()
+        self.assertEqual(desk._get("expert", OTHER).get("via"), "desk")
+        self.assertEqual(desk._scan_get("lead", REQUEST), {})
+
+    def test_a_routed_question_whose_lane_loses_its_desk_is_refused_on_the_card(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        desk.step()                                       # lead's turn: the question is routed to expert
+        self.assertEqual(desk.state("expert", OTHER), "queued")
+        desk.listed.discard("expert")                     # its desk is switched off
+        self.clock.advance(2)
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual(desk.state("expert", OTHER), "failed")
+        [refusal] = self.refusals(t)
+        for part in ("@builder", "lead asked expert", OTHER, "no answer desk any more", "ask it from this card"):
+            self.assertIn(part, refusal["body"])
+
+    def test_a_routed_question_not_taken_in_twenty_minutes_is_refused_on_the_card(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        desk.step()                                       # routed to expert
+        expert.is_paused = True                           # then expert is paused
+        self.clock.advance(10)
+        desk.step()
+        self.assertEqual((desk.state("expert", OTHER), self.refusals(t)), ("queued", []))
+        self.clock.advance(11)
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual(desk.state("expert", OTHER), "failed")
+        [refusal] = self.refusals(t)
+        for part in ("@builder", OTHER, "not taken within 20 min (paused)", "ask it from this card"):
+            self.assertIn(part, refusal["body"])
+        self.assertEqual([x[:2] for x in self.turns], [("lead", REQUEST)])
+
+    def test_a_card_read_a_crash_cut_off_is_done_after_the_lease(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        desk._scan_close = lambda ar, rid: True           # the runner dies after the turn, before the read
+        desk.step()
+        del desk._scan_close
+        self.assertEqual(desk._get("expert", OTHER), {})
+        self.assertEqual(desk._scan_get("lead", REQUEST)["state"], "turn")
+        restarted = AnswerDesk(self.cfg, [r, lead, expert], desk.store, clock=self.clock, spawn=lambda fn: fn(),
+                               run_turn=self.turn,
+                               tmux=SimpleNamespace(all_windows=lambda: [], kill_window=lambda s, w: None)).attach()
+        self.clock.advance(5)
+        restarted.step()
+        self.assertEqual(restarted._get("expert", OTHER), {})       # within its lease the turn may still be live
+        self.clock.advance(11)
+        restarted.step()
+        self.assertEqual(restarted._get("expert", OTHER).get("via"), "desk")
+        self.assertEqual(restarted._scan_get("lead", REQUEST), {})
+
+    def test_a_card_that_is_gone_owes_no_read(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        self.failing_reads(lead, 404, 5)
+        with self.assertLogs("mesh_runner", "WARNING") as logs:
+            desk.step()
+        self.assertTrue(any("is gone" in line for line in logs.output))
+        self.assertEqual(desk._scan_get("lead", REQUEST), {})
+
+    def test_a_question_asked_before_the_turn_is_not_the_desks(self):
+        self.asked_at_offset = -600.0                     # stamped ten minutes before the turn started
+        t, r, lead, expert, desk, a = self.lanes()
+        desk.step()
+        self.assertEqual(desk._get("expert", OTHER), {})
+        self.assertEqual(desk._asked("lead", OTHER), {})
+        self.assertEqual(self.refusals(t), [])
+
+    def test_answered_after_a_reminder_logs_no_stale_reason(self):
+        """The first turn's «still open» note is not the reason of a request answered in the reminder turn."""
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        base, n = desk.run_turn, []
+
+        def run_turn(ar, rid, task_id, text):
+            n.append(1)
+            if len(n) == 2:
+                return base(ar, rid, task_id, text)
+            self.turns.append((ar.agent.name, rid, task_id, text))
+            return "end_turn"
+        desk.run_turn = run_turn
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            desk.step()
+        self.assertEqual(desk.state("lead", REQUEST), "answered")
+        self.assertEqual(desk._get("lead", REQUEST).get("why"), "")
+        self.assertFalse(any("answered (still open" in line for line in logs.output))
 
 
 if __name__ == "__main__":

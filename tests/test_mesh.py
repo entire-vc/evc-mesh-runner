@@ -225,5 +225,44 @@ class SessionReportIdempotencyKey(unittest.TestCase):
         self.assertIsNone(self.key(op.reqs[0]))
 
 
+
+class CommentPages:
+    """Opener serving ``n`` comments one minute apart, Mesh-style: pages oldest-first, ``total_pages``."""
+    def __init__(self, n, page_size):
+        import datetime as dt
+        base = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        self.comments = [{"id": f"c{i}", "created_at": (base + dt.timedelta(minutes=i)).isoformat()}
+                         for i in range(n)]
+        self.page_size, self.pages = page_size, []
+
+    def __call__(self, req, timeout=None):
+        import urllib.parse
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(req.full_url).query))
+        n = int(q["page"])
+        self.pages.append(n)
+        chunk = self.comments[(n - 1) * self.page_size:n * self.page_size]
+        total = max(1, -(-len(self.comments) // self.page_size))
+        return io.BytesIO(json.dumps({"items": chunk, "total_pages": total}).encode())
+
+
+class CommentsSince(unittest.TestCase):
+    def test_reads_back_from_the_last_page_until_before_the_cutoff_however_long_the_history(self):
+        op = CommentPages(25_000, 100)                   # 250 pages: past the whole-history reader's bound
+        got = MeshClient("https://m", "k", opener=op).comments_since("t1", op.comments[24_850]["created_at"])
+        self.assertEqual([c["id"] for c in got], [f"c{i}" for i in range(24_850, 25_000)])
+        self.assertEqual(op.pages, [1, 250, 249])         # the first page for the count, then two from the end
+
+    def test_a_cutoff_older_than_the_card_reads_every_page(self):
+        op = CommentPages(250, 100)
+        got = MeshClient("https://m", "k", opener=op).comments_since("t1", "2025-12-31T00:00:00Z")
+        self.assertEqual(len(got), 250)
+        self.assertEqual(op.pages, [1, 3, 2])             # page 1 is read once
+
+    def test_a_cutoff_inside_the_first_page_of_a_short_card(self):
+        op = CommentPages(30, 100)
+        got = MeshClient("https://m", "k", opener=op).comments_since("t1", op.comments[20]["created_at"])
+        self.assertEqual([c["id"] for c in got], [f"c{i}" for i in range(20, 30)])
+        self.assertEqual(op.pages, [1])
+
 if __name__ == "__main__":
     unittest.main()

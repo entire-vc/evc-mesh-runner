@@ -8,6 +8,8 @@ which is what makes a slot "warm".
 Safety rules:
 - a slot with uncommitted changes (or that git cannot inspect) is ``held`` with
   its reason and never wiped; held slots are re-checked and freed once clean;
+- a slot held only for uncommitted changes is leased again, as it is, to the next attempt of the same
+  card that continues its work (``lease(inherit_from=...)``, a turn-cap continuation), and to nobody else;
 - commits are never lost: branches are refs shared by all worktrees of the
   base clone and survive detaching; commits on a detached HEAD that the remote
   does not have are saved under ``refs/heads/runner-keep/<attempt>-<slot>``
@@ -45,6 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import progress
 from .store import OPEN, Store, iso
 
 log = logging.getLogger("mesh_runner")
@@ -105,6 +108,9 @@ class WorkspaceError(Exception):
     pass
 
 
+LOCK_WAIT_SLICE = 10.0       # seconds a TimedLock waits between two signs of life of its lane
+
+
 class CheckpointSuspendError(WorkspaceError):
     """A failed suspension, bound to the exact generation it tried to release."""
 
@@ -159,9 +165,14 @@ class TimedLock:
         return self._lock._is_owned()
 
     def __enter__(self):
-        if not self._lock.acquire(timeout=self._timeout):
-            raise WorkspaceError(f"lock {self._name} not acquired in {self._timeout:.0f}s; "
-                                 f"last holder: {self._holder or 'unknown'}")
+        # The wait is cut into slices so a lane waiting on another lane's repository still shows
+        # it is alive; the total budget is unchanged.
+        deadline = time.monotonic() + self._timeout
+        while not self._lock.acquire(timeout=max(0.0, min(LOCK_WAIT_SLICE, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline:
+                raise WorkspaceError(f"lock {self._name} not acquired in {self._timeout:.0f}s; "
+                                     f"last holder: {self._holder or 'unknown'}")
+            progress.beat()
         self._holder = threading.current_thread().name
         return self
 
@@ -225,6 +236,12 @@ def _fetch_ref_cas_only(stderr: str) -> bool:
     return found
 
 
+def _run_git(argv: list[str], *, env: dict[str, str], timeout: float) -> subprocess.CompletedProcess:
+    """One git process: its wait is cut into slices, so a lane whose tick runs a slow git command
+    (a fetch, a checkpoint of a large worktree) keeps publishing its status row."""
+    return progress.run(argv, timeout=timeout, text=True, errors="surrogateescape", env=env)
+
+
 def git(cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None,
         timeout: int = 600) -> str:
     env = dict(env if env is not None else os.environ)
@@ -235,8 +252,7 @@ def git(cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired("git", timeout)
-            res = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
-                                 errors="surrogateescape", timeout=remaining, env=env)
+            res = _run_git(["git", "-C", str(cwd), *args], env=env, timeout=remaining)
         except subprocess.TimeoutExpired:
             raise WorkspaceError(f"git {' '.join(args[:2])} in {cwd}: timed out") from None
         if (attempt == 0 and check and args and args[0] == "fetch"
@@ -259,6 +275,7 @@ def _copy_file_fd(src: str, dfd: int, name: str) -> None:
         out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=dfd)
         try:
             while chunk := os.read(sfd, 1 << 20):
+                progress.beat()
                 view = memoryview(chunk)
                 while view:
                     view = view[os.write(out, view):]
@@ -306,6 +323,7 @@ def _entry_digest(path: str) -> dict:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
+            progress.beat()
             h.update(chunk)
     return {"t": "file", "sha256": h.hexdigest(), "size": st.st_size}
 
@@ -807,10 +825,59 @@ class WorkspacePool:
             (str(path), self._pool(repo), attempt, state, note, iso()))
 
     # -- lease / release ---------------------------------------------------------------
-    def lease(self, attempt_id: str, repo_name: str, *, preferred_path: str | None = None) -> Path:
+    def lease(self, attempt_id: str, repo_name: str, *, preferred_path: str | None = None,
+              inherit_from: frozenset[str] | set[str] = frozenset()) -> Path:
+        """A slot for ``attempt_id``. ``inherit_from``: earlier attempts of the same card whose work goes
+        on in this one (a turn-cap continuation, ``runner._turn_cap_carry``); when ``preferred_path`` is
+        a slot one of them left held for uncommitted changes, that slot is leased as it is."""
         repo = self.repos[repo_name]
         with base_lock(repo.base):
+            inherited = self._inherit(attempt_id, repo_name, repo, preferred_path, inherit_from)
+            if inherited is not None:
+                return inherited
             return self._lease(attempt_id, repo_name, repo, preferred_path=preferred_path)
+
+    def inheritable(self, path: str | None, inherit_from: frozenset[str] | set[str]) -> bool:
+        """``path`` is a slot of this pool held only for uncommitted changes by one of ``inherit_from``.
+        Database only: the cheap pre-check a start makes before its checkout; ``lease`` still decides."""
+        if not path or not inherit_from:
+            return False
+        row = self.store.db.execute("SELECT state, note, attempt FROM slots WHERE path=? AND pool LIKE ?",
+                                    (path, f"{self.owner}/%")).fetchone()
+        return bool(row) and row[0] == "held" and row[1] == DIRTY_HOLD_NOTE and row[2] in inherit_from
+
+    def _inherit(self, attempt_id: str, repo_name: str, repo: RepoSpec, path: str | None,
+                 inherit_from: frozenset[str] | set[str]) -> Path | None:
+        """Lease ``path`` to ``attempt_id`` as it is: a slot of this pool that an earlier attempt of the
+        same card (one of ``inherit_from``) left held for uncommitted changes. Its working tree, index,
+        unfinished merge and ignored files are the card's work in progress: nothing in it is touched, the
+        row alone changes, by a compare-and-swap on the row as read. None (the ordinary lease follows)
+        when the row is anything else, a maintenance window holds it, or its admin link is not sound."""
+        if not path or not inherit_from:
+            return None
+        row = next((r for r in self._rows(repo_name) if r["path"] == path), None)
+        if (row is None or row["state"] != "held" or row["note"] != DIRTY_HOLD_NOTE
+                or row["attempt"] not in inherit_from):
+            return None
+        slot = Path(path)
+        try:
+            self._maintenance_guard(row["attempt"], path)
+            why = self._admin_reason(slot, repo)
+        except WorkspaceError as e:
+            why = str(e)
+        if why:
+            log.warning("%s: held worktree %s of attempt %s not carried to attempt %s: %s",
+                        self.owner, path, row["attempt"][:8], attempt_id[:8], why)
+            return None
+        cur = self.store.db.execute(
+            "UPDATE slots SET attempt=?, state='leased', note='', updated_at=? "
+            "WHERE path=? AND state='held' AND attempt=? AND note=? AND updated_at=?",
+            (attempt_id, iso(), path, row["attempt"], DIRTY_HOLD_NOTE, row["updated_at"]))
+        if cur.rowcount != 1:
+            return None                    # `free-slot` or the dead-slot pass won the row meanwhile
+        log.info("%s: held worktree %s carried from attempt %s to attempt %s with its uncommitted work",
+                 self.owner, path, row["attempt"][:8], attempt_id[:8])
+        return slot
 
     def _suspended_sources(self, repo_name: str, attempt_id: str) -> set[str]:
         """Slots that other attempts of this pool were suspended from and have not been restored to."""
@@ -1754,6 +1821,7 @@ class WorkspacePool:
                 cfd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
                 with os.fdopen(cfd, "rb") as b:
                     while True:
+                        progress.beat()
                         x, y = a.read(1 << 20), b.read(1 << 20)
                         if x != y:
                             raise WorkspaceError(f"archived file differs: {name}")
@@ -1829,6 +1897,7 @@ class WorkspacePool:
                             os.close(sparent)
                             os.close(qparent)
                     for _r, _d, _f, dfd in os.fwalk(".", dir_fd=run):    # every directory created inside the run
+                        progress.beat()
                         os.fsync(dfd)
                     if not alive():
                         # the archive vanished after the renames: never free the slot on a missing archive,
@@ -2022,8 +2091,8 @@ class WorkspacePool:
         done = False
         self._moved_any = False
         try:
-            res = subprocess.run(["git", "-C", str(path), "ls-files", "--others", "--exclude-standard",
-                                  "-z", "--directory"], capture_output=True, timeout=600, env=env)
+            res = progress.run(["git", "-C", str(path), "ls-files", "--others", "--exclude-standard",
+                                "-z", "--directory"], timeout=600, env=env)
             if res.returncode != 0:
                 raise WorkspaceError(f"ls-files in {path}: {res.stderr.decode(errors='replace').strip()[:200]}")
             names = [os.fsdecode(n) for n in res.stdout.split(b"\0") if n]    # raw: no strip of odd names
@@ -2076,6 +2145,7 @@ class WorkspacePool:
                 return
             os.fchmod(dest, 0o700)
             for _r, dirs, files, dfd in os.fwalk(".", dir_fd=dest, topdown=False):
+                progress.beat()
                 os.fchmod(dfd, 0o700)                # copied directories keep the source mode (e.g. 0555)
                 for f in files:
                     os.unlink(f, dir_fd=dfd)
@@ -2101,6 +2171,7 @@ class WorkspacePool:
             if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISDIR(now.st_mode):
                 return
             for _r, dirs, files, dfd in os.fwalk(".", dir_fd=fd, topdown=False):
+                progress.beat()
                 for f in files:
                     os.unlink(f, dir_fd=dfd)
                 for d in dirs:

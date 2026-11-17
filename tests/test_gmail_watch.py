@@ -416,11 +416,11 @@ class RunnerGmail(Bench):
                            resume_agent=RESUME, predicate=gw.build_predicate(from_addr=SENDER, thread=THREAD),
                            source_task=SRC, **kw)['registration_id']
 
-    def declare(self, reg_id):
+    def declare(self, reg_id, ahead=5):
         path = self.root / 'turn.jsonl'
         path.write_text(json.dumps(dict(type='result', subtype='success', is_error=False,
                         result='Recorded the outcome through Mesh.', session_id='s')) + '\n')
-        at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=5)).isoformat()
+        at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=ahead)).isoformat()
         row, wait = turn_rows(wait_registered('gmail', reg_id), at=at)
         self.r.mesh.outcomes = {self.obs: [row]}
         self.r.mesh.waits = {self.obs: wait}
@@ -528,6 +528,53 @@ class RunnerGmail(Bench):
         self.r._wake_one(self.a)
         self.assertEqual(self.a.state, 'ready')
         self.assertIn('cancelled', self.a.wake_text)
+
+    def comment_after_wait(self, body, author='lead'):
+        at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=30)    # after the wait's Mesh-clock since
+        return self.r.mesh.add_comment(self.obs, body, author=author, at=at)
+
+    def test_addressed_comment_wakes_a_gmail_wait_and_the_registration_stays(self):
+        """A lead's ``@lane`` question on the card slept for days behind a gmail wait. An address
+        that opens a line wakes the session; the registration is not touched, so the same wait is declared
+        again and the message still wakes it exactly once."""
+        reg = self.waiting()
+        self.comment_after_wait('@builder what is the status of the reply?')
+        self.r._wake_one(self.a)
+        self.assertEqual(self.a.state, 'ready')
+        self.assertIn('what is the status of the reply?', self.a.wake_text)
+        self.assertIn('registration=gmail registration_ref=%s' % reg, self.a.wake_text)
+        self.assertEqual(gw.status(self.r.store, reg)['state'], 'active')
+        self.r.store.update(self.a, state='running')
+        self.declare(reg, ahead=60)                                       # the same wait, declared after the answer
+        self.assertEqual((self.a.state, self.a.wait['kind']), ('waiting', 'gmail'))
+        self.r._wake_one(self.a)
+        self.assertEqual(self.a.state, 'waiting')                         # the answered comment is not news again
+        self.reader.records.append(rec('m0000003', T0 + 1000))
+        self.scan_at(200_000)
+        self.r._wake_one(self.a)
+        self.assertEqual(self.a.state, 'ready')
+        self.assertIn('gmail:%s fired message_id=m0000003' % reg, self.a.wake_text)
+
+    def test_unaddressed_comments_do_not_end_a_gmail_wait(self):
+        """Control: a remark that names the lane inside a sentence, the lane's own note and a runner note
+        are not an address; the wait still ends only on its own event."""
+        self.waiting()
+        self.comment_after_wait('note: asked @builder about it yesterday')
+        self.comment_after_wait('@builder self note', author='agent-1')
+        self.comment_after_wait('[runner] @builder bookkeeping')
+        self.r._wake_one(self.a)
+        self.assertEqual(self.a.state, 'waiting')
+
+    def test_the_message_wins_over_a_comment_in_the_same_tick(self):
+        reg = self.waiting()
+        self.reader.records.append(rec('m0000003', T0 + 1000))
+        self.scan_at(200_000)
+        self.comment_after_wait('@builder any news?')
+        self.r._wake_one(self.a)
+        self.assertEqual(self.a.state, 'ready')
+        self.assertIn('gmail:%s fired message_id=m0000003' % reg, self.a.wake_text)
+        self.assertEqual(self.r.store.db.execute(
+            "SELECT COUNT(*) FROM gmail_outbox WHERE kind='wake' AND state='acked'").fetchone()[0], 1)
 
     def test_F20_two_reads_for_one_registration_cannot_overlap(self):
         reg = self.waiting()

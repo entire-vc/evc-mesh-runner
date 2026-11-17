@@ -490,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
     if args_in and args_in[0] == "workspace-readiness":
         return _workspace_readiness(args_in[1:])
     p = argparse.ArgumentParser(prog="mesh-runner")
-    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "quarantine-list", "quarantine-restore", "pool", "suspend-wait-workspace", "admit-workspace-repo", "admit-git-index", "workspace-maintenance", "clear-auth-hold", "rearm-cap"])
+    p.add_argument("command", choices=["run", "once", "status", "plan", "slots", "free-slot", "quarantine-list", "quarantine-restore", "pool", "suspend-wait-workspace", "admit-workspace-repo", "admit-git-index", "workspace-maintenance", "clear-auth-hold", "rearm-cap", "rearm-review", "api-budget"])
     p.add_argument("--config", required=True)
     p.add_argument("--path", help="slot path for free-slot / quarantine-list / quarantine-restore")
     p.add_argument("--run", help="quarantine-restore: quarantine run name (see quarantine-list)")
@@ -566,6 +566,50 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"eligible": False, "reason": str(exc)}))
             return 1
         print(json.dumps(result))
+        return 0
+
+    if args.command == "rearm-review":
+        # the count of review attempts without a verdict starts again (audited); ordinary admission still runs
+        from . import review_cap
+        from uuid import UUID
+        import getpass
+        if not args.agent or not args.task or not args.reason or not args.reason.strip():
+            p.error("rearm-review requires --agent, --task and --reason")
+        if args.apply and args.dry_run:
+            p.error("choose --apply or --dry-run")
+        try:
+            if str(UUID(args.task)) != args.task:
+                raise ValueError()
+        except ValueError:
+            p.error("--task must be a full canonical UUID")
+        cfg = config_mod.load(args.config)
+        if not any(a.name == args.agent for a in cfg.agents):
+            p.error("--agent must name an exact configured lane")
+        store = Store(cfg.state_dir / "runner.sqlite")
+        try:
+            result = review_cap.request(store, args.agent, args.task, args.reason,
+                                        by=f"operator:{getpass.getuser()}", apply=args.apply)
+        except ValueError as exc:
+            print(json.dumps({"eligible": False, "reason": str(exc)}))
+            return 1
+        print(json.dumps(result))
+        return 0
+
+    if args.command == "api-budget":
+        # the spend pools of API mode: cap, settled spend, open reservations (amounts only, no key)
+        from . import api_mode
+        cfg = config_mod.load(args.config)
+        api = cfg.api or api_mode.ApiConfig()
+        if not api.pools:
+            print(json.dumps({"pools": [], "note": "no [api] spend pool is configured"}))
+            return 1
+        ledger = api_mode.Ledger(api.ledger or cfg.state_dir / "api-spend.sqlite", api.pools)
+        try:
+            pools = [{k: v for k, v in ledger.status(ref).items() if k != "spent_micros"} for ref in sorted(api.pools)]
+        except api_mode.Refused as exc:
+            print(json.dumps({"error": exc.reason}))
+            return 1
+        print(json.dumps({"ledger": str(ledger.path), "pools": pools}, indent=1))
         return 0
 
     if args.command == "clear-auth-hold":

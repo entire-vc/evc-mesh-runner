@@ -195,5 +195,33 @@ class ChatTurn(unittest.TestCase):
         self.assertNotIn("secret", repr(client))
 
 
+class HostCap(unittest.TestCase):
+    """the cap full of busy sessions for the driver's whole wait is not the end of a chat turn. Mesh
+    holds the turn, started; the lease goes on while the delivery waits for a slot, the reply lands once."""
+
+    def delivery(self, busy_runs):
+        import sys
+        import tempfile
+        from pathlib import Path
+        from mesh_runner.chat_delivery import DriverDelivery
+        from test_chat_delivery import busy_then_turn
+        self.root = Path(tempfile.mkdtemp())
+        script = busy_then_turn(self.root, busy_runs)
+        return DriverDelivery("claude", lambda t: ([sys.executable, "-c", script], self.root, {}, t["message"]["body"]),
+                              self.root / "logs", poll=0.02, term_wait=2)
+
+    def test_a_full_host_keeps_the_turn_waiting_and_it_is_answered_once(self):
+        d = self.delivery(2)
+        mesh, client, runner = make(d, clock=time.monotonic)
+        turn = claim(mesh, client, "ping")
+        out = runner.run(turn)
+        t = mesh.turns[turn["turn_id"]]
+        self.assertEqual(out.state, "done")
+        self.assertEqual((t["state"], t["text"]), ("done", "Hi"))
+        self.assertNotIn("error", [e["type"] for e in t["events"]])
+        self.assertEqual([e["seq"] for e in t["events"]], list(range(1, len(t["events"]) + 1)))
+        self.assertEqual((self.root / "delivered").read_text().splitlines(), ["ping"])   # exactly one turn
+
+
 if __name__ == "__main__":
     unittest.main()

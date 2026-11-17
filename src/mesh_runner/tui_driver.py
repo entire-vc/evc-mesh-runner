@@ -30,8 +30,8 @@ if __package__ in (None, ""):                         # run as a file by the run
 
 from mesh_runner.adapters.base import STAMP_V2, precise_stamp  # noqa: E402
 
-from mesh_runner.interactive import (BACKGROUND_WAIT_MINUTES, CHAT_PREFIX, GUARD, HOOK, PATH_GUARD_ENV,  # noqa: E402
-                                     Tmux, forget, pid_alive,
+from mesh_runner.interactive import (BACKGROUND_WAIT_MINUTES, CHAT_PREFIX, GUARD, HOOK, HOST_WAIT_EVENT,  # noqa: E402
+                                     PATH_GUARD_ENV, Tmux, forget, pid_alive,
                                      meta_path, read_meta, session_name, write_meta, write_progress,
                                      read_delivery, write_delivery)
 from mesh_runner import path_guard  # noqa: E402
@@ -137,6 +137,14 @@ def background_agents(screen: str) -> list[str]:
     return agents
 
 
+# Claude Code starts a turn by itself when a background task (a background Bash, a Monitor, a background
+# agent) finishes: its UserPromptSubmit hook carries the notification as the prompt, under a prompt_id of
+# its own. Its Stop hook lists the tasks still running in ``background_tasks`` ([{"id", "type", "status"}]).
+TASK_NOTIFICATION_RE = re.compile(r"^\s*<task-notification>")
+# A Mesh turn command: once the turn called one, its outcome is recorded and nothing is held for a task.
+TURN_COMMAND_RE = re.compile(r"^mcp__[^_].*__(?:wait_for|continue_next|ask_agent|ask_human|finish_task|hand_off)$")
+
+
 PASTE_WRAP_RE = re.compile(r"</?pasted_content[^>]*>")
 SCAN_CHUNK = 1 << 20
 ROLLOUT_TAIL = 1 << 16         # Codex: how much of the rollout's end says whether a task is open
@@ -221,6 +229,11 @@ class DriverError(Exception):
     def __init__(self, message: str, close: bool = False):
         super().__init__(message)
         self.close = close                     # the window is unusable: close it
+
+
+class HostBusy(DriverError):
+    """The window was not started: the host had no room for it (every slot of the cap busy, or the memory floor)
+    for the whole wait. Nothing was started or pasted, so the same turn can be driven again."""
 
 
 class Cancelled(Exception):
@@ -685,11 +698,11 @@ class Driver:
         if not isinstance(item, dict):
             return None
         if rec.get("type") == "event_msg" and item.get("type") == "turn_aborted":
-            return {"message": "", "error": "interrupted"}
+            return {"message": "", "error": "interrupted", "aborted": True}
         if rec.get("type") == "response_item" and item.get("type") == "message" and item.get("role") == "developer":
             text = "".join(str(c.get("text") or "") for c in item.get("content") or [] if isinstance(c, dict))
             if text.lstrip().startswith("<turn_aborted>"):
-                return {"message": "", "error": "interrupted"}
+                return {"message": "", "error": "interrupted", "aborted": True}
         return None
 
     def beat(self, phase: str = "", force: bool = False, moved: bool = False) -> None:
@@ -845,31 +858,39 @@ class Driver:
         inner = f". {f}; rm -f {f}; exec {' '.join(shlex.quote(x) for x in argv)}"
         try:
             deadline = self.clock() + self.t["cap_wait"]
-            told = False
+            told = waited = False
             while True:
                 with self.host_lock():                   # count, evict and create as one step
                     short = self.memory_short()          # read now, not the runner's cached reading
                     if not short and self.make_room():
                         self.new_window(["/usr/bin/env", "-i", "/bin/sh", "-c", inner])
-                        self.save()                      # busy before the lock lets anyone count it
+                        # complete before the lock lets anyone count it: busy, and just started, so a rival's
+                        # make_room never reads it as idle since the epoch (last_end=0) when no live claim protects it
+                        self.meta.update({"harness": self.harness, "digest": self.digest(), "session_id": self.sid,
+                                          "started": self.clock(), "last_end": self.clock(), "transcript": ""})
+                        self.save()
                         break
                 if short and not told:
                     print(f"interactive: host short of memory ({short}), the window waits", file=sys.stderr, flush=True)
                     told = True
+                if not waited:                           # a chat delivery tells a wait for room from a turn
+                    waited = True
+                    self.emit({"type": HOST_WAIT_EVENT, "state": "waiting", "reason": "memory" if short else "cap"})
                 if self.clock() > deadline:
-                    if short:                            # nothing was pasted: the runner retries the start
-                        raise DriverError(f"host short of memory ({short}); the session was not started")
+                    # nothing was started or pasted: the runner retries a card's start, a chat waits on
+                    self.emit({"type": HOST_WAIT_EVENT, "state": "timeout", "reason": "memory" if short else "cap"})
+                    if short:
+                        raise HostBusy(f"host short of memory ({short}); the session was not started")
                     # every live window runs a turn
-                    raise DriverError(f"host session cap reached ({self.max_sessions} live sessions, all busy)")
+                    raise HostBusy(f"host session cap reached ({self.max_sessions} live sessions, all busy)")
                 self.check_cancel()
                 self.beat()
                 self.sleep(self.t["cap_poll"])
+            if waited:
+                self.emit({"type": HOST_WAIT_EVENT, "state": "room"})
         except (DriverError, Cancelled):
             env_file.unlink(missing_ok=True)
             raise
-        self.meta.update({"harness": self.harness, "digest": self.digest(), "session_id": self.sid,
-                          "started": self.clock(), "last_end": self.clock(), "transcript": ""})
-        self.save()
         self.wait_ready()
 
     def wait_ready(self) -> None:
@@ -1026,20 +1047,74 @@ class Driver:
 
     def done(self, base: int) -> dict | None:
         """The last end-of-turn event of OUR prompt. Claude: Stop/StopFailure carrying our
-        prompt_id (an earlier, cut-off turn's Stop does not count)."""
+        prompt_id (an earlier, cut-off turn's Stop does not count), or the prompt_id of a turn
+        Claude Code started by itself on a background task's notification after our prompt:
+        that turn continues ours (``continuations``)."""
         found = None
-        for ev in self.read_events()[base:]:
+        events = self.read_events()[base:]
+        follow = self.continuations(events) if self.harness == "claude" else set()
+        for ev in events:
             if self.harness == "claude" and ev.get("hook_event_name") in ("Stop", "StopFailure"):
                 pid = str(ev.get("prompt_id") or "")
                 # a Stop must name our prompt (both unnamed only on a harness without ids);
                 # a failure may not name it: after ours was taken, it is this turn's
                 if (not pid and ev.get("hook_event_name") == "StopFailure") or \
-                        (pid and pid == self.prompt_id) or \
+                        (pid and (pid == self.prompt_id or pid in follow)) or \
                         (not pid and not self.prompt_id and self.reply_in_turn(ev)):
                     found = ev
             elif self.harness == "codex" and ev.get("type") == "agent-turn-complete" and self.ours(ev):
                 found = ev
         return found
+
+    def continuations(self, events: list[dict]) -> set[str]:
+        """prompt_ids of the turns Claude Code started by itself on a background task's notification
+        after our prompt was submitted. A notification turn before our UserPromptSubmit belongs to
+        an earlier turn and never counts; without a known prompt_id of ours there are none."""
+        if not self.prompt_id:
+            return set()
+        ids, after = set(), False
+        for ev in events:
+            if ev.get("hook_event_name") != "UserPromptSubmit":
+                continue
+            pid = str(ev.get("prompt_id") or "")
+            if pid == self.prompt_id:
+                after = True
+            elif after and pid and TASK_NOTIFICATION_RE.match(str(ev.get("prompt") or "")):
+                ids.add(pid)
+        return ids
+
+    def running_background(self, ev: dict) -> list[str]:
+        """The background tasks a Claude Stop lists as still running, when the turn so far called no
+        Mesh turn command: the session will go on by itself once one of them finishes, so its turn
+        is not over. Empty for any other event, a turn that already called a turn command, or a
+        Claude Code that reports no ``background_tasks``."""
+        if self.harness != "claude" or ev.get("hook_event_name") != "Stop":
+            return []
+        running = [str(t.get("id") or t.get("type") or "task") for t in ev.get("background_tasks") or []
+                   if isinstance(t, dict) and str(t.get("status") or "") == "running"]
+        if not running or self.turn_command_called(str(ev.get("transcript_path") or "")):
+            return []
+        return running
+
+    def turn_command_called(self, path: str = "") -> bool:
+        """The turn (our prompt and the notification turns after it) called a Mesh turn command that
+        did not come back as an error."""
+        try:
+            with open(self.meta.get("transcript") or path, "rb") as fh:
+                fh.seek(self.turn_offset)
+                entries = [json.loads(x) for x in fh if x.strip().startswith(b"{")]
+        except (OSError, ValueError):
+            return False
+        calls, failed = set(), set()
+        for e in self.slice_turn(entries):
+            for b in (e.get("message") or {}).get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and TURN_COMMAND_RE.match(str(b.get("name") or "")):
+                    calls.add(str(b.get("id") or ""))
+                elif b.get("type") == "tool_result" and b.get("is_error"):
+                    failed.add(str(b.get("tool_use_id") or ""))
+        return bool(calls - failed)
 
     def reply_in_turn(self, ev: dict) -> bool:
         """A Stop that names no prompt (a harness without prompt ids) is ours only if its
@@ -1196,6 +1271,7 @@ class Driver:
         self.beat("sent", force=True)
         scan_at, banner_seen, stop_seen = self.clock() + self.t["scan"], "", None
         end_seen = None
+        held_on, held_until = None, 0.0               # the settled Stop held for its background tasks
         while True:
             self.beat()
             self.bind_native_late()
@@ -1204,7 +1280,7 @@ class Driver:
             if self.cancelled:
                 self.interrupt(base)
             ev = self.done(base)
-            if ev is not None:
+            if ev is not None and ev != held_on:
                 # another Stop hook may block the stop and Claude goes on: the turn is over
                 # when the session is idle, its transcript settled and no newer Stop came —
                 # or, so a status line that never clears cannot hold the turn, after stop_wait
@@ -1212,7 +1288,43 @@ class Driver:
                 if self.harness == "codex" or ev.get("hook_event_name") == "StopFailure" or \
                         (self.wait_idle(self.t["settle"] * 3) and self.done(base) == ev) or \
                         self.clock() - stop_seen > self.t["stop_wait"]:
-                    return {"event": self.done(base) or ev, "offset": offset, "totals": totals}
+                    final = self.done(base) or ev
+                    running = self.running_background(final)
+                    if running and self.t["background_wait"] > 0:
+                        # The turn ended on text while its background check still runs: Claude Code
+                        # goes on by itself when the check finishes, and that turn's Stop ends ours.
+                        # Settling now reads "no outcome" and pastes a correction into a session that
+                        # is about to resume on its own. The wait counts from the last such Stop: a
+                        # session that runs its checks one after another is working, not stuck (the
+                        # turn's own limits still bound it: turn_idle_minutes, max_turn_minutes).
+                        held_until = self.clock() + self.t["background_wait"]
+                        if held_on is None:
+                            print("interactive: the turn ended with %d background task(s) running (%s) and "
+                                  "no turn command: waiting up to %g min for the session to go on" % (
+                                      len(running), ", ".join(running)[:120], self.t["background_wait"] / 60),
+                                  file=sys.stderr, flush=True)
+                            self.progress["held"] = True
+                            self.beat(force=True)
+                        else:
+                            print("interactive: the session went on and stopped again with %d background task(s) "
+                                  "running (%s): waiting up to %g min more" % (
+                                      len(running), ", ".join(running)[:120], self.t["background_wait"] / 60),
+                                  file=sys.stderr, flush=True)
+                        held_on, stop_seen = final, None
+                        continue
+                    self.progress["held"] = False
+                    return {"event": final, "offset": offset, "totals": totals}
+                continue
+            if held_on is not None:
+                if self.clock() >= held_until:
+                    self.progress["held"] = False
+                    print("interactive: the session did not go on within %g min of its last stop with "
+                          "background task(s) running, the turn ends" % (self.t["background_wait"] / 60),
+                          file=sys.stderr, flush=True)
+                    return {"event": self.done(base) or held_on, "offset": offset, "totals": totals}
+                if self.window_state() != "alive":
+                    raise DriverError("interactive session exited: " + self.tail(), close=True)
+                self.sleep(self.t["background_poll"])
                 continue
             if self.turn_end is not None:
                 # The rollout says the task ended after our prompt. Codex calls its notify only for a task
@@ -1529,6 +1641,12 @@ class Driver:
                         if current is not None and previous is not None else None)
         self.codex_thread_started(thread)
         final = str(ev.get("last-assistant-message") or "")
+        end = self.turn_end or {}
+        # A provider's terminal error before any model record (a policy refusal, an auth or API failure)
+        # is a failed turn: nothing in it could have recorded an outcome. After model work the turn may
+        # already have recorded one, and an interrupt is not the provider's verdict: both stay a turn
+        # without a final message, so the runner reads Mesh first.
+        error = end.get("error") if not end.get("output") and not end.get("aborted") else ""
         # The final message was streamed only when the rollout was read to the task's end and the last
         # message read from it (none skipped after it) is exactly that text (Codex writes the same string
         # to both); equal text of an earlier message proves nothing. Otherwise (a record longer than one
@@ -1536,11 +1654,14 @@ class Driver:
         streamed = self.turn_end is not None and self.said_last and bool(self.said) and final == self.said[-1]
         if final and not streamed:
             self.emit_codex_text(final)
-        elif not self.said:
+        elif not self.said and not error:
             # no text at all: the turn still carries its (empty) message item, as before streaming
             self.emit({"type": "item.completed", "item": {"type": "agent_message", "text": final}})
-        # a turn without a final message says why (an API error, no model output); readers that do
-        # not know the field see the same empty turn as before
+        # That error reaches the runner's failure handling, even without a notify or final message.
+        # A genuinely empty successful turn still uses no_reply below.
+        if error:
+            self.emit({"type": "turn.failed", "error": {"message": error}, "usage": usage})
+            return False
         why = "" if ev.get("last-assistant-message") else str(ev.get("no-reply") or "no final message")
         self.emit({"type": "turn.completed", "usage": usage, **({"no_reply": why[:300]} if why else {})})
         return True
