@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.120 — 2026-11-22
+
+- Hold a provider-limited task until its quota resets when no switch target is available, preserving its checkpoint and allowing other tasks to run.
+- Dismiss an expired provider limit notice before sending the next prompt.
+
+## 0.2.119 — 2026-11-22
+
+- Recognize the active terminal busy region without treating historical output as a current busy signal.
+
 ## 0.2.118 — 2026-11-22
 
 - Require independent source review for pinned external merge requests when a task merge request is already merged.

@@ -35,6 +35,7 @@ from mesh_runner.interactive import (BACKGROUND_WAIT_MINUTES, CHAT_PREFIX, GUARD
                                      meta_path, read_meta, session_name, write_meta, write_progress,
                                      read_delivery, write_delivery)
 from mesh_runner import path_guard  # noqa: E402
+from mesh_runner import limit_hold  # noqa: E402
 
 def read_own_meta(directory: Path, key: str) -> dict | None:
     """The window's metadata under this runner's state root, or None when the file is absent or
@@ -69,6 +70,9 @@ BUSY_RE = re.compile(r"(esc to interrupt|esc to cancel|working \(|ctrl\+b to run
 LIMIT_NOTICE_RE = re.compile(r"(usage limit reached|continuing automatically at|"
                              r"hit your [\w -]{0,30}limit\b.*\bresets?\b)", re.I)
 LIMIT_NOTICE_LINES = 10        # the notice counts in the last non-empty lines only
+# The notice as Claude Code draws it: the line opens with it (after its ⏺/⎿ mark). A reply that quotes the
+# notice inside a sentence is text, not a limit.
+NATIVE_LIMIT_NOTICE_RE = re.compile(r"^(?:[⏺●⎿]\s*)?(?:you[’']?ve |you have )?(?:" + LIMIT_NOTICE_RE.pattern + ")", re.I)
 CODEX_READY_RE = re.compile(r"(ask codex to do anything|\? for shortcuts)", re.I)
 # Codex still starting: it shows the composer (so CODEX_READY_RE matches) while "Resuming session…" is on
 # screen, and a prompt entered then is queued under "Waiting for startup · esc cancel" until start-up
@@ -206,11 +210,48 @@ def _quota_menu_footer(text: str) -> int | None:
     return footer[0]
 
 
+# Claude Code's spinner line above the input box: a glyph at column 0, a space, the activity, "…" and its
+# parenthesised timer or hint ("✽ Forging… (1m 2s · ↓ 3.1k tokens)", "✶ Running the tests… (esc to
+# interrupt)"). A transcript line starts with ⏺/❯ or is indented; a wrapped line of text has not this shape.
+STATUS_LINE_RE = re.compile(r"[^\w\s⏺●❯>─]\s\S[^…]{0,100}…\s*\(")
+
+
+def _claude_live_start(lines: list[str]) -> int:
+    """First line of the live UI on a Claude Code screen that ends with its input box, else 0.
+
+    The box is a rule, a ``❯`` line and a later rule. Live are the box, everything below it (the
+    footer: "esc to interrupt", "ctrl+b to run in background", the agent list) and the status block
+    right above it: a column-0 spinner line ("✽ Forging… (1m 2s …)") with the indented ``⎿ Tip`` and
+    todo lines under it. Everything higher is the conversation, where a quoted or
+    wrapped "esc to cancel" is text, not a running turn. A screen without the box (a
+    permission dialog, the quota menu, Codex) is read whole, as before."""
+    filled = [i for i, line in enumerate(lines) if line.strip()]
+    box = None
+    for n in range(len(filled) - 2, 0, -1):
+        i = filled[n]
+        if (lines[i].lstrip().startswith("❯") and PROMPT_RULE_RE.match(lines[filled[n - 1]])
+                and any(PROMPT_RULE_RE.match(lines[j]) for j in filled[n + 1:])):
+            box = filled[n - 1]
+            break
+    if box is None:
+        return 0
+    above = [i for i in filled if i < box]
+    k = len(above) - 1
+    while k >= 0 and lines[above[k]][0] in " \t":    # its Tip, todo list and wrapped lines are indented
+        k -= 1
+    if k >= 0 and STATUS_LINE_RE.match(lines[above[k]]):
+        return above[k]
+    return box
+
+
 def is_busy(text: str) -> bool:
-    """A running turn on the screen. A usage-limit notice is not one, whatever hint it carries."""
+    """A running turn on the screen. A usage-limit notice is not one, whatever hint it carries, and
+    neither is a busy hint quoted in the conversation above Claude Code's status line and input box."""
     quota_footer = _quota_menu_footer(text)
-    return bool(BUSY_RE.search("\n".join(x for i, x in enumerate(text.splitlines())
-                                       if i != quota_footer and not LIMIT_NOTICE_RE.search(x))))
+    lines = text.splitlines()
+    live = _claude_live_start(lines)
+    return bool(BUSY_RE.search("\n".join(x for i, x in enumerate(lines) if i >= live
+                                       and i != quota_footer and not LIMIT_NOTICE_RE.search(x))))
 
 
 def limit_notice(text: str) -> str:
@@ -220,7 +261,7 @@ def limit_notice(text: str) -> str:
         return ""
     lines = [x.strip() for x in text.splitlines() if x.strip()][-LIMIT_NOTICE_LINES:]
     for line in reversed(lines):
-        if LIMIT_NOTICE_RE.search(line):
+        if NATIVE_LIMIT_NOTICE_RE.search(line):
             return line[:300]
     return ""
 
@@ -262,6 +303,7 @@ class Driver:
         self.moves = self.read_moves()
         self.python = python or sys.executable
         self.clock, self.sleep = clock, sleep
+        self.wall = lambda: datetime.now().astimezone()   # the host's local time, the zone a notice speaks
         self.t = {"ready": 180, "accept": 30, "poll": 1.0, "scan": 15, "interrupt": 6, "settle": 1.5,
                   # Codex: how long a queued prompt may wait for the harness to finish starting
                   "startup_wait": 300, "bootstrap_backoff": BOOTSTRAP_BACKOFF,
@@ -1185,6 +1227,25 @@ class Driver:
             self.progress["held"], self.progress["released_at"] = False, self.clock()
             self.beat(force=True, moved=True)
 
+    def live_limit_notice(self) -> str:
+        """The limit notice on the idle screen, unless the reset it states is already past: then it is the
+        notice of a limit that has ended, which a resumed Claude session shows again ("Usage limit reached ·
+        continuing automatically at 12am · esc to cancel" at 02:12, 21.11: a window that had reset at 00:00
+        failed some fifty turns before a paste). Such an offer to continue is dismissed once with Escape;
+        a past notice left in the history is not a limit. A live limit names a reset ahead, and one that
+        meets the prompt after the paste still ends the turn as a limit."""
+        notice = limit_notice(self.screen())
+        if not notice or self.harness != "claude" or limit_hold.notice_reset(notice, self.wall())[1] != "notice_passed":
+            return notice
+        if "esc to cancel" in notice.lower():
+            self.tmux.run("send-keys", "-t", self.target, "Escape")
+            self.sleep(self.t["settle"])
+            after = limit_notice(self.screen())
+            if after and limit_hold.notice_reset(after, self.wall())[1] != "notice_passed":
+                return after
+        print("interactive: a limit notice past its reset is not a limit: " + notice, file=sys.stderr, flush=True)
+        return ""
+
     def turn(self, prompt: str) -> dict:
         self.prompt, self.prompt_id = prompt, ""
         self.prompt_taken = False
@@ -1194,7 +1255,7 @@ class Driver:
         self.wait_background()
         # a limit notice still on the idle screen: the provider limit, and a pane that cannot be reused
         # (its screen keeps the notice after the stated time, so every later turn would meet it again)
-        notice = limit_notice(self.screen())
+        notice = self.live_limit_notice()
         if notice:
             if self.prompt_intent and self.harness == "claude":
                 # Quota is an operational failure, not proof the prompt was taken.

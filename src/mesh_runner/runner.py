@@ -56,6 +56,7 @@ from . import harness_hold
 from . import op_resolve
 from . import asks
 from . import card_wait_reconcile
+from . import limit_hold
 from . import deploy_inventory
 from . import next_action
 from . import merge_order
@@ -778,6 +779,10 @@ class AgentRunner:
         self._launch_obs: dict[str, tuple[str, float, launch_probe.Observation]] = {}   # task -> early candidate observation
         self._resume_hold: dict[str, float] = {}              # attempt -> until
         self._capacity_resume: set[str] = set()               # attempts whose resume hold came from a capacity/profile refusal
+        # attempt -> task of a provider-limit hold (`limit_hold_until` mark), and the attempts whose
+        # persisted hold this process has already read back (a restart must not resume before the reset)
+        self._limit_hold_tasks: dict[str, str] = {}
+        self._limit_hold_read: set[str] = set()
         self._hold_route: str | None = None                   # routed harness when the lane hold was taken
         self._route_hold_seen: tuple[str, dt.datetime] | None = None   # (route reason, first seen) of the lane
         # attempt -> (holder attempt, holder slot path, recheck at): resume held because its branch is
@@ -3401,10 +3406,12 @@ class AgentRunner:
             # A terminal auth failure is operational evidence, not completion
             # evidence for this task; do not write a completion comment onto a
             # card that has moved to another owner/status.
+            self._end_limit_streak(a)
             self._finish(a, "completed", "task left the agent's working statuses",
                          report=done and auth_profile is None)
             return
         if auth_profile is not None:
+            self._end_limit_streak(a)                  # not a limit: a later one starts a new streak
             self._authentication_failed(a, auth_profile)
             return
         stream_never_began = (not result.finished and not result.is_error and not result.final_text
@@ -3448,6 +3455,8 @@ class AgentRunner:
             result.is_error, result.error = True, stderr.strip()[-300:]
         if not result.is_error and (self.store.mark(self.agent.name, a.task_id, "outage_since") or ("",))[0]:
             self.store.mark(self.agent.name, a.task_id, "outage_since", "")   # the provider answered: the outage is over
+        if not result.is_error:
+            self._end_limit_streak(a)                  # the provider answered: the limit streak ends
         if result.is_error and result.upgrade_required:
             self._harness_upgrade_required(a, task, result.error_details or result.error)
             return
@@ -3470,12 +3479,15 @@ class AgentRunner:
                 # A headless turn carries the provider's typed verdict (rate_limit_event
                 # "rejected"): the account limit is read from it, not from the wording.
                 self.store.mark(self.agent.name, a.task_id, "quota_admission_required", a.id)
-                switched = self._switch_on_limit(a, result.rate_limit if result.rate_limit_rejected else None)
+                limit = result.rate_limit if result.rate_limit_rejected else None
+                # the limit's own words only: the model's final text and stderr may name any time
+                switched = self._route_limit(a, limit, lambda: result.error_details or result.error)
                 self.life.to_ready(a, pid=0, stamp="",
                     wake_text=prompts.wake_prompt(task,
                         "the provider limit was hit; account routing selected another account"
                         if switched else "the provider limit was hit; fresh account capacity admission is required"))
                 return
+            self._end_limit_streak(a)                  # another failure: not a limit in a row
             failures = a.no_outcome + 1
             startup = not result.session_id        # the harness reported none (Claude's pre-assigned a.session_id does not count)
             if startup:
@@ -4401,13 +4413,26 @@ class AgentRunner:
             self.store.update(a, note=f"authentication held; fallback rc={res.returncode}; attempt {tries}; {suffix}")
         return res.returncode == 0
 
-    def _switch_on_limit(self, a: Attempt, limit: dict | None = None) -> bool:
+    def _route_limit(self, a: Attempt, limit: dict | None, text) -> bool:
+        """A provider limit: ask account routing to switch; True when it did. A routing command that
+        ran and found no other account holds the resume (``_hold_unswitched_limit``). Without a
+        routing command, or when it could not run, the resume goes through capacity admission as
+        before: the start gate may still select an account."""
+        switched = self._switch_on_limit(a, limit)
+        if switched:
+            self._end_limit_streak(a)
+        elif switched is False:
+            self._hold_unswitched_limit(a, limit, text())
+        return bool(switched)
+
+    def _switch_on_limit(self, a: Attempt, limit: dict | None = None) -> bool | None:
         """Ask the operator's command to move the agent to another account or
-        profile. Exit 0 means it did; the next spawn reads the new environment.
+        profile. Exit 0 means it did (True); the next spawn reads the new environment. False: the
+        command ran and switched nothing; None: no command, or it could not run.
         ``limit``: the provider's typed verdict of a headless turn (``rate_limit_event``); its window
         and reset time go to the command, so the account returns at ``resetsAt``, not by a guess."""
         if not self.agent.on_limit_command:
-            return False
+            return None
         env = dict(os.environ, MESH_RUNNER_AGENT=self.agent.name, MESH_RUNNER_TASK=a.task_id, MESH_RUNNER_MODE=a.mode)
         if limit:
             env["MESH_RUNNER_LIMIT_SOURCE"] = "rate_limit_event"
@@ -4418,12 +4443,87 @@ class AgentRunner:
             res = progress.run(self.agent.on_limit_command, text=True, timeout=120, env=env)
         except (OSError, subprocess.TimeoutExpired) as e:
             log.warning("%s: on-limit command: %s", self.agent.name, e)
-            return False
+            return None
         self.store.event(a.id, "limit_switch", f"rc={res.returncode} {res.stdout.strip()[:200]}")
         self.emit("limit", a, switched=res.returncode == 0, detail=res.stdout.strip()[:200])
+        # format read by fiddler-exporter (_ONLIMIT_RE): the card is named by the hold line that follows
         log.info("%s: provider limit; on-limit command rc=%s %s", self.agent.name, res.returncode,
                  res.stdout.strip()[:120])
         return res.returncode == 0
+
+    def _hold_unswitched_limit(self, a: Attempt, limit: dict | None, text: str) -> None:
+        """Account routing found no other account: resuming now meets the same exhausted one (21.11:
+        76 resumes 20 s apart). Hold this attempt's resume until the window's reset when the provider
+        named it, else for a pause that grows with each limit in a row on the task. Runner-internal:
+        the card keeps its status, no task wait and no ``start_after``; a turn without an error ends
+        the streak."""
+        name, tid = self.agent.name, a.task_id
+        mark = self.store.mark(name, tid, "limit_hold_n")
+        try:
+            streak = int(mark[0]) + 1 if mark and mark[0] else 1
+        except ValueError:
+            streak = 1
+        self.store.mark(name, tid, "limit_hold_n", str(streak))
+        at = now().astimezone()                         # a notice without a zone speaks the host's local time
+        reset, source = limit_hold.reset_time(limit, text, at)
+        delay = limit_hold.hold_seconds(streak, reset, at)
+        until = time.monotonic() + delay
+        if until > self._resume_hold.get(a.id, 0):      # a longer hold set meanwhile stands
+            self._resume_hold[a.id] = until
+        # a confirmed pool or route change (invalidate_capacity_holds) may bring capacity before the reset
+        self._capacity_resume.add(a.id)
+        # the deadline outlives a runner restart: read back by _resume_hold_until
+        self._limit_hold_tasks[a.id] = tid
+        self._limit_hold_read.add(a.id)
+        self.store.mark(name, tid, "limit_hold_until", json.dumps(
+            {"attempt": a.id, "until": iso(at + dt.timedelta(seconds=delay))}))
+        self.store.event(a.id, "limit_hold", json.dumps(
+            {"seconds": delay, "streak": streak, "reset_at": iso(reset) if reset else None,
+             "source": source or "backoff"}))
+        log.info("%s: #%s provider limit, no account to switch to: resume held %d s (%s, %d in a row)",
+                 name, a.task8, delay, f"reset {iso(reset)} from {source}" if reset
+                 else f"no reset known{', ' + source if source else ''}", streak)
+
+    def _end_limit_streak(self, a: Attempt) -> None:
+        for key in ("limit_hold_n", "limit_hold_until"):
+            if (self.store.mark(self.agent.name, a.task_id, key) or ("",))[0]:
+                self.store.mark(self.agent.name, a.task_id, key, "")
+
+    def _resume_hold_until(self, a: Attempt) -> float:
+        """The attempt's resume hold (monotonic), with a provider-limit hold persisted before a runner
+        restart read back once per process: the restarted runner waits for the same reset."""
+        if a.id not in self._limit_hold_read:
+            self._limit_hold_read.add(a.id)
+            mark = self.store.mark(self.agent.name, a.task_id, "limit_hold_until")
+            try:
+                rec = json.loads(mark[0]) if mark and mark[0] else None
+            except ValueError:
+                rec = None
+            until = parse_time(rec.get("until")) if isinstance(rec, dict) and rec.get("attempt") == a.id else None
+            left = (until - now()).total_seconds() if until else 0
+            if left > 0:
+                hold = time.monotonic() + left
+                if hold > self._resume_hold.get(a.id, 0):
+                    self._resume_hold[a.id] = hold
+                self._capacity_resume.add(a.id)
+                self._limit_hold_tasks[a.id] = a.task_id
+                log.info("%s: #%s provider-limit hold read back: resume held %d s more",
+                         self.agent.name, a.task8, left)
+        return self._resume_hold.get(a.id, 0)
+
+    @staticmethod
+    def _limit_text(log_path: str | None) -> str:
+        """The limit notice the failed turn wrote (its last error result), for the reset it may state."""
+        if not log_path:
+            return ""
+        try:
+            events = read_events(Path(log_path))
+        except (OSError, ValueError):
+            return ""
+        for e in reversed(events):
+            if e.get("type") == "result" and e.get("is_error"):
+                return str(e.get("result") or "")[:500]
+        return ""
 
     def _record_rate_limit(self, a: Attempt, result: TurnResult) -> None:
         """The account windows the provider reported in this turn (``rate_limit_event`` /
@@ -5739,7 +5839,7 @@ class AgentRunner:
                     # The operator reads the failed log before prior is restored.
                     self.store.mark(self.agent.name, a.task_id, "quota_admission_required", a.id)
                     self._release_gate(a, "pre-send-quota")
-                    self._switch_on_limit(a)
+                    self._route_limit(a, None, lambda: self._limit_text(intent.get("log_path")))
                 # The durable phase precedes every native paste, not an inference
                 # from an empty log. The former driver is gone (or never registered).
                 # A headless quota end ran the native process, but bound no session
@@ -9149,7 +9249,7 @@ class AgentRunner:
                 break
             self._between()
             self._recheck_checkpoint_quarantine(a)
-            if time.monotonic() < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold.get(a.id, 0)):
+            if time.monotonic() < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold_until(a)):
                 continue
             if self._branch_blocked(a) or self._maintenance_held(a):
                 continue
@@ -12094,6 +12194,12 @@ class AgentRunner:
             self._capacity_resume.discard(aid)
             if self._resume_hold.pop(aid, None) is not None:
                 lifted = True
+            self._limit_hold_tasks.pop(aid, None)
+        # every persisted provider-limit hold of the lane, also one a restarted runner has not read back
+        # yet: the change makes it stale, a later restart must not restore it
+        for tid in self.store.marked(self.agent.name, "limit_hold_until"):
+            self.store.mark(self.agent.name, tid, "limit_hold_until", "")
+            lifted = True
         self._hold_route = None
         if lifted:
             log.info("%s: capacity hold lifted (%s); the next cycle re-checks the gate", self.agent.name, why)
@@ -12499,7 +12605,7 @@ class AgentRunner:
             for task_id, a in ready.items():
                 weight = self._ramp_weight(task_id, resuming=True)
                 if (weight <= 0
-                        or mono < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold.get(a.id, 0))
+                        or mono < max(self._quarantine.get((a.id, "resume"), 0), self._resume_hold_until(a))
                         or self._branch_blocked(a) or self._maintenance_held(a)
                         or not self._ready_root_claims(a)):
                     continue
