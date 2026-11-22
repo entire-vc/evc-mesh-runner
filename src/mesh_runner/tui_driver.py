@@ -295,6 +295,9 @@ class Driver:
         self.out = out or sys.stdout
         self.env = {k: v for k, v in dict(os.environ if env is None else env).items() if not SCRUB_ENV.match(k)}
         self.prompt_intent = self.env.pop("_MESH_RUNNER_PROMPT_INTENT", "")
+        # ensure_session started a new window on a resumed session: until our paste its screen is the
+        # session's drawn history, not this account's state (see live_limit_notice)
+        self.resumed_history = False
         self.prompt_sha256 = self.env.pop("_MESH_RUNNER_PROMPT_SHA256", "")
         # The session's working copies moved: the runner kept it only because this launch installs the
         # path guard. Read the map now, before a window rebuild's forget() drops the file; it is written
@@ -997,6 +1000,7 @@ class Driver:
                              ("session", bool(self.sid) and self.meta.get("session_id") not in ("", self.sid)),
                              ("window dead", state == "dead")) if bad))
         print(f"interactive: {why}", file=sys.stderr, flush=True)
+        self.resumed_history = False
         if reuse:
             # a busy session (it goes on after a background task, or a cut-off turn still
             # runs) is not interrupted: turn() waits for it to become idle before pasting
@@ -1009,6 +1013,7 @@ class Driver:
         self.save()                                      # still claimed while the window is rebuilt
         self.beat(force=True)                            # forget() dropped the progress file too
         self.start_window()
+        self.resumed_history = self.mode == "resume"
 
     # ------------------------------------------------------------------ turn
     def paste(self, prompt: str) -> None:
@@ -1233,17 +1238,26 @@ class Driver:
         continuing automatically at 12am · esc to cancel" at 02:12, 21.11: a window that had reset at 00:00
         failed some fifty turns before a paste). Such an offer to continue is dismissed once with Escape;
         a past notice left in the history is not a limit. A live limit names a reset ahead, and one that
-        meets the prompt after the paste still ends the turn as a limit."""
+        meets the prompt after the paste still ends the turn as a limit.
+
+        A window just started on a resumed session shows nothing but that session's history: a notice there,
+        whatever reset it names, is the limit of the account the session last ran on, which may be another
+        (22.11 09:17: a session carried over from an exhausted account failed four resumes in a row under a
+        free one on the old account's weekly notice). This account's own limit meets the paste."""
         notice = limit_notice(self.screen())
-        if not notice or self.harness != "claude" or limit_hold.notice_reset(notice, self.wall())[1] != "notice_passed":
+        if not notice or self.harness != "claude":
+            return notice
+        history = self.resumed_history
+        if not history and limit_hold.notice_reset(notice, self.wall())[1] != "notice_passed":
             return notice
         if "esc to cancel" in notice.lower():
             self.tmux.run("send-keys", "-t", self.target, "Escape")
             self.sleep(self.t["settle"])
             after = limit_notice(self.screen())
-            if after and limit_hold.notice_reset(after, self.wall())[1] != "notice_passed":
+            if after and not history and limit_hold.notice_reset(after, self.wall())[1] != "notice_passed":
                 return after
-        print("interactive: a limit notice past its reset is not a limit: " + notice, file=sys.stderr, flush=True)
+        print("interactive: a limit notice %s is not a limit: %s" % (
+            "in the resumed session's history" if history else "past its reset", notice), file=sys.stderr, flush=True)
         return ""
 
     def turn(self, prompt: str) -> dict:

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.122 — 2026-11-22
+
+- **A session carried over from another account no longer fails its resume on that account's limit.**
+  A new window resumed on a session draws its history, which may end with the old account's
+  limit notice; before the paste the interactive driver no longer reads it as this account's
+  limit (an offer to continue there is dismissed). This account's own limit still ends the turn
+  once it meets the prompt.
+
 ## 0.2.121 — 2026-11-22
 
 - Add the agy harness for Google Antigravity CLI in print mode, with resumable conversations, explicit session permissions, Mesh MCP filtering and admission commands before every start.

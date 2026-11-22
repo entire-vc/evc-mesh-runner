@@ -240,6 +240,9 @@ if os.environ.get("FAKE_TRUST"):                # Claude's first-run question, "
             break
         if key.endswith(b"B"):
             choice = 1
+if kind == "claude" and "--resume" in args and os.environ.get("FAKE_HISTORY"):
+    # a resumed session draws its history: here it ends with the limit notice of the account it last ran on
+    sys.stdout.write("\r\n> earlier prompt\r\n" + os.environ["FAKE_HISTORY"] + "\r\n")
 sys.stdout.write("\x1b[?2004h\r\n" + ("› Ask Codex to do anything\r\n" if kind == "codex" else "> \r\n"))
 sys.stdout.flush()
 if kind == "codex" and os.environ.get("FAKE_UPDATE"):   # Codex's startup update menu
@@ -749,6 +752,26 @@ class DriverTurns(unittest.TestCase):
         last = self.events(out)[-1]
         self.assertTrue(last["is_error"])
         self.assertIn("rate_limit_error", last["result"])
+        self.assertEqual(self.tmux.windows(interactive.session_name("builder")), {})   # closed
+
+    CARRIED = "  ⎿  You've hit your weekly limit · resets Nov 26 at 11pm (Europe/Moscow)"
+
+    def test_a_resumed_history_ending_on_another_accounts_limit_is_no_limit(self):
+        """22.11 09:17: a session carried over from an exhausted account to a free one failed four resumes in
+        a row before the paste, on the old account's notice drawn in the resumed history."""
+        d, out = self.driver("claude", sid="s-1", mode="resume", FAKE_HISTORY=self.CARRIED)
+        self.assertEqual(d.run("hello"), 0)
+        self.assertFalse(self.events(out)[-1]["is_error"])
+
+    def test_this_accounts_own_limit_after_a_resumed_history_still_ends_the_turn_as_a_limit(self):
+        from mesh_runner.runner import QUOTA_HINT
+        d, out = self.driver("claude", sid="s-1", mode="resume", FAKE_HISTORY=self.CARRIED, FAKE_FAIL="1")
+        started = time.time()
+        self.assertEqual(d.run("hello"), 1)
+        self.assertLess(time.time() - started, 20)
+        last = self.events(out)[-1]
+        self.assertTrue(last["is_error"])
+        self.assertRegex(last["result"], QUOTA_HINT)
         self.assertEqual(self.tmux.windows(interactive.session_name("builder")), {})   # closed
 
     def test_without_prompt_ids_a_named_stale_stop_is_still_not_this_turn(self):

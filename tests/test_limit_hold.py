@@ -368,5 +368,66 @@ class StaleNoticeIsNoLimit(unittest.TestCase):
                 drv.turn('prompt')
 
 
+CARRIED = "⎿ You've hit your weekly limit · resets Nov 26 at 11pm (Europe/Moscow)"
+
+
+class CarriedOverHistoryIsNoLimit(unittest.TestCase):
+    """22.11 09:17: a session carried over from an exhausted account resumed in a new window under
+    a free one. Claude Code draws the session's history, which ends with the old account's weekly-limit
+    notice (reset days ahead): read as a live limit before the paste, four resumes in a row failed."""
+    def driver(self, tmux, mode='resume'):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        drv = td.Driver('claude', 'builder', Path(d.name), tmux, 1, Path(d.name), 'fixture-session', mode,
+                        'attempt', ['claude'], out=open(Path(d.name) / 'out.jsonl', 'w'), env={},
+                        sleep=lambda s: None)
+        self.addCleanup(drv.out.close)
+        drv.wall = lambda: at(9, 17, day=22)
+        return drv
+
+    def opened(self, drv, state):
+        """``ensure_session`` with the tmux window's state given: a new window is started, a live one reused."""
+        drv.meta.update({"harness": drv.harness, "digest": drv.digest(), "session_id": drv.sid})
+        with mock.patch.object(drv, 'window_state', return_value=state), \
+                mock.patch.object(drv, 'start_window') as start:
+            drv.ensure_session()
+        self.assertEqual(start.called, state == 'absent')
+        return drv
+
+    def test_the_resumed_history_in_a_new_window_is_no_limit(self):
+        tmux = FramesTmux("history\n" + CARRIED + "\n" + IDLE)
+        drv = self.opened(self.driver(tmux), 'absent')
+        self.assertEqual(drv.live_limit_notice(), "")
+        self.assertEqual(tmux.keys, [])
+
+    def test_an_offer_in_the_resumed_history_is_dismissed_and_is_no_limit(self):
+        offer = "⏺ Usage limit reached · continuing automatically at 11pm · esc to cancel"
+        tmux = FramesTmux("history\n" + offer, "history\n" + CARRIED + "\n" + IDLE)
+        drv = self.opened(self.driver(tmux), 'absent')
+        self.assertEqual(drv.live_limit_notice(), "")
+        self.assertEqual(tmux.keys, ["Escape"])
+
+    def test_the_turn_goes_on_to_the_paste(self):
+        tmux = FramesTmux("history\n" + CARRIED + "\n" + IDLE)
+        drv = self.opened(self.driver(tmux), 'absent')
+
+        class Pasting(Exception):
+            pass
+        with mock.patch.object(drv, 'wait_background', return_value=True), \
+                mock.patch.object(drv, 'wait_idle', side_effect=Pasting):
+            with self.assertRaises(Pasting):
+                drv.turn('prompt')
+
+    def test_the_same_notice_on_a_reused_window_stays_a_limit(self):
+        """Positive control: in a window kept from an earlier turn the notice is this account's own."""
+        tmux = FramesTmux("history\n" + CARRIED + "\n" + IDLE)
+        drv = self.opened(self.driver(tmux), 'alive')
+        self.assertIn("weekly limit", drv.live_limit_notice())
+
+    def test_a_new_session_window_has_no_history_and_keeps_the_check(self):
+        tmux = FramesTmux("x\n" + CARRIED + "\n" + IDLE)
+        drv = self.opened(self.driver(tmux, mode='start'), 'absent')
+        self.assertIn("weekly limit", drv.live_limit_notice())
+
+
 if __name__ == '__main__':
     unittest.main()
