@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.123 — 2026-11-22
+
+- **A git killed on its timeout no longer jams the slot with its `index.lock`.** When the Runner
+  kills a git after the 600 s timeout, an `index.lock`/`HEAD.lock` that was absent right before that
+  git started and is open in no live process (`lsof`, or `/proc` without it) is exchanged with an
+  empty directory barrier. After checking the moved inode and holder again, it is retained as
+  `<lock>.killed-<utc>-<ns>` and the barrier is removed; a concurrently substituted lock is returned
+  while the barrier keeps a second writer out. The log records both paths and rollback `mv`.
+  An existing lock, missing index/HEAD target or unsupported atomic exchange is left alone.
+  If returning a candidate fails, the barrier and file remain and an ERROR gives manual recovery
+  instructions for use after stopping writers.
+
 ## 0.2.122 — 2026-11-22
 
 - **A session carried over from another account no longer fails its resume on that account's limit.**
