@@ -68,6 +68,18 @@ def usd_micros(value) -> int | None:
     return int((amount * _MICRO).to_integral_value())
 
 
+def turn_spend(total_usd, base_usd) -> Decimal | None:
+    """A turn's own cost from the session's running total and the total before the turn (turn_cost),
+    in whole micro-dollars so a session's turns add up to its last total. None (unknown: the
+    reservation is charged) when the total is not a sane amount; an unusable base counts as zero."""
+    total = usd_micros(total_usd)
+    if total is None:
+        return None
+    base = usd_micros(base_usd) if base_usd is not None else 0
+    spent = total - base if base is not None and base <= total else total
+    return Decimal(spent) / _MICRO
+
+
 def fmt(micros: int) -> str:
     return f"{micros / _MICRO:.2f}"
 

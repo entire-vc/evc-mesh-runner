@@ -449,8 +449,9 @@ class Store:
             (attempt_id, limit))]
 
     def auth_turns(self, attempt_id: str) -> int:
-        """Physical turns that terminated at authentication, before any product work.
-        DISTINCT makes replaying settlement after a crash idempotent."""
+        """Physical turns the turn budget ignores: ended at authentication before any product work, at the
+        provider's refusal of the CLI version, or at its refusal of the content that moved the card to the
+        lane's other harness (once per card). DISTINCT makes replaying settlement after a crash idempotent."""
         return int(self.db.execute("SELECT COUNT(DISTINCT detail) FROM events WHERE attempt=? AND kind='auth_only_turn'",
                                    (attempt_id,)).fetchone()[0])
 
@@ -541,6 +542,11 @@ class Store:
                               "AND mode='work' ORDER BY updated_at DESC, rowid DESC LIMIT 1",
                               (agent, task_id, exclude)).fetchone()
         return self._row(row) if row else None
+
+    def work_agents(self, task_id: str) -> list[str]:
+        """Every agent that ran at least one work turn on the task (the authors a review answers)."""
+        return [r[0] for r in self.db.execute("SELECT DISTINCT agent FROM attempts WHERE task_id=? AND turns>0 "
+                                              "AND mode='work' ORDER BY agent", (task_id,))]
 
     def active_count(self, agent: str) -> int:
         return len(self.by_state(agent, ACTIVE))

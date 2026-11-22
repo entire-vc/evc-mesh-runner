@@ -6,8 +6,9 @@
 
 - asker side (``defer``, called from ``Effects.on_wait``): the question is put on the addressee's desk instead
   of a card when the addressee is a lane of this process, listed, not paused, its desk is live (the endpoint
-  answered) and the asking card is in the addressee's workspace (the endpoint lists only the workspace the
-  addressee's key opened). The wait carries ``cardless = {since, lane}``; the request is queued in the store.
+  answered), using the serving lane whose own recipient key is scoped to the asking card's workspace.
+  Multiple workspace lanes of the same recipient are supported; a missing scoped lane uses the ordinary
+  card fallback. The wait carries ``cardless = {since, lane}``; the request is queued in the store.
 - addressee side (``AnswerDesk.step``, one thread of the runner): for each queued request the desk runs one
   agent turn in the lane's profile, keyed by the ASKING card (a second question about it resumes the same
   session), asking it to answer with the Mesh command ``answer_decision``. The answer lands on the asking card
@@ -16,12 +17,19 @@
   for the driver's whole wait) reached nobody: no turn is spent, the request goes back to the queue and the
   next pass drives it again; a request the asker carded meanwhile is not pasted.
 - fallback (``waiting``, called from ``Effects.adopt`` on every pass over the parked wait): the request card is
-  filed through the usual path when 20 minutes passed, the desk failed the request, or the addressee cannot
-  take it any more (paused, removed, not listed, desk disabled). A question is never lost.
+  filed through the usual path when 20 minutes passed since the first delivered turn, the desk failed the
+  request, or the addressee cannot take it any more (paused, removed, not listed, desk disabled). Host-slot
+  and queue waits do not spend these 20 minutes. The lane's transport gate holding its turns does: a held request
+  is stamped with the moment the hold began (``held_since``) and the same 20 minutes run from it, so a gate that
+  holds without end files the card instead of keeping the question; the hold is logged once per reason and the
+  gate is asked again only after ``GATE_RETRY_SECONDS``. The stamp measures one continuous hold: the gate letting
+  a turn through, or a host wait that keeps the gate from being asked, clears it on every request of the lane.
+  A question is never lost.
 
 A turn runs the way a chat turn runs (``chat_host`` / ``chat_delivery``): the lane's routed env and harness
-(``chat_host.routed``: account routing), its transport gate (``ChatLane.transport_hold``), an interactive
-session in a tmux window driven by ``DriverDelivery``, no worktree, no card, no checkout. The window key has
+(``chat_host.routed``: account routing), its transport gate (``ChatLane.transport_hold``), and ``DriverDelivery``
+over either the lane's native headless adapter or its interactive tmux driver, no worktree, no card, no checkout.
+Native turns hold a lease of the same host cap for their whole process lifetime. An interactive window key has
 the chat prefix (``chat-ask<task>``), so the card reaper and ``make_room`` leave it alone and it counts against
 the host cap; the desk stops it after ``IDLE_MINUTES`` (its metadata stays, so the next question resumes).
 
@@ -37,14 +45,14 @@ to nobody, and no lane files its request card (``Effects._file_decision`` files 
 own card; a desk turn has no card, no attempt and no wait). After the turn the desk reads the asking card for the
 ``ask_agent`` comments the lane wrote during it and puts each request on its addressee's desk queue (mark ``via =
 desk``; the answer lands on the asking card, where its owner reads it). One that cannot go there (the addressee is
-no lane of this runner, not listed, headless, paused, its desk off), or that the addressee's desk then fails, is
+no scoped lane of this runner, not listed, paused, its desk off), or that the addressee's desk then fails, is
 refused visibly: a comment on the asking card addressed to its owner names the request and the route (ask from that
 card with ``ask_agent``, which files the request card). The refusal is retried until Mesh takes it (mark
 ``answer_desk_ask`` of the asking lane). The card read itself (back from the newest comment to the turn's start,
 however long the card's history) is owed from the turn's
 start (mark ``answer_desk_scan``): one that fails, or that a crash cut off, is read again until it succeeds or the
 card is gone. A routed question no desk takes has no asker to file its card, so it is refused the same way once its
-lane has no desk, or when it is still queued after ``FALLBACK_SECONDS``. Measured: a QA lane asked an operator lane
+lane has no desk, or when it is still unanswered ``FALLBACK_SECONDS`` after its first delivered turn. Measured: a QA lane asked an operator lane
 from a desk turn and the question sat unseen for two days, its asker sure it was being answered.
 
 Known interaction: the chat service's start sweep (``ChatHost._stop_orphans``) kills every ``chat-*`` window of
@@ -64,7 +72,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .mesh import MeshError
+from .mesh import MeshError, automation_comment
 
 log = logging.getLogger("mesh_runner")
 
@@ -73,13 +81,19 @@ POLL_SECONDS = 30.0                  # at most one list read per lane in this ti
 DISABLED_SECONDS = 600.0             # a Mesh without the route (404) is asked again after this
 ERROR_LOG_SECONDS = 60.0             # any other read failure is logged at most once a minute per lane
 LEASE_SECONDS = 15 * 60.0            # one turn's limit; a ``running`` request older than this was cut by a crash
-FALLBACK_SECONDS = 20 * 60.0         # the asker files the card when the desk has not answered by then
+FALLBACK_SECONDS = 20 * 60.0         # after the first delivered turn; queue/host waits do not spend it
 IDLE_MINUTES = 10.0                  # a desk session idle this long is stopped (resumable from its metadata)
 STEP_SECONDS = 2.0
+GATE_RETRY_SECONDS = 60.0            # a lane its transport gate held is asked again after this, not on every pass
 KEEP_DAYS = 7                        # marks older than this are emptied
 THREAD_PREFIX = "ask"                # window key chat-ask<task>: not hex, so never a chat thread's key
 DONE = ("answered", "failed", "carded")
 HOST_BUSY = "host_busy"              # a turn that found no room on the host: nothing reached the session
+# A turn that ended on the harness, not on the addressee's choice: the desk asks once more before the
+# asker files a card (26 of 302 unanswered desk requests in a week). A started turn that ends
+# "cancelled" ran out of its lease while the addressee worked: asking again would paste the question
+# into a session still busy with it, so it is not retried.
+INFRA_ENDS = ("harness_error",)
 GONE_CHECK_SECONDS = 2.0             # how often a turn waiting for room re-reads whether its request is still ours
 ASK_MARK = "answer_desk_ask"         # store mark: agent = asking desk lane, task_id = "_desk:<request id>" of a
                                      # question its desk session asked (routed to a desk, or refused on the card)
@@ -103,6 +117,11 @@ def thread_of(task_id: str) -> str:
     return THREAD_PREFIX + task_id
 
 
+def _native_dir(state_dir: Path, name: str) -> Path:
+    """Native sessions have their own metadata, separate from tmux windows of the same lane."""
+    return Path(state_dir) / "answer_desk" / "native" / re.sub(r"[^A-Za-z0-9_-]", "_", name)
+
+
 def _since(value: str) -> float:
     try:
         return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
@@ -121,22 +140,34 @@ def prompt(lane: str, item: dict, read_only: bool = True, owner: str = "") -> st
     task_id = str(item.get("task_id") or task.get("id") or "")
     short = task_id[:8]
     question = "\n> ".join(str(item.get("question") or "").splitlines() or [""])
+    if item.get("mention"):
+        return (f"@{lane}, {asker} addressed you on task #{short} «{task.get('title', '')}» ({task_id}).\n\n"
+                f"Request (verbatim):\n> {question}\n\n"
+                f"Answer with a comment ON TASK {task_id}; start it with `Answer:`. "
+                "There is no decision request: do not call answer_decision or a turn command. "
+                "Do not take, move or edit the task. This session has no worktree; change no files. "
+                + ("You cannot run commands. " if read_only else "Read and run only what the request names. ")
+                + "If this needs changes or work you cannot do here, comment `Needs work:` with the reason; "
+                  "the request then reaches you as an ordinary request card.")
     lands = (f"it writes the answer on task #{short}, where {owner} (its owner) and {asker} read it"
              if owner else f"it writes the answer on task #{short} and resumes {asker}")
     return (f"@{lane}, {asker} is waiting for your decision on task #{short} «{task.get('title', '')}» ({task_id}).\n\n"
             f"Question (verbatim):\n> {question}\n\n"
             f"Answer with the Mesh command `answer_decision` (request_id `{rid}`, answer: your decision and why): "
             f"{lands}. Do not take, move or edit #{short}.\n"
+            f"An ordinary answer comment ON TASK {task_id} also counts; start it with `Answer:`. "
             + (f"This session has no worktree and cannot run commands or change files (reading files and Mesh works). "
                f"If a sound answer needs work you cannot do here, "
                if read_only else
                f"This session has no worktree of its own: read and run what the question names where it is, and "
                f"change no files. If a sound answer needs changes or a worktree of your own, ")
-            + f"do NOT call `answer_decision`: say so in one line and stop — the question then reaches you as an "
+            + f"do NOT call `answer_decision`: comment `Needs work:` with the reason and stop — the question then reaches you as an "
               f"ordinary request card.")
 
 
 def reminder(item: dict) -> str:
+    if item.get("mention"):
+        return "No answer was recorded. Comment on the source task with `Answer:` or `Needs work:` and the reason."
     rid = str(item.get("id") or "")
     asker = str((item.get("from_agent") or {}).get("name") or "the asking agent")
     return (f"Request `{rid}` from {asker} is still open: no answer was recorded. Call `answer_decision` now "
@@ -150,7 +181,7 @@ def desk_plan(ar, task_id: str, text: str, read_only: bool = True):
     MCP, which ``answer_decision`` needs), the profile directory as cwd. ``read_only``: the harness denies
     commands and writes; otherwise the lane's ordinary tools, as on a request card."""
     from .chat_delivery import window_key
-    from .chat_host import ChatRefused, pinned, routed, session_for
+    from .chat_host import pinned, routed, session_for
     from .chat_lane import lane_of
     from .interactive import InteractiveAdapter
     lane = lane_of(ar)
@@ -158,14 +189,16 @@ def desk_plan(ar, task_id: str, text: str, read_only: bool = True):
     def plan(turn: dict):
         env, harness, profile = routed(lane)
         adapter = pinned(lane.adapter_for(harness), profile)
-        if not isinstance(adapter, InteractiveAdapter):
-            raise ChatRefused("headless_forbidden", "the answer desk runs interactive sessions only")
+        interactive = isinstance(adapter, InteractiveAdapter)
+        if not interactive:
+            adapter.dir = _native_dir(lane.cfg.state_dir, lane.name)
         thread = thread_of(task_id)
         sid, resume = session_for(adapter, lane, thread, env)
         cwd = lane.agent.profile_dir
         argv = (adapter.resume_argv if resume else adapter.start_argv)(sid, cwd, [])
-        i = argv.index("--")
-        argv = argv[:i] + ["--key", window_key(thread)] + argv[i:]
+        if interactive:
+            i = argv.index("--")
+            argv = argv[:i] + ["--key", window_key(thread)] + argv[i:]
         if read_only:
             argv = adapter.with_read_only(argv)
         return argv, cwd, dict(env), text, harness
@@ -193,6 +226,9 @@ class AnswerDesk:
         self.open: dict[str, list[dict]] = {}    # lane -> the last list read
         self.busy: dict[str, str] = {}           # lane -> request id of its running turn
         self.error_logged: dict[str, float] = {}
+        self.gate_next: dict[str, float] = {}    # lane -> when its transport gate may be asked again after a hold
+        self.gate_held: dict[str, str] = {}      # lane -> the transport hold last logged
+        self.hold_began: dict[str, float] = {}   # lane -> when the desk first saw its current transport hold
         self.idle: dict[tuple[str, str], float] = {}   # (lane, window) -> end of its last turn
         self._pruned = 0.0
         self._refusals_at = 0.0
@@ -235,8 +271,47 @@ class AnswerDesk:
         with self.lock:
             if self.state(lane, rid) in DONE:
                 return False
+            current = self._get(lane, rid)
+            if current.get("first_turn"):
+                record["first_turn"] = current["first_turn"]
             self._set(lane, rid, record)
             return True
+
+    def _delivered(self, lane: str, rid: str, at: str = "") -> None:
+        """Start the answer deadline once a prompt reached its session, never while it waits for room."""
+        with self.lock:
+            mark = self._get(lane, rid)
+            if not mark or mark.get("state") in DONE or mark.get("first_turn"):
+                return
+            mark["first_turn"] = at or self._iso()
+            self._set(lane, rid, mark)
+
+    @staticmethod
+    def _first_turn(mark: dict) -> str:
+        # Marks from an older runner that already delivered a turn predate this field.
+        return str(mark.get("first_turn") or (mark.get("since") if mark.get("turns") else "") or "")
+
+    def _expired(self, mark: dict, now: float) -> str:
+        """Why the request's answering time is up ('' = not yet): ``FALLBACK_SECONDS`` after its first delivered
+        turn, or after its lane's transport gate began holding it (``held_since``: no turn starts while it holds)."""
+        first = self._first_turn(mark)
+        if first and now - _since(first) >= FALLBACK_SECONDS:
+            return "not answered within %d minutes" % (FALLBACK_SECONDS // 60)
+        held = str(mark.get("held_since") or "")
+        if held and now - _since(held) >= FALLBACK_SECONDS:
+            return "transport gate held it for %d minutes: %s" % (FALLBACK_SECONDS // 60, mark.get("held") or "?")
+        return ""
+
+    def recipient(self, addressee: dict, workspace: str):
+        """The listed serving lane whose own agent key belongs to this recipient AND source workspace.
+
+        An agent may have several lanes/keys. A grant in another workspace does not change a key's scope.
+        """
+        if not workspace or not addressee.get("id"):
+            return None
+        return next((ar for name, ar in self.lanes.items() if name in self.listed
+                     and (getattr(ar, "me", None) or {}).get("id") == addressee["id"]
+                     and str((getattr(ar, "me", None) or {}).get("workspace_id") or "") == workspace), None)
 
     # ------------------------------------------------------------------ who can take a question
     def _lane(self, name: str):
@@ -255,14 +330,12 @@ class AnswerDesk:
         ar = self._lane(name)
         if ar is None:
             return "not listed"
-        if getattr(ar, "launch_mode", "interactive") == "headless":
-            return "headless lane"
         if self.clock() < self.disabled_until.get(ar.agent.name, 0.0):
             return "desk disabled: Mesh has no decision-request list"
-        if not self.live.get(ar.agent.name):
-            return "desk not live yet"
         if self._paused(ar):
             return "paused"
+        if not self.live.get(ar.agent.name):
+            return "desk not live yet"
         return ""
 
     def defer(self, asker: str, a, task: dict, wait: dict, addressee: dict | None, me: dict) -> bool:
@@ -271,16 +344,9 @@ class AnswerDesk:
         rid = str(wait.get("decision_request_id") or "")
         if not rid or wait.get("desk_fallback") or not addressee or not addressee.get("id"):
             return False
-        ar = self._lane(addressee.get("name"))
-        if ar is None or ar.agent.name.casefold() == str(asker).casefold() or self.hold(ar.agent.name):
-            return False
-        them = getattr(ar, "me", None) or {}
-        if them.get("id") != addressee["id"]:
-            return False
-        # the endpoint lists the requests of the workspace the addressee's key opened; a card read with the
-        # asker's own key is in the asker's workspace unless Mesh names another
         card_ws = str((task or {}).get("workspace_id") or (me or {}).get("workspace_id") or "")
-        if not card_ws or card_ws != str(them.get("workspace_id") or ""):
+        ar = self.recipient(addressee, card_ws)
+        if ar is None or ar.agent.name.casefold() == str(asker).casefold() or self.hold(ar.agent.name):
             return False
         lane = ar.agent.name
         known = self._get(lane, rid)
@@ -298,14 +364,13 @@ class AnswerDesk:
         """Asker side: '' while the desk may still answer the cardless question, otherwise why the card is due."""
         cardless = wait.get("cardless") or {}
         lane, rid = str(cardless.get("lane") or ""), str(wait.get("decision_request_id") or "")
-        if self.clock() - _since(cardless.get("since") or "") >= FALLBACK_SECONDS:
-            return "not answered within %d minutes" % (FALLBACK_SECONDS // 60)
-        state = self.state(lane, rid) if lane and rid else ""
+        mark = self._get(lane, rid) if lane and rid else {}
+        state = mark.get("state") or ""
         if state == "failed":
             return "the answer desk could not get an answer"
         if state == "answered":
             return ""                                     # the wake is on its way
-        return self.hold(lane)
+        return self._expired(mark, self.clock()) or self.hold(lane)
 
     def carded(self, lane: str, rid: str, why: str) -> None:
         """The asker filed the card: the desk does not answer this request any more."""
@@ -315,6 +380,51 @@ class AnswerDesk:
                 return
             record.update(state="carded", at=self._iso(), why=why[:120])
             self._set(lane, rid, record)
+
+    def mention(self, ar, task: dict, mention: dict) -> bool:
+        """Queue an addressed request without inventing an AskAgent/checkout for its author."""
+        lane = ar.agent.name
+        if lane not in self.listed or self._paused(ar) or self.clock() < self.disabled_until.get(lane, 0.0):
+            return False
+        workspace = str(task.get("workspace_id") or (getattr(ar, "me", None) or {}).get("workspace_id") or "")
+        if workspace != str((getattr(ar, "me", None) or {}).get("workspace_id") or ""):
+            return False
+        cid = str(mention.get("comment_id") or "")
+        if not cid:
+            return False
+        rid = "mention:" + cid
+        with self.lock:
+            if not self._get(lane, rid):
+                at = self._iso()
+                item = {"id": rid, "task_id": task["id"], "task": task, "mention": True,
+                        "question": mention.get("comment_body") or "",
+                        "from_agent": {"id": mention.get("author_id"), "name": mention.get("author_name")}}
+                self._set(lane, rid, {"state": "queued", "at": at, "since": at, "task": task["id"],
+                                      "via": "mention", "item": item, "mention": mention})
+        return True
+
+    def _fallback_mentions(self, now: float) -> None:
+        """A mention has no parked asker to file its fallback. Retain it until the card is delivered."""
+        for lane, ar in self.lanes.items():
+            for rid, mark in self._marks(lane).items():
+                if mark.get("via") != "mention" or mark.get("state") in ("answered", "carded"):
+                    continue
+                expired = bool(self._expired(mark, now))
+                held = self.hold(lane)
+                if mark.get("state") != "failed" and not expired and held in ("", "desk not live yet"):
+                    continue
+                if self.busy.get(lane) == rid or now < float(mark.get("fallback_next") or 0):
+                    continue
+                try:
+                    delivered = ar._mention(mark["mention"], desk_fallback=True)
+                    if delivered:
+                        mark.update(state="carded", at=self._iso())
+                    else:
+                        mark.update(state="answered", at=self._iso(), why="source no longer needs delivery")
+                except Exception as e:
+                    mark.update(fallback_next=now + REFUSE_RETRY_SECONDS)
+                    log.warning("%s: mention fallback %s: %s", lane, rid, type(e).__name__)
+                self._set(lane, rid, mark)
 
     # ------------------------------------------------------------------ addressee side
     def attach(self) -> "AnswerDesk":
@@ -340,6 +450,7 @@ class AnswerDesk:
 
     def step(self) -> None:
         now = self.clock()
+        self._fallback_mentions(now)
         for name in sorted(self.listed):
             self._lane_step(self.lanes[name], now)
         if now - self._refusals_at >= REFUSE_RETRY_SECONDS:
@@ -381,7 +492,10 @@ class AnswerDesk:
 
     def _lane_step(self, ar, now: float) -> None:
         name = ar.agent.name
-        if name in self.busy or self._held(ar):
+        if name in self.busy:
+            return
+        if self._held(ar):
+            self._unstamp(name)                           # a host wait spends nothing, a transport hold neither
             return
         if now < self.disabled_until.get(name, 0.0):
             return
@@ -406,6 +520,7 @@ class AnswerDesk:
         if now >= self.next_poll.get(name, 0.0) and self._poll(ar, now) is None:
             return
         listed = {str(i.get("id")): i for i in self.open.get(name, [])}
+        listed.update({rid: mark["item"] for rid, mark in todo.items() if mark.get("via") == "mention"})
         for rid, mark in sorted(todo.items(), key=lambda kv: kv[1].get("since") or ""):
             if rid in listed:
                 continue
@@ -417,24 +532,75 @@ class AnswerDesk:
                      if rid in listed), None)
         if item is None:
             return
+        if now < self.gate_next.get(name, 0.0):           # its transport gate held it a moment ago
+            self._stamp_held(name, self.gate_held.get(name, ""), todo)    # a question come since counts too
+            return
         from .chat_lane import lane_of
         try:
             reason = lane_of(ar).transport_hold()
         except Exception as e:
             reason = f"gate failed: {type(e).__name__}"
         if reason:
+            self._transport_held(name, reason, todo, now)
             return
+        self.gate_next.pop(name, None)
+        if self.gate_held.pop(name, None):
+            log.info("%s: answer desk: transport gate lets %s's questions through again", name, name)
+        self._unstamp(name)                               # the hold ended for the whole queue, not just this one
         rid = str(item["id"])
         mark = todo[rid]
         if mark.get("state") == "running":                # cut by a crash: retried once
             mark["recovered"] = True
+        mark.pop("held_since", None)
+        mark.pop("held", None)
         mark.update(state="running", at=self._iso())
         if not self._swap(name, rid, mark):               # carded since this pass read it: the card has it
             return
         self.busy[name] = rid
-        if not mark.get("host_busy"):                     # a request back from a full host already started
+        if not mark.get("host_busy") and not mark.get("infra_retry"):   # back from a full host or a harness retry: already started
             self._emit(ar, "answer_started", item)
         self.spawn(lambda: self._answer(ar, item))
+
+    def _transport_held(self, name: str, reason: str, marks: dict[str, dict], now: float) -> None:
+        """The lane's transport gate holds its turns: the gate is asked again after ``GATE_RETRY_SECONDS``, the
+        reason is logged once (again only when it changes), and every queued request is stamped (``_stamp_held``)."""
+        self.gate_next[name] = now + GATE_RETRY_SECONDS
+        self.hold_began.setdefault(name, now)
+        if self.gate_held.get(name) != reason:
+            self.gate_held[name] = reason
+            log.warning("%s: answer desk: transport gate holds %d question(s), request card after %d min: %s", name,
+                        len(marks), FALLBACK_SECONDS // 60, reason[:300])
+        self._stamp_held(name, reason, marks)
+
+    def _stamp_held(self, name: str, reason: str, marks: dict[str, dict]) -> None:
+        """Each queued request of a held lane keeps when its hold began (``held_since``, persisted across restarts),
+        from which ``_expired`` counts its answering time: the later of the lane's hold and the request's own arrival,
+        so a question that came between two gate calls (or before a list read showed it) counts from its arrival,
+        not from when the desk next looked."""
+        began = self.hold_began.get(name)
+        if began is None or not reason:
+            return
+        for rid, mark in marks.items():
+            if mark.get("held_since") and mark.get("held") == reason[:300]:
+                continue
+            if not mark.get("held_since"):
+                start = max(began, _since(mark.get("since") or ""))
+                mark["held_since"] = dt.datetime.fromtimestamp(start, dt.timezone.utc).isoformat(timespec="milliseconds")
+            mark["held"] = reason[:300]
+            self._swap(name, rid, mark)                   # a request carded meanwhile stays carded
+
+    def _unstamp(self, name: str) -> None:
+        """The lane's transport hold is no longer continuous (the gate let a turn through, or a host wait keeps
+        it from being asked): no request of the lane keeps its ``held_since``; a hold seen again starts anew, and
+        the gate is asked at the next pass."""
+        self.hold_began.pop(name, None)
+        self.gate_next.pop(name, None)
+        for rid, mark in self._marks(name).items():
+            if "held_since" not in mark or mark.get("state") in DONE:
+                continue
+            mark.pop("held_since", None)
+            mark.pop("held", None)
+            self._swap(name, rid, mark)
 
     def _due(self, mark: dict, now: float) -> bool:
         state = mark.get("state")
@@ -455,6 +621,16 @@ class AnswerDesk:
                 texts = [reminder(item)]                  # the crashed run already asked once
             else:
                 texts = [prompt(name, item, self.read_only(ar), owner=owner), reminder(item)]
+            if "reply_since" not in mark:
+                mark["reply_since"] = dt.datetime.fromtimestamp(self.clock() - ASK_SLACK_SECONDS, dt.timezone.utc).isoformat()
+                try:
+                    mark["prior_comments"] = [str(c.get("id")) for c in ar.mesh.comments_since(task_id, mark["reply_since"])]
+                except MeshError:
+                    # A failed comment read must not prevent an explicit answer_decision. Do not
+                    # accept an older prose answer without the snapshot; the owed scan retries below.
+                    mark["reply_since"] = dt.datetime.fromtimestamp(self.clock(), dt.timezone.utc).isoformat()
+                    mark["prior_comments"] = []
+                self._swap(name, rid, mark)
             for text in texts:
                 if started is None:
                     started = self.clock()
@@ -465,27 +641,42 @@ class AnswerDesk:
                     # request goes back to the queue (the next pass drives it again, the full question first)
                     state, why = "queued", "no free session slot on the host"
                     break
+                # Injected turn drivers may report only their final result. The ordinary driver records
+                # delivery while it runs; preserve that timestamp rather than overwriting it at completion.
+                self._delivered(name, rid, dt.datetime.fromtimestamp(started, dt.timezone.utc).isoformat())
                 turns += 1
                 self.idle[(name, task_id)] = self.clock()
                 mark.update(turns=int(mark.get("turns") or 0) + 1)
                 if not self._swap(name, rid, mark):
                     state = ""                            # carded during the turn: no reminder next to its card
                     break
-                still = self._still_open(ar, rid)
+                still = True if item.get("mention") else self._still_open(ar, rid)
                 if still is None:
                     why = "the request list could not be read after the turn"
                     break
                 if not still:
                     state, why = "answered", ""           # not the first turn's «still open» note
                     break
+                if self._comment_answer(ar, item, mark):
+                    state, why = "answered", ""
+                    break
+                if mark.get("needs_work"):
+                    why = "the answer needs a work session"
+                    break
                 why = f"still open after {turns} turn(s) ({ended or 'no result'})"
+            else:
+                if turns and ended in INFRA_ENDS and not mark.get("infra_retry"):
+                    # the harness, not the addressee, ended the turns: queue the request once more (the full
+                    # question first); the asker's 20-minute fallback keeps running from the first turn
+                    mark["infra_retry"] = ended
+                    state, why = "queued", f"retried once after {ended}"
         except Exception as e:
             state, why = "failed", f"turn failed: {type(e).__name__}: {str(e)[:120]}"
             log.warning("%s: answer desk request %s: %s", name, rid[:8], why)
         finally:
             if state:
                 mark.update(state=state, at=self._iso(), why=why)
-                if state == "queued":
+                if state == "queued" and not why.startswith("retried once"):
                     mark.update(host_busy=int(mark.get("host_busy") or 0) + 1)
                 if not self._swap(name, rid, mark):
                     state = ""                            # the asker filed the card meanwhile: it stays filed
@@ -501,7 +692,8 @@ class AnswerDesk:
                 self._failed_via_desk(name, rid, mark)
             self.busy.pop(name, None)
         if state == "queued":
-            log.info("%s: answer desk request %s: no free session slot on the host; stays queued", name, rid[:8])
+            log.info("%s: answer desk request %s: %s; stays queued", name, rid[:8],
+                     why if why.startswith("retried once") else "no free session slot on the host")
             return
         if not state:
             log.info("%s: answer desk request %s: carded meanwhile; the request card has it now", name, rid[:8])
@@ -509,6 +701,37 @@ class AnswerDesk:
         self._emit(ar, "answer_done" if state == "answered" else "answer_failed", item, turns=turns, why=why)
         log.log(logging.INFO if state == "answered" else logging.WARNING, "%s: answer desk request %s from %s: %s%s",
                 name, rid[:8], (item.get("from_agent") or {}).get("name") or "?", state, f" ({why})" if why else "")
+
+    def _comment_answer(self, ar, item: dict, mark: dict) -> bool:
+        """Only a fresh comment of this addressee can answer this turn. Use Mesh's answer transaction
+        for a real request, so server waits and repeat-question protection see the same answer."""
+        task_id = str(item.get("task_id") or (item.get("task") or {}).get("id") or "")
+        prior = set(mark.get("prior_comments") or [])
+        candidates = ar.mesh.comments_since(task_id, mark["reply_since"])
+        for c in reversed(candidates):
+            author = c.get("author_id") or (c.get("author") or {}).get("id")
+            meta = c.get("metadata") or {}
+            body = str(c.get("body") or "").strip()
+            if (str(c.get("id")) in prior or author != ar.me.get("id") or not body
+                    or automation_comment(c) or meta.get("command") or meta.get("wakes") is False):
+                continue
+            if re.match(r"^(?:needs work|нужна (?:отдельная )?(?:карточка|рабочая сессия))\s*:", body, re.I):
+                mark["needs_work"] = True
+                return False
+            # A progress note is not a decision, and a question the desk asks is not its answer.
+            if re.match(r"^(?:принял|проверю|сделаю|проверяю|работаю|i(?:'ll| will)|checking|working on)\b", body, re.I):
+                continue
+            if body.startswith("@") or ("?" in body and not re.match(r"^(?:answer|ответ|решение)\s*:", body, re.I)):
+                continue
+            if item.get("mention"):
+                return True
+            try:
+                ar.mesh.answer_decision(str(item["id"]), body, comment_id=str(c.get("id") or ""))
+            except MeshError as e:
+                if e.status != 409 or self._still_open(ar, str(item["id"])) is not False:
+                    raise
+            return True
+        return False
 
     def read_only(self, ar) -> bool:
         """Whether the lane answers without commands. A request card gives its addressee the lane's ordinary
@@ -704,17 +927,21 @@ class AnswerDesk:
 
     def _sweep_routed(self, now: float) -> None:
         """A routed question no desk takes has no asker to file its card: one whose lane no longer has a desk is
-        refused at once, one still queued after ``FALLBACK_SECONDS`` (paused, no room, desk off) is refused then,
-        as the asker of an ordinary desk question files the card by that time."""
+        refused at once, one still unanswered ``FALLBACK_SECONDS`` after delivery is refused then. Waiting
+        for room alone never spends the answer deadline."""
         for lane in sorted(self.lanes):
             for rid, mark in self._marks(lane).items():
                 if mark.get("via") != "desk" or mark.get("state") in DONE:
                     continue
                 if lane not in self.listed:
                     why = "it has no answer desk any more"
-                elif mark.get("state") == "queued" and now - _since(mark.get("since") or "") >= FALLBACK_SECONDS:
+                elif self.hold(lane) not in ("", "desk not live yet"):
+                    why = self.hold(lane)
+                elif self._expired(mark, now).startswith("not answered"):
                     held = self.hold(lane) or self._held(self.lanes[lane])
-                    why = f"not taken within {int(FALLBACK_SECONDS // 60)} min" + (f" ({held})" if held else "")
+                    why = f"not answered within {int(FALLBACK_SECONDS // 60)} min" + (f" ({held})" if held else "")
+                elif self._expired(mark, now):
+                    why = self._expired(mark, now)
                 else:
                     continue
                 mark.update(state="failed", at=self._iso(), why=why)
@@ -799,9 +1026,14 @@ class AnswerDesk:
     def _drive(self, ar, rid: str, task_id: str, text: str) -> str:
         """One turn in the lane's session for ``task_id``; the type of its last event (final / error), or
         ``host_busy`` when no window could be started for it (nothing reached the session)."""
-        from .chat_delivery import HOST_WAIT, DriverDelivery
+        from contextlib import nullcontext
+        from .chat_delivery import HOST_WAIT, DriverDelivery, window_key
         from .chat_lane import lane_of
+        from .host_admission import AdmissionError, HostAdmission
+        from .interactive import agent_dir, read_progress, state_root, write_meta
         lane = lane_of(ar)
+        native = getattr(ar, "launch_mode", "interactive") == "headless"
+        key = window_key(thread_of(task_id))
         # the desk keeps its own queue: a turn without room on the host comes back instead of waiting on
         delivery = DriverDelivery(lane.routed_harness, desk_plan(lane, task_id, text, self.read_only(ar)),
                                   Path(self.cfg.state_dir) / "answer_desk" / "logs", wait_for_room=False)
@@ -810,8 +1042,14 @@ class AnswerDesk:
         name = ar.agent.name
         turn = {"turn_id": uuid.uuid4().hex, "thread_id": thread_of(task_id)}
         gone = {"at": -1e9, "done": False}
+        started = time.time()
 
         def cancelled() -> bool:
+            if not native:
+                progress = read_progress(agent_dir(self.cfg.state_dir, name), key)
+                if (float(progress.get("started") or 0) >= started
+                        and progress.get("phase") in ("sent", "output")):
+                    self._delivered(name, rid)
             if self.stop.is_set() or time.monotonic() > deadline:
                 return True
             if turn.get(HOST_WAIT) != "waiting":
@@ -821,9 +1059,26 @@ class AnswerDesk:
                 gone.update(at=time.monotonic(), done=self.state(name, rid) in DONE)
             return gone["done"]
 
-        for ev in delivery.run(turn, cancelled):
-            if ev.get("type") in ("final", "error"):
-                last = str(ev.get("stop_reason") or ev.get("code") or ev["type"])
+        try:
+            # Native turns occupy the same cross-process cap as card/chat windows. No room: return to
+            # the durable desk queue without starting a process or spending the answering deadline.
+            lease = (HostAdmission(state_root(self.cfg.state_dir), self.cfg.interactive_max_sessions,
+                                   self._tmux()).acquire(time.monotonic() + 0.1, self.stop)
+                     if native else nullcontext())
+        except AdmissionError:
+            return HOST_BUSY
+        with lease:
+            if native and self.state(name, rid) in DONE:
+                return HOST_BUSY
+            for ev in delivery.run(turn, cancelled):
+                kind = ev.get("type")
+                if kind in ("session", "text_delta", "tool_status"):
+                    self._delivered(name, rid)
+                if native and kind == "session" and ev.get("session_id"):
+                    write_meta(_native_dir(self.cfg.state_dir, name), key,
+                               {"session_id": ev["session_id"], "harness": ev.get("harness") or ""})
+                if kind in ("final", "error"):
+                    last = str(ev.get("stop_reason") or ev.get("code") or kind)
         if turn.get(HOST_WAIT) == "cancelled":
             return HOST_BUSY                              # stopped before a window started: nothing was asked
         return last
@@ -839,6 +1094,9 @@ class AnswerDesk:
         for (name, task_id), end in list(self.idle.items()):
             if self.busy.get(name) or now - end < IDLE_MINUTES * 60:
                 continue
+            if getattr(self.lanes[name], "launch_mode", "interactive") == "headless":
+                self.idle.pop((name, task_id), None)
+                continue                                  # native processes end with their turn
             try:
                 stop_window(self._tmux(), self.cfg.state_dir, name, thread_of(task_id))
             except Exception as e:
@@ -866,6 +1124,8 @@ class AnswerDesk:
         self._pruned = now
         for name in self.listed:
             for rid, mark in self._marks(name).items():
+                if mark.get("via") == "mention" and mark.get("state") == "failed":
+                    continue                              # its fallback still owes a delivery
                 if mark.get("state") in DONE and now - _since(mark.get("at") or "") > KEEP_DAYS * 86400:
                     with self.lock:
                         self.store.mark(name, _key(rid), MARK, "")
@@ -895,6 +1155,8 @@ class AnswerDesk:
         hold = self.hold(name)
         if hold:
             out["hold"] = hold
+        if self.gate_held.get(name):
+            out["transport_hold"] = self.gate_held[name]
         return out
 
     def annotate(self, rows: list[dict]) -> None:

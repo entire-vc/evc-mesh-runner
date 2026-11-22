@@ -1,8 +1,10 @@
+import contextlib
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 from mesh_runner import chat as chat_mod
@@ -13,13 +15,23 @@ from tmux_support import TMUX, needs_tmux
 
 @needs_tmux
 class Chat(unittest.TestCase):
-    """Runs on a private tmux server (-L): never touches the host's sessions."""
+    """Runs on a private tmux server (-L): never touches the host's sessions.
+
+    Every test gets a server of its own. `kill-server` returns before the server stops accepting,
+    so the next test on the same socket could reach the dying server and its first `new-session`
+    failed with "server exited unexpectedly" (one socket per process went red in CI under load).
+    """
+    sockets_used: set[str] = set()
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.sock = f"mr-test-{os.getpid()}"
+        self.sock = f"mr-test-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        self.assertNotIn(self.sock, Chat.sockets_used, "a test must not reuse the socket of a killed server")
+        Chat.sockets_used.add(self.sock)
         self.tmux = [TMUX, "-L", self.sock]
+        self.addCleanup(self.stop_server)
         # a server holding a value that must NOT reach the agent's session
         subprocess.run([*self.tmux, "-f", "/dev/null", "new-session", "-d", "-s", "keepalive", "sleep 600"],
                        env={**os.environ, "SERVER_SECRET": "leak", "CLAUDE_CONFIG_DIR": "/server/acct"},
@@ -34,9 +46,13 @@ class Chat(unittest.TestCase):
         self.keeper = ChatKeeper(self.spec, "agent", self.root, self.root / "state", clock=lambda: self.clock[0])
         self.env = {"PATH": os.environ["PATH"], "CLAUDE_CONFIG_DIR": "/acct/a", "LANE_ACCOUNT": "a"}
 
-    def tearDown(self):
+    def stop_server(self):
+        path = subprocess.run([*self.tmux, "display-message", "-p", "#{socket_path}"],
+                              capture_output=True, text=True).stdout.strip()
         subprocess.run([*self.tmux, "kill-server"], capture_output=True)
-        self.tmp.cleanup()
+        if path:                                   # tmux leaves the socket file behind
+            with contextlib.suppress(OSError):
+                os.unlink(path)
 
     def env_of(self, env):
         return lambda: (env, env_digest(env))

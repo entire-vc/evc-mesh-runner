@@ -11,8 +11,8 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from fakes import FakeMesh, calls, task, wait_time, write_replies
-from mesh_runner import api_mode
+from fakes import FakeMesh, calls, next_turn, task, wait_time, write_replies
+from mesh_runner import api_mode, turn_cost
 from mesh_runner.adapters.claude import ClaudeAdapter
 from test_runner import Bench
 
@@ -105,6 +105,18 @@ class ApiTurn(ApiBench):
                          [("0.37", 0.37, "ANTHROPIC_API_KEY")])
         admitted = [json.loads(d) for d in self.events(r, "api_admitted")]
         self.assertEqual([(x["profile"], x["role"]) for x in admitted], [(PROFILE, "primary")])
+
+    def test_the_spend_report_names_the_route_account_its_pools_are_kept_under(self):
+        self.cfg.spend_report_turn_fields = True
+        self.agent.api_optin = True
+        self.agent.api_primary_profile = PROFILE
+        r, t = self.run_one()
+        self.assertEqual(len(calls(self.calls)), 1, "the turn ran under the key")
+        turns = [x for x in r.mesh.report_turns if x]
+        self.assertEqual(len(turns), 1, r.mesh.report_turns)
+        self.assertEqual((turns[0]["account_ref"], turns[0]["billing_mode"], turns[0]["provider"]),
+                         (POOL.rsplit("/", 1)[0], "api", "anthropic"))
+        self.assertLessEqual(turns[0]["started_at"], turns[0]["ended_at"])
 
     def test_the_key_value_is_in_no_journal_log_or_record(self):
         self.agent.api_optin = True
@@ -249,6 +261,107 @@ class ApiTurn(ApiBench):
         self.assertEqual(calls(self.calls), [])
         self.assertEqual(self.events(r, "api_refused"), ["credential_carrier_permissions"])
         self.assertEqual(self.ledger().status(POOL)["open_reservations"], 0)
+
+
+class ResumedTurns(ApiBench):
+    """A resumed Claude session reports its running total as ``total_cost_usd``: the pool is charged
+    each turn's own part of it (the live case: two turns of 0.272918 -> 0.4071958)."""
+
+    def setUp(self):
+        super().setUp()
+        self.agent.api_optin = True
+        self.agent.api_primary_profile = PROFILE
+        self.agent.inline_env["FAKE_COST"] = "0.272918"           # turn 1: the session so far
+        self.agent.inline_env["FAKE_COST_RESUME"] = "0.4071958"   # turn 2 (--resume): the session so far
+
+    def two_turns(self, second, restart=False):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: next_turn("part one"), t["id"][:8] + ":resume": second})
+        r = self.runner(mesh)
+        r.tick()
+        self.settle_all(r)
+        if restart:
+            r = self.runner(mesh)                                   # a runner restart between the turns
+        for _ in range(3):
+            if len(calls(self.calls)) >= 2:
+                break
+            r.tick()
+            self.settle_all(r)
+        self.assertEqual([c["resume"] for c in calls(self.calls)], [False, True])
+        return r
+
+    def charged(self):
+        import sqlite3
+        db = sqlite3.connect(self.cfg.api.ledger)
+        try:
+            return db.execute("SELECT spent, source FROM spend WHERE pool=? ORDER BY created", (POOL,)).fetchall()
+        finally:
+            db.close()
+
+    def test_the_pool_is_charged_the_session_total_once(self):
+        r = self.two_turns(wait_time(why="soak window"))
+        self.assertEqual(self.charged(), [(272918, "total_cost_usd_delta"), (134278, "total_cost_usd_delta")])
+        self.assertEqual(self.ledger().status(POOL)["spent_micros"], 407196)
+        spend = [json.loads(d) for d in self.events(r, "api_spend")]
+        self.assertEqual([(x["total_cost_usd"], x["session_base_usd"]) for x in spend],
+                         [(0.272918, 0.0), (0.4071958, 0.272918)])
+        self.assertEqual([x["cost"] for x in r.mesh.reports], [0.2729, 0.1343],
+                         "Mesh and the API pool settle against the same session base")
+
+    def test_a_runner_restart_between_the_turns_keeps_the_base(self):
+        self.two_turns(wait_time(why="soak window"), restart=True)
+        self.assertEqual(self.ledger().status(POOL)["spent_micros"], 407196)
+
+    def test_a_resumed_turn_without_a_cost_charges_its_whole_reservation(self):
+        self.agent.inline_env["FAKE_COST_RESUME"] = "none"
+        self.two_turns(wait_time(why="soak window"))
+        self.assertEqual(self.charged(), [(272918, "total_cost_usd_delta"),
+                                          (2_000_000, "unknown_charged_reservation")])
+
+
+class _Marks:
+    def __init__(self):
+        self.d = {}
+
+    def mark(self, agent, task_id, key, value=None):
+        if value is not None:
+            self.d[(agent, task_id, key)] = value
+            return None
+        v = self.d.get((agent, task_id, key))
+        return (v, "at") if v is not None else None
+
+
+class SessionBase(unittest.TestCase):
+    def base(self, store, turn, sid, total):
+        return turn_cost.session_base(store, "owner", "t1", turn, sid, total)
+
+    def test_the_base_is_the_previous_total_of_the_same_session(self):
+        m = _Marks()
+        self.assertEqual(self.base(m, "a:1", "s1", 0.272918), 0.0)
+        self.assertEqual(self.base(m, "a:2", "s1", 0.4071958), 0.272918)
+        self.assertEqual(self.base(m, "a:2", "s1", 0.4071958), 0.272918, "a turn settled again: same base")
+        self.assertEqual(self.base(m, "b:1", "s1", 0.5), 0.4071958, "a new attempt resuming the session")
+
+    def test_a_new_session_or_a_counter_that_started_over_counts_whole(self):
+        m = _Marks()
+        self.base(m, "a:1", "s1", 0.4)
+        self.assertEqual(self.base(m, "a:2", "s2", 0.1), 0.0, "another session")
+        self.assertEqual(self.base(m, "a:3", "s2", 0.05), 0.0, "a total below the base")
+        self.assertEqual(self.base(m, "a:4", "", 0.3), 0.0, "no session id")
+
+    def test_a_turn_without_a_total_leaves_the_base(self):
+        m = _Marks()
+        self.base(m, "a:1", "s1", 0.27)
+        self.assertIsNone(self.base(m, "a:2", "s1", None))
+        self.assertEqual(self.base(m, "a:3", "s1", 0.40), 0.27)
+
+    def test_turn_spend_is_the_increment_in_whole_micros(self):
+        self.assertEqual(api_mode.usd_micros(api_mode.turn_spend(0.4071958, 0.272918)), 134278)
+        self.assertEqual(api_mode.usd_micros(api_mode.turn_spend(0.272918, None)), 272918)
+        self.assertEqual(api_mode.usd_micros(api_mode.turn_spend(0.1, 0.4)), 100000, "base above total")
+        self.assertIsNone(api_mode.turn_spend(None, 0.27), "unknown: the reservation is charged")
+        self.assertIsNone(api_mode.turn_spend(-1, 0.27))
 
 
 class Carrier(unittest.TestCase):

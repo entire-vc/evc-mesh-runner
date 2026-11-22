@@ -8,16 +8,42 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 
 from . import workspace_requests as spool_io
+from . import repo_access
 from .workspace import RepoSpec
 
 SPOOL = 'repo-admission'
 FIELDS = {'version', 'request_id', 'agent', 'task', 'attempt', 'generation', 'created', 'expires',
           'repo', 'spec'}
+
+
+def configured_spec(cfg, agent, name: str) -> RepoSpec | None:
+    """Pin the same source as the lane, without changing the registry or calling Mesh.
+
+    Only a never-migrated lane uses legacy repos. An explicit cached permission, including
+    deny-all, selects the allowed host inventory. The tick revalidates the live permission.
+    An unreadable registry must not silently reopen legacy access.
+    """
+    path = cfg.state_dir / 'runner.sqlite'
+    access = None
+    if path.exists():
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+                row = db.execute('SELECT value FROM marks WHERE agent=? AND task_id=? AND key=?',
+                                 (agent.name, repo_access.STORE_TASK, repo_access.STORE_KEY)).fetchone()
+            if row and row[0]:
+                access = repo_access.parse(json.loads(row[0]))
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            raise ValueError('repository access registry unreadable') from exc
+    specs = (agent.repos if access is None else
+             [s for s in cfg.host_repositories if access.allows(s.project or None)])
+    return next((s for s in specs if s.name == name), None)
 
 
 def spec_digest(repo: RepoSpec) -> str:

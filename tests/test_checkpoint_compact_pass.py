@@ -100,6 +100,22 @@ class CheckpointBudget(unittest.TestCase):
             self.assertTrue(any('over the' in line for line in logs.output))
             self.assertTrue((snap / 'blob').exists())
 
+    def test_store_behind_a_link_is_measured(self):
+        # The store moves to the slot volume and pool_root/checkpoints becomes a link
+        # to it; `du -sk <link>` counts the link (0), so the gauge and the budget went blind.
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / 'ssd' / 'checkpoints'
+            (store / 'a' / 'k').mkdir(parents=True)
+            (store / 'a' / 'k' / 'blob').write_bytes(b'x' * 2_000_000)
+            pool = Path(tmp) / 'pool'
+            pool.mkdir()
+            (pool / 'checkpoints').symlink_to(store)
+            r = self._runner(pool, 4.0)
+            Runner._measure_checkpoints(r)
+            self.assertGreaterEqual(r.checkpoint_bytes, 2_000_000)
+
     def test_no_snapshots_is_zero_bytes(self):
         import tempfile
         from pathlib import Path

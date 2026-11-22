@@ -10,9 +10,13 @@ first event (``thread.started``); the runner stores it as the session id.
 from __future__ import annotations
 
 import glob
+import gzip
 import json
 import os
 import re
+import shutil
+import tempfile
+import tomllib
 from pathlib import Path
 
 from ..auth import is_codex_auth_error
@@ -21,6 +25,13 @@ from .base import Adapter, TurnResult, read_events
 
 ROLLOUT_SCAN = 1 << 20          # how much of the rollout's end is searched for the latest turn_context
 _MODEL_LINE = re.compile(r'^\s*model\s*=\s*"([^"]+)"', re.M)
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+# What the runner exports for a card turn (runner._writer_launch_env); a Claude MCP child inherits
+# all of it, a Codex one only what env_vars names. evc-mesh-mcp reads TASK and CHECKOUT_SESSION
+# (memory-read headers, claim-own-created) and CHECKOUT_GENERATION (idempotency keys).
+RUNNER_MCP_ENV = ("MESH_RUNNER_TASK", "MESH_RUNNER_LANE", "MESH_RUNNER_CHECKOUT_GENERATION",
+                  "MESH_RUNNER_CHECKOUT_REQUEST", "MESH_RUNNER_CHECKOUT_SESSION")
+MESH_MCP_COMMANDS = ("mesh-mcp-agent", "mesh-mcp")
 
 
 class CodexAdapter(Adapter):
@@ -56,6 +67,46 @@ class CodexAdapter(Adapter):
         if resume and session_id:
             argv += ["resume", session_id]
         return argv + self.extra_args
+
+    def prepare_resume(self, session_id: str, cwd: Path, env: dict) -> str:
+        """Restore an idle rollout compressed by host retention before checking for it.
+
+        Keep the archive and any existing native rollout. Only one exact thread in
+        the selected home may be restored; an incomplete gzip is never published.
+        """
+        if not re.fullmatch(r"[0-9A-Za-z-]{8,64}", session_id):
+            return ""
+        home = Path(env.get("CODEX_HOME") or Path(env.get("HOME") or Path.home()) / ".codex")
+        sessions = home / "sessions"
+        if any(sessions.glob(f"**/rollout-*{session_id}*.jsonl")):
+            return ""
+        archives = list(sessions.glob(f"**/rollout-*-{session_id}.jsonl.gz"))
+        if not archives:
+            return ""
+        if len(archives) != 1:
+            return "compressed Codex rollout is ambiguous; not restored"
+        archive = archives[0]
+        try:
+            with gzip.open(archive, "rb") as source:
+                first = source.readline()
+                meta = json.loads(first)
+                if (not isinstance(meta, dict) or meta.get("type") != "session_meta"
+                        or not isinstance(meta.get("payload"), dict)
+                        or meta["payload"].get("id") != session_id):
+                    raise ValueError("session metadata does not match")
+                with tempfile.NamedTemporaryFile(dir=archive.parent, prefix=".codex-resume-") as restored:
+                    restored.write(first)
+                    shutil.copyfileobj(source, restored)
+                    restored.flush()
+                    os.fsync(restored.fileno())
+                    try:
+                        os.link(restored.name, archive.with_suffix(""))
+                    except FileExistsError:
+                        return ""              # a concurrent native writer wins; never replace it
+        except (OSError, EOFError, ValueError) as exc:
+            # Decoder errors may contain transcript bytes: only the error class leaves this function.
+            raise OSError(f"compressed Codex rollout could not be restored ({type(exc).__name__})") from None
+        return "Codex rollout restored from local gzip archive"
 
     def session_known(self, session_id: str, cwd: Path, env: dict) -> bool:
         """False only when the Codex home of ``env`` keeps rollouts and none is this thread's:
@@ -117,6 +168,45 @@ class CodexAdapter(Adapter):
                 "-c", prefix + "args=" + json.dumps(list(command[1:])),
                 "-c", prefix + "env=" + table,
                 *argv[1:]]
+
+    def with_runner_env(self, argv: list[str], env: dict) -> list[str]:
+        """Codex starts a stdio MCP server with an allowlisted environment, not its own: the
+        Mesh MCP of a card turn lost MESH_RUNNER_TASK / MESH_RUNNER_CHECKOUT_*, so its memory
+        reads carried no task or session. Root ``-c mcp_servers.<name>.env_vars``
+        forwards the carrier by name (values stay in env) to every server of the profile Codex
+        loads whose command is the Mesh MCP. Only a name that file defines: an override of an
+        unknown name makes Codex refuse its config (``invalid transport``)."""
+        carried = [k for k in RUNNER_MCP_ENV if env.get(k)]
+        if not carried:
+            return argv
+        extra: list[str] = []
+        for name, kept in self._mesh_servers(env):
+            names = kept + [k for k in carried if k not in kept]
+            extra += ["-c", f"mcp_servers.{name}.env_vars=" + json.dumps(names)]
+        return [argv[0], *extra, *argv[1:]] if extra else argv
+
+    def _mesh_servers(self, env: dict) -> list[tuple[str, list[str]]]:
+        """(name, env_vars it already forwards) of each Mesh MCP server in the config file
+        Codex reads for this profile and home: ``<home>/<profile>.config.toml``, else
+        ``<home>/config.toml``. Unreadable or malformed: none (the launch goes on as before)."""
+        home = Path(env.get("CODEX_HOME") or Path(env.get("HOME") or Path.home()) / ".codex")
+        names = ([f"{self.profile}.config.toml"] if self.profile else []) + ["config.toml"]
+        for name in names:
+            try:
+                data = tomllib.loads((home / name).read_text())
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                return []
+            servers = data.get("mcp_servers")
+            out = []
+            for server, spec in (servers.items() if isinstance(servers, dict) else ()):
+                if (isinstance(spec, dict) and _BARE_KEY.fullmatch(server)
+                        and Path(str(spec.get("command") or "")).name in MESH_MCP_COMMANDS):
+                    kept = spec.get("env_vars")
+                    out.append((server, [v for v in kept if isinstance(v, str)] if isinstance(kept, list) else []))
+            return sorted(out)
+        return []
 
     def profile_model(self) -> str:
         """The model the profile pins (``~/.codex/<profile>.config.toml``): Codex does

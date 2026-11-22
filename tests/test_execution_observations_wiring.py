@@ -140,7 +140,6 @@ class AgentHooksTest(unittest.TestCase):
         self.assertEqual((kind, args[:4]), ("start", ("attempt-1", TASK, AGENT, "claude")))
         self.assertEqual((args[4].model, args[4].effort, kw["project_id"]), ("claude-opus-5-5", "high", PROJECT))
         self.assertEqual(ar.fetched, 1)
-        self.assertEqual(ar._obs_home["attempt-1"], {"HOME": "/h"})        # nothing but the two paths kept
 
     def test_unbound_lane_costs_no_mesh_call(self):
         router = RecordingRouter(bound=False)

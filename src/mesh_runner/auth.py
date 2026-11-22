@@ -75,25 +75,58 @@ def profile_id(env: dict[str, str], cwd: Path) -> str:
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
 
 
-def account_label(harness: str, env: dict[str, str], cwd: Path | None = None) -> str:
-    """The human name of the login a spawn uses: the account directory's name
-    (``~/.claude-accounts/ops-team`` -> ``ops-team``), never a credential.
-    The default directory is named as such, so a personal login is recognisable."""
+def _login_dir(harness: str, env: dict[str, str], cwd: Path | None = None) -> tuple[Path, Path, str]:
+    """(login directory of a spawn, the harness's default directory, the variable that names it)."""
     home = Path(env.get("HOME") or Path.home())
     if harness == "codex":
         raw, default, var = env.get("CODEX_HOME"), home / ".codex", "CODEX_HOME"
     else:
         raw, default, var = env.get("CLAUDE_CONFIG_DIR"), home / ".claude", "CLAUDE_CONFIG_DIR"
+    directory = Path(raw) if raw else default
+    if not directory.is_absolute():
+        directory = (cwd or Path.cwd()) / directory
+    return directory, default, var
+
+
+def account_label(harness: str, env: dict[str, str], cwd: Path | None = None) -> str:
+    """The human name of the login a spawn uses: the account directory's name
+    (``~/.claude-accounts/ops-team`` -> ``ops-team``), never a credential.
+    The default directory is named as such, so a personal login is recognisable."""
     if harness != "codex" and env.get("ANTHROPIC_API_KEY"):
         # Provider URLs may contain credentials in userinfo, paths, or queries.
         # This label is persisted and sent to the operator, so omit the URL entirely.
         return "claude API key"
-    directory = Path(raw) if raw else default
-    if not directory.is_absolute():
-        directory = (cwd or Path.cwd()) / directory
+    directory, default, var = _login_dir(harness, env, cwd)
     if os.path.realpath(directory) == os.path.realpath(default):
         return f"{harness} default login ~/{default.name} (no {var})"
     return f"{harness} {directory.name}"
+
+
+# A limit-pool account as quota observations name it: <harness>/<account> (claude/ops-team, codex/ops).
+# Never an email or a path; Mesh refuses a value with "@" or whitespace.
+ACCOUNT_REF = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+_ACCOUNT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+
+
+def account_ref(harness: str, env: dict[str, str], cwd: Path | None = None,
+                aliases: dict[str, str] | None = None) -> str:
+    """The limit-pool account of a spawn's login, ``<harness>/<account>``: the login directory's name, the
+    same name :func:`account_label` shows (``claude ops-team`` -> ``claude/ops-team``), which is how quota
+    observations name the account's pools (``claude/ops-team/5h``). A login directory whose name is not an
+    account (the harness's default directory, a hidden directory of another provider's login) names one
+    only through ``aliases`` ({absolute login directory: account_ref}). A spawn on an API key, a harness
+    without a login directory, or a directory with neither: "" (unknown)."""
+    if harness not in ("claude", "codex") or (harness != "codex" and env.get("ANTHROPIC_API_KEY")):
+        return ""
+    directory, default, _ = _login_dir(harness, env, cwd)
+    real = os.path.realpath(directory)
+    for path, ref in (aliases or {}).items():
+        if os.path.realpath(path) == real:
+            return ref if ACCOUNT_REF.fullmatch(ref) else ""
+    if real == os.path.realpath(default) or not _ACCOUNT_NAME.fullmatch(directory.name):
+        return ""
+    ref = f"{harness}/{directory.name}"
+    return ref if ACCOUNT_REF.fullmatch(ref) else ""
 
 
 def account(store: Store, profile: str) -> str:

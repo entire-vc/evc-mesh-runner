@@ -69,6 +69,7 @@ from pathlib import Path
 
 from . import asks, catalog_launch
 from . import api_mode as _api_mode
+from . import pricing as _pricing
 from .selection import Policy
 from .workspace import RepoSpec
 
@@ -603,6 +604,16 @@ class RunnerConfig:
     tmux_binary: str = "tmux"               # standing chat sessions and interactive turns
     # strict existing-session readonly_metadata receiver (meta_delivery.Settings); None = off
     session_metadata: object = field(default=None, repr=False)
+    # $/MTok list tariffs by model (pricing.py): the spend report prices a turn whose harness gave no
+    # cost; a model without a tariff stays unknown. ``[prices]`` adds or replaces tariffs.
+    prices: dict = field(default_factory=lambda: _pricing.parse_config(None), repr=False)
+    # ``[spend_report] turn_fields``: the spend report also carries the turn's id, times, provider,
+    # account, billing mode and cache split (turn_usage.py). Off by default: a Mesh that does not know
+    # the fields refuses the report (a cache name in ``unknown``), and with it the turn's tokens and cost.
+    spend_report_turn_fields: bool = False
+    # ``[spend_report.account_refs]``: {absolute login directory: account_ref} for a login directory
+    # whose name is not its account (the harness's default directory, a hidden directory)
+    account_refs: dict = field(default_factory=dict)
     # how turns run: "interactive" (the harness's interactive program in tmux, fed by a driver)
     # or "headless" (claude -p / codex exec, one process per turn); both draw on the same
     # subscription windows
@@ -835,6 +846,41 @@ def _exclude_names(value) -> tuple:
                                               for v in value):
         raise ConfigError("checkpoint_exclude_names must be a list of plain directory names")
     return tuple(value)
+
+
+def _prices(section):
+    try:
+        return _pricing.parse_config(section)
+    except _pricing.PriceError as e:
+        raise ConfigError(str(e)) from None
+
+
+def _spend_report(section) -> tuple[bool, dict]:
+    """``[spend_report]``: (turn_fields, {absolute login directory: account_ref})."""
+    from .auth import ACCOUNT_REF
+    if section is None:
+        return False, {}
+    if not isinstance(section, dict):
+        raise ConfigError("[spend_report] must be a table")
+    unknown = set(section) - {"turn_fields", "account_refs"}
+    if unknown:
+        raise ConfigError(f"[spend_report] unknown keys: {', '.join(sorted(unknown))}")
+    on = section.get("turn_fields", False)
+    if not isinstance(on, bool):
+        raise ConfigError(f"[spend_report] turn_fields must be true or false, got {on!r}")
+    refs = section.get("account_refs", {})
+    if not isinstance(refs, dict):
+        raise ConfigError("[spend_report.account_refs] must be a table of login directory = account_ref")
+    out = {}
+    for directory, ref in refs.items():
+        path = Path(str(directory)).expanduser()
+        if not path.is_absolute():
+            raise ConfigError(f"[spend_report.account_refs] {directory!r}: the login directory must be absolute")
+        if not isinstance(ref, str) or not ACCOUNT_REF.fullmatch(ref):
+            raise ConfigError(f"[spend_report.account_refs] {directory!r}: the account must look like "
+                              f"<harness>/<account> (no email, no spaces)")
+        out[str(path)] = ref
+    return on, out
 
 
 def _session_metadata(section):
@@ -1085,6 +1131,7 @@ def load(path: str | Path) -> RunnerConfig:
     names = [a.name for a in agents]
     if len(set(names)) != len(names):
         raise ConfigError("agent names must be unique")
+    spend_turn_fields, spend_account_refs = _spend_report(raw.get("spend_report"))
     cfg = RunnerConfig(
         mesh_url=r["mesh_url"],
         state_dir=_path(r.get("state_dir") or _default_state_dir()),
@@ -1161,6 +1208,9 @@ def load(path: str | Path) -> RunnerConfig:
         idempotency_keys=_bool_option(r.get("idempotency_keys", True), "idempotency_keys"),
         completion_comment=_bool_option(r.get("completion_comment", True), "completion_comment"),
         session_metadata=_session_metadata(raw.get("session_metadata")),
+        prices=_prices(raw.get("prices")),
+        spend_report_turn_fields=spend_turn_fields,
+        account_refs=spend_account_refs,
         chat_enabled=chat.get("enabled", False) is True,
         chat_agents=tuple(_string_list(chat.get("agents"), "[chat] agents", ())),
         chat_credential=read_secret(chat.get("credential_file"), chat.get("credential_env"), "chat credential")

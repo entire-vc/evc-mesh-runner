@@ -1442,6 +1442,10 @@ class MeshEffects(Bench):
             {"comment_id": "c4", "task_id": theirs["id"], "author_id": "agent-lead", "author_name": "lead",
              "comment_body": "⏳ WAIT decision:@builder: which one?", "extracted_at": at(1),
              "mentioned_slug": "builder"}]
+        for row in mesh.mention_rows:
+            mesh.comment_log.setdefault(row["task_id"], []).append({
+                "id": row["comment_id"], "body": row["comment_body"], "author_id": row["author_id"],
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat()})
         write_replies(self.replies, {})
         r = self.runner(mesh)
         r.refresh_me()
@@ -1460,6 +1464,10 @@ class MeshEffects(Bench):
         mesh.mention_rows = [{"comment_id": "c1", "task_id": theirs["id"], "author_id": "agent-lead",
                               "author_name": "lead", "comment_body": "@builder. please look",
                               "extracted_at": "2099-01-01T00:00:00Z", "mentioned_slug": "builder"}]
+        for row in mesh.mention_rows:
+            mesh.comment_log.setdefault(row["task_id"], []).append({
+                "id": row["comment_id"], "body": row["comment_body"], "author_id": row["author_id"],
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat()})
         seen = mesh.mention_seen
         mesh.mention_seen = lambda cid: (_ for _ in ()).throw(MeshError(503, "down"))
         r = self.runner(mesh)
@@ -1494,8 +1502,12 @@ class MeshEffects(Bench):
         if metadata is not None:
             mine["metadata"] = metadata
         mesh.mention_rows = [{"comment_id": f"c-{mine['id']}", "task_id": theirs["id"], "author_id": "agent-lead",
-                              "author_name": "lead", "comment_body": "@builder signal: two sessions on one card",
+                              "author_name": "lead", "comment_body": "@builder signal: please check two sessions on one card",
                               "extracted_at": "2099-01-01T00:00:00Z", "mentioned_slug": "builder"}]
+        for row in mesh.mention_rows:
+            mesh.comment_log.setdefault(row["task_id"], []).append({
+                "id": row["comment_id"], "body": row["comment_body"], "author_id": row["author_id"],
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat()})
         r = self.runner(mesh)
         r.refresh_me()
         with self.assertLogs("mesh_runner", "INFO") as logs:
@@ -4949,7 +4961,8 @@ class WaitWorkspaceCheckpoint(Bench):
 
 
 class ResumeInventoryFixedAtAdmission(Bench):
-    """An attempt resumes with the repositories it was admitted with, not today's config."""
+    """The journal fixes what a restore brings back; a repository the lane gained since is attached
+    beside it, never in place of a journaled one."""
 
     def suspended_one_repo_attempt(self, n):
         self.agent.workspace_wait_release_minutes = 30
@@ -4988,9 +5001,14 @@ class ResumeInventoryFixedAtAdmission(Bench):
         r._resume_one(r.store.get(a.id))
         cur = r.store.get(a.id)
         self.assertEqual(cur.state, 'running')
-        self.assertEqual(len(cur.workspaces), 1)
+        self.assertEqual(len(cur.workspaces), 2)                  # restored app + the added repo
         self.assertEqual(Path(cur.workspaces[0]).joinpath('README').read_text(), 'old work')
+        self.assertEqual(Path(cur.workspaces[1]).parent.name, 'second')
+        self.assertEqual(sorted(r.pool.leased_to(a.id)), sorted(cur.workspaces))
         self.settle_all(r)
+        first = calls(self.calls)[0]                              # the resumed turn (later ones re-prompt)
+        self.assertIn('Repository second was added to this task', first['prompt'])
+        self.assertIn(cur.workspaces[1], first['prompt'])
 
     def test_two_repo_attempt_still_requires_both_repos(self):
         from mesh_runner.workspace import InventoryError
@@ -5003,6 +5021,9 @@ class ResumeInventoryFixedAtAdmission(Bench):
         with self.assertRaisesRegex(InventoryError, 'incomplete repository inventory'):
             r._resume_one(r.store.get(a.id))
         self.assertEqual(r.store.get(a.id).state, 'ready')
+        # the grown config is no way around it: the refusal comes first and leases nothing
+        self.assertEqual(r.pool.leased_to(a.id), [])
+        self.assertEqual(r.store.get(a.id).workspaces, ['/x/app', '/x/second'])
 
     def test_duplicate_unknown_and_extra_repos_are_rejected(self):
         from mesh_runner.workspace import InventoryError

@@ -44,9 +44,10 @@ import logging
 import re
 import time
 import uuid
+from urllib.parse import unquote, urlsplit
 
 from . import answer_desk, card_wait_reconcile, outcome
-from .mesh import MeshClient, MeshError
+from .mesh import MeshClient, MeshError, automation_comment
 from .blocking_path import BlockingPath, Budget
 
 DIAGNOSTIC_TICK_SECONDS = 15.0
@@ -62,6 +63,8 @@ SKIP_EVERY = dt.timedelta(minutes=2)
 SKIP_EVALUATE = 40                      # tasks whose hold reason is read per pass
 DECISION_REQUEST_LABEL = "decision-request"
 DECISION_LABELS = [DECISION_REQUEST_LABEL, "pin-assignee", "owner-locked"]
+ACCESS_REQUEST_LABEL = "access-request"
+ACCESS_LABELS = [ACCESS_REQUEST_LABEL, "pin-assignee", "owner-locked", "runner:workspace-required"]
 DECISION_OWNER = "_decision"          # source-task identity survives lane/attempt changes
 DECISION_MARK = "decision_request"
 DECISION_RECENT_MARK = "decision_recent"   # store mark: requests filed per source, by recipient, for reuse
@@ -90,6 +93,31 @@ UNSCHEDULE_RETRY = dt.timedelta(minutes=1)        # first retry of a pending cle
 UNSCHEDULE_RETRY_MAX = dt.timedelta(minutes=30)
 ORPHAN_CHECK = dt.timedelta(minutes=10)           # per task: how often a held task is checked for an orphan
 _TRAILING_PUNCT = " \t.,;:!?…)]}>»\"'`*_~-—–"     # trailing characters a repeated question differs by
+
+
+def is_ops_request(note: str) -> bool:
+    """An explicit request to perform an operation, not a discussion of that operation.
+
+    This only selects a work-card route; it grants no permission to perform the
+    operation. Keep the vocabulary and the request position bounded: e.g. "should
+    we restart?" and "is it safe to deploy?" still belong to the answer desk.
+    """
+    text = " ".join((note or "").split()).casefold()
+    text = re.sub(r"^@[\w.-]+[,:]?\s*", "", text)
+    if "?" in text and re.search(r"\b(?:or|или)\b", text):
+        return False                       # choosing an operation is still a decision
+    polite = (r"(?:(?:please|(?:can|could|would) you(?: please)?|"
+              r"пожалуйста|прошу|нужно|необходимо|можешь|можете)(?:,?\s+))?")
+    action = (r"(?:deploy|redeploy|install|restart|merge|"
+              r"выкати(?:те|ть)?|выложи(?:те|ть)?|задеплой(?:те)?|задеплоить|"
+              r"установи(?:те|ть)?|перезапусти(?:те|ть)?|"
+              r"влей(?:те)?|влить|слей(?:те)?|слить)\b\s+\S")
+    access = (r"(?:(?:grant|give)\s+(?:\S+\s+){0,4}access\b|"
+              r"(?:выдай|выдайте|выдать|предоставь|предоставьте|предоставить)"
+              r"\s+(?:\S+\s+){0,4}доступ\b)")
+    migration = (r"(?:(?:run|apply)\s+(?:the\s+)?migration\b|"
+                 r"(?:выполни(?:те|ть)?|примени(?:те|ть)?)\s+миграци[юи]\b)")
+    return bool(re.match(polite + "(?:" + action + "|" + access + "|" + migration + ")", text))
 
 
 def normalized_question(note: str, source_id: str = "") -> str:
@@ -611,9 +639,21 @@ class Effects:
         if kind == "decision" and wait.get("handle"):
             if wait.get("decision_request_id") and not self._typed_question(a, wait):
                 return                      # the question could not be read: adopt() retries
+            if self._existing_answer(a, task, wait, me):
+                return                      # the exact recipient already answered this question
             if self._deliver_to_addressee_card(a, wait, me):
                 return                      # an order for the addressee's own live card: asked there
-            if not wait.get("names_addressee_card") and answer_desk.defer(self.desk, self, a, task, wait, me):
+            access = False
+            if is_ops_request(wait.get("question") or wait.get("note") or ""):
+                try:
+                    access = self._access_request(wait, self._resolve_agent(wait["handle"], me) or {})
+                except MeshError as e:
+                    wait["fx"] = False
+                    log.warning("%s: operation request #%s: recipient lookup HTTP %s", self.lane, a.task8,
+                                e.status)
+                    return
+            if (not access and not wait.get("names_addressee_card")
+                    and answer_desk.defer(self.desk, self, a, task, wait, me)):
                 return                      # the addressee's answer desk takes it; adopt() files the card if not
             # ``ask_agent`` records the question on Mesh, but its comment wakes nobody and no queue
             # shows the addressee an open request: the request card is still what starts the addressee
@@ -1139,7 +1179,14 @@ class Effects:
     def _decision_key(task_id: str, recipient: str, wait: dict) -> str:
         question = " ".join((wait.get("note") or "").split())
         identity = [task_id, recipient, question]
+        if wait.get("access_request"):
+            identity.append(ACCESS_REQUEST_LABEL)  # a metadata-only request cannot carry executable work
         return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+
+    def _access_request(self, wait: dict, addressee: dict) -> bool:
+        """Only explicit operations to a configured metadata-only recipient need this route."""
+        return (addressee.get("id") in self._decision_metadata_recipients
+                and is_ops_request(wait.get("question") or wait.get("note") or ""))
 
     def _retain_legacy_decision(self, a: Attempt, wait: dict) -> None:
         if not wait.get("request") or self._decision(a.task_id) or self.store is None:
@@ -1519,14 +1566,17 @@ class Effects:
         if self._deliver_to_addressee_card(a, wait, me, addressee):
             return
         wait["recipient_id"] = addressee["id"]
+        wait["access_request"] = self._access_request(wait, addressee)
         note = (wait.get("note") or "").strip()
         key = self._decision_key(a.task_id, addressee["id"], wait)
         active = self._decision(a.task_id)
-        if not active and not wait.get("request") and self._mirror(a, addressee, wait, me):
+        if (not wait["access_request"] and not active and not wait.get("request")
+                and self._mirror(a, addressee, wait, me)):
             return
         if not active and wait.get("request"):
             # Upgrade an existing parked wait without filing a second request.
-            active = {"key": key, "recipient": addressee["id"], "lane": self.lane, "state": "open",
+            active = {"key": "" if wait["access_request"] else key,
+                      "recipient": addressee["id"], "lane": self.lane, "state": "open",
                       "request": wait["request"]}
             self._save_decision(a.task_id, active)
         if active and active.get("state") != "closed":
@@ -1543,6 +1593,8 @@ class Effects:
                 self._save_decision(a.task_id, active)
                 if active.get("request"):
                     wait["request"] = dict(active["request"])
+                else:
+                    wait["fx"] = False      # keep adopting an ambiguous create until its card is known
                 if active.get("attached_closed"):
                     wait["attached_closed"] = active["attached_closed"]
                 return                      # pending create is fail-closed too
@@ -1595,7 +1647,200 @@ class Effects:
                           self.lane, a.task8, active.get("create_id"), key)
                 active["reported"] = True
                 self._save_decision(a.task_id, active)
+                wait["fx"] = False          # reconcile adopts the card; on_wait then binds it to this wait
             log.warning("%s: decision request #%s: HTTP %s", self.lane, a.task8, e.status)
+
+    @staticmethod
+    def _answer_in(comments: list[dict], question: str, recipient: dict, source: str) -> dict | None:
+        """A reply to this exact question, never a similarly worded progress note.
+
+        A server answer names its ask; a plain ``Answer:`` must follow the latest ask to this recipient.
+        The typed ask header supplies the recipient, while its metadata supplies the stable request id.
+        """
+        matching: dict[str, str] = {}
+        latest = ""
+        latest_matches = False
+        result = None
+        for c in comments:
+            meta, body = c.get("metadata") or {}, str(c.get("body") or "").strip()
+            if meta.get("command") == "ask_agent":
+                asked = answer_desk.ASKED.search(body.split("\n", 1)[0])
+                if asked and asked["to"].lstrip("@").casefold() == str(recipient.get("name") or "").casefold():
+                    latest = str(meta.get("decision_request_id") or "")
+                    latest_matches = (latest == asked["rid"] and
+                        normalized_question(body.partition("\n\n")[2], source) == question)
+                    matching.pop(latest, None)
+                    if latest_matches:
+                        matching[latest] = str(c.get("id") or "")
+                continue
+            command, answered = str(meta.get("command") or ""), str(meta.get("answers") or "")
+            payload = body
+            if command == "answer_decision" and re.match(r"^(?:💬\s*)?\*\*Answer (?:to question|from\b)", body, re.I):
+                head, sep, payload = body.partition("\n\n")
+                if payload.startswith(">"):
+                    quoted, sep, payload = payload.partition("\n\n")
+                if not sep:
+                    continue
+            payload = payload.strip()
+            author = c.get("author_id") or (c.get("author") or {}).get("id")
+            if (author != recipient.get("id") or not payload or automation_comment(c) or payload.startswith("[runner]")
+                    or command not in ("", "answer_decision") or (command == "answer_decision" and not answered)
+                    or meta.get("wakes") is False
+                    or re.match(r"^(?:(?:answer|ответ|решение)\s*:\s*)?(?:needs work|fyi|к сведению|"
+                                r"принял|проверю|сделаю|проверяю|работаю|checking|working on|"
+                                r"нужна (?:отдельная )?(?:карточка|рабочая сессия))\b", payload, re.I)):
+                continue
+            explicit = bool(re.match(r"^(?:answer|ответ|решение)\s*:", payload, re.I))
+            if answered in matching or (not answered and latest_matches and latest in matching and (explicit
+                    or c.get("parent_comment_id") == matching[latest])):
+                result = c
+        return result
+
+    def _existing_answer(self, a: Attempt, task: dict, wait: dict, me: dict,
+                         answer_card: dict | None = None) -> bool:
+        """Reuse a proved answer on the source or a named open incident before asking anyone again.
+
+        A typed request is answered through the exact recipient's client; an asker cannot certify its own
+        answer. Without that client the normal desk/card path remains responsible for the open request.
+        """
+        if wait.get("settled"):
+            return True
+        if wait.get("request") or wait.get("delivered") or wait.get("delivering"):
+            return False
+        try:
+            recipient = self._resolve_agent(wait["handle"], me)
+            if not recipient or recipient.get("id") in (None, me.get("id")):
+                return False
+            source = self.mesh.task(a.task_id)
+            source = source.get("task", source)
+            workspace = str(source.get("workspace_id") or me.get("workspace_id") or "")
+            if ((source.get("assignee_id") or (source.get("assignee") or {}).get("id")) != me.get("id")
+                    or workspace != str(me.get("workspace_id") or "")):
+                return False
+            question = normalized_question(wait.get("question") or wait.get("note") or "", a.task_id)
+            cards = [source]
+            if answer_card is not None:
+                if ("auto-incident" not in (answer_card.get("labels") or [])
+                        or self.cats.category(answer_card) in ("done", "cancelled")
+                        or (answer_card.get("assignee_id") or (answer_card.get("assignee") or {}).get("id")) != recipient["id"]
+                        or str(answer_card.get("workspace_id") or workspace) != workspace
+                        or answer_card.get("project_id") != source.get("project_id")):
+                    return False
+                cards = [answer_card]
+            for card in cards:
+                reply = self._answer_in(self.mesh.comments_all(card["id"]), question, recipient, a.task_id)
+                if not reply:
+                    continue
+                ref = f"{self.mesh.base.removesuffix('/api/v1')}/t/{card['id']}?comment={reply['id']}"
+                text = f"Already answered by {recipient.get('name')}: {ref}\n\n{reply['body']}"
+                rid = str(wait.get("decision_request_id") or "")
+                if rid:
+                    ar = self.desk.recipient(recipient, workspace) if self.desk else None
+                    if ar is None:
+                        return False
+                    try:
+                        ar.mesh.answer_decision(rid, text,
+                            comment_id=str(reply["id"]) if card["id"] == a.task_id else "")
+                    except MeshError as e:
+                        if e.status != 409:
+                            raise
+                        # A conflict can also mean cancelled/stale, not answered. Only the server's
+                        # exact answer to this request on the source proves an already-completed ask.
+                        comments = [c for c in self.mesh.comments_all(a.task_id)
+                            if (c.get("metadata") or {}).get("command") == "ask_agent" or
+                            ((c.get("metadata") or {}).get("command") == "answer_decision" and
+                             str((c.get("metadata") or {}).get("answers") or "") == rid)]
+                        confirmed = self._answer_in(comments, question, recipient, a.task_id)
+                        if not confirmed:
+                            return False
+                        ref = f"{self.mesh.base.removesuffix('/api/v1')}/t/{a.task_id}?comment={confirmed['id']}"
+                        text = f"Already answered by {recipient.get('name')}: {ref}\n\n{confirmed['body']}"
+                wait.update(settled=text, recipient_id=recipient["id"], ask_filed=True)
+                if self.store is not None:
+                    self.store.event(a.id, "decision_existing_answer", f"#{card['id'][:8]} {reply['id']}")
+                return True
+        except MeshError as e:
+            if e.status not in self.DEFINITE_REFUSALS:
+                wait["fx"] = False
+                return True                 # retry an incomplete read, do not file a duplicate meanwhile
+        return False
+
+    @staticmethod
+    def _vcs_order_keys(text: str) -> set[tuple[str, str, str]]:
+        """Exact GitLab MR / branch identities; a missing repository must be disambiguated later."""
+        refs = set()
+        for raw in _URL.findall(text):
+            url = urlsplit(raw.rstrip(_URL_TRAILING))
+            match = re.fullmatch(r"/(.+?)/-/(merge_requests|tree)/(.+)", unquote(url.path).rstrip("/"))
+            if match:
+                project, kind, value = match.groups()
+                if kind == "tree" or value.isdigit():
+                    refs.add(("mr" if kind == "merge_requests" else "branch",
+                              f"{url.netloc.casefold()}/{project.casefold()}", value))
+        for project, iid in re.findall(r"(?<![\w/.-])([\w.-]+(?:/[\w.-]+)+)?!(\d+)\b", text):
+            refs.add(("mr", project.casefold(), iid))
+        for branch in re.findall(r"\b(?:branch|ветк[аеуи])\s*(?:[:=]\s*)?[`\"']?([\w][\w./-]*)", text, re.I):
+            refs.add(("branch", "", branch.rstrip(".,;")))
+        return refs
+
+    def _vcs_order_refs(self, a: Attempt, wait: dict, me: dict, recipient: dict) -> list[str] | None:
+        """Find a unique owner card by VCS, reading only cards assigned to this recipient in this project."""
+        wanted = self._vcs_order_keys(wait.get("question") or wait.get("note") or "")
+        if not wanted:
+            return []
+        try:
+            source = self.mesh.task(a.task_id)
+            source = source.get("task", source)
+            project = str(source.get("project_id") or "")
+            workspace = str(source.get("workspace_id") or me.get("workspace_id") or "")
+            if not project or workspace != str(me.get("workspace_id") or ""):
+                return []
+            source_keys = set().union(*(self._vcs_order_keys(str(link.get("url") or ""))
+                for link in self.mesh.vcs_links(a.task_id) if link.get("link_type") != "reference"))
+            cards = []
+            for page in range(1, 101):
+                out = self.mesh.request("GET", f"/projects/{project}/tasks", query={
+                    "assignee_id": recipient["id"], "page": page, "page_size": 50})
+                if not isinstance(out, dict) or not isinstance(out.get("items"), list):
+                    raise MeshError(0, "unreadable recipient task list")
+                try:
+                    pages = int(out["total_pages"])
+                except (KeyError, ValueError, TypeError):
+                    raise MeshError(0, "unreadable recipient task pagination")
+                if not 0 <= pages <= 100:
+                    raise MeshError(0, "recipient task list exceeds page bound")
+                cards.extend(out["items"])
+                if page >= pages:
+                    break
+            else:
+                raise MeshError(0, "recipient task list exceeds page bound")
+            found = []
+            for card in cards:
+                if (card.get("id") == a.task_id or card.get("project_id") != project
+                        or (card.get("assignee_id") or (card.get("assignee") or {}).get("id")) != recipient["id"]
+                        or str(card.get("workspace_id") or workspace) != workspace
+                        or self.cats.category(card) in ("done", "cancelled")):
+                    continue
+                keys = set().union(*(self._vcs_order_keys(str(link.get("url") or ""))
+                    for link in self.mesh.vcs_links(card["id"]) if link.get("link_type") != "reference"))
+                for kind, repo, value in wanted:
+                    scoped = {k[1] for k in source_keys}
+                    if not repo and len(scoped) > 1:
+                        continue             # the asking card does not identify one repository
+                    if any(k[0] == kind and k[2] == value and
+                           (k[1] == repo or k[1].endswith("/" + repo) if repo else not scoped or k[1] in scoped)
+                           for k in keys):
+                        found.append(card["id"][:8])
+                        break
+            if len(set(found)) == 1:
+                wait["vcs_order"] = True
+                return found
+            return []                       # no arbitrary choice between multiple owner cards
+        except MeshError as e:
+            if e.status not in self.DEFINITE_REFUSALS:
+                self._order_unread(a, wait, f"recipient VCS cards: HTTP {e.status}")
+                return None if not wait.get("order_checked") else []
+            return []
 
     @staticmethod
     def _ordered_refs(note: str, own: str) -> list[str]:
@@ -1668,7 +1913,7 @@ class Effects:
         # that card when it is named after the cap and send the order to the desk. The walk runs once per
         # question (``order_checked``) and Mesh bounds a question's length, so the lookups are bounded too.
         refs = self._ordered_refs(wait.get("question") or wait.get("note") or "", a.task_id)
-        if not refs:
+        if not refs and not self._vcs_order_keys(wait.get("question") or wait.get("note") or ""):
             wait["order_checked"] = True
             return False
         try:
@@ -1679,6 +1924,10 @@ class Effects:
             return self._order_unread(a, wait, f"addressee {wait['handle']}: HTTP {e.status}")
         if not addressee or addressee.get("id") in (me.get("id"), None):
             return False
+        if not refs:
+            refs = self._vcs_order_refs(a, wait, me, addressee)
+            if refs is None:
+                return True
         # A live card of the addressee found after an unread one is delivered at once: either reaches them.
         # A card of the addressee that itself waits on another card is named as context ("check #C"), not as
         # the card to act on: its session sleeps until that other card moves, so the question goes the
@@ -1695,7 +1944,8 @@ class Effects:
                 card = self.mesh.task_by_short(ref)
                 card = card.get("task", card) if isinstance(card, dict) else {}
                 assignee = card.get("assignee_id") or (card.get("assignee") or {}).get("id")
-                if not card.get("id") or assignee != addressee["id"]:
+                if (not card.get("id") or assignee != addressee["id"]
+                        or card.get("workspace_id") not in (None, "", me.get("workspace_id"))):
                     continue
                 category = self.cats.category(card)
             except MeshError as e:
@@ -1706,6 +1956,8 @@ class Effects:
             if category in ("done", "cancelled"):
                 wait.setdefault("names_addressee_card", ref)
                 continue
+            if "auto-incident" in (card.get("labels") or []) and self._existing_answer(a, {}, wait, me, card):
+                return True
             held = self._addressee_wait(card["id"], addressee["id"])
             if held is None:
                 wait.setdefault("names_addressee_card", ref)
@@ -1743,9 +1995,10 @@ class Effects:
                   f"it writes the answer on #{a.task8} and resumes {self.lane}." if rid else
                   f"When done, answer with a comment on #{a.task8} (start it with `Answer:` or @-mention "
                   f"{self.lane}): that comment resumes {self.lane}.")
+        match = "its MR or branch matches this card" if wait.get("vcs_order") else "it names this card"
         body = (f"@{name}, {self.lane} asks on #{a.task8} ({a.task_id}) for this card #{short}.\n\n"
                 f"Question (verbatim):\n> {question}\n\n"
-                f"Act on it here, on #{short}: it names this card, so it is delivered here instead of an answer "
+                f"Act on it here, on #{short}: {match}, so it is delivered here instead of an answer "
                 f"desk or a request card. {answer}")
         wait["delivering"] = {"card": live["id"], "body": body, "key": f"order:{a.task_id}:{rid or a.id}",
                               "name": name, "recipient": addressee["id"], "addressee_wait": live_wait}
@@ -1787,7 +2040,7 @@ class Effects:
 
     def watch_delivered(self, a: Attempt, wait: dict) -> None:
         """A question delivered on its addressee's card (``_post_order``) is answered from that card's session.
-        Still unanswered ``DELIVERED_UNHEARD_MINUTES`` after the delivery, the addressee's wait on that card is
+        Still unanswered ``DELIVERED_UNHEARD_MINUTES`` after the delivery, the wait the addressee holds there is
         read once: the same wait it held when the question was written means its session never woke for it.
         That is logged as a WARNING, recorded as the event ``decision_delivered_unheard`` and kept on the wait
         (``delivered.unheard``), where wait-cycle-watch reads it as a dead end (FleetWaitDeadEnd). A wait the
@@ -1930,6 +2183,10 @@ class Effects:
             assignee = card.get("assignee_id") or (card.get("assignee") or {}).get("id")
             if not project_id or assignee != addressee["id"]:
                 return self._forget_request(a.task_id, addressee["id"])   # someone else holds it now
+            if self._access_request(wait, addressee) != (ACCESS_REQUEST_LABEL in (card.get("labels") or [])):
+                # A new operational request must enter ordinary workspace admission;
+                # a retained metadata-only card keeps its original confinement.
+                return self._forget_request(a.task_id, addressee["id"])
             req["project_id"] = project_id
             category = self.cats.category(card)
             reopened = category in ("done", "cancelled")
@@ -2027,6 +2284,17 @@ class Effects:
         """The question as the addressee reads it: in a new request's body, or (``again``) in
         a comment on the request it already has."""
         note = (wait.get("note") or "").strip()
+        if self._access_request(wait, addressee):
+            return (f"@{addressee.get('name')}, {self.lane} requests an operation for task "
+                    f"#{a.task8} «{task.get('title', '')}» ({a.task_id}).\n\n"
+                    f"Operation (verbatim):\n> {note}\n\n"
+                    "Execute it under your normal permissions and approval requirements. "
+                    "This request grants no additional access or approval. "
+                    f"Report the operation, its probe and the next step ON TASK #{a.task8}; "
+                    f"that comment resumes {self.lane}. "
+                    + (f"Start it with `Answer:` (or @-mention {self.lane}). " if self.answer_marker else "")
+                    + f"Keep ownership of #{a.task8} with {self.lane}. This request closes automatically "
+                    "when the answer arrives.")
         head = (f"@{addressee.get('name')}, {self.lane} asks again on task #{a.task8} "
                 f"«{task.get('title', '')}» ({a.task_id}).\n" if again else
                 f"@{addressee.get('name')}, {self.lane} is waiting for your decision on task "
@@ -2052,11 +2320,13 @@ class Effects:
         short = note if len(note) <= 80 else note[:79].rstrip() + "…"
         body = (f"[runner decision-request:{a.id}]\n[runner decision-key:{key}]\n"
                 f"[runner decision-create:{create_id}]\n" + self._decision_ask(a, task, wait, addressee))
-        fields = {"title": f"[decision] {short or 'decision needed'} (#{a.task8})", "description": body,
+        access = self._access_request(wait, addressee)
+        prefix = "access" if access else "decision"
+        fields = {"title": f"[{prefix}] {short or 'decision needed'} (#{a.task8})", "description": body,
                   "assignee_id": addressee["id"], "assignee_type": "agent", "priority": "high",
-                  "labels": list(DECISION_LABELS)}
+                  "labels": list(ACCESS_LABELS if access else DECISION_LABELS)}
         # Scope uses the resolved identity, never a handle or the source lane.
-        if addressee["id"] in self._decision_metadata_recipients:
+        if not access and addressee["id"] in self._decision_metadata_recipients:
             fields["labels"].append("runner:metadata-only")
         if todo:
             fields["status_id"] = todo
@@ -2071,7 +2341,7 @@ class Effects:
             card = card.get("task", card)
             if self.cats.category(card) not in ("done", "cancelled"):
                 if blocked and not self._close_retry_due(blocked, card):
-                    return              # still behind a human gate: no write until the card changes
+                    return              # still behind a gate: no write until the card changes
                 if card.get("checked_out_by"):
                     # The addressee's turn on the request is still running. Closing the card under its
                     # live checkout makes its next heartbeat fail and the turn is killed. Its
@@ -2095,15 +2365,17 @@ class Effects:
             wait.pop("request", None)
             if blocked:
                 self._close_blocked_set(req["id"], None)
-                log.info("%s: close decision request #%s: closed, human gate no longer blocks it (blocked since %s)",
-                         self.lane, req["id"][:8], blocked.get("since") or "?")
+                log.info("%s: close decision request #%s: closed, %s no longer blocks it (blocked since %s)",
+                         self.lane, req["id"][:8], CLOSE_GATE_NAMES[_blocked_gate(blocked)],
+                         blocked.get("since") or "?")
         except MeshError as e:
+            gate = _close_refusal_gate(e)
             if e.status in (404, 410):
                 wait.pop("request", None)
                 if blocked:
                     self._close_blocked_set(req["id"], None)
-            elif _human_gate_refusal(e):
-                self._close_blocked_hold(req["id"], card, blocked, e)
+            elif gate:
+                self._close_blocked_hold(req["id"], card, blocked, e, gate)
             else:
                 log.warning("%s: close decision request #%s: %s", self.lane, req["id"][:8], e)
 
@@ -2130,26 +2402,68 @@ class Effects:
     @staticmethod
     def _close_retry_due(blocked: dict, card: dict) -> bool:
         """A gate-refused close is tried again once the card changed (the gate may be
-        answered or cleared), or after CLOSE_BLOCKED_RETRY in any case."""
+        answered or cleared, the linked merge request merged or unlinked), or after
+        CLOSE_BLOCKED_RETRY in any case."""
         if str(card.get("updated_at") or "") != str(blocked.get("updated_at") or ""):
             return True
         tried = parse_time(blocked.get("at"))
         return tried is None or now() - tried >= CLOSE_BLOCKED_RETRY
 
-    def _close_blocked_hold(self, request_id: str, card: dict, blocked: dict, err: MeshError) -> None:
-        """Remember that Mesh refused this close behind a human gate, keyed to the card's
-        current ``updated_at``, so the next passes do not repeat the write."""
+    def _close_blocked_hold(self, request_id: str, card: dict, blocked: dict, err: MeshError,
+                            gate: str = "human_gate") -> None:
+        """Remember that Mesh refused this close behind a gate (a person's sign-off, or the
+        delivery gate while a linked merge request is open), keyed to the card's current
+        ``updated_at``, so the next passes do not repeat the write. One warning per hold;
+        a refusal by a different gate than the remembered one warns again."""
         try:
             fresh = self.mesh.task(request_id)    # the refused write or our comment may have moved it
             card = fresh.get("task", fresh)
         except MeshError:
             pass
         self._close_blocked_set(request_id, {"at": iso(), "since": blocked.get("since") or iso(),
-                                             "updated_at": str(card.get("updated_at") or "")})
-        if not blocked:
-            log.warning("%s: close decision request #%s: awaiting human sign-off, retrying when the card "
-                        "changes or every %dh: %s", self.lane, request_id[:8],
+                                             "updated_at": str(card.get("updated_at") or ""), "gate": gate})
+        if not blocked or _blocked_gate(blocked) != gate:
+            log.warning("%s: close decision request #%s: %s, retrying when the card changes or every %dh: %s",
+                        self.lane, request_id[:8], CLOSE_GATE_WAITS[gate],
                         CLOSE_BLOCKED_RETRY.total_seconds() // 3600, err)
+
+
+# Gates that refuse closing a decision request until its card changes, as named in the log.
+CLOSE_GATE_NAMES = {"human_gate": "human gate", "delivery": "delivery gate"}
+CLOSE_GATE_WAITS = {"human_gate": "awaiting human sign-off",
+                    "delivery": "Mesh refuses done, linked merge request not merged or evidence missing"}
+
+
+def _blocked_gate(blocked: dict) -> str:
+    """The gate a hold mark records; a mark written before the gate was recorded is a human gate."""
+    gate = str(blocked.get("gate") or "human_gate")
+    return gate if gate in CLOSE_GATE_NAMES else "human_gate"
+
+
+def _close_refusal_gate(err: MeshError) -> str:
+    """Name the gate behind a refused close, or "" for an error a later pass may not repeat."""
+    if _human_gate_refusal(err):
+        return "human_gate"
+    if _delivery_gate_refusal(err):
+        return "delivery"
+    return ""
+
+
+def _delivery_gate_refusal(err: MeshError) -> bool:
+    """Mesh refused done for missing delivery evidence, usually a linked merge request that is
+    not merged yet (``done_evidence_required``). Only the card changing can lift it."""
+    if err.status != 422:
+        return False
+    body = err.body if isinstance(err.body, dict) else {}
+    if DONE_EVIDENCE_CODE in (str(body.get("code") or ""), str(body.get("error_code") or "")):
+        return True
+    text = f"{err} {json.dumps(err.body, default=str) if err.body is not None else ''}".casefold()
+    return DONE_EVIDENCE_CODE in text or any(marker in text for marker in DONE_EVIDENCE_MARKERS)
+
+
+DONE_EVIDENCE_CODE = "done_evidence_required"
+# Mesh's done-evidence messages, for a refusal whose body carries no code.
+DONE_EVIDENCE_MARKERS = ("is not merged (", "has no recorded merge status", "done requires evidence")
 
 
 def _human_gate_refusal(err: MeshError) -> bool:

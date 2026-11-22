@@ -179,6 +179,7 @@ class FakeMesh:
         self.tasks = {t["id"]: t for t in tasks}
         self.comment_log: dict[str, list[dict]] = {}
         self.deps: dict[str, list[dict]] = {}
+        self.incoming: dict[str, list[dict]] = {}   # edges where the card is the blocker
         self.checkouts: dict[str, dict] = {}
         self.max_concurrent = max_concurrent
         self.refuse_checkout: set[str] = set()
@@ -236,9 +237,10 @@ class FakeMesh:
                 return dict(t)
         raise MeshError(404, "not found")
 
-    def session_report(self, task_id, tokens_in, tokens_out, model, cost, report_id=""):
+    def session_report(self, task_id, tokens_in, tokens_out, model, cost, report_id="", **kw):
         self.reports.append({"task": task_id, "in": tokens_in, "out": tokens_out, "model": model, "cost": cost})
         self.report_ids = getattr(self, "report_ids", []) + [report_id]
+        self.report_turns = getattr(self, "report_turns", []) + [kw.get("turn")]
         if getattr(self, "lose_report_answer", 0):    # applied, but the caller never sees the answer
             self.lose_report_answer -= 1
             raise MeshError(0, "timed out")
@@ -451,6 +453,25 @@ class FakeMesh:
             return None
         return wait
 
+    def wait_for(self, tid, body):
+        """POST /tasks/:id/wait: only the checkout holder may declare (409 otherwise); the commit releases
+        the checkout. Recorded in ``mesh.declared``; ``mesh.wait_for_error`` makes the call fail."""
+        if getattr(self, "wait_for_error", None) is not None:
+            raise self.wait_for_error
+        if tid not in self.checkouts:
+            raise MeshError(409, "the caller does not hold this card's checkout")
+        self.checkouts.pop(tid)
+        self.declared = getattr(self, "declared", [])
+        # the server's clock at the declaration: after every comment the card already has
+        seen = [dt.datetime.fromisoformat(c["created_at"].replace("Z", "+00:00")) + dt.timedelta(milliseconds=1)
+                for c in self.comment_log.get(tid, [])]
+        at = max([dt.datetime.now(dt.timezone.utc), *seen])
+        row = {"id": f"wait-{len(self.declared) + 1}", "task_id": tid, "agent_id": AGENT_ID, "kind": body.get("on"),
+               "project_path": body.get("project_path"), "mr_iid": body.get("mr_iid"),
+               "after_sha": body.get("after_sha"), "note": body.get("note", ""), "created_at": at.isoformat()}
+        self.declared.append((tid, dict(body), row))
+        return {"outcome": {"kind": "wait"}, "wait": dict(row), "released": True}
+
     def resolve_wait(self, tid, wait_id, resolution, cause):
         """POST /tasks/:id/waits/:wait_id/resolve: recorded in ``mesh.resolved``; ``mesh.resolve_errors``
         (a list of MeshError/OSError, consumed in order) makes calls fail."""
@@ -481,7 +502,7 @@ class FakeMesh:
         return [{k: v for k, v in r.items() if k != "to_agent_id"} for r in getattr(self, "decision_rows", [])
                 if r["to_agent_id"] == to and r["state"] == state][:limit]
 
-    def answer_decision(self, rid, answer, author="agent-lead"):
+    def answer_decision(self, rid, answer, author="agent-lead", comment_id=""):
         """POST /decision-requests/:id/answer: the answer is a comment on the asking card."""
         row = next((r for r in getattr(self, "decision_rows", []) if r["id"] == rid), None)
         if row is None:
@@ -502,7 +523,7 @@ class FakeMesh:
         # edges the runner added through add_dependency are real rows in Mesh too
         known = {e.get("id") for e in self.deps.get(tid, [])}
         extra = [e for e in self.edges.get(tid, []) if e["id"] not in known]
-        return {"outgoing": list(self.deps.get(tid, [])) + extra, "incoming": []}
+        return {"outgoing": list(self.deps.get(tid, [])) + extra, "incoming": list(self.incoming.get(tid, []))}
 
     def patch_task(self, tid, fields):
         if self.refuse_patch:
@@ -625,6 +646,9 @@ class AgentView:
     def decision_requests(self, state="open", limit=100):
         return self.mesh.decision_requests(state, limit, to=self.agent_id)
 
+    def answer_decision(self, rid, answer, comment_id=""):
+        return self.mesh.answer_decision(rid, answer, author=self.agent_id, comment_id=comment_id)
+
 
 class HarnessGate:
     """Keep a real fake harness alive until the test explicitly releases it."""
@@ -685,6 +709,8 @@ replies = json.load(open(os.environ["FAKE_REPLIES"]))
 m = re.search(r"#([0-9a-f]{8})", prompt)
 key = m.group(1) if m else ""
 reply = replies.get(key + (":resume" if "--resume" in args else ""), replies.get(key, ""))
+if "--fixture-codex" in args and key + ":codex" in replies:     # the card's turn on its Codex harness
+    reply = replies[key + ":codex"]
 turn_command = None
 if isinstance(reply, dict):                      # the turn ends with a Mesh turn command (mesh_turn)
     turn_command, reply = reply, reply.get("pre", "") + reply.get("text", "")
@@ -786,9 +812,15 @@ print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "model
                   "apiKeySource": "ANTHROPIC_API_KEY" if os.environ.get("ANTHROPIC_API_KEY") else "none"}))
 for _ in range(compactions):
     print(json.dumps({"type": "system", "subtype": "compact_boundary", "session_id": sid}))
-print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": reply, "session_id": sid,
-                  "total_cost_usd": float(os.environ.get("FAKE_COST", "0.01")), "usage": {"input_tokens": 10, "cache_read_input_tokens": 90,
-                                                    "output_tokens": 5}}))
+# a resumed Claude session reports its running total; FAKE_COST_RESUME=none: a result without one
+cost = os.environ.get("FAKE_COST_RESUME") if "--resume" in args and os.environ.get("FAKE_COST_RESUME") \
+    else os.environ.get("FAKE_COST", "0.01")
+result = {"type": "result", "subtype": "success", "is_error": False, "result": reply, "session_id": sid,
+          "total_cost_usd": None if cost == "none" else float(cost),
+          "usage": {"input_tokens": 10, "cache_read_input_tokens": 90, "output_tokens": 5}}
+if cost == "none":
+    del result["total_cost_usd"]
+print(json.dumps(result))
 '''
 
 

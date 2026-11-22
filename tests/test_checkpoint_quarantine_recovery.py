@@ -252,3 +252,36 @@ class CheckpointQuarantineRecovery(Bench):
         self.assertEqual(len(said), 1)
         self.assertEqual(r.store.mark(a.agent, a.task_id, f'lease_retained_notice:{a.id}')[0],
                          'verify-fingerprint/replay-mismatch')
+
+
+class ResumeRestoreRefusalsAreCounted(Bench):
+    """A refused restore on the resume path joins the same durable streak as the start path, the
+    resume quarantine still engages, and the next restore that goes through ends the streak."""
+    parked = WorkspaceRequests.parked
+
+    def test_resume_refusals_are_counted_quarantined_and_cleared_on_success(self):
+        from mesh_runner.workspace import RestoreRefused
+        r, (a,) = self.parked()
+        (Path(a.workspaces[0]) / 'README').write_text('preserved progress\n')
+        r.pool.suspend(a.id, r._suspend_metadata(a), writer_stopped=True)
+        self.assertEqual(r.pool.leased_to(a.id), [])
+        r.store.update(a, state='ready')
+        refusal = 'checkpoint: active git writer in target submodule vendor/kit; lease retained'
+        # mock: external boundary — only the monotonic clock; the refusal is the real exception type
+        clock = time.monotonic()
+        with patch('mesh_runner.runner.time.monotonic', return_value=clock), \
+                patch('mesh_runner.checkpoint.Checkpoints.restore', autospec=True,
+                      side_effect=RestoreRefused(refusal)):
+            for _ in range(3):
+                r._guard(r.store.get(a.id), 'resume', r._resume_one)
+        self.assertIn((a.id, 'resume'), r._quarantine)          # the guard still backs off
+        rows = r.status()['restore_refusals']
+        self.assertEqual([(x['task_id'], x['count'], x['error']) for x in rows], [(a.task_id, 3, refusal)])
+        self.assertIn(rows[0]['target'], [row['target'] for row in r.pool._checkpoint_rows(a.id)])
+        r._quarantine.pop((a.id, 'resume'))
+        r._guard(r.store.get(a.id), 'resume', r._resume_one)
+        self.assertTrue(r.pool.leased_to(a.id))
+        self.assertEqual(Path(r.store.get(a.id).workspaces[0], 'README').read_text(), 'preserved progress\n')
+        self.assertNotIn('restore_refusals', r.status())
+        self.assertEqual(r.store.mark('builder', a.task_id, 'restore_refusals')[0], '')
+        self.finish_turn(r)

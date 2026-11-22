@@ -1,13 +1,3 @@
----
-created: 2026-11-02T05:36:02+03:00
-updated: 2026-11-21T23:00:00+03:00
-author: Entire VC
-status: maintained
-project: mesh
-type: guide
-tags: [mesh, task-management]
----
-
 # Mesh Agent Runner
 
 Runs Claude Code and Codex agents on their [Mesh](https://github.com/entire-vc/evc-mesh) tasks.
@@ -35,9 +25,9 @@ Runs Claude Code and Codex agents on their [Mesh](https://github.com/entire-vc/e
   rules. The runner schedules work, isolates checkouts and coordinates the
   turn, review and merge lifecycle.
 
-Status: actively developed, **0.2.x** release series. For the exact version of this
-checkout, see [package metadata](pyproject.toml). Python ≥ 3.11; the core uses the
-standard library, with optional dependencies for signed receipts.
+Status: actively developed, 0.2 release series. Current release: **0.2.115**
+([package metadata](pyproject.toml)). Python ≥ 3.11; the core uses the standard
+library, with optional dependencies for signed receipts.
 
 ## How it works
 

@@ -1,5 +1,474 @@
 # Changelog
 
+## 0.2.116 — 2026-11-21
+
+- **Follow card waits that name only a short id.** The wait-root radar resolves the
+  target with the waiting lane's access and the existing read budget and cache,
+  so readable targets receive their usual classification instead of `unknown-target`.
+
+## 0.2.115 — 2026-11-21
+
+- Preserve preconfigured repository pools when additive workspace admission fails, and report a bounded credential-masked failure reason in its receipt and log. Mesh-managed admission pins the permitted host inventory specification, including its slot limit, rather than the legacy repository entry.
+
+## 0.2.114 — 2026-11-21
+
+- **What changed.** A Codex card turn's Mesh MCP server now sees the runner carrier
+  (`MESH_RUNNER_TASK`, `MESH_RUNNER_LANE`, `MESH_RUNNER_CHECKOUT_*`). Codex starts a stdio MCP server
+  with an allowlisted environment, so its memory reads reached Mesh without a task or session id.
+  The Codex adapter now names the carrier in `mcp_servers.<name>.env_vars` (names only, values stay in
+  the environment) for each Mesh MCP server defined in the config file Codex loads for the launch's
+  `CODEX_HOME` and profile; an unreadable config leaves the launch unchanged. Cardless turns (answer
+  desk, chat) carry no checkout and stay without ids.
+
+## 0.2.113 — 2026-11-21
+
+- **A returning card starts without replaying its snapshots twice.** Adopting the previous run's
+  working-copy snapshots replayed each of them into scratch under the process-wide checkpoint lock, and
+  the restore right after replayed them again. The start step `task` of such a card took up to 147 s
+  (a lane with 13 repositories: 91 s) and held every other lane's capture and restore meanwhile.
+  Adoption now checks the stored bytes without a replay: the tree against its recorded inventory and
+  every git index against the sha256 the capture now records, or, for a snapshot taken before, against
+  the index's own checksum. Only such an older snapshot whose index git wrote without a checksum
+  (`index.skipHash`) is still proven by a replay. A damaged snapshot is still refused before anything
+  is transferred or leased; it holds only its card, which starts once the snapshot is whole.
+
+## 0.2.112 — 2026-11-20
+
+- **A lane's team-directory entry follows the harness and model its turns actually ran on.** After
+  each settled turn on the lane's own route the Runner compares the harness and the model the harness
+  itself recorded (Claude's stream init, Codex's turn_context) with the lane's Mesh profile and reports
+  `agent_type`/`model` through the agent heartbeat when they differ. A lane switched to another
+  harness, or moved to a Codex profile by a quota fallback, no longer announces its old model family to
+  review routing and reviewers. Configured defaults are never reported: a turn without an observed
+  model reports only a family change and clears the old model. A card routed to its own harness by a
+  label leaves the lane's entry alone.
+
+## 0.2.111 — 2026-11-20
+
+- **A lane's standing chat is checked between the steps of a long tick too.** A chat session that died
+  during a long start (twelve repositories) or a long tick stayed down until the tick ended; the check
+  keeps its once-a-minute pace and its failure never fails the start.
+- **A lease no longer fetches a base fetched successfully within the last 60 s.** A start of a lane with
+  twelve repositories fetched each over the network, and the next start in the same tick did it again;
+  the held-slot recheck still fetches every time.
+- **A start longer than 60 s is logged with its steps** (`<lane>: #<card> start took Ns (reserve, env,
+  preflight, checkout, task, workspaces, admit, end)`), so a slow `start` phase names the step that took it.
+
+## 0.2.110 — 2026-11-20
+
+- **runner.log no longer fills with `MallocStackLogging: can't turn off malloc stack logging`.**
+  On macOS, after the first critical memory pressure event, every child the Runner forked printed
+  that line into runner.log before its streams were redirected (97% of the file, until the next
+  restart). The Runner now turns malloc stack logging on and straight off once at start, which keeps
+  the fork hook silent; the startup line `fork notice: armed: …` shows it took effect.
+
+## 0.2.109 — 2026-11-20
+
+- **Wait advice for another card's code names its merge request, never the card.** When a fix or a
+  dependency is another card's code, the runner's texts (a refused time wait on a red head, the notice
+  on someone else's merge request, a sent-back `until=change` wait, a sent-back `until=deployed` card
+  wait) now advise `wait_for on=mr … until=merged` or a stack on its branch, and with no merge request
+  yet `wait_for on=card target_condition=artifact_published`, then the stack. A plain card wait held
+  the waiter until the owner closed the card, long after the code merged.
+
+## 0.2.108 — 2026-11-20
+
+- **Restores no longer refuse an empty submodule after Git refreshes only its index metadata.** Staged changes still block replacement.
+- **A merge-only card closed without the merge is no longer handed the same head again.** The
+  author's repeated `wait_for on=merge` used to find that closed card by its stable key, "hand" the
+  merge to it and wake at once, on every re-arm, with no new attempt by the lead. Now the re-arm wakes
+  once with the cause quoted from the closed card (its assignee's last comment) and says how a new
+  attempt starts: move the card back to todo, then declare the wait again. A closure seen while
+  waiting quotes the cause too.
+- **A merge gate that gets 404 for an open merge request is classified `merger-no-access`.** The
+  runner reads the merge request as open, so the 404 means the gate's GitLab identity cannot see the
+  project, not a vanished MR. The wake says so and points to an access card; on a merge-only card the
+  runner notes it there and the card's instructions say not to close it.
+
+## 0.2.107 — 2026-11-20
+
+- **A turn that ends while another card's start restores its working copies gives its reservation
+  back during that start.** The release pass ran between the units of the start loop, and one start
+  of a lane with many repositories restores or leases every working copy inside a single unit (up to
+  14 minutes on the fleet host), so an ended turn kept its capacity slot until that start finished.
+  The workspace pool now calls the runner's release pass after each repository it leases or restores,
+  outside the repository's lock; a failing pass is logged and never fails the lease or the restore.
+
+## 0.2.106 — 2026-11-19
+
+- **A session woken on a settled pipeline, merge request or merge gets the result in the wake prompt.**
+  The runner reads it once and puts it under «The runner already read the result». For a pipeline that is
+  the sha, the ref, the link and the job counts. A failed pipeline adds the failed jobs (stage, failure
+  reason, job id), the jobs that failed but were allowed to, and the last 25 lines of the first failed
+  job's log, with terminal codes and section markers removed. A downstream pipeline adds its status. A
+  merge request adds its state, head and link; a merged one adds the merge commit, the target branch and
+  the pipeline on the merge commit. Measured on claude session logs over 7 days (all lanes): after such a
+  wake the first turn made 4.3 to 6.8 glab, git and Mesh calls, mostly re-reading the merge request, the
+  job list and the failed job's log. A read that fails leaves the wake as before, with no detail.
+- **A turn that ends during a long tick gives its gate reservation back in that tick.** The settle step
+  ran once per tick, at its start, so a turn that ended while a busy lane spent minutes starting or
+  resuming other cards kept its capacity slot until the next tick, and other lanes were refused that
+  slot meanwhile. Now the reservation of every ended turn goes back, and its leader is reaped, between
+  the steps of the tick and between the units of the start, resume, wake and skip-state loops; the
+  settle step returns the reservations of all ended turns before it settles the first one. The turn
+  itself is still settled by the next tick's settle step, so its card is never resumed in the tick its
+  turn ended in (one the watchdog cut off included). A turn whose prompt delivery is not proven keeps
+  its reservation until the settle step decides.
+- **A process group whose only members are zombies counts as gone.** The turn's leader is the runner's
+  own child, so after it exits it stays a zombie until reaped, and `killpg(pgid, 0)` cannot tell such a
+  group from a live one (Linux answers success, macOS answers `EPERM`). The liveness check now reads the
+  members' states from the kernel (`sysctl` on macOS, `/proc` on Linux); an unreadable state still
+  counts as alive.
+
+## 0.2.105 — 2026-11-19
+
+- **A lane's row in `status.json` is complete right after the runner starts.** Until a lane's first
+  tick finished or beat (30 s after it began), `status.json` showed it as a placeholder with only
+  `agent` and `tick_at`, no `cap`, `paused` or `attempts`, and every reader that checks a lane took
+  every lane for an unknown state for about 30 s after each restart. A lane now publishes its row in
+  its first tick as soon as its Mesh identity (and so its cap) is read, and a new process holds its
+  first `status.json` until every lane has a row of its own or the error of its tick, at most 30 s;
+  the previous process's file stands meanwhile. A lane still silent then keeps its placeholder and
+  the runner logs `first status without a row of its own`.
+- **A settle that may not clear a released working copy is held on that exact path, like resume.**
+  A `PermissionError` while settling a turn (a root-owned `__pycache__` left in the slot) went to the
+  step's blind quarantine, 15 minutes growing to 4 hours, with no hold event, so the alert never fired
+  and a repaired path still waited out the pause. `settle` and `prompt-delivery` now take the same
+  `permission_hold:<step>` mark and `workspace_permission_hold` event as `resume`: no retry while the
+  path's owner, mode and ACL are unchanged, and one retry on the next tick (`permission_path_changed`)
+  once they change.
+- **The first prompt carries the card description.** Start and review prompts include the description
+  (cut at 6000 characters, with a marker) and the count of open dependencies, so the session no longer
+  spends its first call reading the card; a row without a description is read by id first.
+- **The no-outcome correction is short.** It points to the outcome contract in the session's first
+  prompt instead of repeating it.
+- **A new attempt names why it started.** The launch event and log line carry `reason=new_attempt`
+  with the previous attempt's state and note when the card had earlier work.
+- **A compacted session gets the full outcome contract again.** The short correction points to the
+  contract in the first prompt; after a context compaction that prompt may be gone, so the correction
+  carries the whole contract instead.
+- **The answer desk asks once more after a harness failure.** When the addressee's session ends on a
+  harness error, the desk queues the question once more before the asker files a request card; an
+  addressee that ends its turns without an answer, or a turn that runs out of its time, is not retried.
+
+## 0.2.104 — 2026-11-19
+
+- **A review held by `qa_no_selection:no_available_route` is retried on schedule without a card
+  change.** A route or quota refusal clears off the card (a routing rule change, a restored pool, a
+  quota reset), so the runner now treats it like other QA infrastructure holds: one notice, then the
+  start gate is asked again every `review_unstartable_retry_minutes`. Before, such reviews waited
+  for a comment or an edit of the card. Reviewer absence (`qa_refused:*`, other `qa_no_selection`
+  reasons) still waits for a card change.
+- **A card can name the code it merges after, and the merge gate waits for it.** A `merge-after:`
+  line in the card description (another card, `group/project!iid` or its GitLab URL) holds the merge
+  wait's gate until every predecessor is merged, also when the runner declares the wait itself on a
+  SHIP verdict; before, a SHIP handed back to the author ran the gate in the same tick and could merge
+  ahead of the code it builds on. The author's own `wait_for on=mr until=merged` on another merge
+  request is carried into the runner's merge wait the same way, also without a baseline and when that
+  request cannot be read; when Mesh cannot say which wait the author holds, nothing is declared. An
+  order that can no longer be met (card cancelled, merge request closed, a line naming nothing
+  readable or nothing at all) wakes the author; anything unreadable holds. See README § Merge waits.
+- **A merge wait on a card with an empty description no longer fails.** Mesh leaves an empty
+  description out of the card it returns; the gate took that for an unreadable card and woke the
+  author after three checks instead of merging.
+
+## 0.2.103 — 2026-11-19
+
+- **A refused snapshot of a card's working copies is a declared hold, not a silent retry.** A slot
+  whose populated submodule keeps its repository inside its own path (`.git` a directory, e.g. a
+  clone made there by hand) could not be snapshotted, and every settle, prompt delivery and
+  workspace suspend of the card was refused with the same `populated submodule unsupported` line,
+  the slot staying leased, while only `runner.log` said so. The refusal now names the layout
+  (`populated submodule unsupported (embedded .git directory): <path>`; absorbing the submodule's
+  repository, `git submodule absorbgitdirs`, repairs it). Every refused snapshot of a card counts in
+  a streak (count, call site `wait|ownership|resume|start`, held slots, cause) that survives a
+  restart, is published in `status.json` as `suspend_refusals` for alerting, and ends with the first
+  snapshot that goes through or when the slot is given back. The card gets one comment per attempt
+  that its snapshot keeps failing and its lease is retained, now also when the refusal comes from
+  settle or prompt delivery.
+
+## 0.2.102 — 2026-11-19
+
+- **A resumed Claude session no longer reports its whole running cost again on every turn.**
+  Claude's `total_cost_usd` and `modelUsage` are totals of the session, so each turn's spend
+  report (and the completion comment's notional cost) now carries their increment over the
+  session's previous turn; the first turn of a session is taken as it is. Turn tokens come from
+  the `modelUsage` increment (subagent calls included) when the harness reports it. The totals are
+  kept in the state store, so a restart between turns keeps the same report. The API-mode pool
+  ledger still settles on the turn's raw `total_cost_usd`.
+
+## 0.2.101 — 2026-11-19
+
+- **A start that a full slot table moves to an overflow route is no longer logged as a capacity
+  hold.** The start attempt whose admit is refused and fed again at once on an overflow route used
+  to end with `aborted` / `held: runtime capacity unavailable` in `events.jsonl`, even when the
+  overflow feed started the card seconds later; resumes never did. The superseded attempt now gets
+  its single event once the overflow feed has answered: `overflow: … started on its overflow route`
+  when it started, the overflow attempt's own end when that one was refused again, and the old
+  capacity hold only when no open profile was found. Counting capacity holds in the event log now
+  counts cards that really stay held.
+- **The spend report can carry the turn's id, times, provider, account, billing mode and cache split.**
+  With `[spend_report] turn_fields = true` each turn's report also sends `turn_id`, `started_at`,
+  `ended_at`, `provider`, `account_ref` (`<harness>/<account>`, the name of the account's quota pools),
+  `billing_mode` and `cache_read` / `cache_write` / `cache_write_1h`; a cache figure the turn did not
+  report is named in `unknown`, never sent as 0. Off by default: turn it on only against a Mesh that
+  accepts these fields. `[spend_report.account_refs]` names the account of a default login directory.
+  See `docs/spend-report.md`.
+
+## 0.2.100 — 2026-11-19
+
+- **The checkpoint size gauge measures a store kept behind a link.** `pool_root/checkpoints` may be a
+  symlink onto the slot volume, so that snapshots are APFS clones instead of byte copies on another
+  volume; `du` counted such a link as zero, and `mesh_runner_checkpoint_bytes`, `status.json`
+  `checkpoints.bytes` and the budget warning read 0. The size is now taken from the link's target.
+  Tests pin that a store linked onto the slot volume clones every delta file and restores exactly,
+  and that a store on another volume copies them.
+- **A stale submodule is set aside even when the slot and its git directory sit on different
+  volumes.** A restore into a pooled slot moved the leftover submodule worktree next to its gitdir;
+  with the slot on one volume and the base clone's git directory on another that rename failed with
+  `Cross-device link`, and every start of the lane paused again and again. The worktree is now parked
+  on its own volume in `.runner-stale-submodules-<slot>` beside the real slot directory (the gitdir
+  stays in `runner-stale-submodules` by the modules directory), so both moves remain atomic renames.
+  A set-aside that still fails is a refused restore of that card (`restore_refusals` in
+  `status.json`), not a pause of the lane. Parked pairs are kept for the operator; nothing purges them.
+
+## 0.2.99 — 2026-11-19
+
+- **A card's turn prompt lists the open evidence edges waiting on it.** A card that another card
+  waits on with `artifact_published`, `access_ready` or `contract_ready` used to learn nothing about
+  it: only an attestation on the producer's side releases such an edge while the producer is open,
+  so a published result could sit unattested for hours. The first prompt and every resumed work turn
+  now name each open incoming evidence edge — the waiting card, the condition, the exact criterion,
+  the dependency id — with the one call that releases it (`update_dependency … evidence_criterion=…
+  evidence_url=… attest=true`). Released, attested and `task_done`/typed edges are not shown; with
+  no such edge the prompt is unchanged. An unreadable edge set drops the block with one warning in
+  the runner log and never fails the turn.
+
+## 0.2.98 — 2026-11-19
+
+- **Checkpoint cleanup now removes captured read-only directory trees.** It grants owner rwx through
+  each already-open directory descriptor before unlinking children, without following symlinks, so a
+  read-only stand no longer leaves its lease suspended on a permission error.
+- **A time wait on a card whose merge request is still open is refused.** Its CI result and its
+  merge are the events, not a clock: the correction names the `wait_for on=mr`, `on=pipeline` or
+  `on=merge` command that fits the head pipeline's state (a failed or manual head gets its action
+  first). Repeating the timer ends in the usual correction hold. A time wait already sleeping is
+  checked the same way at most every 10 minutes, and its session is resumed with that hint; only the
+  runner's own schedule is removed. The open state is confirmed with GitLab (or GitHub): when the
+  links or the forge cannot be read, the timer is accepted and the reason is logged.
+- **A fetched submodule tag on a published commit no longer blocks a card's restore, and a
+  restore refused again and again is reported.** A stale submodule gitdir in the target slot is
+  set aside when its tags only name commits a remote already has, or tags the incoming checkpoint or
+  the last fetch brings; a tag on a commit no remote has, or an annotated tag made locally, is still
+  refused. Replayed submodule gitdirs now pack their refs like a clone, so the next card restored
+  into the same slot is not refused on the Runner's own loose tags. A refusal caused by the target
+  slot (stale submodule work, an active git writer, a symlinked gitdir or an unsafe submodule
+  pointer) holds only that card, on the start and the resume path; its streak (count, slot, cause)
+  survives a restart and is published in `status.json` as `restore_refusals` for alerting, and it
+  ends when the card gets its working copies.
+- **An unsent prompt held in `unknown` because its scope changed now ends by the quiet rule, and the
+  same workspaces in another order are no longer a changed scope.** A proven-unsent prompt whose
+  lane's workspaces or harness changed while it waited went to `unknown`
+  (`prompt_retry_scope_changed`), and the quiet rule skipped every retryable intent, so only an
+  operator token ended it: such attempts stood for days with their cards. It now ends like any other
+  quiet `unknown` (turn process gone, evidence unchanged for the quiet minutes): no replay, the card
+  starts in a fresh session, a comment says why, and `runner.log` logs the return to the queue. The
+  narrow restored-scope recovery still runs first, and an operator token still wins. The scope check
+  compares the leased workspaces as a set: the same paths in another order send the exact prompt.
+
+## 0.2.97 — 2026-11-19
+
+- **A task hold can wait on a wake file instead of being re-asked every two minutes.** A start
+  gate that exits 76 may print `HOLD_WAKE_FILE=<absolute path>` and `HOLD_WAKE_SIG=<signature>`;
+  the hold then ends on the first tick at which that file reads differently (or the task is
+  updated), with a two-hour guard, rather than on the gate cadence. A review waiting for its route
+  was re-asked 437 times in a day before. Gates that print no pair behave as before. See the
+  `start_gate_command` section of the README.
+
+## 0.2.96 — 2026-11-18
+
+- **A checkpoint fault of one card no longer stops the whole lane, and no longer repeats forever.**
+  A slot returned to the pool drops its restore marker, so a restore released before launch (an
+  admission refusal) can be replayed into that slot again instead of being refused as "newer work"
+  on every start. The checkpoint pass keeps the snapshots an unspent ownership-loss note still names
+  (up to 14 days), so a card that comes back can adopt them. When those snapshots are gone in whole or in part,
+  the start continues on the card's previous paths and says so once on the card. An inventory fault
+  or a refused restore holds only that card (task backoff, one comment per distinct fault, retried after the backoff); the lane-wide start
+  pause stays for fetch, authentication and disk errors.
+
+## 0.2.95 — 2026-11-18
+
+- **A turn whose harness reports no price is reported to Mesh at the model's list tariff.**
+  Interactive Claude, Codex, Kimi and ZCode turns sent only token counts, so the cost of most cards
+  read «—». The spend report now prices such a turn from its tokens (input, output, cache read, cache
+  write by 5m/1h lifetime; Codex cache hits inside its input) with a built-in table of provider list
+  prices for claude-opus-5-5, claude-sonnet-5-5 and gpt-6.1-sol/6-luna/6-astra; `[prices."<model>"]`
+  in the runner config adds or replaces a tariff (with its `source`), `[prices] builtin = false` drops
+  the table. A model without a tariff, or a cache write whose lifetime is unknown, stays unknown. The
+  interactive Claude driver now keeps the 5m/1h cache-write split in the turn's usage. A provider's
+  own `total_cost_usd` still wins.
+
+## 0.2.94 — 2026-11-18
+
+- **The API spend pool is charged each turn's own cost, not the session's running total.** A resumed
+  harness session reports `total_cost_usd` for the whole session so far; the API ledger charged that
+  total on every turn, so a pool ran out 1.5–3 times sooner than the provider bills. Each API turn is
+  now charged its total minus the total the previous turn of the same session reported (kept across
+  runner restarts); a first turn or a new session is charged in full, and a turn that reports no cost
+  still takes its whole reservation. Ledger rows charged this way carry the source
+  `total_cost_usd_delta`; rows already written stay as they are.
+
+## 0.2.93 — 2026-11-18
+
+- **A card wait sent back because its target waits for a person or a timer no longer leaves its edge
+  behind.** The runner never armed that wait, so no wake ended it: the next outcome only superseded it
+  in Mesh, and the blocks edge Mesh made for it stayed. After the session ended the card was held as
+  blocked by the target, a gate it never declared. The sent-back wait is now resolved as `cancelled`
+  with the reason, and the edge is removed with the owner-checked delete when the receipt says this
+  wait owns it, the same as a sent-back `until=deployed` wait. A failed delete is logged and does not
+  hold the send-back.
+
+## 0.2.92 — 2026-11-18
+
+- **A question whose addressee's transport gate holds every turn now goes to its request card instead of
+  waiting on the answer desk without end.** The desk stamps each request it cannot start because of the
+  lane's transport gate with the moment its hold began (the later of the lane's hold as the desk first saw
+  it and the question's own arrival); 20 minutes later (`FALLBACK_SECONDS`, the same
+  answering time a delivered turn gets) the asker files the `[decision]` card with the gate's reason, and a
+  routed or mention question is refused or carded the same way. The clock measures one continuous hold:
+  the gate letting a turn through, or a memory, load or pause wait in between, restarts it for every
+  question of the lane. The hold is logged once per reason
+  (`answer desk: transport gate holds …`), shown as `transport_hold` in the lane's `answer_desk` status
+  block, and the gate hook is asked again only after 60 s instead of on every 2-second desk pass. Memory,
+  load and host-slot waits still spend none of the 20 minutes.
+
+## 0.2.91 — 2026-11-18
+
+- **A provider's refusal of a Claude turn's content is no longer retried as a harness error.** A turn
+  whose last assistant message carries the typed `stop_reason: refusal` used to be resumed in the same
+  session until the failure cap (each resume refused the same way), then handed up as an opaque
+  `harness error [sha256:…]`. The runner now records the refusal (`provider_refusal` in the attempt's
+  events and in `events.jsonl`, with the harness and `stop_details.category`) and never resumes that
+  session: when the lane also runs the other harness of the Claude/Codex pair, this card alone
+  continues there in a new session (once per card; other cards keep the lane's route); otherwise the
+  card goes up at once with `provider refusal: <category>`. The refusal is read before the turn cap
+  and the refused turn that moves the card is outside the turn budget, so a refusal on the last turn
+  still moves the card or names its category. Neither the provider's text nor the prompt
+  is published. The env command of a card routed to its own harness (this route or the
+  `runner-harness:<h>` label) now gets `MESH_RUNNER_TASK_HARNESS=<h>`, so it can build that harness's
+  environment.
+
+## 0.2.90 — 2026-11-18
+
+- Preserve a returning task's branch, commit and uncommitted work when its previous worktree slot has been reused. A live branch holder blocks the return without launching another writer or retaining an extra lease; releasing the holder lets the same attempt retry.
+
+## 0.2.89 — 2026-11-18
+
+- **Retry review admission after infrastructure holds with diagnostic details.** Missing pool evidence remains an infrastructure refusal when the gate appends its cause and next actor, so the runner probes again after the retry interval even if the card has not changed.
+
+## 0.2.88 — 2026-11-17
+
+- A reviewer's SHIP written below a blank line (a hand-off note: one line naming the new owner, a blank line, then the verdict) now gets the runner's merge wait: the verdict line is read from the verdict word, not from the start of the pattern match (17.11: 20 of 49 SHIP verdicts had that shape and none got the runner's wait). The enumerated-verdict check reads the same line.
+- A card returned to its author is looked at between the steps of the author's tick and between the cards of its long loops (`ShipDue`): a review turn end on this runner and Mesh `task.assigned`/`task.updated` events make it due, so the merge wait no longer waits for the start phase of the next tick (busy lanes tick 135-274 s).
+
+## 0.2.87 — 2026-11-17
+
+- **A headless kimi turn ended by the provider's account limit before it bound a session is a quota
+  failure, not an unknown delivery.** Kimi's print mode names its session only after a completed turn, so a turn
+  refused on the usage window (at once on a resume, or after it had already worked on a fresh session) left no
+  session id, and recovery read it as `headless-native-session-mismatch`: the card was held in `unknown` with an
+  operator alert, and the lane was never moved to another account. Now the CLI's own terminal failure, typed by
+  the adapter as the account's limit, keeps the exact pending prompt (not acknowledged, pending wakes undelivered),
+  runs the on-limit command and requires fresh account capacity for the next start. The pending request continues
+  in a new session, including when the account changes within Kimi; its previous session id is never sent to the
+  fresh account (event `prompt_quota_unbound_reconciled`).
+  Any other failure without a session, an authentication refusal, limit words that only appear in the output
+  of the turn's commands, or a limit line beside another terminal failure the turn names (a typed stream error,
+  an earlier failure line) still hold the card as before. Recovery is limited to Kimi; other harnesses without
+  a session keep their existing unknown-delivery behaviour.
+
+## 0.2.86 — 2026-11-17
+
+- **A decision request whose close Mesh refuses for an unmerged linked merge request is no longer
+  retried every pass.** When the request card carries an open merge request, Mesh answers the move to
+  done with `422 done_evidence_required`; the runner used to repeat that write and log a warning on
+  every pass (hundreds of lines a day per card). The refusal is now held like a human-gate refusal:
+  one warning, then a retry only when the card changes (the merge request merged or unlinked) or
+  every 6 hours.
+
+## 0.2.85 — 2026-11-17
+
+- **After a reviewer's SHIP the merge gate starts in the same tick that declares the merge wait.** The
+  runner used to declare the author's `wait_for on=merge` in one tick and start the gate on the next wake
+  check, one tick later (about 20 s of the 77 s measured live from SHIP to the first gate run). The first
+  wake check of that wait now runs right after the declaration; later checks keep `wake_poll_seconds`.
+
+## 0.2.84 — 2026-11-17
+
+- **Answer desks select the recipient's lane in the asking card's workspace.** Each lane keeps its own scoped credentials; supported headless lanes can answer without a work card, and host contention does not consume the answer deadline before the first delivered turn.
+- **Decision fallback reuses explicit answers and existing work.** Exact recipient answers and explicitly linked incidents prevent duplicate requests; orders naming a merge request or branch reach the recipient's matching active card when the target is unambiguous.
+- Restore a locally compressed Codex rollout before resuming its thread, preserving the original session instead of starting a new one after idle-session retention.
+
+## 0.2.83 — 2026-11-17
+
+- **A card refused at admit for a full slot table is fed again at once when the start gate asked
+  for overflow.** A gate that turns a server slot refusal (`acquire_refused:pool_exhausted`) into
+  an overflow request now prints `TASK_ROUTE_OVERFLOW=requested`; the Runner then runs the card's
+  next reserve in the same call, so the card moves to the next profile of its chain within the
+  tick instead of waiting for the next one. Once per call, never a loop; a refusal without the
+  key keeps the ordinary hold. Start and resume both apply.
+- **Answer comments now complete answer-desk requests.** Fresh recipient answers are recorded in Mesh even without `answer_decision`. Addressed questions use the desk, notifications and program-generated mentions stay silent, and explicit operations for metadata-only recipients receive workspace-required access requests under ordinary permissions.
+- **Fix managed partner reservation release after Runner retires a checkout.** A stopped attempt can release its exact durable pending reservation using its last published fence generation; admission and renewal still require the live checkout. Confirmed releases now acknowledge the Runner end-hook protocol.
+
+## 0.2.82 — 2026-11-16
+
+- **A card wait on another card ends when that card's merge request is merged.** A plain
+  `wait_for on=card` used to sleep until somebody closed the target, often hours after its code was in.
+  Now the Runner wakes it as soon as every merge request linked to the target is merged or closed and at
+  least one is merged (Mesh link status, confirmed by GitLab); a target already merged when the wait is
+  declared releases it on the first check. Mesh's link status alone never releases it: without a GitLab
+  observer, or for a merge request this GitLab does not hold, the wait stays until the target closes. Each merged set is told once, so a re-declared wait on the same
+  target sleeps until closing. A target without a merge request still ends the wait by closing. Typed
+  conditions (`target_condition=deployed|accepted|shipped`) and question waits are unchanged.
+- **The Runner declares the merge wait itself after a reviewer's SHIP.** When a review verdict of
+  someone else names the head of the card's one open, non-draft GitLab merge request, the Runner declares
+  `wait_for on=merge` for the author through its own checkout and parks a sessionless attempt on it: the
+  merge gate runs on the next wake check, and the author's session starts only on the gate's answer
+  (merged, refused, closed, head moved), with that answer as its event. This holds whether the card stays
+  in review or the reviewer hands it back to the author (todo): there the author's earlier session goes on
+  when it can. The author's own verdict, a verdict naming no commit, several open merge requests, a draft,
+  a disabled merge gate, a refused declaration or a comment of someone else after the verdict keep the
+  ordinary path (the author is started with the verdict), once per verdict.
+- **A review start held for its official route is re-asked after 2 minutes, not 10.** The router writes
+  that route without touching the card, so the task hold used to sit its full ten minutes after the route
+  was ready.
+
+## 0.2.81 — 2026-11-16
+
+- **A repository added to a lane now reaches the lane's waiting attempts on their resume.** Until now an
+  attempt kept the repositories it was admitted with: a repository added to `[[agents.repos]]` (or
+  granted in Mesh repository access) later reached new attempts only, every waiting one asked an
+  operator for `admit-workspace-repo`, and one that had released its worktrees into a checkpoint
+  could not be helped at all (`rejected_checkpointed`) and asked again after the restore. On resume,
+  after a checkpoint restore too, the runner now leases each missing configured repository through
+  that command's own journal and tells the turn `[runner] Repository <name> was added to this task`.
+  The restore still brings back exactly the journaled set and refuses an inconsistent one as before;
+  an ambiguous inventory adds nothing, a full pool skips the repository for that turn. Event
+  `repo_admitted_on_resume`; see `docs/repo-preflight.md`.
+
+## 0.2.80 — 2026-11-16
+
+- **A repository-access refusal now reaches its contact even when the contact just spoke on the card.**
+  The mention path drops an `@agent` line on someone else's card when that agent commented there in
+  the last 24 hours (it reads as a reply, not an ask). The refused lane's `@<contact> repository
+  access for lane …` handoff was dropped the same way, so a lane whose card had just been answered
+  by its access contact stood silent until an alert. A comment of exactly that shape (opening
+  `@<contact> repository access for lane` line, `repo_preflight=` facts with an access reason and
+  `next_actor` = the addressee) whose Mesh author is the card's assignee (the only lane whose runner
+  refuses that card) is now filed as a request card regardless of the conversation; the runner logs
+  `is a repository access refusal: filed whatever the conversation`. The same text from anyone else,
+  and plain replies, keep the 24-hour rule.
+
 ## 0.2.79 — 2026-11-16
 
 - **A turn the Runner cut at its own limit after the session took the prompt no longer goes to `unknown`.**

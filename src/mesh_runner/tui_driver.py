@@ -1590,7 +1590,13 @@ class Driver:
         for u in usage.values():
             for k in set(u) | {"input_tokens", "output_tokens"}:
                 v = u.get(k)
-                if not isinstance(v, (int, float)) or (k in total and total[k] is None):
+                if k == "cache_creation" and isinstance(v, dict) and total.get(k, {}) is not None:
+                    # cache writes by lifetime (5m / 1h): their prices differ, so the split is kept
+                    split = total.setdefault(k, {})
+                    for kk, vv in v.items():
+                        known = isinstance(vv, (int, float)) and split.get(kk, 0) is not None
+                        split[kk] = split.get(kk, 0) + vv if known else None
+                elif not isinstance(v, (int, float)) or (k in total and total[k] is None):
                     total[k] = None
                 else:
                     total[k] = total.get(k, 0) + v

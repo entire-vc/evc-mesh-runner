@@ -10,6 +10,7 @@ the task's worktrees are added with --add-dir.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -18,6 +19,20 @@ from ..auth import is_auth_banner, is_verification_required
 
 
 RATE_LIMIT_STATUSES = ("allowed", "allowed_warning", "rejected")
+# ``stop_details.category`` of a provider refusal is an identifier (``reasoning_extraction``, ``cyber``):
+# anything else (prose, a long or odd value) is not published and reads as ``unspecified``.
+REFUSAL_CATEGORY = re.compile(r"[a-z][a-z0-9_.-]{0,47}")
+
+
+def refusal_category(message: dict) -> str:
+    """The category of the provider's typed refusal of one assistant message (``stop_reason: refusal``),
+    ``unspecified`` without a well-formed one; '' when the message is no refusal. Only the typed fields
+    are read: the explanation and the message text never are."""
+    if not isinstance(message, dict) or message.get("stop_reason") != "refusal":
+        return ""
+    details = message.get("stop_details")
+    category = details.get("category") if isinstance(details, dict) else None
+    return category if isinstance(category, str) and REFUSAL_CATEGORY.fullmatch(category) else "unspecified"
 
 
 def _epoch(value) -> int | None:
@@ -183,6 +198,7 @@ class ClaudeAdapter(Adapter):
         r = TurnResult()
         last_text = ""
         had_work = False
+        refusal = ""
         for ev in read_events(log_path):
             sid = ev.get("session_id")
             if sid:
@@ -199,6 +215,8 @@ class ClaudeAdapter(Adapter):
                     r.rate_limit = info
                     r.rate_limit_rejected = r.rate_limit_rejected or info["status"] == "rejected"
             if ev.get("type") == "assistant":
+                # the turn's last assistant message decides: a refusal the model got past is no refusal
+                refusal = refusal_category(ev.get("message") or {})
                 # The CLI can repeat its auth banner as an assistant text event
                 # (zero tokens, no tools) before the identical terminal result.
                 # Every other content block is conservatively treated as work.
@@ -243,6 +261,8 @@ class ClaudeAdapter(Adapter):
                 r.error = r.error_details[:300]
                 r.cost_usd = ev.get("total_cost_usd")
                 r.usage = ev.get("usage") or {}
+                r.model_usage = ev["modelUsage"] if isinstance(ev.get("modelUsage"), dict) else {}
         if not r.finished:
             r.final_text = last_text
+        r.provider_refusal = refusal
         return r

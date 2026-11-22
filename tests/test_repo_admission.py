@@ -5,12 +5,14 @@ import os
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from mesh_runner import config as config_mod
 from mesh_runner import repo_admission as admission
 from mesh_runner import workspace_requests as requests
+from mesh_runner.store import iso
 from mesh_runner.workspace import RepoSpec
+from fakes import calls, task, wait_time, write_replies
 from test_runner import Bench, make_repo
 from test_workspace_requests import WorkspaceRequests as _Fixture
 
@@ -43,7 +45,120 @@ class AdmissionFixture(Bench):
         return sub, json.loads(path.read_text())['status'] if path.exists() else None
 
 
+class AdmissionSpec(AdmissionFixture):
+    def cache(self, repositories):
+        from mesh_runner.repo_access import AccessKeeper
+        from mesh_runner.store import Store
+        store = Store(self.cfg.state_dir / 'runner.sqlite')
+        self.addCleanup(store.close)
+        AccessKeeper(store, self.agent.name).observe({'repository_access': {
+            'revision': 3, 'repositories': [s.project._asdict() for s in repositories]}})
+        return store
+
+    def inventory(self):
+        from mesh_runner.repo_access import identity
+        spec = replace(self.extra, max_slots=18,
+                       project=identity('gitlab', 'git.example', 'group/extra'))
+        self.cfg.host_repositories = [spec]
+        return spec
+
+    def test_never_migrated_uses_legacy_without_creating_registry(self):
+        self.agent.repos.append(self.extra)
+        self.inventory()
+        self.assertEqual(admission.configured_spec(self.cfg, self.agent, 'extra'), self.extra)
+        self.assertFalse((self.cfg.state_dir / 'runner.sqlite').exists())
+
+    def test_explicit_permission_uses_inventory_even_without_legacy_entry(self):
+        spec = self.inventory()
+        self.cache([spec])
+        self.assertEqual(admission.configured_spec(self.cfg, self.agent, 'extra'), spec)
+
+    def test_explicit_deny_does_not_fall_back_to_legacy(self):
+        self.agent.repos.append(self.extra)
+        self.inventory()
+        self.cache([])
+        self.assertIsNone(admission.configured_spec(self.cfg, self.agent, 'extra'))
+
+    def test_corrupt_permission_does_not_fall_back_to_legacy(self):
+        from mesh_runner import repo_access
+        store = self.cache([])
+        store.mark(self.agent.name, repo_access.STORE_TASK, repo_access.STORE_KEY, 'broken')
+        with self.assertRaises(ValueError):
+            admission.configured_spec(self.cfg, self.agent, 'app')
+
+
 class RepoAdmission(AdmissionFixture):
+    def test_failure_diagnostics_mask_known_credentials(self):
+        r, (a,) = self.parked()
+        secret = 'fixture-value'
+        r.env['TEST_TOKEN'] = secret
+        self.extra = replace(self.extra, remote='missing-' + secret)
+        with self.assertLogs('mesh_runner', level='WARNING') as logs:
+            sub, status = self.ask(r, a)
+        self.assertEqual(status, 'failed_preserved')
+        receipt = requests._read(requests.directory(self.cfg.state_dir, a.agent, admission.SPOOL)
+                                 / (sub['request']['request_id'] + '.receipt.json'))
+        for out in (json.dumps(receipt), '\n'.join(logs.output)):
+            self.assertNotIn(secret, out)
+            self.assertIn('[redacted]', out)
+        self.assertLessEqual(len(receipt['error']['message']), 300)
+
+    def test_failed_preconfigured_fetch_keeps_pool_and_existing_work(self):
+        r, (a,) = self.parked()
+        r.tick()  # settle ordinary wait metadata before the preservation snapshot
+        self.extra = replace(self.extra, remote='missing-remote')
+        r.agent.repos.append(self.extra)
+        r.pool.repos['extra'] = self.extra
+        old = r.store.get(a.id)
+        path = Path(old.workspaces[0]) / 'README'
+        path.write_text('uncommitted work\n')
+        rows = r.pool.rows()
+        with self.assertLogs('mesh_runner', level='WARNING') as logs:
+            sub, status = self.ask(r, a, fresh=copy.deepcopy(self.cfg))
+        self.assertEqual(status, 'failed_preserved')
+        self.assertEqual(r.pool.repos['extra'], self.extra)
+        self.assertIsInstance(r._pool_full(), bool)
+        self.assertEqual(r.pool.rows(), rows)
+        got = r.store.get(a.id)
+        self.assertEqual((got.workspaces, got.session_id, got.wait),
+                         (old.workspaces, old.session_id, old.wait))
+        self.assertEqual(path.read_text(), 'uncommitted work\n')
+        receipt = requests._read(requests.directory(self.cfg.state_dir, a.agent, admission.SPOOL)
+                                 / (sub['request']['request_id'] + '.receipt.json'))
+        self.assertEqual(receipt['error']['stage'], 'lease')
+        self.assertEqual(receipt['error']['type'], 'WorkspaceError')
+        self.assertIn('missing-remote', receipt['error']['message'])
+        self.assertIn(sub['request']['request_id'], '\n'.join(logs.output))
+        # The operator repairs the remote; the ordinary request can retry without losing the pool.
+        self.extra = replace(self.extra, remote='origin')
+        r.agent.repos[-1] = self.extra
+        r.pool.repos['extra'] = self.extra
+        self.assertEqual(self.ask(r, got, fresh=copy.deepcopy(self.cfg))[1], 'admitted')
+
+    def test_failed_new_registration_rolls_back_only_the_new_entry(self):
+        r, (a,) = self.parked()
+        self.extra = replace(self.extra, remote='missing-remote')
+        before = dict(r.pool.repos)
+        _, status = self.ask(r, a)
+        self.assertEqual(status, 'failed_preserved')
+        self.assertEqual(r.pool.repos, before)
+        self.assertFalse(r.store.mark(a.agent, a.task_id, f'repo_admission:{a.id}:extra')[0])
+
+    def test_mesh_admission_uses_inventory_spec_instead_of_legacy(self):
+        from mesh_runner.repo_access import identity
+        r, (a,) = self.parked()
+        legacy = replace(self.extra, max_slots=12)
+        inventory = replace(self.extra, max_slots=18,
+                            project=identity('gitlab', 'git.example', 'group/extra'))
+        r.agent.repos.append(legacy)
+        self.cfg.host_repositories = [inventory]
+        r.access.observe({'repository_access': {'revision': 3, 'repositories': [
+            inventory.project._asdict()]}})
+        r._apply_access()
+        _, status = self.ask(r, a, fresh=copy.deepcopy(self.cfg), spec=inventory)
+        self.assertEqual(status, 'admitted')
+        self.assertEqual(r.pool.repos['extra'], inventory)
+
     def test_new_repo_attached_existing_preserved(self):
         r, (a,) = self.parked()
         before = list(r.store.get(a.id).workspaces)
@@ -250,6 +365,54 @@ class RealConfigFixture(AdmissionFixture):
         return sub, json.loads(path.read_text())['status'] if path.exists() else None
 
 
+class AdmissionCLI(RealConfigFixture):
+    def test_cli_pins_inventory_spec_and_tick_admits_it(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import logging
+        from mesh_runner import cli, repo_access
+        from mesh_runner.store import Store
+        root_log = logging.getLogger()
+        self.addCleanup(root_log.setLevel, root_log.level)
+        self.addCleanup(setattr, root_log, 'handlers', root_log.handlers[:])
+        self.write_toml(extra=True)
+        inventory_text = (f'\n[[repositories]]\nname = "extra"\nbase = "{self.extra.base}"\n'
+                          'max_slots = 18\nprovider = "gitlab"\nhost = "git.example"\n'
+                          'project_path = "group/extra"\n')
+        with self.toml.open('a') as out:
+            out.write(inventory_text)
+        self.reload()
+        r, (a,) = self.parked()
+        # parked() adjusts the first repo's capacity; keep the canonical TOML in sync.
+        self.write_toml(extra=True)
+        with self.toml.open('a') as out:
+            out.write(inventory_text)
+        spec = self.cfg.host_repositories[0]
+        grant = {'repository_access': {'revision': 3, 'repositories': [spec.project._asdict()]}}
+        r.access.observe(grant)
+        r._apply_access()
+        store = Store(self.cfg.state_dir / 'runner.sqlite')
+        try:
+            repo_access.AccessKeeper(store, a.agent).observe(grant)
+        finally:
+            store.close()
+        output = StringIO()
+        with redirect_stdout(output):
+            result = cli.main(['admit-workspace-repo', '--config', str(self.toml), '--agent', a.agent,
+                               '--task', a.task_id, '--attempt', a.id,
+                               '--wait-generation', requests.generation(a),
+                               '--request-id', str(uuid.uuid4()), '--repo', 'extra'])
+        self.assertEqual(result, 0)
+        submitted = json.loads(output.getvalue())
+        self.assertEqual(submitted['request']['spec'], admission.spec_digest(spec))
+        r.tick()
+        receipt = requests._read(requests.directory(self.cfg.state_dir, a.agent, admission.SPOOL)
+                                 / (submitted['request']['request_id'] + '.receipt.json'))
+        self.assertEqual(receipt['status'], 'admitted')
+        self.assertEqual(len(r.store.get(a.id).workspaces), 2)
+        self.assertEqual(r.store.get(a.id).session_id, a.session_id)
+
+
 class ActiveJournalAdmission(RealConfigFixture):
     """Waiting attempt after a real suspend -> restore -> resume: the journal rows stay `active`."""
 
@@ -367,3 +530,121 @@ class ActiveJournalAdmission(RealConfigFixture):
         self.fresh(profile_dir=Path('/elsewhere'))
         self.assertEqual(self.ask(r, a, fresh=False)[1], 'rejected_config')
         self.assertEqual(self.ask(r, a, token='0' * 64)[1], 'rejected_wait_generation')
+
+
+class ResumeAdmitsLaneRepos(AdmissionFixture):
+    """A repository added to the lane while an attempt waited reaches that attempt on its
+    resume (live leases or a checkpoint restore), by admit-workspace-repo's own journal, without an
+    operator request. The journal still fixes what a restore brings back."""
+
+    def setUp(self):
+        super().setUp()
+        self.agent.repos.append(self.extra)            # the lane's config grew after the attempt was admitted
+
+    def wake(self, r, a):
+        """The ordinary path: the awaited card closes, the tick wakes and resumes the attempt."""
+        dependency = task(51, assignee_id='agent-lead')
+        r.mesh.tasks[dependency['id']] = dependency
+        r.store.update(r.store.get(a.id), turns=1,
+                       wait={'kind': 'card', 'target': dependency['id'][:8], 'started': iso()})
+        write_replies(self.replies, {a.task8: wait_time(why='external work')})
+        r.mesh.set_category(dependency['id'], 'done')
+        r.tick()
+        self.settle_all(r)
+        return r.store.get(a.id)
+
+    def extra_slot(self, path):
+        return Path(path).parent.name == 'extra'
+
+    def test_waiting_attempt_gets_the_added_repo_on_resume(self):
+        r, (a,) = self.parked()
+        before = list(a.workspaces)
+        self.assertEqual(r.pool.leased_to(a.id), before)          # admitted with app only
+        got = self.wake(r, a)
+        self.assertEqual(got.workspaces[:1], before)               # existing workspace kept, first
+        self.assertEqual(len(got.workspaces), 2)
+        self.assertTrue(self.extra_slot(got.workspaces[1]))
+        self.assertEqual(got.session_id, a.session_id)             # same session resumed
+        self.assertEqual(sorted(r.pool.leased_to(a.id)), sorted(got.workspaces))
+        last = calls(self.calls)[-1]
+        self.assertTrue(last['resume'])
+        self.assertIn('Repository extra was added to this task', last['prompt'])
+        self.assertIn(got.workspaces[1], last['prompt'])
+        mark = json.loads(r.store.mark(a.agent, a.task_id, f'repo_admission:{a.id}:extra')[0])
+        self.assertEqual((mark['phase'], mark['path']), ('done', got.workspaces[1]))
+        self.assertFalse(r.store.mark(a.agent, a.task_id, r.ADMISSION_NOTICE)[0])   # told once
+        self.assertEqual([json.loads(d)['repo'] for _, k, d in r.store.events(a.id)
+                          if k == 'repo_admitted_on_resume'], ['extra'])
+
+    def test_checkpointed_attempt_gets_the_added_repo_after_restore(self):
+        r, (a,) = self.parked()
+        source = list(a.workspaces)
+        (Path(source[0]) / 'README').write_text('edit before the wait\n')
+        r._suspend_waiting(r.store.get(a.id), requested=True)   # the WAIT released its worktree
+        self.assertEqual(r.pool.leased_to(a.id), [])
+        self.assertEqual({x['repo']: x['phase'] for x in r.pool._checkpoint_rows(a.id)}, {'app': 'released'})
+        # the operator's request is refused for exactly this state: the reason the lane asked again and again
+        self.assertTrue(r._admission_journal_unsafe(r.store.get(a.id), 'extra'))
+        got = self.wake(r, a)
+        ev = [json.loads(d) for _, k, d in r.store.events(a.id) if k == 'restore_session']
+        self.assertEqual([(e['intent'], e['reason'], e['workspaces']) for e in ev],
+                         [('resume', 'workspace_restore_same_path', 1)])   # verdict on the journaled set
+        self.assertEqual(got.workspaces[:1], source)
+        self.assertEqual(len(got.workspaces), 2)
+        self.assertTrue(self.extra_slot(got.workspaces[1]))
+        self.assertEqual(got.session_id, a.session_id)
+        self.assertEqual((Path(source[0]) / 'README').read_text(), 'edit before the wait\n')
+        self.assertEqual({x['repo']: x['phase'] for x in r.pool._checkpoint_rows(a.id)}, {'app': 'active'})
+        last = calls(self.calls)[-1]
+        self.assertTrue(last['resume'])
+        self.assertIn('Repository extra was added to this task', last['prompt'])
+        # the grown inventory survives the next WAIT: both repositories are journaled and restored
+        r._suspend_waiting(r.store.get(a.id), requested=True)
+        self.assertEqual(sorted(x['repo'] for x in r.pool._checkpoint_rows(a.id)), ['app', 'extra'])
+
+    def test_repo_outside_lane_repos_is_not_added(self):
+        r, (a,) = self.parked()
+        app = [s for s in self.agent.repos if s.name == 'app']
+        self.assertIn('extra', r.pool.repos)                       # registered in the pool, not granted
+        with patch.object(type(r), 'lane_repos', new_callable=PropertyMock, return_value=app):
+            got = self.wake(r, a)
+        self.assertEqual(got.workspaces, a.workspaces)
+        self.assertEqual(r.pool.leased_to(a.id), a.workspaces)
+        self.assertNotIn('was added to this task', calls(self.calls)[-1]['prompt'])
+
+    def test_lease_outside_inventory_without_intent_adds_nothing(self):
+        r, (a,) = self.parked()
+        stray = self.root / 'stray'
+        r.pool._set(stray, 'extra', 'leased', a.id)                # not ours to adopt: no admission intent
+        self.assertEqual(r._admit_lane_repos(r.store.get(a.id)), [])
+        self.assertEqual(r.store.get(a.id).workspaces, a.workspaces)
+        self.assertEqual(sorted(r.pool.leased_to(a.id)), sorted(a.workspaces + [str(stray)]))
+
+    def test_crash_between_lease_and_commit_is_adopted_on_next_resume(self):
+        r, (a,) = self.parked()
+        with patch.object(r.store, 'update_with_marks', side_effect=RuntimeError('crash')):
+            with self.assertRaises(RuntimeError):
+                r._admit_lane_repos(r.store.get(a.id))
+        self.assertEqual(len(r.pool.leased_to(a.id)), 2)            # leased, not yet in the inventory
+        self.assertEqual(r.store.get(a.id).workspaces, a.workspaces)
+        added = r._admit_lane_repos(r.store.get(a.id))
+        self.assertEqual(len(added), 1)
+        self.assertEqual(r.store.get(a.id).workspaces, a.workspaces + added)
+        self.assertEqual(len(r.pool.leased_to(a.id)), 2)            # adopted, no second lease
+
+    def test_full_pool_skips_the_repo_and_resumes(self):
+        self.agent.repos[-1] = replace(self.extra, max_slots=0)
+        r, (a,) = self.parked()
+        got = self.wake(r, a)
+        self.assertEqual(got.workspaces, a.workspaces)
+        self.assertTrue(calls(self.calls)[-1]['resume'])
+        self.assertNotIn('extra', [Path(p).parent.name for p in r.pool.leased_to(a.id)])
+
+    def test_operator_request_after_auto_admission_is_idempotent(self):
+        r, (a,) = self.parked()
+        added = r._admit_lane_repos(r.store.get(a.id))
+        self.assertEqual(len(added), 1)
+        r.store.mark(a.agent, a.task_id, r.ADMISSION_NOTICE, '')
+        _, status = self.ask(r, r.store.get(a.id))
+        self.assertEqual(status, 'admitted')                       # same journal key: nothing leased twice
+        self.assertEqual(len(r.pool.leased_to(a.id)), 2)

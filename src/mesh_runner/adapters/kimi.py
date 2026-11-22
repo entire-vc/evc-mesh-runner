@@ -61,6 +61,13 @@ _USAGE_KEYS = (("inputOther", "input_tokens"), ("output", "output_tokens"),
                ("inputCacheRead", "cache_read_input_tokens"), ("inputCacheCreation", "cache_creation_input_tokens"))
 
 
+def _typed(detail: str) -> str:
+    """A failure in the runner's words: a provider limit says so."""
+    if _LIMIT_RE.search(detail) and not re.search(r"quota|rate.?limit", detail, re.I):
+        return "quota: " + detail
+    return detail
+
+
 def _journal(home: Path, session_id: str) -> Path | None:
     """The main agent's journal of ``session_id`` in Kimi home ``home``; None unless exactly one.
     The id must have the CLI's own shape and is joined as a path, never used as a glob pattern."""
@@ -214,6 +221,20 @@ class KimiAdapter(Adapter):
         journal = _journal(home, session)
         return _turn_usage(journal, mark) if journal else {}
 
+    @staticmethod
+    def failure_sources(log_path: Path) -> list[str]:
+        """Every terminal failure the turn names, typed as ``parse`` types its one: the stream's ``error``
+        events (``code: message``) and each ``error: failed to run prompt:`` line on stderr. ``parse`` reports
+        only one of them (the last stderr line wins), so a verdict about the cause must hold for all of them,
+        or the evidence contradicts itself."""
+        out = [f"{ev.get('code') or 'error'}: {ev.get('message') or ''}".strip()
+               for ev in read_events(log_path) if ev.get("role") is None and ev.get("type") == "error"]
+        try:
+            stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
+        except OSError:
+            stderr = ""
+        return [_typed(x) for x in out + [line.strip() for line in FAILED_RE.findall(stderr)]]
+
     def parse(self, log_path: Path) -> TurnResult:
         r = TurnResult()
         worked = False
@@ -245,9 +266,7 @@ class KimiAdapter(Adapter):
             # first turn after its mark would be the next invocation's
             r.usage = self._usage(log_path, r.session_id) or r.usage
         if r.is_error:
-            detail = r.error_details or "turn failed"
-            if _LIMIT_RE.search(detail) and not re.search(r"quota|rate.?limit", detail, re.I):
-                detail = "quota: " + detail       # a provider limit, said so in the runner's words
+            detail = _typed(r.error_details or "turn failed")
             r.error_details = detail
             r.error = detail[:300]
             r.auth_failed = bool(_AUTH_RE.search(detail)) and not _LIMIT_RE.search(detail)

@@ -8,7 +8,7 @@ one MR branch is the defect.
 
 The owner notice (red head, merge conflict, failed named jobs) and the declaration send-backs now go
 by the MR's owner: the task's own MR gets them as before; a waiter on someone else's MR is told whose
-MR it is and to wait on that card, once per head; a re-armed merge or success wait on it stands, and
+MR it is and to wait for that MR to merge (never on its card), once per head; a re-armed merge or success wait on it stands, and
 an until=change wait on its red head is sent back without a push instruction."""
 import unittest
 
@@ -81,6 +81,12 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         r._wake_one(a)
         return r.store.get(a.id)
 
+    def assert_merge_wait(self, text):
+        # its code is the MR: a merge wait or a stack on its branch, never a card wait
+        project, _, iid = MR.rpartition('!')
+        self.assertIn(f"wait_for on=mr project_path={project} mr_iid={iid} until=merged", text)
+        self.assertNotIn('wait_for on=card', text)
+
     def assert_no_push(self, text):
         for needle in PUSH_INSTRUCTIONS:
             self.assertNotIn(needle, text)
@@ -98,7 +104,7 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         # the dependent learns whose MR it is and where to wait, never to push into it
         self.assertEqual(b.state, 'ready')
         self.assertIn(f"not this task's: it is the MR of card #{owner['id'][:8]}", b.wake_text)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assertIn('do not push, merge or rebase its branch', b.wake_text)
         self.assert_no_push(b.wake_text)
 
@@ -122,7 +128,7 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         r, owner, dependent, gl = self.flow('failed', source_branch='ci/anchor-occurrence')
         a, b = self.both_waiting(r, owner, dependent)
         b = self.woken(r, b)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assert_no_push(b.wake_text)
 
     def test_unlinked_foreign_mr_names_no_card_and_still_no_push(self):
@@ -150,7 +156,7 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         b = self.woken(r, b)
         self.assertEqual(b.state, 'ready')
         self.assertIn('has a merge conflict with its target branch', b.wake_text)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assert_no_push(b.wake_text)
         b = self.declare(r, dependent, merged_line(), first=False)
         self.assertEqual(b.state, 'waiting')
@@ -166,7 +172,7 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         b = self.declare(r, dependent, change_line())
         self.assertEqual((b.task_id, b.state), (dependent['id'], 'ready'))   # sent back as well
         self.assertIn("nothing changes without the MR owner's push or retry", b.wake_text)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assert_no_push(b.wake_text)
 
     def test_change_wait_woken_by_a_red_result_names_the_owner_of_someone_elses_mr(self):
@@ -180,7 +186,7 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         self.assertIn('changed CI aaaaaaaa pipeline 14845 failed', a.wake_text)
         self.assertNotIn("This MR is not this task's", a.wake_text)             # the owner: as before
         self.assertIn('changed CI aaaaaaaa pipeline 14845 failed', b.wake_text)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assert_no_push(b.wake_text)
 
     # -- a wait on named jobs of the MR ---------------------------------------------------
@@ -202,7 +208,7 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         self.assertIn('fix and push or retry it', a.wake_text)
         self.assertEqual(b.state, 'ready')
         self.assertIn('job(s) test finished: failed', b.wake_text)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assert_no_push(b.wake_text)
 
     def test_named_job_success_wait_declared_again_on_someone_elses_failed_job_stands(self):
@@ -229,12 +235,12 @@ class TwoCardsOfOneLaneOnOneMR(Bench):
         b = self.woken(r, b)
         self.assertEqual(b.state, 'ready')                                   # the change itself
         self.assertIn('job(s) test finished: failed', b.wake_text)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assert_no_push(b.wake_text)
         b = self.declare(r, dependent, change_line('failed', jobs=['test']), first=False)
         self.assertEqual((b.task_id, b.state), (dependent['id'], 'ready'))  # told: sent back
         self.assertIn("nothing changes without the MR owner's push or retry", b.wake_text)
-        self.assertIn(f"`wait_for on=card target_task_id={owner['id'][:8]}`", b.wake_text)
+        self.assert_merge_wait(b.wake_text)
         self.assert_no_push(b.wake_text)
 
 if __name__ == '__main__':

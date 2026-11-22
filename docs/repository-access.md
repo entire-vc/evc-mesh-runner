@@ -55,7 +55,8 @@ host or provider is a different repository.
   local repository names did not change (e.g. `no_membership` -> `missing_approved_clone`).
 - Grant: newly allowed inventory clones are registered in the pool hot, and the failed-start backoff an
   access refusal set is dropped; the next tick starts the card. A deadline another
-  failure set since stays.
+  failure set since stays. A waiting attempt gets the granted repository on its next resume
+  (`docs/repo-preflight.md`).
 - A Mesh grant is the runner's permission only: the lane still fetches with its own forge identity.
   Give that user at least Reporter on the project before the `PUT`, else the start fails on
   `git fetch` and the whole lane's starts pause for `abort_backoff_minutes`.
@@ -63,6 +64,14 @@ host or provider is a different repository.
   registered in the pool while the lane holds slots of it. New starts, and resumes whose card needs
   it, are checked against the current permission. Under Mesh access a config entry alone does not
   pass `admit-workspace-repo`.
+- `admit-workspace-repo` pins the permitted host inventory spec under Mesh access, including its
+  slot limit; a never-migrated lane still pins `agents.repos`. The CLI reads the persisted permission
+  without modifying the registry; the tick checks the current permission again.
+- An admission exception returns `failed_preserved` with a bounded, credential-masked `error`
+  (`stage`, `type`, `message`) in the receipt and a matching request ID in the log. Preconfigured
+  pool entries and existing workspaces, sessions and leases stay intact. Repair the reported cause,
+  then submit a new request ID for the same attempt with its current wait generation; an existing
+  admission intent adopts a lease created before an interrupted commit.
 - `status.json` per lane: `repository_access` = `{source: legacy|mesh, revision, repositories, lane_repos}`.
 
 ## Who is told about a refusal

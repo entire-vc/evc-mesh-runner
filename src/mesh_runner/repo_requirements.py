@@ -109,6 +109,28 @@ class Verdict:
                 f"{self.project or '-'}\n{line}")
 
 
+FACTS_PREFIX = "repo_preflight="
+
+
+def access_handoff_to(body: str, slug: str) -> bool:
+    """True when ``body`` has the shape of a runner's access-refusal handoff addressed to ``slug``: it
+    opens with ``@<slug> repository access for lane`` and its ``repo_preflight=`` facts line names an
+    access reason with ``next_actor`` = ``slug``. The shape is text anyone can type: it is never proof
+    alone. The mention path pairs it with the author Mesh records (the card's assignee, the only lane
+    whose runner refuses that card) before treating it as a new request rather than a reply."""
+    slug = slug.lstrip("@").casefold()
+    lines = str(body or "").strip().splitlines()
+    if not slug or not lines or not lines[0].casefold().startswith(f"@{slug} repository access for lane "):
+        return False
+    facts_line = next((line for line in reversed(lines) if line.startswith(FACTS_PREFIX)), "")
+    try:
+        facts = json.loads(facts_line[len(FACTS_PREFIX):]) if facts_line else None
+    except ValueError:
+        return False
+    return (isinstance(facts, dict) and facts.get("reason") in ACCESS_REASONS
+            and str(facts.get("next_actor") or "").casefold() == slug)
+
+
 def _mr_links(links: list[dict], base_url: str) -> list[tuple[str, bool]]:
     """``(group/project, terminal)`` of every typed MR link on this GitLab. Nothing is read from prose."""
     host = urllib.parse.urlsplit(base_url).netloc

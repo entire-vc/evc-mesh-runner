@@ -12,6 +12,7 @@ occupied instead of racing the next writer.
 from __future__ import annotations
 
 import errno
+import functools
 import json
 import os
 import signal
@@ -30,6 +31,9 @@ class TurnResult:
     error: str = ""
     cost_usd: float | None = None
     usage: dict = field(default_factory=dict)
+    # Claude ``modelUsage``: per-model totals of the whole session (subagents included), like
+    # ``cost_usd`` on a resumed session; ``usage`` is this turn only. See ``spend``.
+    model_usage: dict = field(default_factory=dict)
     finished: bool = False          # the stream contains a terminal event
     model: str = ""
     compactions: int = 0            # context compactions the harness reported in this turn
@@ -38,6 +42,10 @@ class TurnResult:
     auth_only: bool = False         # no assistant/tool work preceded that banner
     verification_required: bool = False  # the exact terminal provider envelope `verification_required`
     upgrade_required: bool = False  # the provider refused this harness version (harness_hold)
+    # The provider refused the turn's content: the turn's last assistant message carries the typed
+    # ``stop_reason: refusal``. The value is the refusal category (``stop_details.category``, a
+    # short identifier or ``unspecified``), never the provider's text or the prompt.
+    provider_refusal: str = ""
     # Claude stream-json ``rate_limit_event``: the provider's own account-window verdict for this turn.
     # ``rate_limit`` is the last event (numbers and enums only), ``rate_limit_rejected`` = any event of
     # the turn said ``rejected``: the account cannot run, whatever text the turn ended with.
@@ -144,6 +152,12 @@ class Adapter:
     def with_mcp(self, argv: list[str], name: str, command: list[str], env: dict) -> list[str]:
         """argv whose MCP server ``name`` is the stdio ``command`` with ``env``, in place of
         whatever the profile configures under that name. A harness without MCP returns argv."""
+        return argv
+
+    def with_runner_env(self, argv: list[str], env: dict) -> list[str]:
+        """argv under which the session's Mesh MCP child sees this turn's runner carrier
+        (``MESH_RUNNER_TASK`` / ``MESH_RUNNER_CHECKOUT_*``) from ``env``, the exact launch env.
+        A harness whose MCP children inherit its environment returns argv."""
         return argv
 
     @property
@@ -337,19 +351,94 @@ def pid_reused(pid: int, stamp: str) -> bool:
 
 
 def group_alive(pgid: int, stamp: str = "") -> bool:
-    """True while any process of the attempt's process group exists. With a
-    stamp, a live leader whose start time differs is a reused pid: not ours."""
+    """True while any process of the attempt's process group can still run. With a
+    stamp, a live leader whose start time differs is a reused pid: not ours.
+
+    ``killpg(pgid, 0)`` does not tell a group whose only members are zombies (a leader that
+    exited and that its parent, the runner, has not reaped yet) from a live one: Linux answers
+    success, Darwin answers EPERM, the same error as for a live group of another user. Such a
+    group runs nothing and writes nothing, so it is gone. Only a kernel read that lists every
+    member of the group as a zombie says so; an unreadable state, a leader that is not a
+    zombie, or one other member that is not a zombie keeps the group alive (fail-closed: a
+    writer check, a checkpoint and the straggler grace rely on it)."""
     if pgid <= 0:
         return False
     if pid_reused(pgid, stamp):
         return False
     try:
         os.killpg(pgid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        pass                    # another user's live group, or (Darwin) a group of zombies only
+    return not only_zombies(pgid)
+
+
+SZOMB = 5                       # <sys/proc.h>: p_stat of a zombie
+_KINFO_PROC_SIZE = 648          # sizeof(struct kinfo_proc) on 64-bit Darwin
+_P_STAT = 36                    # extern_proc: p_un (16), p_vmspace (8), p_sigacts (8), p_flag (4), p_stat
+_P_PID = 40                     # ... then 3 bytes of padding and p_pid
+
+
+@functools.lru_cache(maxsize=1)
+def _libc():
+    import ctypes
+    import ctypes.util
+    return ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+
+
+def _darwin_procs(mib3: int, arg: int) -> list[tuple[int, int]] | None:
+    """(pid, p_stat) of every kinfo_proc that sysctl kern.proc.<mib3>.<arg> returns; None when
+    the read fails or its size is not a whole number of records."""
+    import ctypes
+    libc = _libc()
+    mib = (ctypes.c_int * 4)(1, 14, mib3, arg)       # CTL_KERN, KERN_PROC, KERN_PROC_PID|PGRP, arg
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 4, None, ctypes.byref(size), None, 0) != 0:
+        return None
+    size = ctypes.c_size_t(size.value + 8 * _KINFO_PROC_SIZE)   # room for members that join meanwhile
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value % _KINFO_PROC_SIZE:
+        return None
+    raw = buf.raw[:size.value]
+    return [(int.from_bytes(raw[i + _P_PID:i + _P_PID + 4], "little", signed=True), raw[i + _P_STAT])
+            for i in range(0, len(raw), _KINFO_PROC_SIZE)]
+
+
+def _linux_state(pid: str, proc_root: str) -> tuple[str, int] | None:
+    """(state, pgrp) from /proc/<pid>/stat; None when the process is gone or the line unreadable."""
+    try:
+        with open(f"{proc_root}/{pid}/stat") as fh:
+            rest = fh.read().rsplit(")", 1)[1].split()
+        return rest[0], int(rest[2])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def only_zombies(pgid: int, proc_root: str = "/proc") -> bool:
+    """True only when the kernel lists the group's leader and every other member as a zombie.
+    The leader is read first, without listing the group, so a running turn costs one read."""
+    try:
+        if sys.platform == "darwin":
+            leader = _darwin_procs(1, pgid)                   # KERN_PROC_PID
+            if not leader or leader[0] != (pgid, SZOMB):
+                return False
+            members = _darwin_procs(2, pgid)                  # KERN_PROC_PGRP
+            return bool(members) and all(state == SZOMB for _, state in members)
+        if sys.platform.startswith("linux"):
+            leader = _linux_state(str(pgid), proc_root)
+            if leader is None or leader != ("Z", pgid):
+                return False
+            for name in os.listdir(proc_root):
+                if not name.isdigit():
+                    continue
+                row = _linux_state(name, proc_root)
+                if row is not None and row[1] == pgid and row[0] != "Z":
+                    return False
+            return True
+    except (OSError, ValueError, AttributeError):
+        pass
+    return False
 
 
 def interrupt_group(pgid: int, sig: int = signal.SIGINT) -> None:

@@ -97,6 +97,38 @@ class GraphTest(unittest.TestCase):
         self.assertEqual(radar.weights(), {})
         self.assertEqual(radar.behind(), {}, "a woken card of a broken chain weighs nothing either")
 
+    def test_short_only_target_is_followed_through_its_short_id(self):
+        def short_only(agent, n):
+            return {"agent": agent, "state": "waiting", "updated_at": "2026-11-11T00:00:00Z",
+                    "wait": {"kind": "card", "target": tid(n)[:8], "edge": "e"}}
+
+        open_ = {tid(1): [short_only("A", 2)],                 # 2: our lane's card, ready
+                 tid(3): [short_only("A", 4)],                 # 4: unreadable with A's key
+                 tid(5): [short_only("A", 6)],                 # 6: transport trouble
+                 tid(7): [short_only("B", 2)]}
+        shorts = []
+
+        def read_short(short, agent):
+            shorts.append((short, agent))
+            return {tid(2)[:8]: card(2), tid(6)[:8]: {"_unread": True}}.get(short)
+
+        radar = wait_roots.build(open_, self.reader({}), OURS, NOW, read_short=read_short)
+        self.assertEqual(sorted((r.task_id, r.kind, r.behind) for r in radar.roots),
+                         [(tid(2), "ready", 2), (tid(4)[:8], "foreign", 1), (tid(6)[:8], "unread", 1)])
+        self.assertEqual(self.reads, [], "the short read ends the chain, no second read by full id")
+        self.assertEqual(sorted(shorts), sorted([(tid(2)[:8], "A"), (tid(4)[:8], "A"),
+                                                 (tid(6)[:8], "A"), (tid(2)[:8], "B")]))
+        self.assertEqual(radar.weights(), {tid(2): 2})
+        self.assertEqual(radar.depth, {1: 4})
+        self.assertNotIn("unknown-target", radar.kinds())
+
+    def test_short_read_answering_another_card_is_not_followed(self):
+        open_ = {tid(1): [{"agent": "A", "state": "waiting", "updated_at": "2026-11-11T00:00:00Z",
+                           "wait": {"kind": "card", "target": tid(2)[:8]}}]}
+        radar = wait_roots.build(open_, self.reader({}), OURS, NOW, read_short=lambda s, a: card(9))
+        self.assertEqual([(r.task_id, r.kind) for r in radar.roots], [(tid(2)[:8], "unread")])
+        self.assertEqual(radar.weights(), {})
+
     def test_unread_card_is_never_ready(self):
         open_ = {tid(1): [waiting("A", tid(2))]}
         radar = wait_roots.build(open_, lambda t, a: {"_unread": True}, OURS, NOW)
@@ -177,6 +209,17 @@ class CardReaderTest(unittest.TestCase):
         self.assertIsNone(r(tid(1), "A"))
         r = wait_roots.CardReader({"A": C(0)})
         self.assertEqual(r(tid(1), "A"), {"_unread": True})
+
+    def test_by_short_reads_the_short_route_and_shares_the_budget(self):
+        c = Cards({tid(2)[:8]: card(2), tid(3): card(3)})
+        r = wait_roots.CardReader({"A": c}, budget=2)
+        self.assertEqual(r.by_short(tid(2)[:8], "A"), card(2))
+        self.assertEqual(r.by_short(tid(2)[:8], "A"), card(2))          # cached
+        self.assertIsNone(r.by_short(tid(4)[:8], "A"))                   # 404: not readable here
+        self.assertEqual(r(tid(3), "A"), {"_unread": True})              # budget spent
+        self.assertEqual(c.calls, ["/tasks/by-short-id/" + tid(2)[:8], "/tasks/by-short-id/" + tid(4)[:8]])
+        mismatch = wait_roots.CardReader({"A": Cards({tid(5)[:8]: card(6)})})
+        self.assertEqual(mismatch.by_short(tid(5)[:8], "A"), {"_unread": True})
 
     def test_budget(self):
         class C:

@@ -14,5 +14,14 @@ refused start aborts the attempt with no lease and no model turn. `no_free_slot`
 existing pool hold. The check never edits config, clones, uses another actor key, or touches
 foreign leases. Once the approved config carries the repo the same card starts normally.
 
+A waiting attempt needs no `admit-workspace-repo` request for a repository the lane gained after it was
+admitted: on its resume, after a checkpoint restore too, the runner leases each missing `lane_repos`
+entry through the same journal (intent mark, lease, one commit of workspaces, done mark and notice),
+and the turn's prompt says `[runner] Repository <name> was added to this task`. The restore itself
+still brings back exactly the journaled set; an ambiguous inventory (a lease outside the attempt's
+workspaces without that intent, a journal not in `active`, a snapshot disagreeing with the journal)
+adds nothing, and the restore's own refusal stays `InventoryError`. A repository without a free slot
+is skipped for that turn; an unsent-prompt retry keeps its exact workspaces.
+
 When Mesh `repository_access` is explicit for the lane, Mesh alone decides membership and the
 host inventory supplies the clone: see `docs/repository-access.md`.

@@ -1,5 +1,6 @@
 """A lane's status row stays fresh while a long tick works (progress beats), and a wedged one
 is still reported."""
+import contextlib
 import os
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ from unittest import mock
 
 from mesh_runner import checkpoint, progress, workspace
 from mesh_runner.runner import AgentRunner, Runner
+import fakes
 from test_runner import Bench
 
 FRESH = 300          # the age past which status readers take a lane row for an unknown state
@@ -197,6 +199,103 @@ class LongTickKeepsRowFresh(Bench):
         self.assertIn("lane: tick took 400s", line)
         self.assertIn("wakes 200s", line)
         self.assertIn("resume 190s", line)
+
+
+LANE_STATES = {"starting", "running", "unknown", "waiting", "ready"}
+
+
+class FirstRowAfterStart(Bench):
+    """Right after a runner starts, every lane's row must already carry what status readers require
+    (cap, paused, attempts): a placeholder makes every reader that checks a lane (its pause, its free
+    capacity) see an unknown state."""
+
+    def assert_lane_contract(self, row, now):
+        # the contract of a status reader that checks one lane: a row without these fields is
+        # "stale or malformed" and the lane's state unknown
+        self.assertLessEqual(now - row["tick_at"], FRESH, row)
+        self.assertIs(type(row.get("paused")), bool, row)
+        self.assertIs(type(row.get("cap")), int, row)
+        self.assertGreaterEqual(row["cap"], 1, row)
+        self.assertIsInstance(row.get("attempts"), list, row)
+        for a in row["attempts"]:
+            self.assertIn(a.get("state"), LANE_STATES, row)
+
+    def lane(self, max_concurrent=3):
+        ar = self.runner(fakes.FakeMesh([], max_concurrent=max_concurrent))
+        runner = Runner(self.cfg, lock=False)
+        runner.agents = [ar]
+        return runner, ar
+
+    def mid_first_tick(self, *, early=True):
+        """The lane's row as a reader sees it in the middle of the lane's first tick (``early=False``:
+        with the lane's early publication switched off)."""
+        runner, ar = self.lane()
+        runner._started = time.time()
+        seen = []
+        settle = ar.settle_finished
+        ar.settle_finished = lambda: (seen.append(runner.snapshot()[0]), settle())[-1]
+        with mock.patch("mesh_runner.runner.progress.ready", lambda: None, create=True) if not early \
+                else contextlib.nullcontext():
+            runner._tick_agent(ar)
+        return seen[0]
+
+    def test_a_row_published_in_the_first_tick_before_it_ends_meets_the_reader_contract(self):
+        row = self.mid_first_tick()
+        self.assertIn("tick_running_since", row)            # published by the running tick, not at its end
+        self.assert_lane_contract(row, time.time())
+        self.assertEqual(row["cap"], 3)                     # read from Mesh, not the default of an unread lane
+        self.assertFalse(row["paused"])
+
+    def test_positive_control_without_the_early_publication_the_first_row_is_a_placeholder(self):
+        row = self.mid_first_tick(early=False)
+        self.assertNotIn("attempts", row)
+        with self.assertRaises(AssertionError):
+            self.assert_lane_contract(row, time.time())
+
+    def test_a_lane_with_a_row_of_its_own_does_not_republish_at_every_tick_start(self):
+        runner, ar = self.lane()
+        runner._tick_agent(ar)
+        published = []
+        with mock.patch.object(runner, "_pulse", lambda *a: published.append(a)):
+            runner._tick_agent(ar)
+        self.assertEqual(published, [])
+
+    def test_the_first_status_file_of_a_process_carries_every_lanes_own_row(self):
+        runner, ar = self.lane()
+        self.cfg.poll_seconds = 0.2
+        released, stop, first = threading.Event(), threading.Event(), []
+        settle = ar.settle_finished
+        ar.settle_finished = lambda: (released.wait(10), settle())[-1]   # the first tick is still running
+        write = runner.write_status
+
+        def recorded(out):
+            if not first:
+                first.append([dict(r) for r in out])
+                released.set()
+                stop.set()
+            write(out)
+
+        with mock.patch.object(runner, "write_status", side_effect=recorded):
+            loop = threading.Thread(target=runner.run_forever, args=(stop,))
+            loop.start()
+            loop.join(timeout=30)
+        self.assertFalse(loop.is_alive())
+        row = first[0][0]
+        self.assertIn("tick_running_since", row)            # the lane's early row, not its finished tick
+        self.assert_lane_contract(row, time.time())
+
+    def test_a_silent_lane_holds_the_first_status_only_for_its_budget(self):
+        runner, ar = self.lane()
+        started = time.monotonic()
+        with self.assertLogs("mesh_runner", level="WARNING") as logs:
+            runner._await_first_rows(threading.Event(), budget=0.3)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("builder", logs.output[0])
+        stop = threading.Event()
+        stop.set()
+        started = time.monotonic()
+        runner._await_first_rows(stop, budget=30)           # a stop never waits for the budget
+        self.assertLess(time.monotonic() - started, 5)
 
 
 class Beats(unittest.TestCase):

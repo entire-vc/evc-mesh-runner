@@ -76,10 +76,21 @@ class TurnContract(unittest.TestCase):
     def test_the_prompts_name_the_command_and_never_ask_for_a_line(self):
         t = task(1)
         for text in (prompts.no_outcome_prompt(t), prompts.no_outcome_prompt(t, "⏳ WAIT 2h", "relative", merge=True)):
-            head = " ".join(text[:text.index("End every turn")].split())
+            head = " ".join(text.split())
             self.assertIn("call it, do not write it as a line", head)
             self.assertIn("Text is never read as an outcome", head)
             self.assertNotIn("marker", head)
+
+    def test_the_correction_names_the_contract_instead_of_repeating_it(self):
+        # The session already holds the contract; ~4k characters per correction were repeats
+        t = task(1)
+        for merge in (False, True):
+            text = prompts.no_outcome_prompt(t, merge=merge)
+            self.assertNotIn("End every turn", text)
+            self.assertNotIn(DECISION_WAIT_GUIDANCE.strip()[:60], text)
+            self.assertIn("outcome contract at the end of this session's first prompt", " ".join(text.split()))
+            self.assertEqual("wait_for on=merge" in text, merge)
+            self.assertLess(len(text), 1200)
 
     def test_a_named_result_wait_and_the_answered_refusal_are_offered(self):
         # a result another card produces in parts is waited on as that result, not as the card's
