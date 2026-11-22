@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.118 — 2026-11-22
+
+- Require independent source review for pinned external merge requests when a task merge request is already merged.
+
 ## 0.2.117 — 2026-11-22
 
 - Recheck cached start-gate refusals when explicitly declared installed hook or helper bytes change, while preserving full gate and checkout admission.

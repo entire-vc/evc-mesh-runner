@@ -1447,3 +1447,43 @@ An accepted reply can include `fair_ids`, a list of distinct IDs from `order` se
 For ordinary attempts the runner writes `queue_order` in its local attempt database with that
 task's fairness flag and the IDs it tried and passed over earlier in the same dispatch. A null
 flag means there was no accepted fairness assignment, including on fallback.
+
+## Optional external source reviews (`source_review_command`)
+
+A selected reviewer can execute a pinned external review while its delivery card
+keeps its owner and workflow status. This per-agent helper is disabled by default.
+`source_review_timeout_seconds` bounds each subprocess call (default 60 seconds).
+The helper receives JSON version 1 with `agent_id`, `lane` and `phase` on stdin:
+
+- `list` returns `{"version":1,"jobs":[...]}` (at most 64 distinct source cards).
+- `check` also receives `unit`; it returns version 1, the exact `job_id`, and
+  `status: "ready"` after authenticating the selected reviewer and current evidence.
+- `result` revalidates the same unit and returns `status: "verified"` and a positive
+  `note_id`. Worker prose or a successful process exit cannot complete a unit.
+
+Each unit pins `source_task_id`, `project_id`, `delivery_owner_id`, `reviewer_id`,
+`reviewer_lane`, `mr_url`, `head_sha`, and six SHA256 fields: `binding_sha256`,
+`contract_sha256`, `package_sha256`, `criteria_sha256`, `manifest_sha256`, and
+`source_context_sha256`. It has `version: 1`, `scope: "external-source-refresh"`,
+`purpose: "delta-review"` or `"verify-admission"`, and `inputs` containing absolute
+paths for `contract`, `package`, `files_root`, and `brief`. `job_id` is SHA256 of the
+UTF-8 JSON object without `job_id`, sorted keys, compact separators, and literal
+Unicode. A verification unit also pins `existing_note_id`; it must return that note
+and may run on a completed delivery without reopening it or publishing another note.
+
+The configured helper is a trusted local integration. It must validate the immutable
+package, bound independent identity and roles, original and current source evidence,
+receipt attribution, native subject/head, workflow context and gates on every check.
+The runner supplies the lane's own key and identity; discovery alone is not admission.
+It checks again before checkout and immediately before spawning the ordinary harness.
+Account capacity, host limits, a real Mesh checkout, durable prompt delivery and process
+supervision still apply. Product repository worktrees and owner turn commands are excluded.
+The worker receives the descriptor in `MESH_RUNNER_SOURCE_REVIEW`; the start gate also
+receives it and must revalidate the same scope instead of the delivery card's merged MR.
+
+Launch intent is persisted before spawning. Failed, interrupted or unverifiable units
+are not automatically replayed; an operator must inspect the attempt and explicitly
+stage another unit. `source_review_launch_intent`, `source_review_started`, and
+`source_review_verified` events link the job, attempt, subject/head and verified note.
+Normal owner completion comments, workflow changes and task turn outcomes are suppressed
+for these bounded units. Ordinary task and review queues retain their existing behavior.

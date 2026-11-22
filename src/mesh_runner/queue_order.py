@@ -37,11 +37,11 @@ def _kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def run_helper(argv: list[str], body: bytes, timeout: float) -> str:
+def run_helper(argv: list[str], body: bytes, timeout: float, *, env=None) -> str:
     """One bounded helper run; returns stdout, raises RuntimeError with the reason on failure."""
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+                                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True, env=env)
     except (OSError, ValueError) as e:
         raise RuntimeError(f"cannot start: {e.__class__.__name__}") from None
     def feed() -> None:
@@ -81,6 +81,8 @@ def run_helper(argv: list[str], body: bytes, timeout: float) -> str:
     except BaseException:
         _kill_group(proc)
         raise
+    finally:
+        proc.stdout.close()
     _kill_group(proc)                            # a descendant that outlived the helper
     if proc.returncode != 0:
         raise RuntimeError(f"exit {proc.returncode}")

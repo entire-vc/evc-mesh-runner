@@ -60,6 +60,7 @@ from . import deploy_inventory
 from . import next_action
 from . import merge_order
 from . import reviewer_merge
+from . import source_review
 from . import review_cap
 from . import inputs
 from . import prompt as prompts
@@ -1408,6 +1409,9 @@ class AgentRunner:
         statuses the attempt works in (todo/in_progress, or review for a review)."""
         if not task:
             return False
+        if mode == source_review.MODE:
+            unit = source_review.unit_for(self, task["id"])
+            return bool(unit and source_review.source_allowed(self, unit, task))
         assignee = task.get("assignee_id") or (task.get("assignee") or {}).get("id")
         return assignee == self.agent_id and self.cats.category(task) in (REVIEWING if mode == "review" else WORKING)
 
@@ -2132,14 +2136,15 @@ class AgentRunner:
     def _finish(self, a: Attempt, state: str, note: str = "", report: bool = False,
                 lock_lost: bool = False, emit: bool = True) -> None:
         self._release_gate(a, state)            # no-op unless a gate is still held (crash paths)
-        if a.wait:
+        if a.wait and a.mode != source_review.MODE:
             wait = dict(a.wait)
             self.effects.on_end(a, wait, f"the attempt is {state}", close_request=False)
-        if not lock_lost:
+        if not lock_lost and a.mode != source_review.MODE:
             # a lost lock: the card may be another holder's now; its decision and runtime state are not ours
             self.effects.close_terminal_decision(a)
             self.effects.clear_state(a.task_id)
-        self.effects.taken(a.task_id)          # nothing of a skip state is left to clear
+        if a.mode != source_review.MODE:
+            self.effects.taken(a.task_id)          # nothing of a skip state is left to clear
         self._release_checkout(a)
         try:
             kept = self.pool.release(a.id)
@@ -2155,7 +2160,7 @@ class AgentRunner:
         self._lane_route.pop(a.id, None)
         if self.observations is not None:
             self.observations.attempt_ended(a.id, state)
-        if report and state == "completed" and a.turns and self.cfg.completion_comment:
+        if report and a.mode != source_review.MODE and state == "completed" and a.turns and self.cfg.completion_comment:
             self._comment(a.task_id, self._completion_line(a)[len("[runner] "):], key=f"completion|{a.id}")
 
     def _observe_start(self, a: Attempt, adapter, native_argv: list[str], env: dict) -> None:
@@ -3375,6 +3380,9 @@ class AgentRunner:
         if lost is not None:
             # stopped for a lost lock: no outcome is read and nothing is written on the card
             self._finish(a, "failed", f"checkout lost: {lost}", lock_lost=True)
+            return
+        if a.mode == source_review.MODE:
+            source_review.settle(self, a, result)
             return
         task = self._task(a.task_id)
         if self._still_ours(task, a.mode) and not self._settle_native(a, task):
@@ -9249,6 +9257,14 @@ class AgentRunner:
         return True
 
     def _resume_one(self, a: Attempt) -> None:
+        if a.mode == source_review.MODE:
+            # A source unit is one bounded execution. A crash/ambiguous launch
+            # must be inspected, never resumed as a delivery owner's task turn.
+            unit = source_review.unit_for(self, a.task_id, a)
+            if unit:
+                self.store.mark(self.agent.name, a.task_id, source_review.mark_key(unit), "interrupted")
+            self._finish(a, "failed", "interrupted source review; requires explicit revalidation")
+            return
         if self._maintenance_held(a):
             return
         # One answer admits ONE resume: the decision id is claimed the first time a gate
@@ -11676,6 +11692,10 @@ class AgentRunner:
                    MESH_RUNNER_TASK=task_id, MESH_RUNNER_MODE=mode, MESH_RUNNER_PHASE=phase,
                    MESH_RUNNER_HARNESS=attempt.harness if attempt else self.agent.harness,
                    MESH_RUNNER_ATTEMPT=attempt.id if attempt else "")
+        if mode == source_review.MODE:
+            unit = source_review.unit_for(self, task_id, attempt)
+            if unit:
+                env["MESH_RUNNER_SOURCE_REVIEW"] = json.dumps(unit, sort_keys=True)
         if phase in ("reserve", "admit") and self._quota_admission_required(attempt):
             env["MESH_RUNNER_REQUIRE_ACCOUNT_CAPACITY"] = "1"
         if phase in ("reserve", "admit") and task_id in self._launch_obs:
@@ -12165,6 +12185,8 @@ class AgentRunner:
         return reason
 
     def _hold_reason(self, task: dict, mode: str, reconcile: bool = False) -> str:
+        if mode == source_review.MODE:
+            return source_review.hold(self, task)
         if reason := self._assignment_scope_reason(task, mode, publish=reconcile):
             return reason
         if reason := self.pool.disk_hold():
@@ -12359,6 +12381,7 @@ class AgentRunner:
         for cat in ("in_progress", "todo"):
             work += [t for t in feed[cat] if t.get("id") not in held]
         out = self._roots_before_reviews(reviews, [dict(t, _mode="work") for t in self._work_order(work)])
+        out = self._source_review_candidates(held) + out
         for task in out:
             if task.get("human_gate") and task.get("_mode") == "work":
                 did = self._gate_decision_for(task)
@@ -12368,6 +12391,29 @@ class AgentRunner:
         mine = {tid for tid in held | {t.get("id") for t in out} if tid}
         self.owners.replace_for(self.agent.name, mine)   # Mesh events name a task; this says whose it is
         return out
+
+    def _source_review_candidates(self, held: set[str]) -> list[dict]:
+        command = getattr(self.agent, "source_review_command", [])
+        if not command:
+            return []
+        identity = getattr(self, "me", None)
+        agent_id = identity.get("id") if isinstance(identity, dict) else None
+        if not isinstance(agent_id, str) or not agent_id:
+            return []  # no external admission without a known reviewer identity
+        external = []
+        for unit in source_review.discover(command, agent_id, self.agent.name,
+                                          getattr(self.agent, "source_review_timeout_seconds", 3)):
+            tid = unit["source_task_id"]
+            if tid in held:
+                continue
+            try:
+                task = self._task(tid)
+            except MeshError:
+                continue  # an unreadable source never changes the ordinary feed
+            if (source_review.source_allowed(self, unit, task)
+                    and not self.store.mark(self.agent.name, tid, source_review.mark_key(unit))):
+                external.append(dict(task, _mode=source_review.MODE, _source_review=unit))
+        return external
 
     def _work_order(self, work: list[dict]) -> list[dict]:
         """Priority order, with decision requests addressed to this agent first (an answer frees
@@ -12469,7 +12515,8 @@ class AgentRunner:
             for task_id in fresh:
                 t = feed.get(task_id)
                 mode = (t or {}).get("_mode", "work")
-                if (t is None or t.get("human_gate") or (pool_full and not metadata_only(t, mode))
+                if (t is None or (t.get("human_gate") and mode != source_review.MODE)
+                        or (pool_full and mode != source_review.MODE and not metadata_only(t, mode))
                         or self.hold_reason(t, mode, log_change=False)):
                     continue
                 claims[task_id] = mine[task_id]
@@ -12552,7 +12599,8 @@ class AgentRunner:
                     kept = True
                     self._break_review_streaks()
                 continue                       # the ramp keeps the next slot for a heavier wait root
-            if (self._pool_full() and not metadata_only(task, task.get("_mode", "work"))
+            if (task.get("_mode") != source_review.MODE and self._pool_full()
+                    and not metadata_only(task, task.get("_mode", "work"))
                     and not self._carry_fits(tid)):
                 self._break_review_streaks()
                 continue                       # a later typed decision may need no Git slot
@@ -12609,6 +12657,8 @@ class AgentRunner:
         return bool(hold)
 
     def _start_one(self, task: dict, *, overflow_retry: bool = False) -> bool:
+        if task.get("_mode") == source_review.MODE:
+            return source_review.start(self, task)
         if not overflow_retry:
             self._overflow_feed, self._overflow_reason = None, ""
         backoff = time.monotonic() + self.cfg.abort_backoff_minutes * 60
@@ -13408,7 +13458,8 @@ class AgentRunner:
         self._step("slots")
         self.recheck_slots()
         self._step("publish")
-        attempts = self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))
+        attempts = [a for a in self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))
+                    if a.mode != source_review.MODE]
         for a in attempts:
             self.effects.taken(a.task_id)
         self.effects.publish(attempts)
@@ -13431,7 +13482,7 @@ class AgentRunner:
             return
         self._skips_due = time.monotonic() + SKIP_EVERY.total_seconds()
         try:
-            tasks = self.candidates()
+            tasks = [t for t in self.candidates() if t.get("_mode") != source_review.MODE]
         except MeshError as e:
             log.warning("%s: skip states: %s", self.agent.name, e)
             return
@@ -13471,6 +13522,7 @@ class AgentRunner:
         tasks = ([dict(t, _mode="review") for t in feed["review"]] if self.agent.feed_review else [])
         for cat in ("in_progress", "todo"):
             tasks += [dict(t, _mode="work") for t in feed[cat]]
+        tasks = self._source_review_candidates(set(held)) + tasks
         for t in tasks:
             reason = held.get(t["id"]) and f"attempt {held[t['id']]}"
             reason = reason or self.hold_reason(t, t["_mode"], log_change=False)
