@@ -258,5 +258,25 @@ if os.environ.get('MESH_RUNNER_REQUIRE_ACCOUNT_CAPACITY') == '1':
         self.assertEqual(r._starts_paused_until, 0.0)
 
 
+    def test_routing_that_found_no_account_holds_the_resume_before_the_gate(self):
+        """On-limit ran and switched nothing (rc=1): the resume is held, the gate is not asked again
+        right away. Without an on-limit command (the tests above) the gate still decides at once."""
+        import sys, time
+        t = task(1)
+        self.capacity_gate()
+        self.capacity.touch()
+        self.agent.on_limit_command = [sys.executable, '-c', 'import sys; print("no switch"); sys.exit(1)']
+        self.quota_replies(t)
+        r = self.runner(FakeMesh([t], max_concurrent=1))
+        r.tick()
+        self.settle_all(r)
+        for _ in range(3):
+            r.tick()
+        self.assertEqual(len(calls(self.calls)), 1)
+        a = r.store.by_state(self.agent.name, ('ready',))[0]
+        self.assertGreater(r._resume_hold_until(a), time.monotonic() + 60)
+        self.assertNotIn('reserve:1', self.gate_calls.read_text())
+
+
 if __name__ == '__main__':
     unittest.main()
