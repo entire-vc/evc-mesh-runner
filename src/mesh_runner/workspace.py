@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import stat
 import sqlite3
@@ -263,6 +264,213 @@ def _run_git(argv: list[str], *, env: dict[str, str], timeout: float) -> subproc
     return progress.run(argv, timeout=timeout, text=True, errors="surrogateescape", env=env)
 
 
+_KILLED_GIT_LOCKS = ("index.lock", "HEAD.lock")
+
+
+def _killed_git_dir(cwd: Path, args: tuple[str, ...], env: dict[str, str]) -> Path | None:
+    """The gitdir whose index/HEAD a `git -C cwd *args` locks, read from the filesystem without starting
+    a process (this runs before every git): --git-dir= among the leading options, GIT_DIR, cwd/.git (a
+    directory, or a linked worktree's `gitdir:` pointer), or cwd itself when it is a bare repository.
+    None when unsure; the caller then never touches a lock."""
+    for a in args:
+        if a.startswith("--git-dir="):
+            d = Path(a[len("--git-dir="):])
+            return d if d.is_absolute() else cwd / d
+        if not a.startswith("-"):
+            break
+    if env.get("GIT_DIR"):
+        d = Path(env["GIT_DIR"])
+        return d if d.is_absolute() else cwd / d
+    dotgit = cwd / ".git"
+    try:
+        st = os.lstat(dotgit)
+    except FileNotFoundError:
+        return cwd if (cwd / "HEAD").is_file() and (cwd / "objects").is_dir() else None
+    except OSError:
+        return None
+    if stat.S_ISDIR(st.st_mode):
+        return dotgit
+    if stat.S_ISREG(st.st_mode):
+        try:
+            text = dotgit.read_text(errors="surrogateescape").strip()
+        except OSError:
+            return None
+        if text.startswith("gitdir: ") and "\n" not in text:
+            d = Path(text[len("gitdir: "):])
+            return d if d.is_absolute() else cwd / d
+    return None
+
+
+def _git_locks_before(gitdir: Path | None) -> dict[str, tuple[int, int, int] | None]:
+    """Which of the gitdir's index/HEAD locks exist right before a git starts: name -> (dev, ino,
+    mtime_ns), None for absent. A name that could not be read is left out (= never touched)."""
+    seen: dict[str, tuple[int, int, int] | None] = {}
+    if gitdir is None:
+        return seen
+    for name in _KILLED_GIT_LOCKS:
+        try:
+            st = os.lstat(gitdir / name)
+        except FileNotFoundError:
+            seen[name] = None
+        except OSError:
+            continue
+        else:
+            seen[name] = (st.st_dev, st.st_ino, st.st_mtime_ns)
+    return seen
+
+
+def _lock_held(lock: Path) -> bool | None:
+    """True: some live process has the lock open (a git holds its lock file open until it commits it);
+    False: none has; None: unknown (lsof failed, /proc unreadable, neither available)."""
+    lsof = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
+    if lsof:
+        try:
+            r = progress.run([lsof, "-w", "-t", "--", str(lock)], timeout=30, text=True,
+                             errors="surrogateescape")
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+        if r.returncode == 1 and not r.stdout.strip() and not r.stderr.strip():
+            return False
+        return None
+    if not os.path.isdir("/proc/self/fd"):
+        return None
+    try:
+        want = os.stat(lock)
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                fds = os.listdir(f"/proc/{pid}/fd")
+            except FileNotFoundError:
+                continue                        # exited meanwhile
+            for fd in fds:
+                try:
+                    st = os.stat(f"/proc/{pid}/fd/{fd}")
+                except FileNotFoundError:
+                    continue
+                if (st.st_dev, st.st_ino) == (want.st_dev, want.st_ino):
+                    return True
+    except OSError:                             # e.g. another user's process: cannot rule a holder out
+        return None
+    return False
+
+
+# Kernel file timestamps may trail the wall clock by a coarse tick (Linux: a few ms): a lock made right
+# after the start must not read as older than it. The slack only applies to a lock proven absent at the
+# start (`_git_locks_before`); a lock that existed then is never touched, however close its timestamp.
+_LOCK_CLOCK_SLACK_NS = 100_000_000
+
+
+def _park_git_lock(gitdir: Path, name: str, expected: os.stat_result, parked: str) -> bool:
+    """Exchange the candidate with an empty directory before validating what we actually took.
+
+    The directory keeps O_EXCL writers out and cannot be committed over an index/HEAD file.
+    A concurrently substituted lock is exchanged back, never unlinked. If that rollback fails,
+    leave the barrier and the taken file intact, with an explicit operator recovery command.
+    """
+    dfd = os.open(gitdir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    created = swapped = accepted = False
+    try:
+        # A directory barrier must never be eligible for rename to an absent index/HEAD.
+        # Existing regular targets make that attempted commit fail at the kernel boundary.
+        target = os.stat(name.removesuffix(".lock"), dir_fd=dfd, follow_symlinks=False)
+        if not stat.S_ISREG(target.st_mode):
+            raise WorkspaceError("lock target is not a regular file; recovery refused")
+        os.mkdir(parked, 0o700, dir_fd=dfd)
+        created = True
+        barrier = os.stat(parked, dir_fd=dfd, follow_symlinks=False)
+        _rename_exchange(dfd, name, dfd, parked)
+        swapped = True
+        taken = os.stat(parked, dir_fd=dfd, follow_symlinks=False)
+        def identity(st):
+            return st.st_dev, st.st_ino, st.st_mtime_ns
+        if (not stat.S_ISREG(taken.st_mode) or identity(taken) != identity(expected)
+                or _lock_held(gitdir / parked) is not False
+                or identity(os.stat(parked, dir_fd=dfd, follow_symlinks=False)) != identity(expected)):
+            log.warning("git timeout recovery: %s was replaced, changed or has a holder; returning it",
+                        gitdir / name)
+            return False
+        # rmdir cannot remove a replacement regular lock, even if the barrier was moved by hand.
+        os.rmdir(name, dir_fd=dfd)
+        accepted = True
+        return True
+    finally:
+        try:
+            if swapped and not accepted:
+                try:
+                    current = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != (barrier.st_dev, barrier.st_ino):
+                        raise WorkspaceError("recovery barrier was replaced")
+                    _rename_exchange(dfd, name, dfd, parked)
+                except Exception as e:
+                    # Nothing is removed: the taken file and barrier are the recovery anchors.
+                    command = (f"rmdir -- {shlex.quote(str(gitdir / name))} && "
+                               f"mv -n -- {shlex.quote(str(gitdir / parked))} "
+                               f"{shlex.quote(str(gitdir / name))}")
+                    log.error("git timeout recovery: cannot return %s to %s: %s; barrier retained. "
+                              "After stopping writers and checking both paths, manual recovery: %s",
+                              gitdir / parked, gitdir / name, e, command)
+                else:
+                    os.rmdir(parked, dir_fd=dfd)
+            elif created and not swapped:
+                os.rmdir(parked, dir_fd=dfd)
+        finally:
+            os.close(dfd)
+
+
+def _reclaim_killed_git_locks(cwd: Path, args: tuple[str, ...], gitdir: Path | None,
+                              before: dict[str, tuple[int, int, int] | None], started_ns: int) -> None:
+    """A git the Runner killed on its timeout cannot remove its index.lock/HEAD.lock, and every later
+    git write in that gitdir then fails with "File exists". Set such a lock aside, never
+    delete it: exchange it with a directory barrier and validate the moved inode and holder before
+    releasing the barrier. Retain it as <lock>.killed-<utc>-<ns>, logging both paths (rollback: mv back).
+    Only a lock that was absent right before this process started (`before`, taken after `started_ns`),
+    is not older than that start and is open in no live process is accepted. A replacement taken in
+    the exchange race is immediately returned while the barrier excludes a second writer. A lock
+    that already existed, a held one or any doubt stays, and the caller's timeout error stands."""
+    try:
+        what = " ".join(args[:2])
+        if gitdir is None:
+            log.warning("git %s in %s timed out: gitdir not resolved, its locks (if any) left in place", what, cwd)
+            return
+        for name in _KILLED_GIT_LOCKS:
+            lock = gitdir / name
+            try:
+                st = os.lstat(lock)
+            except FileNotFoundError:
+                continue
+            if name not in before or before[name] is not None:
+                log.warning("git %s in %s timed out: %s already existed when it started (or was unreadable), "
+                            "left in place", what, cwd, lock)
+                continue
+            born = st.st_mtime_ns
+            if getattr(st, "st_birthtime", None) is not None:
+                born = min(born, int(st.st_birthtime * 1_000_000_000))
+            if not stat.S_ISREG(st.st_mode) or born < started_ns - _LOCK_CLOCK_SLACK_NS:
+                log.warning("git %s in %s timed out: %s predates it (or is not a file), left in place",
+                            what, cwd, lock)
+                continue
+            held = _lock_held(lock)
+            if held is not False:
+                log.warning("git %s in %s timed out: %s %s, left in place", what, cwd, lock,
+                            "is held by a live process" if held else "holder unknown (lsof failed)")
+                continue
+            again = os.lstat(lock)
+            if (again.st_ino, again.st_dev, again.st_mtime_ns) != (st.st_ino, st.st_dev, st.st_mtime_ns):
+                log.warning("git %s in %s timed out: %s changed while checked, left in place", what, cwd, lock)
+                continue
+            parked = f"{name}.killed-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{started_ns}"
+            if not _park_git_lock(gitdir, name, st, parked):
+                continue
+            log.warning("git %s in %s timed out and was killed: set aside the lock it left, %s -> %s "
+                        "(rollback: mv %s %s)", what, cwd, lock, gitdir / parked, gitdir / parked, lock)
+    except Exception as e:                      # recovery must never mask the timeout itself
+        log.warning("git %s in %s timed out: lock reclaim failed; no further changes: %s: %s",
+                    " ".join(args[:2]), cwd, type(e).__name__, e)
+
+
 def git(cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = None,
         timeout: int = 600) -> str:
     env = dict(env if env is not None else os.environ)
@@ -273,7 +481,18 @@ def git(cwd: Path, *args: str, check: bool = True, env: dict[str, str] | None = 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired("git", timeout)
-            res = _run_git(["git", "-C", str(cwd), *args], env=env, timeout=remaining)
+            started_ns = time.time_ns()
+            try:                                    # bookkeeping for a timeout; never fails the git itself
+                gitdir = _killed_git_dir(cwd, args, env)
+                before = _git_locks_before(gitdir)
+            except Exception:
+                gitdir, before = None, {}
+            try:
+                res = _run_git(["git", "-C", str(cwd), *args], env=env, timeout=remaining)
+            except subprocess.TimeoutExpired:
+                # the process is killed and reaped: a lock it took can never be released by it
+                _reclaim_killed_git_locks(cwd, args, gitdir, before, started_ns)
+                raise
         except subprocess.TimeoutExpired:
             raise WorkspaceError(f"git {' '.join(args[:2])} in {cwd}: timed out") from None
         if (attempt == 0 and check and args and args[0] == "fetch"
@@ -306,6 +525,23 @@ def _copy_file_fd(src: str, dfd: int, name: str) -> None:
             os.close(out)
     finally:
         os.close(sfd)
+
+
+def _rename_exchange(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+    """Atomically exchange two existing entries, including a file and an empty directory.
+
+    No fallback: without kernel support the source lock must remain untouched.
+    """
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    fn = getattr(libc, "renameatx_np" if sys.platform == "darwin" else "renameat2", None)
+    if fn is None:
+        raise WorkspaceError("no atomic exchange rename on this platform; lock recovery refused")
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    if fn(src_fd, os.fsencode(src), dst_fd, os.fsencode(dst), 2) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), src)
 
 
 def _rename_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
