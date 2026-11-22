@@ -4,12 +4,15 @@ Claude Code keeps "Usage limit reached · continuing automatically at 12pm · es
 stated time. BUSY_RE read its "esc to cancel" as a running turn, so every later turn on that window waited
 busy_wait, failed with "the session stayed busy" and the runner paused new starts for 30 minutes, again and again.
 """
+import datetime as dt
 import io
 import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+from zoneinfo import ZoneInfo
 
 from mesh_runner.tui_driver import Driver, DriverError, is_busy, limit_notice
 
@@ -27,6 +30,18 @@ SPINNER = ("⏺ Reading the card.\n✽ Forging… (1m 2s · ↓ 3.1k tokens)\n"
 INTERRUPT = "⏺ Running tests\n" + "─" * 41 + "\n❯\n" + "─" * 41 + "\n  esc to interrupt · ctrl+b to run in background\n"
 WORKING = "• Working (3s • esc to interrupt)\n› Ask Codex\n"
 IDLE = "⏺ Done.\n✻ Crunched for 12s\n" + "─" * 41 + "\n❯\n" + "─" * 41 + "\n  ⏵⏵ bypass permissions on\n"
+MSK = ZoneInfo("Europe/Moscow")
+NOTICE_SHOWN = dt.datetime(2026, 11, 21, 11, 32, tzinfo=MSK)   # "done 11:32 AM": the limit is live until 12pm
+NOTICE_PASSED = dt.datetime(2026, 11, 21, 14, 0, tzinfo=MSK)   # the same screen after its 12pm reset
+
+
+def host_clock_at(when):
+    """Patch the driver module's datetime so datetime.now() reads ``when``: the host's clock, not the fixture's."""
+    class Fixed(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return when.astimezone(tz) if tz else when.astimezone().replace(tzinfo=None)
+    return mock.patch("mesh_runner.tui_driver.datetime", Fixed)
 
 
 class FakeClock:
@@ -83,19 +98,48 @@ class TurnOnALimitScreen(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def driver(self, screen):
+    def driver(self, screen, wall=NOTICE_SHOWN):
+        """The wall clock is the notice's own moment: the screen says "done 11:32 AM" and "resets 12pm", so the
+        limit is live. Read from the host, the same fixture turned into a past notice after noon (red on 0.2.120)."""
         tmux = ScriptedTmux(screen)
         out = io.StringIO()
         d = Driver(harness="claude", agent="builder", state=self.root / "state", tmux=tmux, max_sessions=10,
                    cwd=self.root, session_id="", mode="resume", key="att-1", argv=["claude"], out=out,
                    env={"HOME": str(self.root)}, clock=self.clock.time, sleep=self.clock.sleep,
                    timeouts={"beat": 3600, "paste": 5})
+        d.wall = lambda: wall
         d.private_dir()
         d.ensure_session = lambda: None
         d.marks = {}
         return d, tmux, out
 
     def test_the_limit_is_reported_at_once_and_the_window_is_closed(self):
+        self.assert_reported_and_closed()
+
+    def test_the_outcome_does_not_depend_on_the_host_clock(self):
+        for i, host in enumerate((NOTICE_SHOWN.replace(hour=11, minute=0), NOTICE_PASSED)):
+            with self.subTest(host=host.isoformat()), host_clock_at(host):
+                self.root, self.clock = Path(self.tmp.name) / str(i), FakeClock()
+                self.assert_reported_and_closed()
+
+    def test_the_same_notice_after_its_reset_is_no_limit(self):
+        """Past 12pm the notice has outlived its window (StaleNoticeIsNoLimit in test_limit_hold): the offer is
+        dismissed once and the turn goes on to the paste instead of closing the window as a limit."""
+        d, tmux, _ = self.driver(NOTICE, wall=NOTICE_PASSED)
+        self.assertEqual(d.live_limit_notice(), "")
+        self.assertEqual([c[-1] for c in tmux.calls if c[0] == "send-keys"], ["Escape"])
+
+        d, tmux, _ = self.driver(NOTICE, wall=NOTICE_PASSED)
+
+        class Pasting(Exception):
+            pass
+        with mock.patch.object(d, "wait_background", return_value=True), \
+                mock.patch.object(d, "wait_idle", side_effect=Pasting):
+            with self.assertRaises(Pasting):
+                d.turn(PROMPT)
+        self.assertFalse(tmux.killed())
+
+    def assert_reported_and_closed(self):
         d, tmux, out = self.driver(NOTICE)
         start = self.clock.now
         self.assertEqual(d.run(PROMPT), 1)

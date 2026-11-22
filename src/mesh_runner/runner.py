@@ -85,6 +85,7 @@ from . import watchdog
 from .adapters.base import Adapter, Launch, LaunchExecError, LaunchProbeDenied, TurnResult, group_alive, interrupt_group, pid_reused, proc_stamp, read_events
 from .adapters.claude import ClaudeAdapter
 from .adapters.codex import CodexAdapter
+from .adapters.agy import AgyAdapter
 from .adapters.kimi import KimiAdapter
 from .adapters.zcode import ZCodeAdapter
 from . import queue_wait
@@ -221,6 +222,11 @@ PROVIDER_OUTAGE_HINT = re.compile(
     r"authentication_failed|API Error: 403|Request not allowed|workspace routing discovery failed"
     r"|account/read failed during TUI bootstrap|\b(?:server_)?overloaded\b", re.I)
 OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY = "_runtime", "_provider_outage", "pause_until"
+# The host's egress to a provider is down (agy: the Google tunnel wrapper refused the launch, exit 69).
+# Retried like a provider outage, but it never pauses other lanes: their harnesses use other routes.
+AUTH_HARNESSES = ("claude", "codex", "agy")    # harnesses whose login the runner fingerprints and holds
+AGY_AUTH_UNSENT = "agy-auth-unsent"
+EGRESS_HINT = re.compile(r"\begress_unavailable\b")
 POLICY_REFUSAL_HINT = re.compile(r"flagged for possible cybersecurity risk", re.I)
 # Codex says "No saved session found with ID …" when it cannot resume a thread
 NO_SESSION_HINT = re.compile(r"no conversation found|no saved session found|session .*not found|thread .*not found", re.I)
@@ -415,6 +421,8 @@ def make_adapter(agent: AgentConfig) -> Adapter:
         return KimiAdapter(agent.binary or "kimi", agent.args)
     if agent.harness == "zcode":
         return ZCodeAdapter(agent.binary or "zcode", agent.args)
+    if agent.harness == "agy":
+        return AgyAdapter(agent.binary or "agy", agent.args, admission_commands=agent.admission_commands)
     return ClaudeAdapter(agent.binary or "claude", agent.args)
 
 
@@ -427,6 +435,9 @@ def make_alt_adapter(harness: str, spec: dict) -> Adapter:
         return KimiAdapter(spec.get("binary") or "kimi", list(spec.get("args") or []))
     if harness == "zcode":
         return ZCodeAdapter(spec.get("binary") or "zcode", list(spec.get("args") or []))
+    if harness == "agy":
+        return AgyAdapter(spec.get("binary") or "agy", list(spec.get("args") or []),
+                          admission_commands=list(spec.get("admission_commands") or []))
     raise ValueError(f"unknown harness {harness}")
 
 
@@ -2336,6 +2347,8 @@ class AgentRunner:
             adapter = self.adapter_for("codex")
             adapter = getattr(adapter, "base", adapter)     # the interactive wrapper keeps the real adapter here
             return auth.codex_profile_id(env, str(getattr(adapter, "profile", "") or ""))
+        if harness == "agy":
+            return auth.agy_profile_id(env)
         return ""
 
     def _auth_blocked(self, a: Attempt, env: dict[str, str]) -> str:
@@ -2347,7 +2360,7 @@ class AgentRunner:
         except ValueError:
             unknown = {}
         unrecorded = unknown.get("profile", "") if isinstance(unknown, dict) and unknown.get("attempt") == a.id else ""
-        return (unrecorded if routed in ("claude", "codex") and unrecorded and auth.held(self.store, unrecorded) else
+        return (unrecorded if routed in AUTH_HARNESSES and unrecorded and auth.held(self.store, unrecorded) else
                 profile if profile and auth.held(self.store, profile) else "")
 
     def _writer_launch_env(self, a: Attempt, env: dict[str, str],
@@ -2954,13 +2967,16 @@ class AgentRunner:
         until = parse_time(mark[0]) if mark and mark[0] else None
         return until is not None and now() < until
 
-    def _provider_outage(self, a: Attempt, task: dict, public_error: str) -> None:
+    def _provider_outage(self, a: Attempt, task: dict, public_error: str, fleet_pause: bool = True) -> None:
         """A provider outage is neither a failed turn nor a start: back off and retry the same
-        attempt, give up only after the outage has lasted ``provider_outage_giveup_minutes``."""
+        attempt, give up only after the outage has lasted ``provider_outage_giveup_minutes``.
+        ``fleet_pause=False`` (a host egress failure of one harness) never pauses other lanes' starts."""
         name, tid = self.agent.name, a.task_id
         # not a product turn: the turn budget ignores it, like an authentication-only turn
         self.store.event(a.id, "auth_only_turn", str(a.turns))
         self.store.event(a.id, "provider_outage", str(a.turns))
+        if not fleet_pause:
+            self.store.event(a.id, "egress_outage", str(a.turns))
         since = self.store.mark(name, tid, "outage_since")
         began = parse_time(since[0]) if since and since[0] else None
         if began is None:
@@ -2979,7 +2995,7 @@ class AgentRunner:
         delay = min(self.cfg.provider_outage_backoff_cap_seconds,
                     self.cfg.provider_outage_backoff_seconds * 2 ** (n - 1))
         lanes = self.cfg.provider_outage_lanes
-        if lanes and self.store.outage_lanes(now() - dt.timedelta(minutes=15)) >= lanes:
+        if fleet_pause and lanes and self.store.outage_lanes(now() - dt.timedelta(minutes=15)) >= lanes:
             until = now() + dt.timedelta(seconds=delay)
             mark = self.store.mark(OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY)
             held = parse_time(mark[0]) if mark and mark[0] else None
@@ -3393,7 +3409,7 @@ class AgentRunner:
         if self._still_ours(task, a.mode) and not self._settle_native(a, task):
             return
         auth_profile = None
-        if a.harness in ("claude", "codex") and (result.auth_failed or result.verification_required):
+        if a.harness in AUTH_HARNESSES and (result.auth_failed or result.verification_required):
             # The process's exact profile is evidence even if ownership/status
             # changed before settle. Record it before releasing this attempt.
             auth_profile = self._record_authentication_failure(a, result.auth_only, result.verification_required)
@@ -3418,7 +3434,8 @@ class AgentRunner:
                               and not result.session_id and bool(stderr.strip()))
         outage_turn = ((result.is_error or stream_never_began) and bool(PROVIDER_OUTAGE_HINT.search(
             f"{result.error_details or result.error} {result.final_text} {stderr[-500:]}"))
-            or result.upgrade_required)
+            or result.upgrade_required
+            or (result.is_error and bool(EGRESS_HINT.search(result.error_details or result.error))))
         capped = (a.turns - self.store.auth_turns(a.id) >= self.cfg.max_turns and not outage_turn
                   and not self._cap_at_resume(a))
         if capped and result.provider_refusal:
@@ -3467,6 +3484,10 @@ class AgentRunner:
         if result.is_error:
             text = f"{result.error_details or result.error} {result.final_text} {stderr[-500:]}"
             public_error = public_harness_error(text)
+            if EGRESS_HINT.search(result.error_details or result.error):
+                # the adapter's typed verdict only: not a quota, not a login, not a fault of the task
+                self._provider_outage(a, task, public_error, fleet_pause=False)
+                return
             if PROVIDER_OUTAGE_HINT.search(text):
                 self._provider_outage(a, task, public_error)
                 return
@@ -5771,6 +5792,13 @@ class AgentRunner:
             result.session_id = intent["session_id"]
         if not result.session_id and self._headless_quota_unbound(a, intent, result):
             return HEADLESS_QUOTA_UNBOUND, ""
+        if a.harness == "agy" and not result.session_id and result.is_error and not events:
+            if EGRESS_HINT.search(result.error_details):
+                # the egress wrapper refused before the native CLI started: no stream, no conversation
+                return "unsent", ""
+            if result.auth_failed:
+                # the CLI refused its login before it opened a conversation: the prompt reached no model
+                return AGY_AUTH_UNSENT, ""
         if not result.session_id or (intent.get("session_id") and result.session_id != intent["session_id"]):
             return "headless-native-session-mismatch", ""
         # A unique per-turn file is owned by the registered process group. The
@@ -5787,7 +5815,7 @@ class AgentRunner:
                 return "headless-native-terminal-mismatch", ""
             if not terminals and not accepted:
                 return "headless-native-terminal-mismatch", ""
-        elif a.harness in ("kimi", "zcode"):
+        elif a.harness in ("kimi", "zcode", "agy"):
             # print modes write no acceptance receipt: only a finished, session-bound stream acknowledges
             if not result.finished:
                 return "headless-native-terminal-mismatch", ""
@@ -5832,7 +5860,13 @@ class AgentRunner:
                         self.store.other_sessions(a.id))
             except (OSError, ValueError, KeyError, TypeError):
                 resolution = "native-evidence-unreadable"
-            if resolution in ("unsent", "quota-unsent", HEADLESS_QUOTA_UNBOUND):
+            if resolution in ("unsent", "quota-unsent", HEADLESS_QUOTA_UNBOUND, AGY_AUTH_UNSENT):
+                if resolution == AGY_AUTH_UNSENT:
+                    # the login of that launch is held; the next admission meets the hold and runs the
+                    # ordinary auth path (operator signal, on_auth route). Not an auth-only turn: the
+                    # unsent path below already restores the prior turn count, so the budget is untouched.
+                    self._record_authentication_failure(a, auth_only=False)
+                    resolution = "unsent"
                 if resolution != "unsent":
                     # Use the same quota policy as a failed accepted turn, but do
                     # not consume this undelivered prompt or its pending marks.

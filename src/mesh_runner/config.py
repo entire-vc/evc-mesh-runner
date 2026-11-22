@@ -46,7 +46,7 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     [[agents]]
     name = "builder"
     key_file = "~/.config/mesh-runner/builder.key"
-    harness = "claude"            # claude | codex | kimi | zcode
+    harness = "claude"            # claude | codex | kimi | zcode | agy
     profile_dir = "~/agents/builder"   # session cwd: the agent's rules, skills, MCP config
     args = ["--model", "sonnet"]
     max_parallel = 0              # 0: use the agent's max_concurrent_tasks in Mesh
@@ -269,6 +269,7 @@ class AgentConfig:
     turn_end_command: list[str] = field(default_factory=list)    # after every turn, with the gate's output
     launch_probe_command: list[str] = field(default_factory=list)  # Codex launch-context probe helper (stdin protocol)
     launch_probe_version: int = 1                                  # 2 = opt-in: reply also carries used percents
+    admission_commands: list[list[str]] = field(default_factory=list)  # agy: argvs run before every start, all 0 = go
     queue_order_command: list[str] = field(default_factory=list)   # ordinary-work start order helper; empty = off
     source_review_command: list[str] = field(default_factory=list)  # pinned external review units; empty = off
     source_review_timeout_seconds: float = 60.0
@@ -700,8 +701,8 @@ class RunnerConfig:
 
 
 LAUNCH_MODES = ("interactive", "headless")
-# kimi and zcode run headless only: their print modes draw on the same subscription as their TUIs
-HARNESSES = ("claude", "codex", "kimi", "zcode")
+# kimi, zcode and agy run headless only: their print modes draw on the same subscription as their TUIs
+HARNESSES = ("claude", "codex", "kimi", "zcode", "agy")
 
 
 def _probe_version(value, name: str) -> int:
@@ -729,6 +730,14 @@ def _str_list(value, key: str, name: str) -> list[str]:
     if not isinstance(value, list) or any(not isinstance(v, str) or not v.strip() for v in value):
         raise ConfigError(f"agent {name}: {key} must be a list of names")
     return [v.strip() for v in value]
+
+
+def _argv_list(value, key: str, name: str) -> list[list[str]]:
+    """A list of commands, each a non-empty list of strings."""
+    if not isinstance(value, list) or any(
+            not isinstance(c, list) or not c or any(not isinstance(x, str) or not x for x in c) for c in value):
+        raise ConfigError(f"agent {name}: {key} must be a list of commands (lists of strings)")
+    return [list(c) for c in value]
 
 
 def _qo_argv(value, name: str, key: str = "queue_order_command") -> list[str]:
@@ -1076,9 +1085,11 @@ def load(path: str | Path) -> RunnerConfig:
         harness = a.get("harness", "claude")
         if harness not in HARNESSES:
             raise ConfigError(f"agent {a.get('name')}: harness must be one of {', '.join(HARNESSES)}")
-        for alt in a.get("alt") or {}:
+        for alt, spec in (a.get("alt") or {}).items():
             if alt not in HARNESSES:
                 raise ConfigError(f"agent {a.get('name')}: alt harness must be one of {', '.join(HARNESSES)}")
+            if isinstance(spec, dict) and "admission_commands" in spec:
+                _argv_list(spec["admission_commands"], f"alt.{alt}.admission_commands", a.get("name"))
         repos = [_repo_spec(x, f"agent {a.get('name')} repos") for x in a.get("repos") or []]
         ident = a.get("identity")
         if "project_ids" in a:
@@ -1108,6 +1119,7 @@ def load(path: str | Path) -> RunnerConfig:
             turn_end_command=list(a.get("turn_end_command") or []),
             launch_probe_command=list(a.get("launch_probe_command") or []),
             launch_probe_version=_probe_version(a.get("launch_probe_version", 1), a["name"]),
+            admission_commands=_argv_list(a.get("admission_commands", []), "admission_commands", a["name"]),
             queue_order_command=_qo_argv(a.get("queue_order_command"), a["name"]),
             source_review_command=_qo_argv(a.get("source_review_command"), a["name"], "source_review_command"),
             source_review_timeout_seconds=_qo_seconds(a.get("source_review_timeout_seconds", 60), "source_review_timeout_seconds", a["name"]),

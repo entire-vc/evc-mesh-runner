@@ -55,6 +55,13 @@ def codex_profile_id(env: dict[str, str], profile: str = "") -> str:
     return hashlib.sha256(json.dumps(["codex", os.path.realpath(home), profile]).encode()).hexdigest()[:32]
 
 
+def agy_profile_id(env: dict[str, str]) -> str:
+    """Fingerprint the Antigravity login a spawn uses: its Gemini home (``$HOME/.gemini``).
+    Credential values never participate."""
+    home = Path(env.get("HOME") or Path.home()) / ".gemini"
+    return hashlib.sha256(json.dumps(["agy", os.path.realpath(home)]).encode()).hexdigest()[:32]
+
+
 def is_verification_required(text: str) -> bool:
     # The provider's whole terminal reason, nothing else: quoted prose or a longer message is not it.
     return text.strip() == "verification_required"
@@ -96,6 +103,8 @@ def account_label(harness: str, env: dict[str, str], cwd: Path | None = None) ->
         # Provider URLs may contain credentials in userinfo, paths, or queries.
         # This label is persisted and sent to the operator, so omit the URL entirely.
         return "claude API key"
+    if harness == "agy":
+        return f"agy login {os.path.realpath(Path(env.get('HOME') or Path.home()) / '.gemini')}"
     directory, default, var = _login_dir(harness, env, cwd)
     if os.path.realpath(directory) == os.path.realpath(default):
         return f"{harness} default login ~/{default.name} (no {var})"
