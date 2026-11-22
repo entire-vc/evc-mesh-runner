@@ -1,3 +1,13 @@
+---
+created: 2026-11-02T05:36:02+03:00
+updated: 2026-11-21T23:00:00+03:00
+author: Entire VC
+status: maintained
+project: mesh
+type: guide
+tags: [mesh, task-management]
+---
+
 # Mesh Agent Runner
 
 Runs Claude Code and Codex agents on their [Mesh](https://github.com/entire-vc/evc-mesh) tasks.
@@ -8,16 +18,26 @@ Runs Claude Code and Codex agents on their [Mesh](https://github.com/entire-vc/e
 - **One worktree per task, from a warm pool.** Parallel writers never share a
   checkout. Clean worktrees are reused, so dependency installs and build caches
   survive; a worktree with uncommitted or unpushed work is kept, never wiped.
-- **Waits resume the same session.** When an agent ends a turn with
-  `⏳ WAIT pipeline:…`, `mr:…`, `card:…`, `decision:@…` or a time, its slot is
-  freed and the session is kept. When the condition is met — or someone writes on
-  the task — the runner resumes that same conversation instead of re-explaining
-  the task to a fresh one.
-- **Policy-free.** Team rules, review gates and prompts live in the agent's own
-  profile directory (`CLAUDE.md`, skills, MCP config) and an optional preamble
-  file. The runner only schedules, isolates and resumes.
+- **Explicit turn commands.** Agents end each turn through Mesh commands such as
+  `wait_for`, `continue_next` and `finish_task`. Mesh validates and records the
+  outcome; text in a comment or final message does not end a turn.
+- **Waits resume the same session.** `wait_for` declares a pipeline, merge request,
+  card or external event to await; `ask_agent` and `ask_human` request a decision.
+  Once the turn process exits, its execution slot is free and its session and
+  worktrees are kept. The matching event resumes the same conversation; a human
+  question waits for its answer or for the human gate to be lifted.
+- **Independent review and a configurable merge gate.** Review routing assigns a
+  reviewer from the configured registry. With a merge command configured,
+  `wait_for on=merge` runs the gate for the specified MR head, then returns the
+  result to the author for delivery and verification.
+- **Team policy stays in configuration.** Agent profiles (`CLAUDE.md`, skills, MCP
+  config), an optional preamble and the configured merge command define team
+  rules. The runner schedules work, isolates checkouts and coordinates the
+  turn, review and merge lifecycle.
 
-Status: early (0.1). Python ≥ 3.11, standard library only.
+Status: actively developed, **0.2.x** release series. For the exact version of this
+checkout, see [package metadata](pyproject.toml). Python ≥ 3.11; the core uses the
+standard library, with optional dependencies for signed receipts.
 
 ## How it works
 
@@ -28,17 +48,37 @@ Mesh agent ── cap = max_concurrent_tasks
 
 Each tick, per agent: settle finished turns → check wake conditions → resume
 woken tasks, then start new ones while active sessions < cap → heartbeat
-checkouts. A turn is over only when the harness process **and all its children**
-have exited, so a background command keeps the slot busy instead of racing the
-next writer. See [docs/architecture.md](docs/architecture.md).
+checkouts. Each task keeps its own native session and isolated worktrees.
+
+1. The agent works on the task and calls exactly one Mesh turn command.
+   `continue_next` records completed work and requests another turn; `wait_for`
+   parks it on the declared event; `finish_task` records delivery evidence or
+   sends the result to review with `to=review`. Questions and hand-offs have
+   their own commands, listed below.
+2. Mesh stores a typed outcome. The runner settles it only after the harness
+   process **and all its children** exit, so a background command keeps the slot
+   busy instead of racing the next writer. Waiting releases execution capacity
+   while preserving the task's conversation and worktrees.
+3. Review routing selects an independent reviewer for work sent to review.
+   A `Verify: SHIP @<full-head-sha>` verdict applies to that MR head; a changed
+   head needs a new verdict. The author remains responsible for delivery.
+4. When enabled, `wait_for on=merge` invokes the configured merge command for
+   that exact head. The command enforces the project's CI, review and hold rules;
+   the runner re-reads the MR state and wakes the author when it is merged,
+   blocked or changed. An independent SHIP on the linked, open MR can start this
+   wait automatically. `wait_for on=mr until=merged` only observes an MR.
+5. After merge, the author installs or publishes the result where required,
+   verifies its ordinary user path, and calls `finish_task` with the evidence.
+
+See [docs/architecture.md](docs/architecture.md), the outcome contract below and
+[Merge waits](#merge-waits-merge_command) for configuration and failure handling.
 
 ## Outcome contract
 
 The agent ends each turn by calling exactly one Mesh turn command (a Mesh MCP tool, `task_id` =
 the card). Mesh records the outcome as a typed row, writes the comment and keeps or releases the
-checkout; a refused command writes nothing. The runner reads only these typed records: a marker
-line in a comment or in the final message (`⏳ WAIT`, `↻ NEXT`, `❓ Blocking`) ends nothing, see
-CHANGELOG for the release that stopped reading them.
+checkout; a refused command writes nothing. The runner reads only these typed records.
+Comments and final messages are prose, never turn commands.
 
 ```
 wait_for on=card target_task_id=<card> [target_condition=shipped|deployed|accepted|artifact_published criterion=<result>]
@@ -67,19 +107,28 @@ use their own `wait_for` kind or `ask_agent`/`ask_human`. Missing GitLab configu
 retains a visible integration-blocked event wait, without manufacturing a retry deadline.
 Internal transport retries/backoff stay internal and never become task `start_after`.
 
+A time wait on a card whose merge request is open is refused too: the MR's CI result and its
+merge are the events. The runner takes the card's merge request links from Mesh and confirms the
+open state with the forge; the refusal names the `wait_for on=mr`, `on=pipeline` or `on=merge`
+command that fits the head pipeline's state (a failed or manual head gets its action first). A
+persisted time wait is checked the same way at most every 10 minutes and its session is resumed
+with that hint; only the runner's own schedule of it is removed. Links or a forge that cannot be
+read, or a link no configured forge serves, accept the timer and log why. Review attempts are not
+checked.
+
 Invalid declarations get the normal bounded correction turn, then a visible failed attempt
 with a repair owner and action. That correction hold survives restart, cooldown and the next
 UTC day; another author's correction comment or the same identity's explicit newer
 `continue_next note=<what was corrected>` releases it. Ordinary own comments, older `continue_next` outcomes and
 runner notices cannot release it. It never writes task `start_after`.
-Existing persisted time waits are not retroactively guessed invalid: preserve them until an
+Apart from provider quota and an open merge request (above), existing persisted time waits are
+not retroactively guessed invalid: preserve them until an
 explicit audit records the source and either confirms the external deadline or posts a
 correction and clears that specific wait. The runner does not migrate old waits by itself.
 The fields enforce an evidence contract; they do not prove the external source is truthful.
 
-Or moves the task to its review/done status. No outcome → the runner asks once
-in the same session (once). A second turn in a row without a readable
-outcome puts the task back in todo with the same lane until new input arrives (a comment,
+If no readable outcome was recorded, the runner asks once in the same session.
+A second turn in a row without a readable outcome puts the task back in todo with the same lane until new input arrives (a comment,
 a change to a linked merge request or pipeline, a closed dependency: the same inputs that
 restart a capped task; no timer). The
 third turn in a row without a readable outcome on the task (any lane; a readable outcome resets the count) hands it to the lead. A task that was handed up
@@ -92,6 +141,12 @@ or unavailable targets and human gates, first after 2 hours, then every 6 hours,
 question to a person retains its separate one-day re-check. A pipeline or MR wait with no
 GitLab/GitHub observer is not re-checked by age: it stays integration-blocked until the
 observer is restored. An `on=card` wait whose card is itself waiting on this agent is woken as a cycle.
+A plain `on=card` wait (no `target_condition`) waits for the target's code: it ends as soon as every
+merge request linked to the target is merged or closed and at least one is merged (Mesh link status,
+confirmed by GitLab), also when that is already so at the declaration. Mesh's status alone never ends
+it: with no GitLab observer, or for a merge request this GitLab does not hold, it waits for the closing. Each merged set is told once:
+a wait declared again on the same target sleeps until the target closes, unless another merge request
+of it merges. A target without a merge request ends the wait by closing, as before.
 
 A parked typed refill can adopt a queue
 wait without a turn. The newest machine timestamp selects the source; its typed
@@ -241,9 +296,9 @@ that agent's sessions (so it acts under the lane's identity), and judges the res
 the merge request, never by the command's text:
 
 - MR state `merged`: the agent is woken once ("MR !56 merged at `<sha>`: deploy / verify ...").
-- The command's last output line is `⏳ WAIT pipeline:<project>#<id> ...` (the merge script's own
-  output protocol, not an agent outcome; queued): the agent stays
-  asleep. The command is run again when that pipeline or the MR's head pipeline reaches a final
+- The merge command reports a queued pipeline through its output protocol
+  (separate from the agent's Mesh turn commands): the agent stays asleep. The
+  command is run again when that pipeline or the MR's head pipeline reaches a final
   status, and in any case every `merge_rerun_minutes`; once the wait has been
   queued for 24 hours the agent is woken with the run history.
 - The last line is `⛔ MERGE RIGHTS <project>!<iid> ...` with a non-zero exit (every check passed, but
@@ -263,6 +318,41 @@ the merge request, never by the command's text:
 | `merge_rerun_minutes` | `5` | fallback re-run interval while queued |
 
 One run of the command is killed (with its process group) after 15 minutes.
+
+**Merge order.** A card that may merge only after other code names it in its description, one line
+per predecessor (the line may sit in a list item or in backticks; prose is not read):
+
+```
+merge-after: #0123abcd
+merge-after: group/project!12
+```
+
+A merge request may also be given by its GitLab URL. While any predecessor is unmerged the gate is not
+run and the merge wait stands, whoever declared it (the author, or the runner on a SHIP verdict, whose
+declaration note then names what it waits for). A predecessor card is merged when every merge request
+linked to it is merged or closed and at least one is merged, each confirmed by this GitLab (a request
+on another forge holds until the card is done), or when the card is done; a named merge request when it
+is merged. The author's own `wait_for on=mr ... until=merged` on another merge request, replaced by the
+runner's merge wait on a SHIP, is carried into it as one more predecessor, with or without a baseline
+(`after_sha`) and also when that merge request cannot be read; when Mesh cannot say which wait the
+author holds, the runner declares nothing and the verdict reaches the author. The author is woken with the
+reason, and nothing is merged, when the order can no longer be met: a predecessor card cancelled before
+its merge, a named merge request closed without merge, a `merge-after:` line that names nothing
+readable (a bare `!12`, a typo, an empty `merge-after:`), or a card Mesh does not find on three checks in a row. Anything else
+unreadable holds: the order is never assumed met. The line is read afresh before every run, so one
+added while the wait stands holds the next run.
+
+After a review verdict of someone else (`Verify: SHIP @<sha>`) names the head of the card's one
+open, non-draft GitLab merge request, the runner does not start the author only to declare this wait:
+it declares `wait_for on=merge` for the author itself, through its own checkout, and parks an attempt
+without a session on it. The gate runs on the next wake check; the author's first session starts on
+the gate's answer, with that answer as its event. The same applies when the reviewer hands the card
+back to the author (todo / in progress) instead of leaving it in review: the work start declares the
+wait instead of starting the author, and the author's earlier session goes on, when it can, on the
+gate's answer. The author's own verdict, a verdict naming no commit, several open merge requests, a
+draft, `merge_command` unset, a declaration Mesh refuses or a comment of someone other than the
+reviewer after the verdict keep the ordinary path (the author is started with the verdict); each
+verdict is tried once.
 
 This is an explicit opt-in contract, not a migration of existing stored waits. Stored
 pipeline / MR waits declared without a baseline retain their current completion semantics;
@@ -478,6 +568,10 @@ counts>`. Set it to `false` on a runner whose board people outside the team read
 instance): the line names the harness, the session and the token counts, and nothing else on the
 task needs it.
 
+Spend reports (`session_reports`, default `true`): after each turn the runner reports its tokens and
+cost on the agent's Mesh record. The separate `[spend_report]` table (`turn_fields`, default `false`)
+adds the turn's id, times, provider, account, billing mode and cache split: [spend report](docs/spend-report.md).
+
 `deploy_inventory` (path, default unset = off): the deploy inventory JSON a deploy marker reads
 (`{"repos": {"<group>/<project>": {"components": {"<name>": {"source": {"type": ...}}}}}}`). Mesh
 releases a card wait `until=deployed` only once every open or merged merge request of the target carries
@@ -490,16 +584,33 @@ not list is not checked.
 `cardless_question_lanes` (list of lane names, `["*"]` = every lane of this runner, default `[]` = off):
 a question one lane asks a listed lane of the same runner with `ask_agent` gets no `[decision]` request
 card. The addressee's answer desk (`src/mesh_runner/answer_desk.py`) reads its open requests
-(`GET /agents/me/decision-requests`, at most every 30 s) and runs one turn in the addressee's profile, in a
-session keyed by the asking card, that answers with `answer_decision` on the asking card; a request still
-open after that turn gets one reminder turn. The asker files the request card as before when the desk
-fails the request, when 20 minutes pass, when the addressee is paused or no longer listed, when Mesh has
-no such list (404: the desk is off for 10 minutes) or when the asking card is not in the addressee's
-workspace. A turn that finds no room on the host (every slot of `interactive_max_sessions` busy, or
-the memory floor) for the whole start wait is not an answer and spends nothing: the request stays
-queued and the desk asks again on a later pass; the 20-minute fallback is unchanged. `status.json`
+(`GET /agents/me/decision-requests`, at most every 30 s) using that lane's workspace-scoped key. When an
+agent has several lanes, the desk selects the lane serving the asking card's workspace. Interactive and
+headless lanes use their routed profile and share the host session cap, in a session keyed by the asking
+card. It answers with `answer_decision` or an ordinary answer comment on that
+card; the desk records a fresh answer from the addressee through Mesh's answer transaction. Older comments,
+progress notes, questions and program-generated comments do not count. A request still open after that turn
+gets one reminder turn. An explicit `Needs work:` reply goes straight to the work-card fallback.
+Addressed questions and requests in comments use the same desk; notifications and program-generated
+mentions create no request card. The queued mention survives its feed acknowledgement and a restart;
+failed or expired desk delivery falls back to a request card. Explicit operations for configured
+metadata-only recipients go straight to an `access-request` card with `runner:workspace-required`, under
+the recipient's normal permissions and approval requirements. Ordinary decisions keep their confinement.
+The asker files the request card as before when the desk
+fails the request, when 20 minutes pass after the first delivered turn, when the addressee is paused or
+no longer listed, when Mesh has no such list (404: the desk is off for 10 minutes) or when no recipient
+lane has a key for the asking card's workspace. A turn that finds no room on the host (every slot of
+`interactive_max_sessions` busy, or the memory floor) spends no turn: the request stays queued and the
+answer deadline starts only once the question reaches a session. Reminders and restarts preserve that
+deadline. `status.json`
 shows an `answer_desk` block per listed lane; `events.jsonl` has `answer_started`, `answer_done` and
 `answer_failed`.
+
+Before creating a decision fallback, the runner checks for a recipient's answer to the exact question
+on the asking card or an explicitly named open incident. Progress notes and answers from another actor
+do not settle the request. An order naming a merge request or branch can instead reach the recipient's
+matching active card in the same project. The match must be unambiguous; delivery leaves the asking
+card waiting for the recipient's answer.
 
 `native_result_dir` and `native_result_channels_dir` are also read from `[runner]`, but they are
 not ordinary options: the native-result adoption protocol checks them in the file itself
@@ -626,6 +737,13 @@ Optional hooks per agent:
   holds only that task for 10 minutes. An observed update of the refused task permits a fresh gate decision; a
   successful local turn release also rechecks a capacity refusal. Neither event
   authorizes a start. Successful admission resets the backoff.
+  An exit 76 may name a wake file: `HOLD_WAKE_FILE=<absolute path>` and
+  `HOLD_WAKE_SIG=<what the gate read there before deciding>` (`[A-Za-z0-9_.:-]`,
+  at most 128; `absent` for a missing or empty file). The hold then ends on the
+  first tick at which the file's first line reads differently, or on an update of
+  the task, and otherwise lasts two hours; nothing else re-asks the gate. The pair
+  is never part of the public reason. A missing, relative or malformed pair keeps
+  the ordinary task hold; an unreadable file is no event.
   Chat starts use a separate `transport` phase (15-second hook timeout), with
   empty task/attempt and mode `chat`. It must check only transport, without
   reserving capacity or reading a task. Any refusal leaves a standing pane
@@ -658,6 +776,20 @@ Several harnesses (`[agents.alt.codex] profile = "…"`, or `[agents.alt.claude]
 when the env command prints `MESH_RUNNER_HARNESS=codex|claude`, a new task starts on
 that harness, and a waiting task the agent was moved away from continues in a new
 session there (a session cannot move between harnesses). Each attempt keeps its own.
+
+A provider refusal of a Claude turn's content (the turn's last assistant message has
+`stop_reason: refusal`) is not retried: the same session is refused again. The refusal is
+recorded as `provider_refusal` (harness, `stop_details.category`, the route taken) in the
+attempt's events and in `events.jsonl`. When the agent also runs the other harness of the
+Claude/Codex pair (native or `[agents.alt]`), that one card continues there in a new
+session and stays there; other cards keep the agent's route. A card moves once: a refusal
+after that, or an agent without the other harness, hands the card up at once with
+`provider refusal: <category>`. The refusal is read before the turn cap (a review is capped
+at settle), and the refused turn that moves the card is outside the turn budget, so a refusal
+on the last turn still moves the card or names its category, never a bare "stopped after N
+turns". The provider's text and the prompt stay in the local turn log. For a card on its own harness (this route or the `runner-harness:<h>` label), the env
+command gets `MESH_RUNNER_TASK_HARNESS=<h>` next to `MESH_RUNNER_TASK`, so it can print
+that harness's environment.
 
 Standing chat session (`[agents.chat]` `session = "lead"`, optional `command`
 (required for non-Claude harnesses), `idle_command`, `max_age_hours`, `adopt`):
@@ -736,7 +868,7 @@ the agent earlier, with what changed in the prompt, when something happens that 
 agent has not seen: someone else comments, a review verdict is posted, a linked merge
 request is merged or closed, gets a new head or a finished pipeline (Mesh VCS links;
 with `[gitlab]`, GitLab itself), or the wait the agent declared in its last comment is
-over. A question to a human (`❓ Blocking`) ends only with someone's comment or with
+over. A question sent with `ask_human` ends only with someone's comment or with
 the human gate being lifted, not with code news. If nothing happens for the whole
 window, the author gets it once to route it on (0 = at once). On its own work the
 author never gets the accept protocol, at any age, unless someone else commented or a
@@ -784,14 +916,14 @@ A loop is never held to the next UTC day by this path.
 
 A turn extends the streak when nothing moved and it is one of:
 
-- a `↻ NEXT` after which the leased worktrees have the same HEAD and diff as at the turn start and
-  the agent wrote nothing new on the card;
+- a `continue_next` after which the leased worktrees have the same HEAD and diff
+  as at the turn start and the agent wrote nothing new on the card;
 - a wait that the runner sent back (the time, dead, stale, unattended, card and repeated-decision
   bounces) and the agent declared again unchanged;
 - a wait the agent already declared in the current window but not just before it (alternating
   between waits A and B);
 - the same wait as the previous one, accepted, declared again in a turn the agent started itself
-  with `↻ NEXT`.
+  with `continue_next`.
 
 An accepted wait declared again right after itself, after a wake that was not the agent's own NEXT,
 leaves the streak as it is: a runner re-check of a standing wait (a person's answer, a decision, a
@@ -843,17 +975,17 @@ never on a timer. Details: `docs/requeue-on-event.md`.
   task again in a new session instead of `RUNNER GAVE UP` to the lead. The restart counts as a start,
   so `daily_start_cap` (required, > 0) bounds the loop; with no recent progress, a spent start cap or
   `daily_start_cap = 0` the task goes to the lead. The cap is applied
-  when the attempt resumes, after the capped turn's own outcome is recorded (a `WAIT` waits first). Both paths log `turn cap: ...` and record
+  when the attempt resumes, after the capped turn's own outcome is recorded (a `wait_for` waits first). Both paths log `turn cap: ...` and record
   a `turn_cap` attempt event.
-- A `WAIT decision:@x` whose addressee cannot answer (not run by
+- An `ask_agent` question whose addressee cannot answer (not run by
   this runner, paused, or itself) is put to the project lead.
-- A `WAIT decision:@person` that no hard rule matches
+- An `ask_human` question that no hard rule matches
   (the built-in keyword and label lists in `asks.py`: money, secrets and access, irreversible actions, publishing, legal, actions only the person can take)
   is put to the project lead instead of raising a human gate; the person can still override by
   commenting on the card.
 
-A `❓ Blocking @person` ask (the `ask_human` command or a hand-written marker) is classified by Mesh
-itself with the same rules (`asks.gate_class`): a question no hard rule matches, whose author stated
+An `ask_human` question is classified by Mesh itself with the same rules
+(`asks.gate_class`): a question no hard rule matches, whose author stated
 a default, arms a soft gate, and Mesh applies that default at the deadline.
 
 `mesh_runner.cli asks classify --config runner.toml` lists the human gates open now with the
