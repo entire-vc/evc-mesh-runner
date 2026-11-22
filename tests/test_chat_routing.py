@@ -162,6 +162,32 @@ class ChatRouting(Bench):
         self.assertEqual(r.chat.start.call_args.args[2], ["codex"])
         self.assertEqual((r.chat.held_since, r._chat_hold), (None, ""))
 
+    # the chat was checked only as the tick's last step, so a session that died in a
+    # 12-repository start (up to 14 min) or a 35-minute tick stayed down until the tick ended
+    def test_a_gone_chat_is_started_between_the_steps_of_a_long_tick(self):
+        r = self.chat_runner(["codex", "--profile", "steward"])
+        r._between(step=True)
+        r.chat.start.assert_called_once()
+
+    def test_a_gone_chat_is_started_between_the_repositories_of_one_start(self):
+        r = self.chat_runner(["codex", "--profile", "steward"])
+        r._between_repos()
+        r.chat.start.assert_called_once()
+
+    def test_the_chat_check_between_steps_keeps_its_once_a_minute_pace(self):
+        r = self.chat_runner(["codex", "--profile", "steward"])
+        r._between(step=True)
+        r._between()
+        r._between_repos()
+        r.chat.start.assert_called_once()                        # the next check is a minute away
+
+    def test_a_failing_chat_check_between_steps_does_not_fail_the_start(self):
+        r = self.chat_runner(["codex", "--profile", "steward"])
+        r.chat.check = mock.Mock(side_effect=ValueError("broken"))
+        with self.assertLogs("mesh_runner", "WARNING"):
+            r._between_repos()
+        self.assertIn("broken", r._chat_error)
+
 
 if __name__ == "__main__":
     unittest.main()

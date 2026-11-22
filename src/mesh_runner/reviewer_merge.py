@@ -191,7 +191,9 @@ def card_fields(req: dict, project_id: str, status_id: str) -> dict:
                f"Мёржит: {req['reviewer_lane']} (GitLab `{req['reviewer_username']}`). Merge gate автора прошёл "
                "все проверки, но GitLab-личность автора не может вливать в целевую ветку (MERGE RIGHTS).\n")
         refused = ("тогда прокомментируй причину и закрой эту карточку (finish_task): автор проснётся на своей "
-                   "карточке и прочтёт причину.")
+                   "карточке и прочтёт причину. Исключение — merger-no-access (gate получил 404 на MR под твоей "
+                   "личностью: нет доступа к проекту): карточку не закрывай, нужна access-карточка (kind:ops) "
+                   "владельцу доступов и wait_for on=card на ней, затем снова wait_for on=merge.")
     else:
         who = (f"Merge-only поручение reviewer'у по MR {target}; продуктовая карточка #{src8} остаётся у автора "
                f"({req['author_lane']}): checkout, deploy и live QA не меняются.\n\n"

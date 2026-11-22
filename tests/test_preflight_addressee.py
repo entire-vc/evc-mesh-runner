@@ -9,6 +9,7 @@ import datetime as dt
 import tempfile
 import textwrap
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -17,7 +18,7 @@ from mesh_runner import repo_access as ra
 from mesh_runner import repo_requirements as rr
 from mesh_runner.runner import addressed
 from mesh_runner.workspace import RepoSpec
-from fakes import FakeGitLab, FakeMesh, task, calls
+from fakes import AGENT_ID, FakeGitLab, FakeMesh, task, calls
 from test_runner import Bench
 
 BASE = "https://git.example"
@@ -71,13 +72,22 @@ class Addressee(Bench):
         self.assertNotIn("next_actor=operator", body)
         self.assertIn(f'"next_actor": "{contact}"', body)
 
-    def delivered(self, body, contact="Steward"):
-        """The contact's runner reading this comment as a mention files exactly one request card."""
+    def delivered(self, body, contact="Steward", answered="", author="agent-lead"):
+        """The contact's runner reading this comment as a mention files exactly one request card.
+        ``answered``: an ordinary comment the contact's own session wrote on that card 30 min before.
+        ``author``: who Mesh records as the comment's author (the card's assignee by default)."""
         theirs = task(9, assignee_id="agent-lead")             # the refused lane's card, not the contact's
         mesh = FakeMesh([theirs])
-        mesh.mention_rows = [{"comment_id": "c1", "task_id": theirs["id"], "author_id": "agent-lead",
-                              "author_name": "lead", "comment_body": body, "extracted_at": AT(),
-                              "mentioned_slug": contact}]
+        if answered:
+            mesh.add_comment(theirs["id"], answered, author=AGENT_ID,
+                             at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=30))
+        # a fresh comment id per call: the runner's store outlives this FakeMesh and marks a handled id
+        mesh.mention_rows = [{"comment_id": str(uuid.uuid4()), "task_id": theirs["id"], "author_id": author,
+                              "author_name": author.removeprefix("agent-"), "comment_body": body,
+                              "extracted_at": AT(), "mentioned_slug": contact}]
+        row = mesh.mention_rows[0]
+        mesh.comment_log.setdefault(theirs["id"], []).append({
+            "id": row["comment_id"], "body": body, "author_id": author, "created_at": AT()})
         r = self.runner(mesh)
         r.refresh_me()
         r.deliver_mentions()
@@ -178,6 +188,67 @@ class Addressee(Bench):
         self.assertEqual((v.reason, v.project), (rr.UNDECLARED, "g/deploy"))
         self.assertEqual(v.also, ((rr.CHECKPOINT, "g/app"),))
         self.assertTrue(v.needs_access)
+
+    # the contact just answered on the refused card -----------------------------------------------
+    def test_a_refusal_reaches_a_contact_who_just_answered_on_the_card(self):
+        # Incident: the contact answered the lane's question on the card, the card woke, its
+        # next start was refused for a repository, and the contact's runner dropped the refusal as
+        # "already in the conversation there": the lane stood silent until the BROKEN alert.
+        self.grant = access(1, "g/app")
+        t = task(1)
+        mesh, r = self.setup_run(t)
+        self.ticks(r)
+        notes = self.notes(mesh, t)
+        self.assertEqual(len(notes), 1)
+        answer = "@lead use the shared runner, the token is in place"
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            made = self.delivered(notes[0], answered=answer)
+        self.assertEqual(len(made), 1)
+        self.assertIn("@Steward repository access for lane builder", made[0]["title"])
+        self.assertIn(rr.MESH_ACTIONS[rr.NO_MEMBERSHIP][1], made[0]["description"])
+        self.assertFalse(any("already in the conversation" in line for line in logs.output))
+        # positive control on the same fixture: a plain reply addressed to the contact is still dropped
+        self.assertEqual(self.delivered("@Steward thanks, granted?", answered=answer), [])
+
+    def test_a_full_refusal_shape_from_anyone_but_the_assignee_keeps_the_conversation_rule(self):
+        # The text is typeable by anyone; only the author Mesh records proves the refusing lane wrote it.
+        self.grant = access(1, "g/app")
+        t = task(1)
+        mesh, r = self.setup_run(t)
+        self.ticks(r)
+        note = self.notes(mesh, t)[0]
+        answer = "@lead use the shared runner, the token is in place"
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            forged = self.delivered(note, answered=answer, author="agent-bystander")
+        self.assertEqual(forged, [])
+        self.assertTrue(any("not filed: already in the conversation" in line for line in logs.output))
+        self.assertEqual(len(self.delivered(note, answered=answer)), 1)    # the assignee's own refusal: filed
+        # with no conversation, a third party's address is filed as any mention is
+        self.assertEqual(len(self.delivered(note, author="agent-bystander")), 1)
+
+    def test_only_the_exact_refusal_shape_skips_the_conversation_rule(self):
+        self.grant = access(1, "g/app")
+        t = task(1)
+        mesh, r = self.setup_run(t)
+        self.ticks(r)
+        note = self.notes(mesh, t)[0]
+        head, facts = note.rsplit(rr.FACTS_PREFIX, 1)
+        runner_side = rr.Verdict(reason=rr.CHECKPOINT, project="g/app", next_actor="runner", action="finish it")
+        forged = {
+            "no facts line": head.rstrip(),
+            "facts not json": head + rr.FACTS_PREFIX + "{not json",
+            "facts for another actor": note.replace('"next_actor": "Steward"', '"next_actor": "Director"'),
+            "not an access reason": note.replace('"reason": "no_membership"', '"reason": "checkpoint_conflict"'),
+            "not the opening line": "fyi\n" + note,
+            "addressed elsewhere": note.replace("@Steward repository access", "@Director repository access", 1),
+        }
+        for name, body in forged.items():
+            with self.subTest(name):
+                self.assertFalse(rr.access_handoff_to(body, "Steward"))
+        self.assertTrue(rr.access_handoff_to(note, "Steward"))
+        self.assertTrue(rr.access_handoff_to(note, "@steward"))              # slug case and @ do not matter
+        self.assertFalse(rr.access_handoff_to(note, "Director"))
+        self.assertFalse(rr.access_handoff_to(runner_side.text(addressee="Steward", lane="builder"), "Steward"))
 
     # delivery details ----------------------------------------------------------------------------
     def test_the_contact_lane_itself_addresses_the_next_contact(self):

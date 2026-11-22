@@ -55,6 +55,9 @@ class DeployedWaitOnUnmarkedRepo(Bench):
         self.assertIn("g/ci-defs has no live-commit source (type: none: CI definitions", a.wake_text)
         self.assertIn("g/ci-defs!41", a.wake_text)
         self.assertIn("wait_for on=mr project_path=g/ci-defs mr_iid=41 until=merged", a.wake_text)
+        # its code is the merge request: never a plain card wait
+        self.assertNotIn("wait_for on=card", a.wake_text)
+        self.assertIn("stack", a.wake_text)
         line = next(m for m in logs.output if "until=deployed sent back" in m)
         self.assertIn(f"#{x['id'][:8]}", line)
         self.assertIn("never becomes `deployed`: g/ci-defs has no live-commit source", line)

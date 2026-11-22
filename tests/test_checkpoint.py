@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import shutil
@@ -11,13 +12,19 @@ from unittest.mock import patch
 from mesh_runner.checkpoint import DEFAULT_EXCLUDE_NAMES, Checkpoints, _gitdir, fingerprint, submodule_plan
 from mesh_runner.config import ConfigError, _exclude_names
 from mesh_runner.store import Store
-from mesh_runner.workspace import RepoSpec, WorkspacePool, WorkspaceError, git
+from mesh_runner.workspace import RepoSpec, RestoreRefused, WorkspacePool, WorkspaceError, git
 from test_workspace import make_repo
 
 
 def _modules(path):
     modules = Path(git(path, 'rev-parse', '--git-path', 'modules'))
     return modules if modules.is_absolute() else path / modules
+
+
+def _worktree_park(slot):
+    """Where a stale submodule worktree is parked: beside the real slot directory, on its volume."""
+    real = Path(os.path.realpath(slot))
+    return real.parent / f'.runner-stale-submodules-{real.name}'
 
 
 class Checkpoint(unittest.TestCase):
@@ -697,6 +704,33 @@ class Checkpoint(unittest.TestCase):
             self.pool.suspend('attempt', {}, writer_stopped=True)
         self.assertTrue(self.pool.full('app'))
 
+    def test_embedded_submodule_repository_is_named_retains_the_lease_and_suspends_once_absorbed(self):
+        # The repository cloned into the gitlink's own path (`.git` a directory) beside a
+        # stale absorbed gitdir; and the same without the stale one. Both refuse with the layout named.
+        for stale_kept in (True, False):
+            with self.subTest(stale_kept=stale_kept):
+                name = f'kit-{int(stale_kept)}'
+                sub = self.add_submodule(name)
+                gd = _modules(self.source) / name
+                (sub / '.git').unlink()
+                shutil.copytree(gd, sub / '.git', symlinks=True)
+                subprocess.run(['git', 'config', '--file', str(sub / '.git' / 'config'), '--unset', 'core.worktree'],
+                               check=True)
+                if not stale_kept:
+                    shutil.rmtree(gd)
+                before = fingerprint(self.source, None, (), ())
+                with self.assertRaisesRegex(WorkspaceError,
+                                            rf'populated submodule unsupported \(embedded \.git directory\): {name}$'):
+                    self.pool.suspend('attempt', {}, writer_stopped=True)
+                self.assertTrue(self.pool.full('app'))
+                self.assertEqual(fingerprint(self.source, None, (), ()), before)
+                # the repair the refusal names: the embedded repository is absorbed under modules/
+                shutil.rmtree(gd, ignore_errors=True)
+                git(self.source, 'submodule', 'absorbgitdirs', '--', name)
+                self.assertTrue((sub / '.git').is_file())
+        self.pool.suspend('attempt', {}, writer_stopped=True)
+        self.assertFalse(self.pool.full('app'))
+
     def add_gitlink(self, name='infra/placeholder', oid='1234567890123456789012345678901234567890'):
         git(self.source, 'update-index', '--add', '--cacheinfo', '160000', oid, name)
         return self.source / name
@@ -930,6 +964,27 @@ class Checkpoint(unittest.TestCase):
             checkpoints.restore(cp, target)
         self.assertEqual((target / 'materialized' / 'README').read_text(), 'later staged work')
 
+    def test_empty_submodule_index_stat_refresh_does_not_block_restore(self):
+        self.add_submodule()
+        git(self.source, 'submodule', 'deinit', '--force', 'materialized')
+        self.pool.suspend('attempt', {}, writer_stopped=True)
+        checkpoints = self.pool._checkpoints()
+        cp = next(p for p in checkpoints.root.iterdir() if (p / 'manifest.json').exists())
+        target = self.root / 'target'; target.mkdir(); git(target, 'init', '--quiet')
+        checkpoints.restore(cp, target)
+        gd = _modules(target) / 'materialized'
+        wt = target / 'materialized'
+        before = (gd / 'index').read_bytes()
+        for args in (('checkout-index', '--all', '--force'), ('update-index', '--refresh')):
+            subprocess.run(['git', '--git-dir', str(gd), '--work-tree', str(wt), *args],
+                           check=True, capture_output=True)
+        shutil.rmtree(wt); wt.mkdir()
+        self.assertNotEqual((gd / 'index').read_bytes(), before)
+        checkpoints.restore(cp, target)
+        _gitdir(gd, 'update-index', '--force-remove', 'README')
+        with self.assertRaisesRegex(WorkspaceError, 'work in target differs'):
+            checkpoints.restore(cp, target)
+
     def test_truncated_parent_bundle_refuses_before_touching_target(self):
         checkpoints, cp, target = self._suspended_submodule()
         bundle = cp / 'commits.bundle'
@@ -1103,7 +1158,7 @@ class Checkpoint(unittest.TestCase):
         checkpoints.restore(cp, target)
         self.assertEqual(fingerprint(target, plan), expected)
         self.assertFalse((target / 'never').exists() and any((target / 'never').iterdir()))
-        parked = list((_modules(target).parent / 'runner-stale-submodules').glob('*-never.worktree'))
+        parked = list(_worktree_park(target).glob('*-never.worktree'))
         self.assertEqual(len(parked), 1)
         self.assertEqual((parked[0] / 'local.env').read_text(), 'ignored secret-ish data')
         self.assertEqual((parked[0] / 'cache' / 'blob').read_text(), 'ignored cache data')
@@ -1116,8 +1171,9 @@ class Checkpoint(unittest.TestCase):
         stale_head = _gitdir(gd, 'rev-parse', 'HEAD')
         checkpoints.restore(cp, target)
         park = _modules(target).parent / 'runner-stale-submodules'
-        parked = next(park.glob('*-never.worktree'))
+        parked = next(_worktree_park(target).glob('*-never.worktree'))
         parked_gd = next(p for p in park.glob('*-never') if p.is_dir())
+        self.assertEqual(parked.name, parked_gd.name + '.worktree')
         self.assertEqual(git(parked, 'rev-parse', 'HEAD'), stale_head)
         self.assertEqual(os.path.realpath(git(parked, 'rev-parse', '--show-toplevel')), os.path.realpath(parked))
         self.assertEqual(os.path.realpath(git(parked, 'rev-parse', '--absolute-git-dir')), os.path.realpath(parked_gd))
@@ -1127,18 +1183,59 @@ class Checkpoint(unittest.TestCase):
     def test_set_aside_path_that_is_a_symlink_or_a_file_refuses_and_moves_nothing(self):
         checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
         target = self._stale_target('never')
-        park = _modules(target).parent / 'runner-stale-submodules'
         elsewhere = self.root / 'elsewhere'; elsewhere.mkdir()
-        os.symlink(elsewhere, park)
-        with self.assertRaisesRegex(WorkspaceError, 'set-aside path'):
+        # both set-aside directories: the gitdir's (by the modules directory) and the worktree's (by the slot)
+        for park in (_modules(target).parent / 'runner-stale-submodules', _worktree_park(target)):
+            os.symlink(elsewhere, park)
+            with self.assertRaisesRegex(RestoreRefused, 'set-aside path'):
+                checkpoints.restore(cp, target)
+            park.unlink(); park.write_text('not a directory')
+            with self.assertRaisesRegex(RestoreRefused, 'set-aside path'):
+                checkpoints.restore(cp, target)
+            park.unlink()
+            self.assertEqual(list(elsewhere.iterdir()), [])
+            self.assertTrue((target / 'never' / 'README').is_file())
+            self.assertTrue(os.path.lexists(_modules(target) / 'never'))
+            self.assertEqual((target / 'sentinel').read_text(), 'keep me')
+
+    def test_stale_submodule_worktree_on_another_volume_than_its_gitdir_is_set_aside(self):
+        """A pooled slot lives on one volume, the git directory it shares with the base clone on
+        another: the submodule's worktree is in the slot, its gitdir under that git directory. Each
+        is parked on its own volume, so no move crosses volumes and the restore completes."""
+        checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
+        base = self._external('slot-base')
+        target = self.root / 'other-volume' / 'slot-3'; target.parent.mkdir()
+        git(base, 'worktree', 'add', '--quiet', '--detach', str(target))
+        git(target, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(self._external('stale-never')), 'never')
+        git(target, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'old card')
+        gd = _modules(target) / 'never'
+        (gd / 'info').mkdir(exist_ok=True)
+        with open(gd / 'info' / 'exclude', 'a') as out:
+            out.write('local.env\n')
+        (target / 'never' / 'local.env').write_text('ignored data')
+        stale_head = _gitdir(gd, 'rev-parse', 'HEAD')
+        git_volume = os.path.realpath(git(target, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        self.assertTrue(os.path.realpath(gd).startswith(git_volume + os.sep))
+        self.assertFalse(os.path.realpath(target).startswith(git_volume + os.sep))
+        real = os.rename
+        def rename(src, dst):
+            on_git = [os.path.realpath(p).startswith(git_volume + os.sep) for p in (src, os.path.dirname(dst))]
+            if on_git[0] != on_git[1]:
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+            return real(src, dst)
+        with self.assertRaises(OSError) as crossed:     # positive control: the fake volumes refuse a crossing
+            rename(target / 'sentinel-missing', gd.parent / 'x')
+        self.assertEqual(crossed.exception.errno, errno.EXDEV)
+        with patch('mesh_runner.checkpoint.os.rename', rename):
             checkpoints.restore(cp, target)
-        park.unlink(); park.write_text('not a directory')
-        with self.assertRaisesRegex(WorkspaceError, 'set-aside path'):
-            checkpoints.restore(cp, target)
-        self.assertEqual(list(elsewhere.iterdir()), [])
-        self.assertTrue((target / 'never' / 'README').is_file())
-        self.assertTrue(os.path.lexists(_modules(target) / 'never'))
-        self.assertEqual((target / 'sentinel').read_text(), 'keep me')
+        self.assertEqual(fingerprint(target, plan), expected)
+        self.assertFalse(os.path.lexists(gd))
+        parked = next(_worktree_park(target).glob('*-never.worktree'))
+        parked_gd = next(p for p in (_modules(target).parent / 'runner-stale-submodules').glob('*-never'))
+        self.assertEqual((parked / 'local.env').read_text(), 'ignored data')
+        self.assertEqual(git(parked, 'rev-parse', 'HEAD'), stale_head)
+        self.assertEqual(os.path.realpath(git(parked, 'rev-parse', '--absolute-git-dir')), os.path.realpath(parked_gd))
+        self.assertEqual(git(parked, 'status', '--porcelain'), '')
 
     def test_set_aside_failure_puts_the_worktree_back(self):
         checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
@@ -1149,24 +1246,157 @@ class Checkpoint(unittest.TestCase):
                 raise OSError(18, 'Invalid cross-device link')
             return real(src, dst)
         with patch('mesh_runner.checkpoint.os.rename', fail_for_gitdir):
-            with self.assertRaisesRegex(WorkspaceError, 'cannot set aside'):
+            # this card's target slot, not the lane: counted and held as a refused restore
+            with self.assertRaisesRegex(RestoreRefused, 'cannot set aside stale submodule never '
+                                                        r'\(Invalid cross-device link\); lease retained'):
                 checkpoints.restore(cp, target)
         self.assertTrue((target / 'never' / 'README').is_file())
         self.assertTrue(os.path.lexists(_modules(target) / 'never'))
 
-    def test_stale_submodule_extra_branch_or_local_tag_on_a_remote_commit_is_refused(self):
+    def test_stale_submodule_extra_branch_or_local_annotated_tag_on_a_remote_commit_is_refused(self):
         checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
         target = self._stale_target('never')
         sub = target / 'never'
         git(sub, 'branch', 'extra')                 # on a commit the remote has
-        with self.assertRaisesRegex(WorkspaceError, 'submodule gitdir differs.*local branch extra'):
+        with self.assertRaisesRegex(RestoreRefused, 'submodule gitdir differs.*local branch extra'):
             checkpoints.restore(cp, target)
         git(sub, 'branch', '-D', 'extra')
-        git(sub, 'tag', 'mine')
-        with self.assertRaisesRegex(WorkspaceError, 'submodule gitdir differs.*local tag mine'):
+        # An annotated tag made here: its message exists nowhere else, although its commit is published.
+        git(sub, '-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', '-m', 'my notes', 'mine')
+        with self.assertRaisesRegex(RestoreRefused, 'submodule gitdir differs.*local annotated tag mine'):
             checkpoints.restore(cp, target)
         self.assertTrue(os.path.lexists(_modules(target) / 'never'))
         self.assertEqual((target / 'sentinel').read_text(), 'keep me')
+
+    def test_stale_submodule_fetched_tag_on_a_published_commit_is_set_aside(self):
+        """A tag released after the slot cloned its submodule arrives loose (not in packed-refs)
+        with a later fetch; its commit is on the remote, so it is no one's work."""
+        checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
+        target = self._stale_target('never')
+        remote = Path(git(target / 'never', 'remote', 'get-url', 'origin'))
+        git(remote, 'tag', 'v0.1.0')                                        # lightweight
+        git(remote, '-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', '-m', 'release', 'v0.1.1')
+        git(target / 'never', 'fetch', '--quiet', '--tags', 'origin')
+        gd = _modules(target) / 'never'
+        self.assertTrue((gd / 'refs' / 'tags' / 'v0.1.0').is_file())        # loose, as a fetch writes it
+        self.assertTrue((gd / 'refs' / 'tags' / 'v0.1.1').is_file())
+        stale_head = _gitdir(gd, 'rev-parse', 'HEAD')
+        checkpoints.restore(cp, target)
+        self.assertEqual(fingerprint(target, plan), expected)
+        self.assertFalse(os.path.lexists(gd))
+        kept = list((_modules(target).parent / 'runner-stale-submodules').glob('*-never'))
+        self.assertEqual([_gitdir(k, 'rev-parse', 'HEAD') for k in kept], [stale_head])
+        self.assertEqual(_gitdir(kept[0], 'tag', '--list'), 'v0.1.0\nv0.1.1')
+
+    def test_stale_submodule_tag_on_an_unpublished_commit_is_refused(self):
+        checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
+        target = self._stale_target('never')
+        sub = target / 'never'
+        git(sub, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--allow-empty', '-qm', 'unpublished')
+        git(sub, 'tag', 'v0.1.0')
+        git(sub, 'reset', '--quiet', '--hard', 'HEAD~1')    # HEAD back on the remote: only the tag holds it
+        with self.assertRaisesRegex(RestoreRefused, r'submodule gitdir differs in target '
+                                                    r'\(local tag v0\.1\.0 on a commit no remote has\): never; lease retained'):
+            checkpoints.restore(cp, target)
+        self.assertIn('unpublished', git(sub, 'log', '-1', '--format=%s', 'v0.1.0'))
+        self.assertTrue(os.path.lexists(_modules(target) / 'never'))
+        self.assertEqual((target / 'sentinel').read_text(), 'keep me')
+
+    def test_stale_submodule_packed_tag_on_an_unpublished_commit_is_still_refused(self):
+        """packed-refs exempts a tag only from the tag check (a clone or a replay recorded it); its
+        commit still goes through the remote check, so a packed tag on an unpublished commit refuses."""
+        checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
+        target = self._stale_target('never')
+        sub = target / 'never'
+        git(sub, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--allow-empty', '-qm', 'unpublished')
+        git(sub, 'tag', 'v0.1.0')
+        git(sub, 'reset', '--quiet', '--hard', 'HEAD~1')
+        gd = _modules(target) / 'never'
+        _gitdir(gd, 'pack-refs', '--all')
+        self.assertFalse((gd / 'refs' / 'tags' / 'v0.1.0').exists())
+        with self.assertRaisesRegex(RestoreRefused, r'submodule gitdir differs in target '
+                                                    r'\(commits not on any remote\): never; lease retained'):
+            checkpoints.restore(cp, target)
+        self.assertEqual(_gitdir(gd, 'log', '-1', '--format=%s', 'v0.1.0'), 'unpublished')
+        self.assertFalse(os.path.lexists(_modules(target).parent / 'runner-stale-submodules'))
+
+    def test_active_writer_in_the_target_refuses_this_restore_only(self):
+        """A git lock in the target slot is that slot's fault: RestoreRefused (the card is held and
+        counted), not a plain WorkspaceError that pauses every start of the lane."""
+        checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
+        target = self._stale_target('never')
+        lock = Path(git(target, 'rev-parse', '--absolute-git-dir')) / 'index.lock'
+        lock.write_text('')
+        with self.assertRaisesRegex(RestoreRefused, 'active git writer in target; lease retained'):
+            checkpoints.restore(cp, target)
+        lock.unlink()
+
+    def _tagged_checkpoint(self, name):
+        """Another lane's card: `name` populated from a remote with a lightweight and an annotated tag."""
+        other = WorkspacePool(self.store, self.root / f'pool-{name}', [RepoSpec('app', self.base, max_slots=1)],
+                              owner=f'agent-{name}')
+        source = other.lease('attempt-' + name, 'app')
+        remote = self._external('tagged-' + name)
+        git(remote, 'tag', 'v1.0.0')
+        git(remote, '-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', '-m', 'release', 'v1.1.0')
+        git(source, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(remote), name)
+        git(source, 'commit', '-qm', f'add {name}')
+        other.suspend('attempt-' + name, {}, writer_stopped=True)
+        checkpoints = other._checkpoints()
+        return checkpoints, next(p for p in checkpoints.root.iterdir() if (p / 'manifest.json').exists()), remote
+
+    def test_slot_left_by_a_replayed_submodule_takes_the_next_cards_restore(self):
+        """Live 18.11: card A's restore replays its submodule gitdir from the snapshot bundle; card B's
+        restore into the same pooled slot must set that gitdir aside, not refuse the runner's own tags."""
+        checkpoints, cp_b, plan_b, expected_b = self._suspended_uninitialised_submodule()
+        checkpoints_a, cp_a, _ = self._tagged_checkpoint('never')
+        slot = self.root / 'slot'; slot.mkdir(); git(slot, 'init', '--quiet')
+        checkpoints_a.restore(cp_a, slot)
+        gd = _modules(slot) / 'never'
+        self.assertEqual(_gitdir(gd, 'tag', '--list'), 'v1.0.0\nv1.1.0')
+        checkpoints.restore(cp_b, slot)
+        self.assertEqual(fingerprint(slot, plan_b), expected_b)
+        self.assertFalse(os.path.lexists(gd))
+        kept = list((_modules(slot).parent / 'runner-stale-submodules').glob('*-never'))
+        self.assertEqual([_gitdir(k, 'tag', '--list') for k in kept], ['v1.0.0\nv1.1.0'])
+
+    def test_replayed_submodule_gitdir_records_its_refs_like_a_clone(self):
+        checkpoints_a, cp_a, _ = self._tagged_checkpoint('never')
+        slot = self.root / 'slot'; slot.mkdir(); git(slot, 'init', '--quiet')
+        checkpoints_a.restore(cp_a, slot)
+        gd = _modules(slot) / 'never'
+        self.assertEqual([p.name for p in (gd / 'refs' / 'tags').rglob('*') if p.is_file()], [])
+        packed = (gd / 'packed-refs').read_text()
+        self.assertIn(' refs/tags/v1.0.0\n', packed)
+        self.assertIn(' refs/tags/v1.1.0\n', packed)
+
+    def test_stale_submodule_annotated_tag_the_checkpoint_brings_back_is_set_aside(self):
+        """A loose annotated tag that the incoming snapshot carries unchanged loses nothing."""
+        checkpoints_a, cp_a, remote = self._tagged_checkpoint('never')
+        target = self.root / 'stale-slot'; target.mkdir(); git(target, 'init', '--quiet')
+        git(target, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(remote), 'never')
+        git(target, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'old card')
+        gd = _modules(target) / 'never'
+        (gd / 'packed-refs').write_text('')                                # every ref as a later fetch leaves it
+        git(target / 'never', 'fetch', '--quiet', '--tags', 'origin')
+        _gitdir(gd, 'update-ref', 'refs/remotes/origin/old', _gitdir(gd, 'rev-parse', 'HEAD'))  # differs from A
+        (gd / 'FETCH_HEAD').unlink()                                       # no fetch record: only the snapshot proves it
+        self.assertTrue((gd / 'refs' / 'tags' / 'v1.1.0').is_file())
+        checkpoints_a.restore(cp_a, target)
+        self.assertEqual(_gitdir(_modules(target) / 'never', 'tag', '--list'), 'v1.0.0\nv1.1.0')
+        self.assertEqual(len(list((_modules(target).parent / 'runner-stale-submodules').glob('*-never'))), 1)
+
+    def test_stale_submodule_annotated_tag_received_by_a_fetch_is_set_aside(self):
+        checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()
+        target = self._stale_target('never')
+        remote = Path(git(target / 'never', 'remote', 'get-url', 'origin'))
+        git(remote, '-c', 'user.name=t', '-c', 'user.email=t@t', 'tag', '-a', '-m', 'release', 'v0.2.0')
+        git(target / 'never', 'fetch', '--quiet', 'origin')                # auto-follows the new tag
+        gd = _modules(target) / 'never'
+        self.assertTrue((gd / 'refs' / 'tags' / 'v0.2.0').is_file())
+        checkpoints.restore(cp, target)
+        self.assertEqual(fingerprint(target, plan), expected)
+        self.assertFalse(os.path.lexists(gd))
 
     def test_stale_submodule_branch_equal_to_a_remote_branch_and_cloned_tags_are_accepted(self):
         checkpoints, cp, plan, expected = self._suspended_uninitialised_submodule()

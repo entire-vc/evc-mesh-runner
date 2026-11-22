@@ -33,6 +33,15 @@ class BasicAuth(unittest.TestCase):
 
 
 class MoveSource(unittest.TestCase):
+    def test_desk_answer_records_the_decision_through_the_server_transaction(self):
+        op = Opener()
+        client = MeshClient("https://mesh.example", "k", opener=op)
+        client.answer_decision("r1", "ship", comment_id="c1")
+        self.assertEqual(op.req.method, "POST")
+        self.assertEqual(op.req.full_url, "https://mesh.example/api/v1/decision-requests/r1/answer")
+        self.assertEqual(json.loads(op.req.data), {"answer": "ship"})
+        self.assertIn("idempotency-key", {k.lower() for k, _ in op.req.header_items()})
+
     def test_move_declares_the_runner_as_producer(self):
         op = Opener()
         MeshClient("https://mesh.example", "k", opener=op).move("t1", "s1", expected_version=3,

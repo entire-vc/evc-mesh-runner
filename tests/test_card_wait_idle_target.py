@@ -3,11 +3,16 @@ A question X put to an agent (``ask_agent``), the waiter itself included, is not
 import datetime as dt
 
 from fakes import FakeMesh, task, write_replies, wait_card, wait_time
+from mesh_runner.mesh import MeshError
 from mesh_runner.store import iso
+from test_card_wait_owned_edge import EDGE, OwnerCheckedMesh, server_edge
 from test_runner import Bench
+from test_typed_outcome import TypedTurn
 
 # a decision wait addressed to a person: the handle is no workspace agent (FakeMesh has builder and lead)
 PERSON_ASK = {'kind': 'decision', 'target': '', 'handle': 'owner'}
+# X asked a person with ask_human: Mesh armed the gate
+ASK_HUMAN = {'kind': 'blocking', 'target': '', 'handle': 'owner', 'human_gate_ref': 'gate-1'}
 
 
 class CardWaitOnIdleTarget(Bench):
@@ -301,3 +306,66 @@ class CardWaitOnIdleTarget(Bench):
                                     'external_time': {'event': '', 'source': '', 'why': 'measure'}})
         self.assertTrue(self.sent_back(self.turn(r, t, x)))
 
+
+
+class SentBackPersonGatedWaitLeavesNothing(TypedTurn):
+    """A typed card wait on X sent back because X waits for a person (``ask_human``) is never
+    armed, so no wake ends it. Its Mesh wait is resolved as cancelled and the blocks edge Mesh made for it
+    is removed with the owner-checked delete. Before, the edge stayed with the next outcome superseding
+    the wait: the card read as blocked by X (``held: blocked by X``) after its session ended, a gate it
+    never declared. An edge the receipt does not give this wait stays."""
+
+    def flow(self, *, owned=True, owner="w-1", x_wait=None, gate=True, delete_errors=()):
+        source, target = task(1), task(3)
+        target["human_gate"] = gate
+        mesh = OwnerCheckedMesh([source, target])
+        write_replies(self.replies, {source["id"][:8]: "Recorded the outcome through Mesh."})
+        r = self.runner(mesh)
+        self.addCleanup(r.store.db.close)
+        r.refresh_me()
+        ax = r.store.create(self.agent.name, target["id"], "claude")
+        r.store.update(ax, state="waiting", wait={**(x_wait or ASK_HUMAN), "since": iso(), "started": iso()})
+        r.start_new(1)
+        mesh.deps[source["id"]] = [server_edge(source, target, "task_done", owner)]
+        self.typed(mesh, source, "wait", {"kind": "card", "target_task_id": target["id"], "dependency_id": EDGE,
+                                          "dependency_generation": 1, "dependency_owned": owned})
+        mesh.wait_delete_errors = list(delete_errors)
+        return r, self.finish_turn(r), mesh, source
+
+    def outgoing(self, mesh, source):
+        return [e["id"] for e in mesh.dependencies(source["id"])["outgoing"]]
+
+    def test_owned_edge_is_removed_and_the_wait_cancelled(self):
+        with self.assertLogs("mesh_runner", level="INFO") as logs:
+            r, a, mesh, s = self.flow()
+        self.assertEqual(a.state, "ready")
+        self.assertIn("a person (ask_human → @owner)", a.wake_text)
+        self.assertEqual([(w, res) for _t, w, res, _c in getattr(mesh, "resolved", [])], [("w-1", "cancelled")])
+        self.assertIn("does not hold development", mesh.resolved[0][3])
+        self.assertEqual(mesh.wait_deletes, [(s["id"], EDGE, 1, "w-1")])
+        self.assertEqual((mesh.plain_deletes, self.outgoing(mesh, s)), ([], []))
+        self.assertTrue(any(f"removed the edge {EDGE} of its wait w-1" in m for m in logs.output), logs.output)
+
+    def test_edge_of_another_wait_stays(self):
+        r, a, mesh, s = self.flow(owned=False, owner="w-other")
+        self.assertEqual(a.state, "ready")
+        self.assertEqual([(w, res) for _t, w, res, _c in mesh.resolved], [("w-1", "cancelled")])
+        self.assertEqual((mesh.wait_deletes, mesh.plain_deletes), ([], []))
+        self.assertEqual(self.outgoing(mesh, s), [EDGE])
+
+    def test_a_failed_delete_does_not_hold_the_send_back(self):
+        with self.assertLogs("mesh_runner", level="WARNING") as logs:
+            r, a, mesh, s = self.flow(delete_errors=[MeshError(503, "unavailable")])
+        self.assertEqual(a.state, "ready")
+        self.assertIn("does not hold development", a.wake_text)
+        self.assertEqual(len(mesh.wait_deletes), 1)
+        self.assertEqual(self.outgoing(mesh, s), [EDGE])
+        self.assertTrue(any("unavailable" in m for m in logs.output), logs.output)
+
+    def test_an_accepted_wait_keeps_its_edge_and_its_wait(self):
+        # positive control: X waits for an agent's answer, so the wait is armed and binds the edge as its own
+        r, a, mesh, s = self.flow(x_wait={"kind": "decision", "target": "", "handle": "lead",
+                                          "decision_request_id": "dr-1"}, gate=False)
+        self.assertEqual((a.state, a.wait.get("edge")), ("waiting", EDGE))
+        self.assertEqual((getattr(mesh, "resolved", []), mesh.wait_deletes), ([], []))
+        self.assertEqual(self.outgoing(mesh, s), [EDGE])

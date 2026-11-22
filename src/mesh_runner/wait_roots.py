@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -42,6 +43,7 @@ QUEUED = "queued"          # the root's own attempt here is ready to resume
 ACTIVE_STATES = ("running", "starting")
 HUMAN = "human"
 UNWEIGHTED = ("cycle", "unknown-target")   # broken chains: shown, never a weight
+_SHORT = re.compile(r"[0-9a-f]{8}")
 
 
 @dataclass(frozen=True)
@@ -171,9 +173,13 @@ def _wait_holder(row: dict) -> tuple[str, str]:
 
 
 def build(open_: dict[str, list[dict]], read_card: Callable[[str, str], dict | None],
-          agents: frozenset[str], at: dt.datetime | None = None) -> Radar:
+          agents: frozenset[str], at: dt.datetime | None = None,
+          read_short: Callable[[str, str], dict | None] | None = None) -> Radar:
     """The roots of every open card wait in ``open_`` (see ``open_attempts``).
-    ``read_card(task_id, agent)`` reads a chain end with that lane's key; ``None`` = unreadable."""
+    ``read_card(task_id, agent)`` reads a chain end with that lane's key; ``None`` = unreadable.
+    ``read_short(short_id, agent)`` reads a card by its short id the same way: a wait that names
+    only the short id of a card nobody here waits on (a wait kept on a Mesh dependency edge never
+    pins the full id) is followed through it instead of being shown as ``unknown-target``."""
     now = at or dt.datetime.now(dt.timezone.utc)
     by_short = {t[:8]: t for t in open_}
     ends: dict[tuple[str, str], tuple[str, str]] = {}
@@ -187,9 +193,27 @@ def build(open_: dict[str, list[dict]], read_card: Callable[[str, str], dict | N
             ends[key] = classify_card(read_card(task, via), agents)
         return ends[key]
 
-    def target_of(row: dict) -> str:
+    def target_of(row: dict) -> tuple[str, tuple[str, str] | None]:
+        """(full id of the awaited card, None) or ("", end) when only its short id is known and it
+        cannot be read: end = (kind, holder) of that card as a chain end, None = no usable id."""
+        nonlocal reads
         w = row["wait"]
-        return str(w.get("target_id") or by_short.get(str(w.get("target") or ""), "") or "")
+        short = str(w.get("target") or "").lower()
+        full = str(w.get("target_id") or by_short.get(short, "") or "")
+        if full or read_short is None or not _SHORT.fullmatch(short):
+            return full, None
+        key = ("s:" + short, row["agent"])
+        if key not in ends:
+            reads += 1
+            got = read_short(short, row["agent"])
+            cid = str(got.get("id") or "") if isinstance(got, dict) and not got.get("_unread") else ""
+            if cid.startswith(short):
+                ends[(cid, row["agent"])] = classify_card(got, agents)   # the same read ends the chain
+                ends[key] = ("=", cid)
+            else:
+                ends[key] = classify_card(None if got is None else {"_unread": True}, agents)
+        kind, holder = ends[key]
+        return (holder, None) if kind == "=" else ("", (kind, holder))
 
     def root(task: str, seen: tuple[str, ...], via: str) -> tuple[str, str, str, int]:
         rows = open_.get(task)
@@ -205,7 +229,9 @@ def build(open_: dict[str, list[dict]], read_card: Callable[[str, str], dict | N
         if r["state"] != "waiting":
             return task, "unknown-state", r["agent"], d
         if r["wait"].get("kind") == "card":
-            nxt = target_of(r)
+            nxt, end = target_of(r)
+            if end:
+                return str(r["wait"].get("target")), end[0], end[1], d + 1
             if not nxt:
                 return task, "unknown-target", str(r["wait"].get("target") or "?"), d
             if nxt in seen or nxt == task:
@@ -224,8 +250,10 @@ def build(open_: dict[str, list[dict]], read_card: Callable[[str, str], dict | N
             if r["state"] != "waiting" or r["wait"].get("kind") != "card":
                 continue
             waits += 1
-            nxt = target_of(r)
-            if nxt and nxt != task:
+            nxt, end = target_of(r)
+            if end:
+                rid, (kind, holder), d = str(r["wait"].get("target")), end, 1
+            elif nxt and nxt != task:
                 rid, kind, holder, d = root(nxt, (task,), r["agent"])
             else:
                 rid, kind, holder, d = task, ("unknown-target" if not nxt else "cycle"), "-", 0
@@ -287,7 +315,15 @@ class CardReader:
         self._cache = {k: v for k, v in self._cache.items() if now - v[0] < self.cache_seconds}
 
     def __call__(self, task_id: str, agent: str) -> dict | None:
-        key = (task_id, agent)
+        return self._read(task_id, agent, "/tasks/" + task_id, lambda c: c.get("id") == task_id)
+
+    def by_short(self, short: str, agent: str) -> dict | None:
+        """The card with this short id, read with ``agent``'s key (same budget, cache and answers)."""
+        return self._read("s:" + short, agent, "/tasks/by-short-id/" + short,
+                          lambda c: str(c.get("id") or "").startswith(short))
+
+    def _read(self, ref: str, agent: str, path: str, ok: Callable[[dict], bool]) -> dict | None:
+        key = (ref, agent)
         hit = self._cache.get(key)
         if hit and time.monotonic() - hit[0] < self.cache_seconds:
             return hit[1]
@@ -297,7 +333,7 @@ class CardReader:
         self.spent += 1
         from .mesh import MeshError
         try:
-            row = client.bounded_get("/tasks/" + task_id, timeout=READ_TIMEOUT)
+            row = client.bounded_get(path, timeout=READ_TIMEOUT)
         except MeshError as e:
             if e.status in (403, 404):
                 self._cache[key] = (time.monotonic(), None)
@@ -305,7 +341,7 @@ class CardReader:
             return {"_unread": True}                     # transport trouble is not "foreign"
         if isinstance(row, dict):
             row = row.get("task", row)
-        card = row if isinstance(row, dict) and row.get("id") == task_id else {"_unread": True}
+        card = row if isinstance(row, dict) and ok(row) else {"_unread": True}
         if not card.get("_unread"):
             self._cache[key] = (time.monotonic(), card)
         return card
@@ -323,7 +359,7 @@ def compute(db_path: Path, reader: CardReader, agents: frozenset[str]) -> Radar:
     finally:
         db.close()
     reader.new_pass()
-    return build(open_, reader, agents)
+    return build(open_, reader, agents, read_short=reader.by_short)
 
 
 class RootRadar:

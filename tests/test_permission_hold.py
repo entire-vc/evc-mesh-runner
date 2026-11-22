@@ -129,3 +129,109 @@ class PermissionHold(Bench):
                 invoked = []
                 r._guard(a, "resume", lambda attempt: invoked.append(attempt.id))
                 self.assertEqual(invoked, [a.id])
+
+    def _settling(self, mesh, t, settle):
+        """A runner whose turn is over and whose settle is ``settle``: drives the real
+        ``settle_finished`` call site, so the step name it guards is what is under test."""
+        r = self.runner(mesh)
+        r._turn_over = lambda attempt: True
+        r.settle = settle
+        return r
+
+    def test_denied_settle_holds_on_exact_path_until_it_changes(self):
+        t = task(1)
+        mesh = FakeMesh([t])
+        r = self.runner(mesh)
+        a = r.store.create(self.agent.name, t["id"], "claude")
+        r.store.update(a, state="running", pid=2 ** 22 + 7)
+        folder = self.root / "scripts" / "__pycache__"
+        folder.mkdir(parents=True)
+        (folder / "x.pyc").write_text("cache")
+        folder.chmod(0o000)          # stands in for a root-owned directory: the signature carries mode and owner
+        self.addCleanup(lambda: folder.chmod(0o700) if folder.exists() else None)
+        invoked = []
+
+        def settle(attempt):
+            invoked.append(attempt.id)
+            for child in folder.iterdir():
+                child.unlink()
+
+        r = self._settling(mesh, t, settle)
+        r.settle_finished()
+        self.assertEqual(len(invoked), 1)
+        # A restarted runner reads the durable hold: no settle on any later tick.
+        r = self._settling(mesh, t, settle)
+        for _ in range(4):
+            r.settle_finished()
+        self.assertEqual(len(invoked), 1)
+        held = json.loads(r.store.mark(a.agent, a.task_id, "permission_hold:settle")[0])
+        self.assertEqual((held["attempt"], held["path"]), (a.id, str(folder)))
+        (self.root / "unrelated").write_text("activity")
+        r.settle_finished()
+        self.assertEqual(len(invoked), 1)
+        folder.chmod(0o700)
+        r.settle_finished()
+        self.assertEqual(len(invoked), 2)
+        self.assertFalse(list(folder.iterdir()))
+        events = [row[1] for row in r.store.events(a.id)]
+        self.assertEqual(events.count("workspace_permission_hold"), 1)
+        self.assertEqual(events.count("permission_path_changed"), 1)
+        self.assertFalse([e for e in events if e.startswith(("error:", "quarantine:"))])
+        self.assertFalse(r._quarantine)
+        self.assertFalse(r._errors)
+
+    @unittest.skipUnless(sys.platform == "darwin", "real Darwin ACL")
+    def test_settle_clear_tree_denied_by_directory_acl_holds_until_repair(self):
+        from pathlib import Path
+        from mesh_runner import checkpoint
+        t = task(1)
+        mesh = FakeMesh([t])
+        r = self.runner(mesh)
+        a = r.store.create(self.agent.name, t["id"], "claude")
+        r.store.update(a, state="running", pid=2 ** 22 + 7)
+        slot = self.root / "slot"
+        cache = slot / "scripts" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "x.pyc").write_text("cache")
+        user = pwd.getpwuid(os.geteuid()).pw_name
+        subprocess.run(["/bin/chmod", "+a", f"user:{user} deny delete_child", str(cache)], check=True)
+        invoked = []
+
+        def settle(attempt):
+            invoked.append(attempt.id)
+            checkpoint._clear_tree(slot)
+
+        try:            # tearDown removes the tree before cleanups run: drop the ACL here
+            r = self._settling(mesh, t, settle)
+            for _ in range(3):
+                r.settle_finished()
+            self.assertEqual(len(invoked), 1)
+            held = json.loads(r.store.mark(a.agent, a.task_id, "permission_hold:settle")[0])
+            self.assertEqual(Path(held["path"]), cache.absolute())
+        finally:
+            subprocess.run(["/bin/chmod", "-N", str(cache)], check=True)
+        r.settle_finished()
+        self.assertEqual(len(invoked), 2)
+        self.assertEqual(list(slot.iterdir()), [])
+
+    def test_denied_prompt_delivery_settle_holds_like_settle(self):
+        t = task(1)
+        r = self.runner(FakeMesh([t]))
+        a = r.store.create(self.agent.name, t["id"], "claude")
+        folder = self.root / "blocked"
+        folder.mkdir()
+        folder.chmod(0o000)
+        self.addCleanup(lambda: folder.chmod(0o700) if folder.exists() else None)
+        invoked = []
+
+        def deliver(attempt):
+            invoked.append(attempt.id)
+            list(folder.iterdir())
+
+        for _ in range(4):
+            r._guard(a, "prompt-delivery", deliver)
+        self.assertEqual(len(invoked), 1)
+        self.assertFalse(r._errors)
+        folder.chmod(0o700)
+        r._guard(a, "prompt-delivery", deliver)
+        self.assertEqual(len(invoked), 2)

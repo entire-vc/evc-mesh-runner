@@ -2,6 +2,7 @@
 file (team rules, review gates); the runner itself stays policy-free."""
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -58,6 +59,26 @@ def _comments_block(comments: list[dict], limit: int = 6, size: int = 600, skip:
     return "\n".join(rows) or "- (none)"
 
 
+DESCRIPTION_MAX = 6000
+
+
+def description_block(task: dict) -> str:
+    """The card's description, so the first turn does not fetch the task again only to read it.
+    Cut at ``DESCRIPTION_MAX`` with a marker; dependencies are named by count only."""
+    body = str(task.get("description") or "").strip()
+    if not body:
+        text = "Description: (empty)"
+    else:
+        cut = (f"\n[… cut at {DESCRIPTION_MAX} of {len(body)} characters; get_task for the rest]"
+               if len(body) > DESCRIPTION_MAX else "")
+        text = "Description (as of this prompt; do not fetch the task again only to read it):\n" \
+               + body[:DESCRIPTION_MAX] + cut
+    deps = task.get("open_dependency_count") or 0
+    if deps:
+        text += f"\nOpen dependencies: {deps}; read them with your Mesh tools."
+    return text + "\n"
+
+
 def harness_note(agent_name: str, harness: str = "") -> str:
     """Who the session is: the lane name plus the harness it was actually routed to."""
     return f"{agent_name} (running on the {harness} harness)" if harness else agent_name
@@ -83,9 +104,67 @@ def delivery_note(task: dict) -> str:
     return ""
 
 
+# Conditions of a ``blocks`` edge that only evidence releases while the blocker is open (evc-mesh
+# DependencyCondition EvidenceOnly): the producer's owner attests the named result.
+EVIDENCE_ONLY = ("artifact_published", "access_ready", "contract_ready")
+EVIDENCE_EDGES_SHOWN = 8
+
+
+def evidence_edges_block(task_id: str, rows, closed=None) -> str:
+    """The open evidence edges waiting on this card, '' when there are none.
+
+    ``rows``: GET /tasks/{id}/dependencies ({outgoing, incoming}); only ``incoming`` rows count: a
+    ``blocks`` edge whose blocker is this card, with an evidence-only condition and Mesh's verdict
+    ``condition_satisfied`` False (a released or attested edge reads True). ``closed(status_id)`` says
+    the waiting card is closed; an unknown status keeps the edge. Only the producer's side can release
+    such an edge before the producer closes, and its session used not to know the edge existed: the
+    result was published, nobody attested it and the waiting card slept for hours. The criterion is
+    quoted exactly: Mesh compares the evidence criterion with it as written."""
+    edges = rows.get("incoming") if isinstance(rows, dict) else None
+    if not isinstance(edges, list):
+        return ""
+    shown = []
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        cond = str(e.get("condition") or "")
+        waiter, edge_id = str(e.get("task_id") or ""), str(e.get("id") or "")
+        if (e.get("dependency_type") != "blocks" or cond not in EVIDENCE_ONLY
+                or e.get("condition_satisfied") is not False
+                or e.get("depends_on_task_id") != task_id or not waiter or waiter == task_id or not edge_id):
+            continue
+        status = e.get("related_task_status_id")
+        if closed is not None and status and closed(status):
+            continue
+        shown.append((waiter, edge_id, cond, e))
+    if not shown:
+        return ""
+    rows_out = ["", "[runner] Cards waiting on a result of this card (open evidence edges). While this card is "
+                    "open only your attestation releases them, so attest each one the moment its result is ready, "
+                    "not at closing:"]
+    for waiter, edge_id, cond, e in shown[:EVIDENCE_EDGES_SHOWN]:
+        criterion = str(e.get("criterion") or "").strip() or cond
+        title = " ".join(str(e.get("related_task_title") or "").split())[:120]
+        status = str(e.get("evidence_status") or "")
+        note = f", evidence so far: {status}" if status and status != "none" else ""
+        rows_out.append(
+            f"  - #{waiter[:8]}{f' «{title}»' if title else ''} waits for {cond} (dependency {edge_id}{note})\n"
+            f"    result ready → update_dependency task_id={waiter} depends_on_task_id={task_id} "
+            f"evidence_criterion={json.dumps(criterion, ensure_ascii=False)} "
+            f"evidence_url=<https link to the result> attest=true")
+    if len(shown) > EVIDENCE_EDGES_SHOWN:
+        rows_out.append(f"  - (+{len(shown) - EVIDENCE_EDGES_SHOWN} more; get_task include_dependencies=true lists "
+                        f"them)")
+    rows_out.append("Without evidence_url and the exact evidence_criterion the attestation releases nothing. Not "
+                    "ready yet → say so on the waiting card.")
+    return "\n".join(rows_out) + "\n"
+
+
 def start_prompt(task: dict, agent_name: str, workspaces: list[str], comments: list[dict],
-                 preamble: str = "", merge: bool = False, harness: str = "", stopped: str = "") -> str:
-    """``stopped``: the ``where_you_stopped_block`` of a fresh session on a card this lane worked on."""
+                 preamble: str = "", merge: bool = False, harness: str = "", stopped: str = "",
+                 evidence: str = "") -> str:
+    """``stopped``: the ``where_you_stopped_block`` of a fresh session on a card this lane worked on;
+    ``evidence``: the ``evidence_edges_block`` of the card ('' when nothing waits on it)."""
     short = task["id"][:8]
     where = "\n".join(f"  - {p}" for p in workspaces) or "  - (no repository configured)"
     return f"""{preamble.strip()}
@@ -98,12 +177,11 @@ You are {harness_note(agent_name, harness)}. This session belongs to this one ta
 Work only in these checkouts; other clones of the same repositories belong to other sessions.
 The task is already checked out for you — do not check it out or release it yourself.
 
-Read the task description and dependencies with your Mesh tools before acting. The comments below are the
-delta, not the whole thread: older history is not required by default; read it only for a concrete gap
-({FETCH_HINT}).
+{description_block(task)}The comments below are the delta, not the whole thread: older history is not required by default;
+read it only for a concrete gap ({FETCH_HINT}).
 Latest comments:
 {_comments_block(comments)}
-
+{evidence}
 {contract(merge)}{delivery_note(task)}""".strip() + "\n"
 
 
@@ -193,8 +271,8 @@ You are {harness_note(agent_name, harness)}. Checkouts you may use to verify it 
 {where}
 The task is already checked out for you — do not check it out or release it yourself.
 
-Read the task description and dependencies with your Mesh tools before deciding. The comments below are the
-delta, not the whole thread; read older ones only for a concrete gap ({FETCH_HINT}).
+{description_block(task)}The comments below are the delta, not the whole thread; read older ones only for a concrete gap
+({FETCH_HINT}).
 Latest comments:
 {_comments_block(comments, skip=frozenset(c.get("id") for c in news_comments or [] if c.get("id")))}
 {since}
@@ -202,10 +280,14 @@ Latest comments:
 """.strip() + "\n"
 
 
-def wake_prompt(task: dict, event: str) -> str:
+def wake_prompt(task: dict, event: str, detail: str = "") -> str:
+    """``detail``: the result the runner already read for this event (Ф1), shown so the session
+    does not fetch the merge request, the pipeline or the failed job's log again."""
+    result = (f"\nThe runner already read the result; use it instead of fetching it again:\n{detail}\n"
+              if detail else "")
     return f"""[runner] Resumed on task #{task['id'][:8]} — {task.get('title', '')}
 What changed: {event}
-
+{result}
 The new comments by others are listed below when there are any; read older ones only for a concrete gap
 ({FETCH_HINT}). Continue from where you stopped, and end the turn with one Mesh
 turn command (wait_for, continue_next, ask_agent, ask_human, finish_task or hand_off). A line of text is not
@@ -249,7 +331,8 @@ def new_comments_block(comments: list[dict], limit: int = 8, size: int = 1500) -
     return "\n".join(lines) + "\n"
 
 
-def no_outcome_prompt(task: dict, line: str = "", why: str = "", merge: bool = False) -> str:
+def no_outcome_prompt(task: dict, line: str = "", why: str = "", merge: bool = False,
+                      full: bool = False) -> str:
     if line:
         # the agent did declare something: say exactly what was not understood,
         # or it will post the same line again
@@ -257,10 +340,18 @@ def no_outcome_prompt(task: dict, line: str = "", why: str = "", merge: bool = F
                 f"cannot read:\n  {line.strip()[:300]}\n" + (f"({why})\n" if why else ""))
     else:
         head = f"[runner] Your last turn on task #{task['id'][:8]} ended without an outcome.\n"
+    # The full contract is already in this session (its start prompt carries it, and a fresh
+    # session gets the start prompt before this text), so it is named here, not repeated. A session that
+    # compacted its context (``full``) may have lost that first prompt: it gets the contract again.
+    if full:
+        return head + f"""End the turn now with ONE Mesh turn command: call it, do not write it as a line. Text is
+never read as an outcome; if Mesh refused the command, fix what it names and call again.
+{contract(merge)}{delivery_note(task)}"""
     return head + f"""End the turn now with ONE Mesh turn command (wait_for, continue_next, ask_agent, ask_human,
 finish_task or hand_off): call it, do not write it as a line. Text is never read as an outcome; if Mesh
-refused the command, fix what it names and call again.
-{contract(merge)}{delivery_note(task)}"""
+refused the command, fix what it names and call again. The commands and their arguments are in the outcome
+contract at the end of this session's first prompt{"; a merge request waits with wait_for on=merge" if merge else ""}.
+{delivery_note(task)}"""
 
 
 def ask_not_raised_prompt(task: dict, handle: str, refusal: str = "") -> str:

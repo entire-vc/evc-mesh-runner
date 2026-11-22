@@ -16,6 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 
 from .mesh import MeshClient, MeshError
+from .outcome import mr_merged_wait
 from . import observation_budget as budget
 from .selection import AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, parse_time, satisfied
 
@@ -47,6 +48,14 @@ RUN_CONCLUSIONS = {"success": "success", "neutral": "success", "failure": "faile
 
 
 _PROVIDER = re.compile(r"^(github|gitlab):")
+
+
+TRACE_RANGE = 64 * 1024        # Ф1: how much of a failed job's log end is asked for
+TRACE_MAX = 4 * 1024 * 1024    # a server that ignores the range: past this the tail is not read
+TRACE_LINES = 25               # lines of that tail the woken session gets
+TRACE_CHARS = 2000
+FAILED_LISTED = 5
+_TRACE_NOISE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|section_(?:start|end):\d+:[^\r\n]*?(?=\r|\n|$)|\r")
 
 
 def split_provider(target: str) -> tuple[str, str]:
@@ -202,6 +211,30 @@ class GitLab:
             if len(batch) < 100:
                 break
         return rows
+
+    def job_trace_tail(self, target: str, job_id: int) -> str:
+        """The end of a job's log (Ф1). Asks for the last 64 KiB; a server that ignores the range
+        and sends a log over 4 MiB gives '' rather than its beginning."""
+        project = split_provider(target)[1].rsplit("#", 1)[0]
+        req = urllib.request.Request(f"{self.base_url.rstrip('/')}/api/v4/projects/{self.project(project)}/jobs/{int(job_id)}/trace",
+                                     headers={"PRIVATE-TOKEN": self.token, "Range": f"bytes=-{TRACE_RANGE}"})
+        with urllib.request.urlopen(req, timeout=budget.cap(30, "GET", "vcs")) as r:
+            body = budget.read(r, TRACE_MAX + 1)
+        if len(body) > TRACE_MAX:
+            return ""
+        return body.decode("utf-8", "replace")
+
+    def pipeline_bridges(self, target: str) -> list[dict]:
+        """Downstream (trigger) jobs of a GitLab pipeline: they are not in ``pipeline_jobs``."""
+        project, pid = split_provider(target)[1].rsplit("#", 1)
+        rows = self.get(f"projects/{self.project(project)}/pipelines/{pid}/bridges?per_page=100")
+        return rows if isinstance(rows, list) else []
+
+    def pipeline_of_sha(self, project: str, sha: str) -> dict | None:
+        """The newest pipeline GitLab ran on commit ``sha`` of ``project``, or None."""
+        rows = self.get(f"projects/{self.project(project)}/pipelines?sha={urllib.parse.quote(sha)}"
+                        "&order_by=id&sort=desc&per_page=1")
+        return rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
 
     def newer_pipeline(self, target: str, row: dict | None = None) -> dict | None:
         """The latest pipeline of the same ref that is newer than ``target``, or None (always None
@@ -382,6 +415,64 @@ def gitlab_mr_targets(links: list[dict], base_url: str) -> list[str]:
         if m and m[1] == host and f"{m[2]}!{m[3]}" not in out:
             out.append(f"{m[2]}!{m[3]}")
     return out
+
+
+CARD_MR_MERGED = "card_mr_merged:"     # delivery mark: the merged MR set of a card target already told
+
+
+def target_mr_merged(mesh, gitlab, target: dict, wait: dict, delivery_reader=None) -> str:
+    """A plain card WAIT (no typed condition, not a question to the target's holder) waits for the
+    target's code: it ends when the target's merge requests are merged, not when somebody closes the
+    card hours later (2026-11-16: 6 of 25 live card waits, ~45 h, sat behind an already merged MR).
+
+    Mesh's own link states pick the moment (no GitLab read while an MR is open); every linked merge
+    request is then confirmed in that state by GitLab itself. Every linked MR must be settled
+    (merged or closed) with at least one merged; an open one, a target without merge requests, an
+    unreadable link set, a disagreeing GitLab, no GitLab observer at all, or a merge request this
+    GitLab does not hold (another forge or host: nothing confirms it) leave the wait to the target's
+    ordinary closing. Mesh's link state alone never ends the wait.
+
+    Told once per merged set: the set goes into ``wait["ci_observation"]`` and the runner commits it
+    as a delivery mark with the wake, so a wait re-declared on the same target afterwards waits for
+    the closing (or a newly merged MR) instead of waking again."""
+    tid = str(target.get("id") or "")
+    if not tid or wait.get("card_condition") or wait.get("watch_comments_by"):
+        return ""
+    if gitlab is None:
+        return ""                          # no observer to confirm a merge: the ordinary closing decides
+    try:
+        links = [link for link in mesh.vcs_links(tid)
+                 if link.get("link_type") in ("pr", "pull_request", "merge_request")]
+        states = {str(link.get("url") or link.get("external_id") or ""): str(link.get("status") or "")
+                  for link in links}
+        if not states or "" in states or any(state not in ("merged", "closed") for state in states.values()):
+            return ""
+        merged = sorted(url for url, state in states.items() if state == "merged")
+        if not merged:
+            return ""
+        key = CARD_MR_MERGED + tid
+        value = " ".join(merged)
+        if delivery_reader is not None and str(delivery_reader(key) or "") == value:
+            return ""
+        shown = []
+        for link in links:
+            url = str(link.get("url") or link.get("external_id") or "")
+            ref = gitlab_mr_targets([link], getattr(gitlab, "base_url", ""))
+            if not ref:
+                return ""                  # a merge request this GitLab does not hold: nothing confirms it
+            row = gitlab.get_mr(ref[0])
+            if not isinstance(row, dict) or row.get("state") != states[url]:
+                return ""                  # Mesh ahead of or behind GitLab: the next check decides
+            if states[url] == "merged":
+                shown.append(ref[0])
+    except Exception as e:                 # noqa: BLE001 - the ordinary closing still ends this wait
+        log.debug("card #%s merge request read failed: %r", tid[:8], e)
+        return ""
+    wait["ci_observation"] = {"key": key, "value": value}
+    return (f"the merge request of task #{tid[:8]} is merged ({', '.join(shown)}); the card itself is still "
+            "open. Its code is in: continue the work that waited for it. If you need more than the code "
+            "(its deploy, its acceptance), wait for that condition (wait_for on=card target_condition="
+            "deployed|accepted|shipped), not for the card's closing")
 
 
 def vcs_event(links: list[dict], since: dt.datetime, echo: dt.timedelta = dt.timedelta(0)) -> str:
@@ -890,21 +981,22 @@ def foreign_mr_notice(target: str, what: str, card: str) -> str:
     a second session push the same fix into the owner's branch while the owner pushed its own. This
     one names the owner and the wait that follows it, and never asks for a push: the owner makes the
     new head, and a merge wait on the MR declared again after it stands."""
-    return f"action required: MR {target} {what}; it will not merge as is. " + foreign_mr_next_step(card)
+    return f"action required: MR {target} {what}; it will not merge as is. " + foreign_mr_next_step(card, target)
 
 
-def foreign_mr_next_step(card: str) -> str:
+def foreign_mr_next_step(card: str, target: str = "") -> str:
     """Whose MR it is and what a task that only waits on it does next (see ``foreign_mr_notice``);
-    also the tail of a declaration send-back on someone else's MR."""
+    also the tail of a declaration send-back on someone else's MR. ``target``: that MR. Its merge is
+    the event: a merge wait on it or a stack on its branch, never a wait on the
+    owner's card, which closes long after the code merged."""
+    wait = f"keep waiting for this MR to merge ({mr_merged_wait(target)}) or stack your branch on its branch"
     if card:
         owner = f"it is the MR of card #{card}"
-        step = (f"wait on that card (`wait_for on=card target_task_id={card}`), or keep waiting for "
-                "this MR to merge; work on what does not need it meanwhile")
+        step = f"{wait}; work on what does not need it meanwhile"
     else:
         owner = "it is not linked to this card and does not name it"
         step = ("if it is in fact this card's MR, link it to this card (`add_vcs_link`) and declare the "
-                "wait again; otherwise ask its owner (`ask_agent`) and wait on their card, or keep waiting "
-                "for this MR to merge")
+                f"wait again; otherwise {wait}")
     return (f"This MR is not this task's: {owner}. Its owner makes the new head: do not push, merge or "
             f"rebase its branch from this task. Next step: {step}.")
 
@@ -1013,7 +1105,7 @@ def _foreign_red_tail(kind: str, target: str, status: str, foreign_mr) -> str:
     if kind != "mr" or not foreign_mr or status not in ("failed", "canceled", "cancelled", "skipped"):
         return ""
     card = foreign_mr(target, None)
-    return "" if card is None else ". " + foreign_mr_next_step(card)
+    return "" if card is None else ". " + foreign_mr_next_step(card, target)
 
 
 def _jobs_event(gitlab, kind: str, target: str, contract: dict, sha: str, pid: int, delivered,
@@ -1479,7 +1571,8 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
             elif satisfied(cats, target):
                 event = f"task #{wait['target']} has shipped (still {cat})"
             else:
-                event = _watched_comment(mesh, target, wait, since, delivery_reader)
+                event = (target_mr_merged(mesh, gitlab, target, wait, delivery_reader)
+                         or _watched_comment(mesh, target, wait, since, delivery_reader))
         elif kind in ("pipeline", "mr"):
             if gitlab is None:
                 wait["integration_blocked"] = "GitLab observer unavailable"
@@ -1537,3 +1630,98 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
     if event and not action_required:
         wait["met"] = True
     return event
+
+
+def _trace_tail(text: str) -> str:
+    lines = [ln.rstrip() for ln in _TRACE_NOISE.sub("", text).split("\n")]
+    lines = [ln for ln in lines if ln.strip()][-TRACE_LINES:]
+    out = "\n".join(lines)
+    return out[-TRACE_CHARS:]
+
+
+def _pipeline_detail(gitlab, target: str) -> list[str]:
+    row = gitlab.get_pipeline(target) or {}
+    status = str(row.get("status") or "unknown")
+    head = (f"pipeline {target}: {status}, sha {str(row.get('sha') or '')[:12] or '?'}, "
+            f"ref {row.get('ref') or '?'}")
+    if row.get("web_url"):
+        head += f", {row['web_url']}"
+    out = [head]
+    owns = getattr(gitlab, "github_owns", None)
+    if owns is not None and owns(target):
+        return out                              # a GitHub run: no per-job reads here
+    jobs = gitlab.pipeline_jobs(target)
+    failed = [j for j in jobs if j.get("status") == "failed" and not j.get("allow_failure")]
+    soft = [j for j in jobs if j.get("status") == "failed" and j.get("allow_failure")]
+    if failed:
+        named = ", ".join(f"{j.get('name')} (stage {j.get('stage') or '?'}, "
+                          f"{j.get('failure_reason') or 'failed'}, job {j.get('id')})" for j in failed[:FAILED_LISTED])
+        more = f" and {len(failed) - FAILED_LISTED} more" if len(failed) > FAILED_LISTED else ""
+        out.append(f"failed jobs: {named}{more}")
+        tail_of = getattr(gitlab, "job_trace_tail", None)
+        if tail_of is not None and failed[0].get("id") is not None:
+            try:
+                tail = _trace_tail(tail_of(target, failed[0]["id"]))
+            except Exception:                   # noqa: BLE001 - the job list is still worth giving
+                tail = ""
+            if tail:
+                out.append(f"last lines of {failed[0].get('name')}:\n```\n{tail}\n```")
+    elif jobs:
+        counts: dict[str, int] = {}
+        for j in jobs:
+            counts[str(j.get("status"))] = counts.get(str(j.get("status")), 0) + 1
+        out.append("jobs: " + ", ".join(f"{n} {st}" for st, n in sorted(counts.items(), key=lambda kv: -kv[1])))
+    if soft:
+        out.append("failed but allowed to fail: " + ", ".join(str(j.get("name")) for j in soft[:FAILED_LISTED]))
+    bridges_of = getattr(gitlab, "pipeline_bridges", None)
+    if bridges_of is not None:
+        try:
+            bridges = bridges_of(target)
+        except Exception:                       # noqa: BLE001
+            bridges = []
+        if bridges:
+            out.append("downstream: " + ", ".join(
+                f"{b.get('name')} {((b.get('downstream_pipeline') or {}).get('status')) or b.get('status')}"
+                for b in bridges[:FAILED_LISTED]))
+    return out
+
+
+def ci_result_detail(gitlab, kind: str, target: str) -> str:
+    """Ф1: what a session woken on a settled pipeline, merge request or merge reads first, read once
+    by the runner and put into the wake prompt: the sha, the link and the pipeline result; on a
+    failure the failed jobs and the end of the first one's log. '' when nothing could be read: the
+    wake itself never depends on it."""
+    if gitlab is None or not target:
+        return ""
+    try:
+        if kind == "pipeline" and "#" in target:
+            return "\n".join(_pipeline_detail(gitlab, target))
+        if kind not in ("mr", "merge") or "!" not in target:
+            return ""
+        provider, path = split_provider(target)
+        project = path.rsplit("!", 1)[0]
+        mr = gitlab.get_mr(target) or {}
+        state = str(mr.get("state") or "unknown")
+        line = f"MR {target}: {state}, head {str(mr.get('sha') or '')[:12] or '?'}"
+        if mr.get("web_url"):
+            line += f", {mr['web_url']}"
+        out = [line]
+        merged_at = mr.get("merge_commit_sha") or mr.get("squash_commit_sha")
+        if state == "merged" and merged_at:
+            out.append(f"merged as {str(merged_at)[:12]} into {mr.get('target_branch') or '?'}")
+            of_sha = getattr(gitlab, "pipeline_of_sha", None)
+            owns = getattr(gitlab, "github_owns", None)
+            if of_sha is not None and not (owns is not None and owns(target)):
+                row = of_sha(project, str(merged_at))
+                if row and type(row.get("id")) is int:
+                    out.append(f"pipeline on the merge commit: {row['id']} {row.get('status')}"
+                               + (f", {row['web_url']}" if row.get("web_url") else ""))
+            return "\n".join(out)
+        head = mr.get("head_pipeline") or {}
+        if type(head.get("id")) is int and head["id"] > 0:
+            prefix = f"{provider}:" if provider else ""
+            out += _pipeline_detail(gitlab, f"{prefix}{project}#{head['id']}")
+        return "\n".join(out)
+    except Exception as e:                      # noqa: BLE001 - a missing detail never blocks the wake
+        log.info("ci result detail for %s %s unavailable: %s", kind, target, type(e).__name__)
+        return ""

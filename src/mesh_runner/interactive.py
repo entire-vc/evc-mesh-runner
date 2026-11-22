@@ -337,6 +337,10 @@ class InteractiveAdapter(Adapter):
         head, tail = self._split(argv)
         return head + self.base.with_mcp(tail, name, command, env)
 
+    def with_runner_env(self, argv: list[str], env: dict) -> list[str]:
+        head, tail = self._split(argv)
+        return head + self.base.with_runner_env(tail, env)
+
     def prepare_resume(self, session_id: str, cwd: Path, env: dict) -> str:
         return self.base.prepare_resume(session_id, cwd, env)
 

@@ -219,6 +219,13 @@ def _sweep_unique(key: str, me, read, pinned: str = "", known_id: str = ""):
     return None
 
 
+def known_category(status_id: str) -> str:
+    """The category of a status id some agent of this process already read, '' when unknown. No request:
+    for a hint (a waiting card shown in a prompt), never for a decision that needs the answer."""
+    with _SHARED_LOCK:
+        return _SHARED.get(status_id or "", "")
+
+
 class StatusCategories:
     """status_id -> category, cached per project."""
 

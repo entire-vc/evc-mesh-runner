@@ -63,6 +63,81 @@ def quota_time_wait(wait: dict) -> bool:
     return bool(_PROVIDER_CAPACITY.search(text))
 
 
+OPEN_MR_TIME_WAIT_REFUSED = "a time WAIT is refused while this card has an open merge request"
+_IN_PROGRESS = ("created", "waiting_for_resource", "preparing", "pending", "running", "scheduled")
+
+
+def mr_merged_wait(target: str = "") -> str:
+    """The merge wait on merge request ``target`` (``group/project!iid`` or ``github:org/repo!n``),
+    backticked; placeholders for an unknown or unparsable target."""
+    github = target.startswith("github:")
+    project, sep, iid = target.split(":", 1)[-1].rpartition("!")
+    if not (sep and project and iid.isdigit()):
+        project, iid = "<group>/<project>", "<iid>"
+    return (f"`wait_for on=mr {'provider=github ' if github else ''}project_path={project} mr_iid={iid} "
+            "until=merged after_sha=<full-head-sha> after_status=opened`")
+
+
+def foreign_code_wait(card: str = "", target: str = "") -> str:
+    """What a task does when it needs code that another card delivers: that card's
+    merge request merging, or a stack on its branch; with no merge request known yet (``target``
+    ''), a wait for the card to publish one (``artifact_published``), then the stack. Never a plain
+    card wait: the card closes long after its code merged (or never, while it waits for this one),
+    and lanes follow this text word for word. ``card``: the owner card's 8-hex id."""
+    text = f"wait for its merge request to merge ({mr_merged_wait(target)}) or stack your branch on its MR branch"
+    if not target:
+        text += (f"; no merge request yet: `wait_for on=card target_task_id={card or '<card>'} "
+                 "target_condition=artifact_published criterion=<its MR and branch>`, then stack on that branch")
+    return text
+
+
+def open_mr_time_wait_guidance(mrs: list[dict]) -> str:
+    """Why a time WAIT on a card with an open merge request is refused, and the wait to declare instead.
+
+    ``mrs``: the open merge requests as just read from the forge: ``target`` (``group/project!iid``, or
+    ``github:org/repo!n``), ``sha`` (the head) and, for GitLab, ``pipeline_id`` / ``pipeline_status`` of
+    the head pipeline. Each hint is a command this runner accepts for that state: ``until=changed`` on a
+    final baseline is sent back, so a failed or manual head names its action first; ``until=green`` on a
+    red head stands on another card's merge request (its owner pushes) and on the card's own until the
+    red result is delivered once."""
+    lines = [OPEN_MR_TIME_WAIT_REFUSED + ": its CI result and its merge are the events, not a clock. "
+             "Wait on the event itself:"]
+    for mr in mrs:
+        target = str(mr.get("target") or "")
+        github = target.startswith("github:")
+        project, _, iid = target.split(":", 1)[-1].rpartition("!")
+        sha = str(mr.get("sha") or "") or "<full-head-sha>"
+        status = str(mr.get("pipeline_status") or "")
+        pid = mr.get("pipeline_id")
+        mr_wait = f"wait_for on=mr {'provider=github ' if github else ''}project_path={project} mr_iid={iid}"
+        merged = f"`{mr_wait} until=merged after_sha={sha} after_status=opened`"
+        if github:
+            lines.append(f"- {target}: {merged}; its Actions run: `wait_for on=pipeline provider=github "
+                         f"project_path={project} pipeline_id=<run id> until=green|changed`.")
+        elif pid and status in _IN_PROGRESS:
+            lines.append(f"- {target}: head pipeline {pid} is {status}: `{mr_wait} until=green after_sha={sha} "
+                         f"after_pipeline_id={pid} after_status={status}` (or `until=changed` for any result), "
+                         f"or `wait_for on=pipeline project_path={project} pipeline_id={pid} until=finished`.")
+        elif pid and status in ("failed", "canceled", "cancelled"):
+            lines.append(f"- {target}: head pipeline {pid} {status}: no clock changes that. Fix it and push "
+                         f"(or retry the job), then `{mr_wait} until=green after_sha=<new head sha> "
+                         "after_pipeline_id=<its pipeline id> after_status=<its status>`. When the fix is "
+                         f"not yours (another card's merge request, a job someone else owns): `{mr_wait} "
+                         f"until=green after_sha={sha} after_pipeline_id={pid} after_status={status}` waits "
+                         "for the new head its owner pushes. When the fix is another card's code: "
+                         + foreign_code_wait() + ".")
+        elif pid and status == "manual":
+            lines.append(f"- {target}: head pipeline {pid} waits for a manual job: start the job it needs, then "
+                         f"`wait_for on=pipeline project_path={project} pipeline_id={pid} until=green "
+                         f"after_sha={sha} after_pipeline_id={pid} after_status=<its status once started>`.")
+        else:
+            state = f"head pipeline {pid} {status}" if pid and status else "no head pipeline"
+            lines.append(f"- {target} ({state}): the merge is the event: {merged}; after a SHIP verdict on "
+                         f"this head `wait_for on=merge project_path={project} mr_iid={iid} after_sha={sha}`.")
+    lines.append("A time wait stays valid only for an external schedule on a card without an open merge request.")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class Outcome:
     """What the agent declared. ``kind`` is one of: pipeline, mr, merge, card, decision,

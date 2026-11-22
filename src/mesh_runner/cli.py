@@ -543,6 +543,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "once":
                 guarded.append("--once")
             return launch_guard.main(guarded)
+        if args.command == "run":
+            # the guarded image that forks every child, before any thread or child starts;
+            # runner.log is its stderr (see fork_notice)
+            from .fork_notice import quiet_fork_stack_logging_notice
+            logging.getLogger("mesh_runner.fork_notice").info(
+                "fork notice: %s", quiet_fork_stack_logging_notice())
 
     if args.command == "rearm-cap":
         from . import cap_rearm
@@ -703,10 +709,10 @@ def main(argv: list[str] | None = None) -> int:
             p.error("--agent must name a configured agent")
         if not all((args.task, args.attempt, args.wait_generation, args.request_id, args.repo)):
             p.error("exact --task, --attempt, --wait-generation, --request-id and --repo required")
-        spec = next((r for r in agent.repos if r.name == args.repo), None)
-        if spec is None:
-            p.error("--repo must be configured for --agent in the fresh config")
         try:
+            spec = repo_admission.configured_spec(cfg, agent, args.repo)
+            if spec is None:
+                p.error("--repo must be in the lane's effective repository inventory")
             result = repo_admission.submit(cfg.state_dir, args.agent, args.task, args.attempt,
                                            args.wait_generation, args.request_id, spec, args.ttl_seconds)
         except (ValueError, OSError):

@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -57,6 +58,13 @@ _BASE_LOCKS_GUARD = threading.Lock()
 
 
 _COMMON_DIRS: dict[str, str] = {}
+
+# A lease starts a slot on the base's remote branch as of the base's last fetch. One start of a lane with
+# twelve repositories fetched each of them over the jump host, and the next start in the same tick did it
+# all again: a base fetched successfully this recently is not fetched again for a lease. The
+# held-slot recheck still fetches every time: it decides whether a branch reached the remote.
+FETCH_FRESH_SECONDS = 60.0
+_FETCHED: dict[tuple, float] = {}           # (base, remote, url overrides) -> monotonic time of the last good fetch
 
 # A failed or interrupted eviction has an uncertain filesystem outcome. Keep
 # this durable marker until an operator explicitly inspects the slot.
@@ -125,6 +133,19 @@ class MaintenanceHeld(WorkspaceError):
 
 class InventoryError(WorkspaceError):
     """The attempt's repository inventory cannot be proven; only a config/journal change heals it."""
+
+
+class RestoreRefused(WorkspaceError):
+    """A checkpoint restore refused to overwrite its target. A fault of one card's working copies,
+    never of the lane: the start path holds that card, not every start of the agent. ``target`` is
+    the slot it refused (set by ``WorkspacePool.restore``; empty when unknown)."""
+
+    target = ""
+
+
+# Written by ``Checkpoints.restore`` into the slot's git dir. It describes the slot's content after a
+# completed restore; a slot returned to the pool has none of that content any more.
+RESTORE_MARKER = "runner-restore-marker.json"
 
 
 class BranchInUse(WorkspaceError):
@@ -383,6 +404,9 @@ class WorkspacePool:
         self.checkpoint_exclude_names = checkpoint_exclude_names
         self.root = Path(root) / owner
         self.repos = {r.name: r for r in repos}
+        # called between the repositories of one restore, outside every repository lock; the runner
+        # gives back the capacity reservations of turns that ended meanwhile (``between_repos``)
+        self.between: Callable[[], None] | None = None
         store.db.executescript(SCHEMA)
 
     def on_store(self, store: Store) -> "WorkspacePool":
@@ -924,7 +948,7 @@ class WorkspacePool:
         self._check_disk()
         self._keep_base_bare(repo)
         self._clean_staging(repo)
-        self._fetch(repo)
+        self._fetch_for_lease(repo)
         self._check_disk()
         start = f"{repo.remote}/{repo.branch}"
         slots = self._rows(repo_name, "free")
@@ -1178,6 +1202,7 @@ class WorkspacePool:
                 _clear_tree(path)
                 git(path, "checkout", "--quiet", "--force", "--detach",
                     f"{repo.remote}/{repo.branch}", env=self.env)
+                self._forget_restore(path)
                 self._set(path, repo_name, "free")
                 self.store.db.execute("UPDATE workspace_checkpoints SET phase='released' "
                     "WHERE owner=? AND attempt=? AND repo=?", (self.owner, attempt_id, repo_name))
@@ -1213,6 +1238,67 @@ class WorkspacePool:
         return [dict(r) for r in self.store.db.execute(
             "SELECT * FROM workspace_checkpoints WHERE owner=? AND attempt=? ORDER BY repo",
             (self.owner, attempt_id))]
+
+    def adopt_checkpoints(self, previous_id: str, attempt_id: str) -> list[dict]:
+        """Carry immutable snapshots to a new attempt of the same task after ownership returns.
+
+        The old attempt must have finished with every lease durably suspended. Copy journal rows,
+        not workspace bytes: normal restore handles slot preference, branch conflicts and replay.
+        Mark the source transferred so it no longer reserves slots. A refused first launch may
+        retry from the same snapshots; an existing target journal is never reset or replayed here.
+        """
+        self._maintenance_guard(previous_id)
+        self._maintenance_guard(attempt_id)
+        previous, current = self.store.get(previous_id), self.store.get(attempt_id)
+        if (not previous or not current or previous.id == current.id or previous.state != 'completed'
+                or current.state not in ('starting', 'ready')
+                or previous.agent != self.owner or current.agent != self.owner
+                or previous.task_id != current.task_id):
+            raise InventoryError('checkpoint handover: previous task owner is not completed')
+        rows = self._checkpoint_rows(previous_id)
+        if (not rows or any(r['phase'] not in ('released', 'transferred') for r in rows)
+                or any(r['repo'] not in self.repos for r in rows)
+                or sorted(r['source'] for r in rows) != sorted(previous.workspaces)
+                or self.leased_to(previous_id)):
+            raise InventoryError('checkpoint handover: incomplete source inventory')
+        # No replay: the capture proved this snapshot by one, and a scratch replay here held the
+        # process-wide checkpoint IO lock for every repository of the card (a returning start waited up
+        # to 147 s in its step `task`, 20.11). The stored bytes are checked instead, before anything is
+        # transferred or leased: a replay copies the tree and the indexes into its target before it checks
+        # the result, and damage found only there cost a held slot per retry. The
+        # commits are proven by restore() before it touches the target.
+        checkpoints = self._checkpoints()
+        for row in rows:
+            manifest = checkpoints.read(Path(row['checkpoint']))
+            metadata = manifest.get('metadata', {})
+            if metadata.get('task') != current.task_id or metadata.get('repo') != row['repo']:
+                raise InventoryError('checkpoint handover: snapshot belongs to another task or repository')
+            try:
+                checkpoints.preflight(Path(row['checkpoint']))
+            except WorkspaceError as e:
+                # this card's snapshot: the card is held and retried, the lane goes on (runner start path)
+                raise InventoryError(f"checkpoint handover: {row['repo']}: {e}") from e
+        self.store.db.execute('BEGIN IMMEDIATE')
+        try:
+            existing = self._checkpoint_rows(attempt_id)
+            signature = lambda items: [(r['repo'], r['checkpoint'], r['source']) for r in items]
+            if existing and signature(existing) != signature(rows):
+                raise InventoryError('checkpoint handover: target journal already differs')
+            if not existing:
+                for row in rows:
+                    self.store.db.execute('INSERT INTO workspace_checkpoints VALUES(?,?,?,?,?,?,?)',
+                        (self.owner, attempt_id, row['repo'], row['checkpoint'], row['source'], 'released', ''))
+                # Recovery validates the journal against the admitted inventory. Persist both
+                # together: a crash before restore must not leave an empty new attempt beside it.
+                if not self.store.update(current, workspaces=[r['source'] for r in rows]):
+                    raise InventoryError('checkpoint handover: target attempt disappeared')
+            self.store.db.execute("UPDATE workspace_checkpoints SET phase='transferred' "
+                "WHERE owner=? AND attempt=? AND phase='released'", (self.owner, previous_id))
+            self.store.db.execute('COMMIT')
+        except BaseException:
+            self.store.db.execute('ROLLBACK')
+            raise
+        return self._checkpoint_rows(attempt_id)
 
     # -- branch ownership ----------------------------------------------------------------
     def _worktree_branches(self, repo: RepoSpec) -> list[tuple[Path, str]]:
@@ -1349,12 +1435,27 @@ class WorkspacePool:
                     if why := self._admin_reason(target, repo):
                         raise WorkspaceError(f"checkpoint: restore target {target}: {POOL_ADMIN_HOLD_NOTE}: "
                                              f"{why}; lease retained")
-                    manifest = checkpoints.restore(Path(row["checkpoint"]), target)
+                    try:
+                        manifest = checkpoints.restore(Path(row["checkpoint"]), target)
+                    except RestoreRefused as e:
+                        e.target = str(target)
+                        raise
                     self.store.db.execute("UPDATE workspace_checkpoints SET phase='restored' "
                         "WHERE owner=? AND attempt=? AND repo=?", (self.owner, attempt_id, row["repo"]))
                 paths.append(str(target))
                 manifests.append(manifest)
+            self.between_repos()                # one restore of a lane's repositories took up to 14 min
         return paths, manifests
+
+    def between_repos(self) -> None:
+        """The owner's ``between`` hook, between the repositories one start leases or restores and
+        outside their locks. Its failure is logged and never fails the lease or the restore."""
+        if self.between is None:
+            return
+        try:
+            self.between()
+        except Exception as e:                  # noqa: BLE001 - a side pass must not abort a restore
+            log.warning("workspace: between-repositories hook failed: %s", e)
 
     def recheck_held(self, open_attempts: set[str]) -> list[str]:
         """Free held slots that became safe (e.g. their branch was pushed), unless
@@ -1629,7 +1730,24 @@ class WorkspacePool:
             "SELECT * FROM slots WHERE pool LIKE ? ORDER BY path", (f"{self.owner}/%",))]
 
     # -- helpers -------------------------------------------------------------------------
+    fetch_fresh_seconds = FETCH_FRESH_SECONDS
+
+    def _fetch_key(self, repo: RepoSpec) -> tuple:
+        return (os.path.realpath(repo.base), repo.remote, tuple(repo.fetch_url_overrides or ()))
+
+    def _fetch_for_lease(self, repo: RepoSpec) -> None:
+        """``_fetch`` unless this base was fetched successfully within ``fetch_fresh_seconds`` (under its
+        base lock, so the answer holds until the checkout from it)."""
+        at = _FETCHED.get(self._fetch_key(repo))
+        if at is not None and time.monotonic() - at < self.fetch_fresh_seconds:
+            return
+        self._fetch(repo)
+
     def _fetch(self, repo: RepoSpec) -> None:
+        self._fetch_remote(repo)
+        _FETCHED[self._fetch_key(repo)] = time.monotonic()
+
+    def _fetch_remote(self, repo: RepoSpec) -> None:
         env = self.env
         if repo.fetch_url_overrides:
             env = dict(self.env if self.env is not None else os.environ)
@@ -2190,10 +2308,19 @@ class WorkspacePool:
         st, now = os.fstat(fd), os.stat(name, dir_fd=parent, follow_symlinks=False)
         return stat.S_ISDIR(now.st_mode) and (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino)
 
+    def _forget_restore(self, path: Path) -> None:
+        """Drop the restore marker of a slot going back to the pool. Kept, it outlives the content it
+        describes: the next restore of the same snapshot into this (now reset) slot was refused as
+        "newer work" forever, and every such start paused the whole lane (live)."""
+        marker = Path(git(path, "rev-parse", "--git-path", RESTORE_MARKER, env=self.env))
+        marker = marker if marker.is_absolute() else path / marker
+        marker.unlink(missing_ok=True)
+
     def _free(self, path: Path, repo: RepoSpec) -> None:
         self._archive_untracked(path)
         # Detach at the remote tip: frees any branch and pins no old commit.
         git(path, "checkout", "--quiet", "--detach", f"{repo.remote}/{repo.branch}", env=self.env)
+        self._forget_restore(path)
         self._set(path, repo.name, "free")
 
     def _new_path(self, repo: RepoSpec, avoid=()) -> Path:

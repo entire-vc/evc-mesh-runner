@@ -10,6 +10,7 @@ import datetime as dt
 import logging
 import math
 import itertools
+import json
 import os
 import re
 import shutil
@@ -458,6 +459,38 @@ def prune_ignored(pool: WorkspacePool, *, idle_hours: float, apply: bool = False
 
 
 _LIVE_ATTEMPT_STATES = frozenset({"starting", "running", "unknown", "waiting", "ready"})
+
+# How long an unspent ownership-loss note keeps the snapshots of the attempt it names.
+OWNERSHIP_KEEP_DAYS = 14
+
+
+def _ownership_kept(db, owner: str) -> set[str]:
+    """Attempts whose snapshots an unspent ``ownership_loss`` note of this lane still names: the card
+    left the lane with its work checkpointed and its next start adopts exactly these rows
+    (``WorkspacePool.adopt_checkpoints``). The source attempt has ended, so the plain age rule
+    removed them, and the return then failed with "incomplete source inventory" on every start
+    (live: one lane lost the snapshots of 10 repositories). A launch spends the note (value
+    ''); a note of a card closed when it left names nothing; a note older than
+    OWNERSHIP_KEEP_DAYS stops protecting."""
+    since = iso(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=OWNERSHIP_KEEP_DAYS))
+    try:
+        rows = db.execute("SELECT value FROM marks WHERE agent=? AND key='ownership_loss' "
+                          "AND value<>'' AND at>=?", (owner, since)).fetchall()
+    except Exception:          # noqa: BLE001 - no marks table: nothing is protected by a note
+        return set()
+    kept = set()
+    for (value,) in rows:
+        try:
+            note = json.loads(value)
+        except ValueError:
+            continue
+        if not isinstance(note, dict) or not note.get("checkpointed") or not note.get("attempt"):
+            continue
+        status = note.get("observed_status")
+        if status in ("done", "cancelled") and not (status == "done" and note.get("decision_request") is True):
+            continue
+        kept.add(str(note["attempt"]))
+    return kept
 _CHECKPOINT_REF_PREFIXES = ("refs/runner-checkpoints/", "refs/runner-checkpoint-bases/")
 
 
@@ -595,7 +628,12 @@ def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = 
                     "FROM workspace_checkpoints w LEFT JOIN attempts a ON a.id = w.attempt "
                     "WHERE w.owner=?", (pool.owner,))]
                 named = {r["checkpoint"] for r in rows}
+                kept_attempts = _ownership_kept(db, pool.owner)
+                # an adopter's copied row names the same directory as its source: keep it by path too
+                kept = {r["checkpoint"] for r in rows if r["attempt"] in kept_attempts}
                 for row in rows:
+                    if row["attempt"] in kept_attempts or row["checkpoint"] in kept:
+                        continue
                     if (row["repo"] == repo_name and row["attempt_state"] is not None
                             and row["attempt_state"] not in _LIVE_ATTEMPT_STATES
                             and _ended_before(row["attempt_updated"], cutoff)):
@@ -647,8 +685,11 @@ def prune_checkpoints(pool: WorkspacePool, *, grace_hours: float, apply: bool = 
 
 
 def checkpoint_bytes(pool_root: Path, deadline: float | None = None) -> int:
-    """Disk used by every owner's WAIT snapshots (du estimate; 0 when there are none)."""
-    root = Path(pool_root) / "checkpoints"
+    """Disk used by every owner's WAIT snapshots (du estimate; 0 when there are none).
+
+    The store may be a link onto the slot volume (clonefile works only within one volume);
+    du counts a link operand as the link itself, so measure its target."""
+    root = Path(os.path.realpath(Path(pool_root) / "checkpoints"))
     if not root.is_dir():
         return 0
     return _dir_bytes(root, deadline if deadline is not None else time.monotonic() + 120)

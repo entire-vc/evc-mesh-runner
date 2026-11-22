@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 from fakes import FakeMesh, task
 from test_runner import Bench
-from mesh_runner.runner import gate_hold_reason, GATE_HOLD_SECONDS
+from mesh_runner.runner import gate_hold_reason, GATE_HOLD_SECONDS, TASK_HOLD_SECONDS, HOLD_WAKE_GUARD_SECONDS
 
 
 class PublicReason(unittest.TestCase):
@@ -243,3 +243,134 @@ class RouteHoldAlert(Bench):
             self.assertFalse(r._note_route_hold('runtime capacity unavailable', self.at(m)))
             self.assertFalse(r._note_route_hold('card writer still active (holder=x)', self.at(m)))
         self.assertEqual(self.alerts(r), [])
+
+
+class RoutePendingTaskHold(Bench):
+    """A review refused until the router writes the card's official route is re-asked at the gate
+    cadence: the route write does not change the card's updated_at, so the ten-minute task hold
+    would outlive the route by up to ten minutes."""
+
+    def _held_for(self, out):
+        a = task(1)
+        r = self.runner(FakeMesh([a]))
+        self.agent.start_gate_command = ['operator-gate']
+        with patch.object(r, '_run_hook', return_value=(76, out, '')), \
+                patch('mesh_runner.runner.time.monotonic', return_value=1000):
+            self.assertFalse(r._start_one(a))
+        return r._gate_hold[a['id']][1] - 1000, r
+
+    def test_route_pending_hold_is_re_asked_within_gate_cadence(self):
+        ttl, r = self._held_for('original review fence: original review waits for verified official native route')
+        self.assertLessEqual(ttl, 120)
+        self.assertEqual(ttl, GATE_HOLD_SECONDS)
+        self.assertIsNone(r._agent_gate_hold)       # still a hold of this card only
+        self.assertFalse(r._start_held)
+
+    def test_other_task_holds_keep_the_ten_minutes(self):
+        ttl, _ = self._held_for('HOLD_REASON_CODE=human')
+        self.assertEqual(ttl, TASK_HOLD_SECONDS)
+
+
+ROUTE_PENDING = 'original review fence: original review waits for verified official native route'
+
+
+class HoldWakeFile(Bench):
+    """A route-pending review hold re-asked every GATE_HOLD_SECONDS made 437 gate asks on
+    one card in a day. A gate that names a wake file turns the hold into a declared wait on it: the
+    route write (or a re-bind on a new MR head) ends it on the next tick, the card's update ends it,
+    and nothing else re-asks the gate before the guard."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile, os
+        self.dir = tempfile.mkdtemp()
+        self.wake = os.path.join(self.dir, 'wake')
+        self.clock = [1000.0]
+
+    def _write(self, text):
+        with open(self.wake, 'w') as fh:
+            fh.write(text)
+
+    def _out(self, sig, path=None):
+        return (ROUTE_PENDING + '\nHOLD_WAKE_FILE=' + (path or self.wake) + '\nHOLD_WAKE_SIG=' + sig)
+
+    def _reason(self, r, t):
+        with patch('mesh_runner.runner.time.monotonic', side_effect=lambda: self.clock[0]):
+            return r.hold_reason(t, 'work')
+
+    def _ticks(self, r, hook_out, at):
+        with patch.object(r, '_run_hook', return_value=(76, hook_out, '')) as hook, \
+                patch('mesh_runner.runner.time.monotonic', side_effect=lambda: self.clock[0]):
+            for t in at:
+                self.clock[0] = 1000.0 + t
+                r.tick()
+        return hook.call_count
+
+    def test_an_unbound_route_is_not_re_asked_on_the_gate_cadence(self):
+        a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+        self._write('sig1')
+        # 0 s .. the guard minus a second: 60 ticks on the old 120 s cadence, one ask now
+        calls = self._ticks(r, self._out('sig1'), [0, 121, 241, 600, 1800, 3599, HOLD_WAKE_GUARD_SECONDS - 1])
+        self.assertEqual(calls, 1)
+        self.assertEqual(self._reason(r, a), 'gate: ' + ROUTE_PENDING)
+        # the guard bounds a missed write: the second ask comes after it
+        self.assertEqual(self._ticks(r, self._out('sig1'), [HOLD_WAKE_GUARD_SECONDS + 1]), 1)
+
+    def test_a_route_that_never_binds_is_asked_at_most_twenty_times_a_day(self):
+        a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+        self._write('sig1')
+        calls = self._ticks(r, self._out('sig1'), list(range(0, 86400, 120)))
+        self.assertLessEqual(calls, 20)
+        self.assertGreaterEqual(calls, 2)                   # the guard still re-asks
+
+    def test_the_route_write_ends_the_hold_on_the_next_tick(self):
+        a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+        self._write('sig1')
+        self.assertEqual(self._ticks(r, self._out('sig1'), [0, 30]), 1)
+        self._write('sig2')                      # the router bound or re-bound the route
+        self.assertEqual(self._reason(r, a), '')
+        self.assertNotIn(a['id'], r._gate_hold)
+        self.assertEqual(self._ticks(r, self._out('sig2'), [31]), 1)   # asked again at once
+
+    def test_a_route_file_that_appears_ends_a_hold_taken_while_it_was_absent(self):
+        a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+        self.assertEqual(self._ticks(r, self._out('absent'), [0, 200]), 1)
+        self.assertTrue(self._reason(r, a).startswith('gate: '))
+        self._write('sig1')
+        self.assertEqual(self._reason(r, a), '')
+
+    def test_a_card_update_still_ends_the_hold(self):
+        a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+        self._write('sig1')
+        self._ticks(r, self._out('sig1'), [0])
+        self.assertEqual(self._reason(r, dict(a, updated_at='new-event')), '')
+
+    def test_an_unreadable_wake_file_is_no_event(self):
+        import os
+        a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+        os.mkdir(self.wake)                       # reading a directory raises: no signature
+        self.assertEqual(self._ticks(r, self._out('absent'), [0, 300, 900]), 1)
+
+    def test_a_malformed_pair_keeps_the_ordinary_cadence(self):
+        for out in (self._out('sig1', path='relative/wake'), self._out('bad sig!'), ROUTE_PENDING):
+            a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+            self._write('sig1')
+            with patch.object(r, '_run_hook', return_value=(76, out, '')), \
+                    patch('mesh_runner.runner.time.monotonic', return_value=1000):
+                self.assertFalse(r._start_one(a))
+            self.assertEqual(r._gate_hold[a['id']][1] - 1000, GATE_HOLD_SECONDS, out)
+            self.assertEqual(len(r._gate_hold[a['id']]), 3, out)
+
+    def test_a_lane_hold_never_takes_a_wake_file(self):
+        a = task(1); r = self.runner(FakeMesh([a])); self.agent.start_gate_command = ['operator-gate']
+        self._write('sig1')
+        with patch.object(r, '_run_hook', return_value=(75, 'HOLD_REASON_CODE=capacity\nHOLD_WAKE_FILE='
+                                                         + self.wake + '\nHOLD_WAKE_SIG=sig1', '')), \
+                patch('mesh_runner.runner.time.monotonic', return_value=1000):
+            r._start_one(a)
+        self.assertEqual(r._gate_hold[a['id']][1] - 1000, GATE_HOLD_SECONDS)
+        self.assertIsNotNone(r._agent_gate_hold)
+
+    def test_the_wake_pair_never_reaches_the_public_reason(self):
+        self.assertEqual(gate_hold_reason(self._out('sig1')), ROUTE_PENDING)
+

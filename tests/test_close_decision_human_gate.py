@@ -1,5 +1,7 @@
-"""A decision request whose close Mesh refuses behind a human gate is not retried every pass."""
+"""A decision request whose close Mesh refuses behind a human gate or the delivery gate
+is not retried every pass."""
 import datetime as dt
+import json
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +15,12 @@ from mesh_runner.store import now
 
 GATE = ("Task is awaiting human sign-off (human_gate=true). "
         "Only a human can approve or reject it.")
+# Mesh's done-evidence refusal, as it answers a move to done while a linked merge request is open.
+UNMERGED = ("PR «fix: example change» is not merged (verified live against GitLab just now) — merge it "
+            "first, or if this read is wrong, re-link it with an explicit status (add_vcs_link ... status=merged)")
+UNMERGED_BODY = {"code": "done_evidence_required", "error_code": "done_evidence_required", "message": UNMERGED}
+NO_EVIDENCE = ("done requires evidence: add a PR/VCS link, artifact upload, or comment with proof "
+               "before closing")
 
 
 class GatedMove:
@@ -20,13 +28,14 @@ class GatedMove:
 
     def __init__(self, mesh: FakeMesh, request_id: str):
         self.mesh, self.request_id, self.gated, self.calls = mesh, request_id, True, 0
+        self.error = MeshError(422, GATE, body={"error": GATE})
         self._move = mesh.move
 
     def __call__(self, tid, status_id):
         if tid == self.request_id:
             self.calls += 1
             if self.gated:
-                raise MeshError(422, GATE, body={"error": GATE})
+                raise self.error
         return self._move(tid, status_id)
 
 
@@ -158,11 +167,105 @@ class CloseDecisionHumanGate(Bench):
         self.assertEqual(move.calls, 1)
         self.assertIn('request', pending)
 
+    def delivery_gated(self, body=None):
+        r, mesh, source, attempt, wait = self.setup_question()
+        request = wait['request']['id']
+        mesh.tasks[request]['updated_at'] = '2026-10-20T10:00:00Z'
+        move = GatedMove(mesh, request)
+        move.error = MeshError(422, UNMERGED, body=UNMERGED_BODY if body is None else body)
+        mesh.move = move
+        return r, mesh, source, attempt, wait, request, move
+
+    def test_delivery_refusal_is_not_retried_until_the_card_changes(self):
+        # Mesh refuses done while a linked merge request is open; the card stays as it is,
+        # so the same write on every pass only repeats the refusal and a warning line.
+        for body in (UNMERGED_BODY, None):
+            with self.subTest(body=bool(body)):
+                r, mesh, source, attempt, wait, request, move = self.delivery_gated(body or {})
+                with self.assertLogs('mesh_runner', level='INFO') as logs:
+                    r.effects.on_end(attempt, wait, 'answered', close_request=True)
+                    for _ in range(3):
+                        self.tick(r)
+                    fx.log.info('marker')
+                self.assertEqual(move.calls, 1)
+                warnings = [line for line in logs.output if line.startswith('WARNING')]
+                self.assertEqual(len(warnings), 1, logs.output)
+                self.assertIn('linked merge request not merged', warnings[0])
+                self.assertEqual(r.effects._decision(source['id'])['state'], 'closing')
+                mark = json.loads(r.store.mark(DECISION_OWNER, request, CLOSE_BLOCKED_MARK)[0])
+                self.assertEqual(mark['gate'], 'delivery')
+                self.tearDown()
+                self.setUp()
+
+    def test_delivery_refusal_is_retried_when_the_card_changes(self):
+        r, mesh, source, attempt, wait, request, move = self.delivery_gated()
+        r.effects.on_end(attempt, wait, 'answered', close_request=True)
+        self.tick(r)
+        mesh.tasks[request]['updated_at'] = '2026-10-21T08:00:00Z'   # a comment, the MR still open
+        with self.assertLogs('mesh_runner', level='INFO') as logs:
+            self.tick(r)
+            self.tick(r)
+            fx.log.info('marker')
+        self.assertEqual(move.calls, 2)
+        self.assertFalse([line for line in logs.output if line.startswith('WARNING')], logs.output)
+        move.gated = False
+        mesh.tasks[request]['updated_at'] = '2026-10-22T08:00:00Z'   # the merge request was merged
+        with self.assertLogs('mesh_runner', level='INFO') as logs:
+            self.tick(r)
+        self.assertEqual(move.calls, 3)
+        self.assertEqual(mesh.category(mesh.tasks[request]), 'done')
+        self.assertFalse(r.effects._decision(source['id']))
+        self.assertFalse(r.store.mark(DECISION_OWNER, request, CLOSE_BLOCKED_MARK)[0])
+        self.assertEqual(len([line for line in logs.output if 'delivery gate no longer blocks' in line]), 1,
+                         logs.output)
+
+    def test_delivery_refusal_is_retried_after_the_retry_interval(self):
+        r, mesh, source, attempt, wait, request, move = self.delivery_gated()
+        r.effects.on_end(attempt, wait, 'answered', close_request=True)
+        later = now() + CLOSE_BLOCKED_RETRY + dt.timedelta(minutes=1)
+        with patch.object(fx, 'now', return_value=later):
+            self.tick(r)
+        self.assertEqual(move.calls, 2)
+
+    def test_gate_change_logs_again(self):
+        r, mesh, source, attempt, wait, request, move = self.gated()
+        r.effects.on_end(attempt, wait, 'answered', close_request=True)
+        move.error = MeshError(422, UNMERGED, body=UNMERGED_BODY)
+        mesh.tasks[request]['updated_at'] = '2026-10-21T08:00:00Z'   # sign-off given, the MR still open
+        with self.assertLogs('mesh_runner', level='INFO') as logs:
+            self.tick(r)
+            self.tick(r)
+        self.assertEqual(move.calls, 2)
+        self.assertEqual(len([line for line in logs.output if 'linked merge request not merged' in line]), 1,
+                         logs.output)
+
+    def test_legacy_mark_without_gate_reads_as_human_gate(self):
+        r, mesh, source, attempt, wait, request, move = self.gated()
+        r.effects.on_end(attempt, wait, 'answered', close_request=True)
+        mark = json.loads(r.store.mark(DECISION_OWNER, request, CLOSE_BLOCKED_MARK)[0])
+        mark.pop('gate')
+        r.store.mark(DECISION_OWNER, request, CLOSE_BLOCKED_MARK, json.dumps(mark))
+        move.gated = False
+        mesh.tasks[request]['updated_at'] = '2026-10-21T08:00:00Z'
+        with self.assertLogs('mesh_runner', level='INFO') as logs:
+            self.tick(r)
+        self.assertEqual(len([line for line in logs.output if 'human gate no longer blocks' in line]), 1,
+                         logs.output)
+
     def test_refusal_detection(self):
         self.assertTrue(fx._human_gate_refusal(MeshError(422, GATE)))
         self.assertTrue(fx._human_gate_refusal(MeshError(422, 'unprocessable', body={'error': GATE})))
         self.assertFalse(fx._human_gate_refusal(MeshError(403, GATE)))
         self.assertFalse(fx._human_gate_refusal(MeshError(422, 'invalid status')))
+        self.assertEqual(fx._close_refusal_gate(MeshError(422, GATE)), 'human_gate')
+        self.assertEqual(fx._close_refusal_gate(MeshError(422, UNMERGED, body=UNMERGED_BODY)), 'delivery')
+        self.assertEqual(fx._close_refusal_gate(MeshError(422, UNMERGED)), 'delivery')
+        self.assertEqual(fx._close_refusal_gate(MeshError(422, 'x', body={'error_code': 'done_evidence_required'})),
+                         'delivery')
+        self.assertEqual(fx._close_refusal_gate(MeshError(422, NO_EVIDENCE)), 'delivery')
+        self.assertEqual(fx._close_refusal_gate(MeshError(409, UNMERGED, body=UNMERGED_BODY)), '')
+        self.assertEqual(fx._close_refusal_gate(MeshError(422, 'invalid status transition')), '')
+        self.assertEqual(fx._close_refusal_gate(MeshError(422, 'x', body={'code': 'dod_gate_blocked'})), '')
 
 
 if __name__ == '__main__':

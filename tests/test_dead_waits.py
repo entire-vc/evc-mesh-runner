@@ -90,7 +90,7 @@ class DeadWaits(Bench):
         r, t, gl = self.flow(mr=mr_row('failed'))
         a = self.turn(r, t, change('mr', 'failed'))
         self.assert_bounced(a, 'already finished: failed', 'nothing changes without a push or a retry',
-                            'Fix the cause and push', 'wait_for on=card')
+                            'Fix the cause and push', 'until=merged', 'target_condition=artifact_published')
 
     def test_canceled_or_skipped_head_is_sent_back_like_failed(self):
         for status in ('canceled', 'cancelled', 'skipped'):

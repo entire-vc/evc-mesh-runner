@@ -41,6 +41,54 @@ class Pool(unittest.TestCase):
         self.assertEqual(git(a, "config", "user.name"), "Agent")
         self.assertEqual(git(self.base, "config", "user.name"), "t")   # operator clone untouched
 
+    # each lease fetched its base over the network; a lane with twelve repositories paid
+    # twelve fetches per start and the next start in the same tick paid them again
+    def counted_fetches(self, fail=False):
+        """Every ``git fetch`` of the pool, counted where it runs (``workspace.git``)."""
+        from unittest import mock
+        import mesh_runner.workspace as ws
+        calls, real = [], ws.git
+
+        def counting(cwd, *args, **kw):
+            if args and args[0] == "fetch":
+                calls.append(Path(cwd).name)
+                if fail:
+                    raise WorkspaceError("fetch refused")
+            return real(cwd, *args, **kw)
+        patcher = mock.patch.object(ws, "git", counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_a_base_fetched_moments_ago_is_not_fetched_again_for_the_next_lease(self):
+        calls = self.counted_fetches()
+        self.pool.lease("a1", "app")
+        self.pool.lease("a2", "app")
+        self.assertEqual(calls, ["base"])
+
+    def test_a_base_is_fetched_again_once_its_last_fetch_is_older_than_the_window(self):
+        calls = self.counted_fetches()
+        self.pool.fetch_fresh_seconds = 0
+        self.pool.lease("a1", "app")
+        self.pool.lease("a2", "app")
+        self.assertEqual(calls, ["base", "base"])
+
+    def test_a_failed_fetch_is_not_taken_for_a_fresh_one(self):
+        calls = self.counted_fetches(fail=True)
+        for attempt in ("a1", "a2"):
+            with self.assertRaises(WorkspaceError):
+                self.pool.lease(attempt, "app")
+        self.assertEqual(calls, ["base", "base"])
+
+    def test_a_fresh_lease_starts_on_the_remote_head_of_its_last_fetch(self):
+        self.pool.lease("a1", "app")
+        (self.base / "README").write_text("y\n")
+        git(self.base, "commit", "-qam", "next")
+        git(self.base, "push", "-q", "origin", "HEAD:main")
+        self.pool.fetch_fresh_seconds = 0                       # the window is over: the new head is taken
+        b = self.pool.lease("a2", "app")
+        self.assertEqual(git(b, "rev-parse", "HEAD"), git(self.base, "rev-parse", "HEAD"))
+
     def test_chat_slot_is_leased_returned_and_refused_when_the_pool_is_empty(self):
         from mesh_runner.chat_host import ChatRefused, lease_slot, return_slot
         from types import SimpleNamespace as NS

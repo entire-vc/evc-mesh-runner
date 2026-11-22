@@ -16,13 +16,14 @@ import mesh_runner.store as store_clock
 
 
 REASON = 'qa_no_selection:sibling_evidence_unknown'
+DETAILED_REASON = REASON + ' cause:pool_unverified next:pool-owner'
 GATE = '''import json, os, pathlib, sys
 mode = pathlib.Path(sys.argv[1]).read_text().strip()
 with pathlib.Path(sys.argv[2]).open('a') as out:
     out.write(json.dumps({'phase': os.environ['MESH_RUNNER_PHASE'], 'mode': mode}) + '\\n')
 if mode == 'allow':
     raise SystemExit(0)
-print('route: ' + mode + ' trace=synthetic-profile:pool_evidence_unknown')
+print('route: ' + mode + ('' if ' cause:' in mode else ' trace=synthetic-profile:pool_evidence_unknown'))
 raise SystemExit(76)
 '''
 
@@ -60,13 +61,16 @@ class SiblingEvidenceRetry(Bench):
     def test_recovery_after_restart_without_card_edit(self):
         self.public_case('allow')
 
+    def test_suffixed_hold_recovers_after_restart_without_card_edit(self):
+        self.public_case('allow', initial=DETAILED_REASON, saved_reason='route: ' + DETAILED_REASON)
+
     def test_recovered_evidence_still_refuses_author(self):
         self.public_case('qa_refused:reviewer_is_author_or_identity_unknown')
 
     def test_recovered_evidence_still_refuses_reviewer_absence(self):
         self.public_case('qa_refused:strict_independent_review_unavailable')
 
-    def public_case(self, recovered):
+    def public_case(self, recovered, *, initial=REASON, saved_reason=REASON):
         clock = Clock()
         t = task(1, cat='review')
 
@@ -77,7 +81,7 @@ class SiblingEvidenceRetry(Bench):
         mesh = Mesh([t])
         gate, mode, gate_log = (self.root / p for p in ('gate.py', 'gate-mode', 'gate-calls'))
         gate.write_text(GATE)
-        mode.write_text(REASON)
+        mode.write_text(initial)
         gate_log.write_text('')
         self.agent.start_gate_command = [sys.executable, str(gate), str(mode), str(gate_log)]
         write_replies(self.replies, {t['id'][:8]: wait_time(why="synthetic review follow-up")})
@@ -111,7 +115,7 @@ class SiblingEvidenceRetry(Bench):
                 r.start_new(1)
                 parked(r, 2)
                 saved = r.store.mark(self.agent.name, t['id'], 'review_unstartable')
-                self.assertEqual(saved[0], REASON)
+                self.assertEqual(saved[0], saved_reason)
                 self.assertEqual(len(mesh.comment_log[t['id']]), 1)
                 r.store.db.close()
                 r = boot()
@@ -176,7 +180,7 @@ class SiblingEvidenceRetry(Bench):
     def test_only_exact_sibling_unknown_tag_is_added(self):
         for prefix in ('', 'route: '):
             self.assertTrue(mod.AgentRunner._qa_infra_refusal(prefix + REASON))
-        for reason in ('qa_no_selection:no_available_route', 'qa_no_selection:attempt_limit',
+        for reason in ('qa_no_selection:attempt_limit',
                        'qa_refused:reviewer_is_author_or_identity_unknown',
                        'qa_refused:strict_independent_review_unavailable',
                        REASON + ':extra', REASON + 'suffix', 'prefix ' + REASON,
@@ -191,5 +195,9 @@ class SiblingEvidenceRetry(Bench):
             cleaned = mod.gate_hold_reason('route: ' + REASON + suffix + ' trace=PRIVATE')
             self.assertEqual(cleaned, 'qa_no_selection: review admission unavailable')
             self.assertFalse(mod.AgentRunner._qa_infra_refusal(cleaned))
+        route = 'qa_no_selection:no_available_route'
+        self.assertEqual(mod.gate_hold_reason('route: ' + route + ' profile=PRIVATE trace=PRIVATE'), route)
+        self.assertEqual(mod.gate_hold_reason('route: ' + route + '_future trace=PRIVATE'),
+                         'qa_no_selection: review admission unavailable')
         self.assertEqual(mod.gate_hold_reason('HOLD_REASON_CODE=unknown\nroute: ' + REASON),
                          'held by the start gate')

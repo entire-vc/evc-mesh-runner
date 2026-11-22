@@ -48,6 +48,51 @@ def lead_lane(mesh, name="lead", agent_id="agent-lead", workspace="ws1"):
     return ar
 
 
+# A transport gate that holds every turn of a lane.
+HOLD = "VPN transport unavailable: route check failed"
+FALLBACK_MIN = int(answer_desk.FALLBACK_SECONDS // 60)
+GATE_GAP_SECONDS = 30.0         # the gate hook (timeout 15 s) is asked no more often than this per lane
+GATE_SILENCE_SECONDS = 300.0    # and still asked at least this often, so a lifted hold is noticed
+
+
+def gated(clock, lane, reason=HOLD):
+    """``lane``'s transport gate holds every turn with ``reason``; returns the clock of every gate call."""
+    calls = []
+
+    def gate(phase, task_id, mode):
+        calls.append((phase, clock()))
+        return lane.gate_hold, {}
+    lane.gate_hold = reason
+    lane._gate = gate
+    return calls
+
+
+def run_for(clock, desk, minutes, tick=None):
+    """The desk's own loop (one pass every ``STEP_SECONDS``) and the asking lane's tick once a minute."""
+    for _ in range(int(minutes)):
+        for _ in range(int(60 / answer_desk.STEP_SECONDS)):
+            clock.now += answer_desk.STEP_SECONDS
+            desk.step()
+        if tick:
+            tick()
+
+
+def held_lines(output):
+    return [line for line in output if "answer desk: transport gate holds" in line]
+
+
+
+
+def assert_bounded_gate(case, calls):
+    """The gate was asked, only in its transport phase, and never more often than ``GATE_GAP_SECONDS``."""
+    case.assertTrue(calls)
+    times = [at for _, at in calls]
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    case.assertGreaterEqual(min(gaps or [GATE_GAP_SECONDS]), GATE_GAP_SECONDS, f"{len(calls)} gate calls")
+    case.assertLessEqual(max(gaps or [0.0]), GATE_SILENCE_SECONDS)
+    case.assertEqual({phase for phase, _ in calls}, {"transport"})
+
+
 class Desk(TypedTurn):
     """An asking lane (a real AgentRunner on the fake Mesh) and an addressee lane ``lead`` on one desk."""
 
@@ -127,6 +172,54 @@ class Off(Desk):
 
 
 class Answered(Desk):
+    def test_plain_recipient_comment_answers_server_request_without_a_fallback_card(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        def comment(ar, rid, tid, text):
+            self.turns.append(text)
+            mesh.add_comment(tid, "Выкладка разрешена: проверенный коммит совпадает.", author=ar.me["id"])
+            return "end_turn"
+        desk.run_turn = comment
+        desk.step()
+        self.assertEqual(desk.state("lead", REQUEST), "answered")
+        self.assertEqual(mesh.decision_requests(to="agent-lead"), [])
+        self.assertEqual(len(self.turns), 1)
+        r.tick()
+        self.assertEqual(mesh.created, [])
+
+    def test_old_progress_other_actor_and_automation_comments_do_not_answer(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        mesh.add_comment(t["id"], "Earlier answer", author="agent-lead")
+        def comments(ar, rid, tid, text):
+            mesh.add_comment(tid, "ship", author="agent-other")
+            mesh.add_comment(tid, "Проверю commit", author=ar.me["id"])
+            c = mesh.add_comment(tid, "ship", author=ar.me["id"])
+            c["metadata"] = {"source": "daily-census"}
+            return "end_turn"
+        desk.run_turn = comments
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual(desk.state("lead", REQUEST), "failed")
+        self.assertEqual(len(mesh.decision_requests(to="agent-lead")), 1)
+
+    def test_needs_work_comment_keeps_the_request_open_for_the_work_card(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        def comment(ar, rid, tid, text):
+            self.turns.append(text)
+            mesh.add_comment(tid, "Needs work: a worktree is required", author=ar.me["id"])
+            return "end_turn"
+        desk.run_turn = comment
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual((desk.state("lead", REQUEST), len(self.turns)), ("failed", 1))
+        r.tick()
+        self.assertEqual(len(mesh.created), 1)
+
     def test_a_listed_addressee_answers_on_its_desk_and_no_card_is_filed(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
@@ -285,6 +378,74 @@ class Unanswered(Desk):
         r.tick()
         self.assertEqual((len(self.turns), len(mesh.created)), (2, 1))   # nothing repeats
 
+    def harness_turns(self, mesh, ends):
+        """Desk turns that end as ``ends`` says; the last entry repeats. "answer" answers the request."""
+        seq = list(ends)
+        def run_turn(ar, rid, task_id, text):
+            self.turns.append((ar.agent.name, rid, task_id, text))
+            end = seq.pop(0) if len(seq) > 1 else seq[0]
+            if end == "answer":
+                mesh.answer_decision(rid, "ship it", author=ar.me["id"])
+                return "end_turn"
+            return end
+        return run_turn
+
+    def test_a_harness_failure_is_asked_once_more_before_the_card(self):
+        # The harness, not the addressee, ended both turns: one more pass, then the answer
+        self.answer = False
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        desk.run_turn = self.harness_turns(mesh, ["end_turn", "harness_error", "answer"])
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            desk.step()
+        self.assertEqual((desk.state("lead", REQUEST), len(self.turns)), ("queued", 2))
+        self.assertTrue(any("retried once after harness_error; stays queued" in m for m in logs.output))
+        r.tick()
+        self.assertEqual(mesh.created, [])                            # no card while the retry is owed
+        self.clock.advance(1)
+        desk.step()
+        self.assertEqual((desk.state("lead", REQUEST), len(self.turns)), ("answered", 3))
+        self.assertIn(QUESTION, self.turns[2][3])                     # the retry asks the full question
+        self.assertEqual([k for k, _ in lead.events], ["answer_started", "answer_done"])
+        r.tick()
+        self.assertEqual(mesh.created, [])
+
+    def test_the_harness_retry_happens_once_then_the_card(self):
+        self.answer = False
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        desk.run_turn = self.harness_turns(mesh, ["harness_error"])
+        desk.step()
+        self.clock.advance(1)
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual((desk.state("lead", REQUEST), len(self.turns)), ("failed", 4))
+        r.tick()
+        self.assertEqual(len(mesh.created), 1)
+
+    def test_an_addressee_that_ends_its_turns_is_not_retried(self):
+        self.answer = False
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        desk.run_turn = self.harness_turns(mesh, ["end_turn"])
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual((desk.state("lead", REQUEST), len(self.turns)), ("failed", 2))
+
+    def test_a_turn_cut_by_its_lease_is_not_retried(self):
+        # a started turn that ends "cancelled" ran out of time while the addressee worked: no second paste
+        self.answer = False
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, lead, desk, a = self.parked(mesh, t)
+        desk.run_turn = self.harness_turns(mesh, ["cancelled"])
+        with self.assertLogs("mesh_runner", "WARNING"):
+            desk.step()
+        self.assertEqual((desk.state("lead", REQUEST), len(self.turns)), ("failed", 2))
+
     def test_after_twenty_minutes_the_card_is_filed(self):
         t = task(1)
         mesh = FakeMesh([t], max_concurrent=1)
@@ -297,6 +458,10 @@ class Unanswered(Desk):
         r.tick()
         self.assertEqual((self.turns, mesh.created), ([], []))
         self.clock.advance(2)
+        r.tick()
+        self.assertEqual(mesh.created, [])                            # queue time is not answering time
+        desk._delivered("lead", REQUEST)
+        self.clock.advance(20)
         r.tick()
         self.assertEqual(len(mesh.created), 1)
         a = r.store.get(a.id)
@@ -643,6 +808,7 @@ class CardedRace(Desk):
         base = desk.run_turn
 
         def run_turn(ar, rid, task_id, text):
+            desk._delivered(ar.agent.name, rid)                      # the fake harness accepted its prompt
             ended = base(ar, rid, task_id, text)
             if len(self.turns) == 1:
                 self.clock.advance(21)                            # the first turn outlived the fallback
@@ -832,7 +998,8 @@ class AskedFromTheDesk(Desk):
         real, failed = lane.mesh.comments_since, []
 
         def comments_since(tid, since, **kw):
-            if len(failed) < times:
+            # The failure belongs to the owed post-turn scan, after any pre-turn snapshot.
+            if self.turns and len(failed) < times:
                 failed.append(status)
                 raise MeshError(status, "unavailable")
             return real(tid, since, **kw)
@@ -913,19 +1080,31 @@ class AskedFromTheDesk(Desk):
         for part in ("@builder", "lead asked expert", OTHER, "no answer desk any more", "ask it from this card"):
             self.assertIn(part, refusal["body"])
 
-    def test_a_routed_question_not_taken_in_twenty_minutes_is_refused_on_the_card(self):
+    def test_a_routed_question_its_addressee_gate_holds_is_refused_on_the_card(self):
+        t, r, lead, expert, desk, a = self.lanes()
+        calls = gated(self.clock, expert)
+        desk.step()                                                      # lead's turn routes the question
+        self.assertEqual(desk.state("expert", OTHER), "queued")
+        with self.assertLogs("mesh_runner", "INFO") as logs:
+            run_for(self.clock, desk, FALLBACK_MIN + 2)
+        self.assertEqual(desk.state("expert", OTHER), "failed")
+        [refusal] = self.refusals(t)
+        for part in ("@builder", OTHER, "transport gate", HOLD, "ask it from this card"):
+            self.assertIn(part, refusal["body"])
+        self.assertEqual(len(held_lines(logs.output)), 1)
+        self.assertEqual([x[:2] for x in self.turns], [("lead", REQUEST)])
+        assert_bounded_gate(self, calls)
+
+    def test_a_routed_question_whose_lane_is_paused_is_refused_on_the_card(self):
         t, r, lead, expert, desk, a = self.lanes()
         desk.step()                                       # routed to expert
         expert.is_paused = True                           # then expert is paused
-        self.clock.advance(10)
-        desk.step()
-        self.assertEqual((desk.state("expert", OTHER), self.refusals(t)), ("queued", []))
-        self.clock.advance(11)
+        self.clock.advance(2)                            # the next refusal sweep
         with self.assertLogs("mesh_runner", "WARNING"):
             desk.step()
         self.assertEqual(desk.state("expert", OTHER), "failed")
         [refusal] = self.refusals(t)
-        for part in ("@builder", OTHER, "not taken within 20 min (paused)", "ask it from this card"):
+        for part in ("@builder", OTHER, "paused", "ask it from this card"):
             self.assertIn(part, refusal["body"])
         self.assertEqual([x[:2] for x in self.turns], [("lead", REQUEST)])
 

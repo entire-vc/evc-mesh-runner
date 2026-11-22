@@ -312,6 +312,12 @@ class MeshClient:
     def me(self) -> dict:
         return self.request("GET", "/agents/me")
 
+    def report_runtime(self, fields: dict) -> None:
+        """The harness (``agent_type``) and ``model`` the agent runs on, on its profile. The heartbeat
+        route writes only these columns (PATCH /agents/me writes the whole row back from a snapshot and
+        could undo a concurrent presence update); ``model`` "" clears it."""
+        self.request("POST", "/agents/heartbeat", fields)
+
     def my_tasks(self, status_category: str) -> list[dict]:
         out: list[dict] = []
         page = 1
@@ -328,6 +334,11 @@ class MeshClient:
         """Decision requests (``ask_agent``) addressed to this agent in the workspace its key opened,
         oldest first. A Mesh without the route answers 404 (raised as MeshError)."""
         return _items(self.request("GET", "/agents/me/decision-requests", query={"state": state, "limit": limit}))
+
+    def answer_decision(self, request_id: str, answer: str, comment_id: str = "") -> dict:
+        """Record the addressee's desk reply through Mesh's normal answer/wake transaction."""
+        return self.request("POST", f"/decision-requests/{request_id}/answer", {"answer": answer},
+                            idem_key=write_key("desk-answer", request_id, comment_id))
 
     # -- tasks -------------------------------------------------------------------
     def task(self, task_id: str) -> dict:
@@ -435,6 +446,12 @@ class MeshClient:
             raise
         return out if isinstance(out, dict) else None
 
+    def wait_for(self, task_id: str, body: dict) -> dict:
+        """POST /tasks/:id/wait: declare a typed wait for this agent (the turn command ``wait_for``). Mesh
+        takes it only from the agent holding the card's live checkout and releases that checkout in the
+        same transaction; the answer is the turn result (``wait`` is the stored wait row)."""
+        return self.request("POST", f"/tasks/{task_id}/wait", body) or {}
+
     def wait_receipt(self, task_id: str, wait_id: str) -> dict:
         """Read this source card's exact wait, including a server resolution."""
         return self.request("GET", f"/tasks/{task_id}/wait", query={"wait_id": wait_id})
@@ -483,13 +500,16 @@ class MeshClient:
         return self._fenced("POST", task_id, f"/tasks/{task_id}/move", body)
 
     def session_report(self, task_id: str, tokens_in: int | None, tokens_out: int | None, model: str, cost: float | None,
-                       report_id: str = "") -> None:
+                       report_id: str = "", turn: dict | None = None) -> None:
         """Spend of one turn on the agent's Mesh record (POST /agents/me/sessions/report).
 
         ``report_id`` names the report (the turn it accounts for). It becomes the request's
         ``Idempotency-Key``: a repeat of the same report sends the same key, so a Mesh that honours
         it applies the report once; another report gets another key. A Mesh that does not know the
-        header ignores it."""
+        header ignores it.
+
+        ``turn`` holds the turn fields (turn_usage.turn_fields): sent only by a runner configured for a
+        Mesh that accepts them; its ``unknown`` names are added after the report's own."""
         # None is missing evidence, while an observed zero is a known value. Mesh's
         # unknown-measures contract keeps that distinction in its totals.
         # Keep the existing complete-report wire order for retries spanning an upgrade.
@@ -500,6 +520,10 @@ class MeshClient:
         unknown = [name for name in ("tokens_in", "tokens_out", "estimated_cost") if body[name] is None]
         for name in unknown:
             del body[name]
+        if turn:
+            extra = dict(turn)
+            unknown += [n for n in extra.pop("unknown", ()) or () if n not in unknown and n not in extra]
+            body.update({k: v for k, v in extra.items() if k not in body})
         if unknown:
             body["unknown"] = unknown
         if task_id:

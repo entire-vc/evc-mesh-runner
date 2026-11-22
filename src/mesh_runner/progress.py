@@ -32,15 +32,29 @@ _wait_clock = time.monotonic     # real waits keep real deadlines, whatever a te
 SLICE_SECONDS = 10.0             # longest single wait of a sliced subprocess wait between two beats
 
 
-def bind(callback: Callable[[], None] | None, interval: float) -> None:
+def bind(callback: Callable[[], None] | None, interval: float, *, eager: bool = False) -> None:
     """Start a tick on this thread. ``callback`` republishes the lane's row (None: steps are
-    still timed, nothing is published)."""
+    still timed, nothing is published). ``eager``: the lane has no row of its own yet, so
+    ``ready()`` publishes one at once instead of after ``interval``."""
     _local.callback = callback
     _local.interval = max(0.0, float(interval))
     _local.last = _local.started = _local.step_at = _clock()
     _local.step = "start"
     _local.steps = {}
     _local.busy = False
+    _local.eager = bool(eager)
+
+
+def ready() -> None:
+    """The lane has read what its row needs (its Mesh identity, which carries the cap). A tick
+    bound ``eager`` publishes the row now: the first beat would come only ``interval`` seconds
+    after the bind, and until then every reader of a just-started runner finds the lane without
+    cap, pause state and attempts, an unknown state. Once per bind; a no-op otherwise."""
+    if not bound() or not getattr(_local, "eager", False):
+        return
+    _local.eager = False
+    _local.last = float("-inf")
+    beat()
 
 
 def unbind() -> dict[str, float]:

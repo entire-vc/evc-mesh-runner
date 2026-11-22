@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mesh_runner.checkpoint import (SLIM_GIT_COMMANDS, SLIM_REASONS, SLIM_STAGES, Checkpoints, _copy,
-                                    _copy_file, _slim_failure_reason, fingerprint, manifest_digest,
+                                    _copy_file, _rmtree, _slim_failure_reason, fingerprint, manifest_digest,
                                     slim_failure_cause)
 from mesh_runner.cli import _checkpoint_pin_arg
 from mesh_runner.pool_ops import _bounded_rmtree
@@ -67,6 +67,77 @@ class CheckpointStorage(unittest.TestCase):
         self.assertEqual(fingerprint(target), expected)
         self.assertFalse((target / 'deleted').exists())
         self.assertEqual(git(target, 'show', ':README'), 'staged\0')
+
+    def _volumes(self, slot_volume: Path):
+        """Two fake volumes: everything under slot_volume, and the rest. clonefile() works only
+        inside one volume (EXDEV across), as APFS does; counts clones and refused clones."""
+        import ctypes
+        import errno
+        import shutil
+        from mesh_runner import checkpoint
+        ssd = os.path.realpath(slot_volume)
+        counts = {'cloned': 0, 'refused': 0}
+
+        def volume(path) -> str:
+            real = os.path.realpath(path)
+            return 'ssd' if real == ssd or real.startswith(ssd + os.sep) else 'data'
+
+        def clone(src: bytes, dst: bytes, flags: int) -> int:
+            src, dst = os.fsdecode(src), os.fsdecode(dst)
+            if volume(src) != volume(os.path.dirname(dst)) or os.path.lexists(dst):
+                counts['refused'] += 1
+                ctypes.set_errno(errno.EXDEV)
+                return -1
+            shutil.copyfile(src, dst)
+            counts['cloned'] += 1
+            return 0
+        # mock: the native clone API is a filesystem boundary; CI (Linux) has no clonefile at all.
+        return counts, (patch.object(checkpoint, '_clonefile', return_value=clone),
+                        patch.object(checkpoint, '_same_volume', lambda a, b: volume(a) == volume(b)))
+
+    def _slot_with_work(self, volume: Path) -> Path:
+        volume.mkdir()
+        source = make_repo(volume)
+        (source / 'README').write_text('changed\n')
+        (source / 'notes').mkdir()
+        for i in range(3):
+            (source / 'notes' / f'n{i}.txt').write_bytes(b'u' * 4096 * (i + 1))
+        return source
+
+    def test_store_on_another_volume_than_the_slot_copies_every_file(self):
+        # Known-broken control: store on Data, slots on the SSD -> every delta file is a byte copy.
+        ssd = self.root / 'ssd'
+        source = self._slot_with_work(ssd)
+        counts, (clonefile, same_volume) = self._volumes(ssd)
+        with clonefile, same_volume:
+            Checkpoints(self.root / 'data' / 'checkpoints' / 'Agent').create('crossvol', source, {})
+        self.assertEqual(counts['cloned'], 0)
+        self.assertGreaterEqual(counts['refused'], 4)
+
+    def test_store_linked_onto_the_slot_volume_clones_and_restores(self):
+        # pool_root/checkpoints is a link onto the slot volume; the owner level stays a real
+        # directory. Every delta file is a clone, none is copied, and the snapshot restores exactly.
+        ssd = self.root / 'ssd'
+        source = self._slot_with_work(ssd)
+        expected = fingerprint(source)
+        (ssd / 'checkpoints').mkdir()
+        pool_root = self.root / 'data' / 'worktrees'
+        pool_root.mkdir(parents=True)
+        (pool_root / 'checkpoints').symlink_to(ssd / 'checkpoints')
+        counts, (clonefile, same_volume) = self._volumes(ssd)
+        with clonefile, same_volume:
+            cp = Checkpoints(pool_root / 'checkpoints' / 'Agent')
+            path = cp.create('linked', source, {})
+            cloned_by_capture = counts['cloned']
+            cp.verify(path)
+            target = self.root / 'ssd' / 'target'; target.mkdir(); git(target, 'init', '--quiet')
+            cp.restore(path, target)
+        self.assertGreaterEqual(cloned_by_capture, 4)
+        self.assertEqual(counts['refused'], 0)
+        self.assertFalse((pool_root / 'checkpoints' / 'Agent').is_symlink())
+        self.assertEqual(path.parent, pool_root / 'checkpoints' / 'Agent')     # journal paths keep their prefix
+        self.assertEqual(manifest_digest(path), manifest_digest(ssd / 'checkpoints' / 'Agent' / 'linked'))
+        self.assertEqual(fingerprint(target), expected)
 
     def test_real_slim_failure_is_classified_without_exception_details(self):
         source = make_repo(self.root)
@@ -148,6 +219,19 @@ class CheckpointStorage(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
                 _checkpoint_pin_arg(value)
         self.assertEqual(_checkpoint_pin_arg('id:'+'a'*64), ('id', 'a'*64))
+
+    def test_checkpoint_cleanup_readonly_tree_never_follows_symlinks(self):
+        outside = self.root / 'outside'; outside.mkdir(); (outside / 'keep').write_text('safe')
+        trash = self.root / 'trash'; trash.mkdir(); nested = trash / 'readonly'; nested.mkdir()
+        (nested / 'payload').write_text('remove'); (nested / 'link').symlink_to(outside, target_is_directory=True)
+        nested.chmod(0o555); trash.chmod(0o555)
+        try:
+            _rmtree(trash)
+            self.assertFalse(trash.exists()); self.assertEqual((outside / 'keep').read_text(), 'safe')
+        finally:
+            for path in (nested, trash):
+                if os.path.lexists(path):
+                    path.chmod(0o755)
 
     def test_bounded_cleanup_readonly_tree_never_follows_symlinks(self):
         outside = self.root / 'outside'; outside.mkdir(); (outside / 'keep').write_text('safe')
