@@ -198,6 +198,13 @@ def _path(value: str | None) -> Path | None:
     return Path(os.path.expandvars(os.path.expanduser(value))) if value else None
 
 
+def _gate_implementation_files(value) -> list[Path]:
+    if not isinstance(value, list) or len(value) > 64 or any(
+            not isinstance(v, str) or not v or "\0" in v or not _path(v).is_absolute() for v in value):
+        raise ConfigError("start_gate_implementation_files must be a list of at most 64 absolute file paths")
+    return [_path(v) for v in value]
+
+
 def _basic_auth(r: dict) -> str:
     if not r.get("basic_auth_file"):
         return ""
@@ -258,6 +265,7 @@ class AgentConfig:
     on_limit_command: list[str] = field(default_factory=list)  # run on a provider limit; exit 0 = switched
     on_auth_command: list[str] = field(default_factory=list)  # exact auth hold; exit 0 = routed, never clears hold
     start_gate_command: list[str] = field(default_factory=list)  # before a start/resume: 0 go, 75 hold
+    start_gate_implementation_files: list[Path] = field(default_factory=list)
     turn_end_command: list[str] = field(default_factory=list)    # after every turn, with the gate's output
     launch_probe_command: list[str] = field(default_factory=list)  # Codex launch-context probe helper (stdin protocol)
     launch_probe_version: int = 1                                  # 2 = opt-in: reply also carries used percents
@@ -1093,6 +1101,7 @@ def load(path: str | Path) -> RunnerConfig:
             on_limit_command=list(a.get("on_limit_command") or []),
             on_auth_command=list(a.get("on_auth_command") or []),
             start_gate_command=list(a.get("start_gate_command") or []),
+            start_gate_implementation_files=_gate_implementation_files(a.get("start_gate_implementation_files", [])),
             turn_end_command=list(a.get("turn_end_command") or []),
             launch_probe_command=list(a.get("launch_probe_command") or []),
             launch_probe_version=_probe_version(a.get("launch_probe_version", 1), a["name"]),
