@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.117 — 2026-11-22
+
+- Recheck cached start-gate refusals when explicitly declared installed hook or helper bytes change, while preserving full gate and checkout admission.
+
 ## 0.2.116 — 2026-11-21
 
 - **Follow card waits that name only a short id.** The wait-root radar resolves the

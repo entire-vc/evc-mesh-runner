@@ -25,9 +25,9 @@ Runs Claude Code and Codex agents on their [Mesh](https://github.com/entire-vc/e
   rules. The runner schedules work, isolates checkouts and coordinates the
   turn, review and merge lifecycle.
 
-Status: actively developed, 0.2 release series. Current release: **0.2.115**
-([package metadata](pyproject.toml)). Python ≥ 3.11; the core uses the standard
-library, with optional dependencies for signed receipts.
+Status: actively developed, **0.2.x** release series. For the exact version of this
+checkout, see [package metadata](pyproject.toml). Python ≥ 3.11; the core uses the
+standard library, with optional dependencies for signed receipts.
 
 ## How it works
 
@@ -731,9 +731,18 @@ Optional hooks per agent:
   `HOLD_WAKE_SIG=<what the gate read there before deciding>` (`[A-Za-z0-9_.:-]`,
   at most 128; `absent` for a missing or empty file). The hold then ends on the
   first tick at which the file's first line reads differently, or on an update of
-  the task, and otherwise lasts two hours; nothing else re-asks the gate. The pair
+  the task, and otherwise lasts two hours. The pair
   is never part of the public reason. A missing, relative or malformed pair keeps
   the ordinary task hold; an unreadable file is no event.
+  `start_gate_implementation_files = ["/opt/gate.py", "/opt/gate_helper.py"]`
+  optionally declares the installed hook and all helpers whose changes require
+  a recheck. The Runner fingerprints their actual bytes before a refused
+  `reserve`/`admit` call. Changed bytes make that task's cached refusal stale on
+  the next ordinary cycle; the full gate and checkout admission still run.
+  Unchanged bytes or an unreadable file keep the hold. With an empty list
+  (the default), implementation changes do not trigger rechecks. List absolute
+  paths (home/environment expansion is supported), including imported helpers;
+  source checkout revisions and mtimes are not implementation evidence.
   Chat starts use a separate `transport` phase (15-second hook timeout), with
   empty task/attempt and mode `chat`. It must check only transport, without
   reserving capacity or reading a task. Any refusal leaves a standing pane

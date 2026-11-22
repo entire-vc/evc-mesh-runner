@@ -771,6 +771,7 @@ class AgentRunner:
         self.ramp = StartRamp(cfg.host_ramp_start_interval_seconds, cfg.host_ramp_seconds,
                               (self.memgate, self.loadgate))
         self._gate_hold: dict[str, tuple[str, float]] = {}    # task -> (reason, until) from the start gate
+        self._gate_implementations: dict[str, str] = {}      # bytes observed before the refused hook ran
         self._agent_gate_hold: tuple[str, float, str] | None = None
         self._gate_failures: dict[tuple[str, str], int] = {}
         self._launch_obs: dict[str, tuple[str, float, launch_probe.Observation]] = {}   # task -> early candidate observation
@@ -11802,8 +11803,13 @@ class AgentRunner:
         hook_env = self._hook_env(task_id, mode, phase, attempt, gate)
         if quota_required:
             hook_env["MESH_RUNNER_REQUIRE_ACCOUNT_CAPACITY"] = "1"
+        implementation = self._gate_implementation() if phase in ("reserve", "admit") else None
         rc, out, err = self._run_hook(self.agent.start_gate_command,
                                       hook_env, timeout=15 if phase == "transport" else 120)
+        if phase in ("reserve", "admit"):
+            self._gate_implementations.pop(task_id, None)
+            if rc != 0 and implementation is not None:
+                self._gate_implementations[task_id] = implementation
         if rc == 0:
             fresh = self._kv(out)
             gate.update(fresh)
@@ -12039,6 +12045,7 @@ class AgentRunner:
     def _clear_agent_gate_hold(self) -> None:
         if self._agent_gate_hold:
             self._gate_hold.pop(self._agent_gate_hold[2], None)
+            self._gate_implementations.pop(self._agent_gate_hold[2], None)
         self._agent_gate_hold = None
         self._gate_failures.clear()
 
@@ -12046,6 +12053,7 @@ class AgentRunner:
         """The slot refusal that asked for overflow held this card (and, without account capacity,
         the lane): the overflow feed that follows at once asks the gate anew."""
         self._gate_hold.pop(task_id, None)
+        self._gate_implementations.pop(task_id, None)
         if self._agent_gate_hold and self._agent_gate_hold[2] == task_id:
             self._clear_agent_gate_hold()
 
@@ -12076,17 +12084,44 @@ class AgentRunner:
         if self._agent_gate_hold and self._hold_route is not None and self._hold_route != self._routed_harness:
             self.invalidate_capacity_holds("route changed")
 
+    def _gate_implementation(self) -> str | None:
+        """Fingerprint the operator-declared installed hook and helpers; unreadable is no event.
+
+        Sample before execution: a concurrent install must not label an old verdict with new bytes.
+        No import inference, source-repository revision or mtime stands in for the consumed files.
+        """
+        paths = self.agent.start_gate_implementation_files
+        if not paths:
+            return None
+        digest = hashlib.sha256(json.dumps(self.agent.start_gate_command).encode())
+        try:
+            for path in paths:
+                file_hash = hashlib.sha256()
+                with Path(path).open("rb") as stream:
+                    while chunk := stream.read(65536):
+                        file_hash.update(chunk)
+                digest.update(json.dumps([str(path), file_hash.hexdigest()]).encode())
+        except (OSError, ValueError):
+            return None
+        return digest.hexdigest()
+
     def _gate_event(self, task: dict) -> None:
-        """An update of the refused task, or a write to the wake file its hold waits on, lifts its
-        cached gate for a fresh decision."""
+        """Task, declared wake or installed implementation changes recheck the full gate."""
         held = self._gate_hold.get(task["id"])
-        if not (held and len(held) >= 3):
+        if not held:
             return
+        previous = self._gate_implementations.get(task["id"])
+        current = self._gate_implementation() if previous is not None else None
+        changed = current is not None and current != previous
         woke = len(held) >= 4 and bool(held[3]) and read_hold_wake(held[3][0]) not in (None, held[3][1])
         if woke:
             log.info("%s: #%s start hold lifted: its wake file changed", self.agent.name, task["id"][:8])
-        if woke or held[2] != (task.get("updated_at") or ""):
+        if changed:
+            log.info("%s: #%s start hold stale: installed gate implementation changed; rechecking",
+                     self.agent.name, task["id"][:8])
+        if changed or woke or (len(held) >= 3 and held[2] != (task.get("updated_at") or "")):
             self._gate_hold.pop(task["id"], None)
+            self._gate_implementations.pop(task["id"], None)
             if self._agent_gate_hold and self._agent_gate_hold[2] == task["id"]:
                 self._clear_agent_gate_hold()
 
