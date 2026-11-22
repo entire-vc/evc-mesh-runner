@@ -456,10 +456,13 @@ class Store:
                                    (attempt_id,)).fetchone()[0])
 
     def outage_lanes(self, since: "dt.datetime") -> int:
-        """Agents with a provider-outage turn since ``since``."""
+        """Agents with a provider-outage turn since ``since``. A host egress failure of one harness
+        (``egress_outage`` beside it, same turn) is no provider outage: it never pauses other lanes."""
         return int(self.db.execute(
             "SELECT COUNT(DISTINCT attempts.agent) FROM events JOIN attempts ON attempts.id=events.attempt "
-            "WHERE events.kind='provider_outage' AND events.at>=?", (iso(since),)).fetchone()[0])
+            "WHERE events.kind='provider_outage' AND events.at>=? AND NOT EXISTS (SELECT 1 FROM events e2 "
+            "WHERE e2.attempt=events.attempt AND e2.kind='egress_outage' AND e2.detail=events.detail)",
+            (iso(since),)).fetchone()[0])
 
     def starts_today(self, agent: str, task_id: str) -> int:
         """Attempts this agent began on this task since UTC midnight that ran at least

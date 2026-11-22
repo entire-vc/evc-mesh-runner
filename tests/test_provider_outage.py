@@ -125,6 +125,36 @@ class ProviderOutage(Loop):
         self.assertTrue(r._outage_paused())
         self.assertEqual(r.start_new(1), 1)
 
+    def egress_refused(self, r, t, turns=1):
+        """An agy turn the Google egress wrapper refused (exit 69, its stderr line, no stream)."""
+        from mesh_runner.adapters.agy import AgyAdapter
+        r.alt_adapters = {"agy": AgyAdapter(admission_commands=[["true"]])}
+        r.refresh_me()
+        a = r.store.create(self.agent.name, t["id"], "agy")
+        path = self.root / f"{a.id}-egress.jsonl"
+        path.write_text("")
+        path.with_suffix(".stderr").write_text("Google egress: proxy-unavailable; launch refused (egress route required).\n")
+        r.store.update(a, state="running", turns=turns, log_path=str(path))
+        r.settle(r.store.get(a.id))
+        return r.store.get(a.id)
+
+    def test_agy_egress_refusal_is_retried_and_never_pauses_other_lanes(self):
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        self.cfg.max_turns = 1
+        self.agent.alt = {"agy": {}}
+        r = self.runner(mesh)
+        for lane in ("A", "B", "C"):                 # other agy lanes whose egress is down too
+            a = r.store.create(lane, f"task-{lane}", "agy")
+            r.store.event(a.id, "provider_outage", "1")
+            r.store.event(a.id, "egress_outage", "1")
+        a = self.egress_refused(r, t)
+        self.assertEqual(a.state, "ready")              # retried, not a failed turn or a turn-cap give-up
+        self.assertEqual(mesh.comment_log, {})
+        self.assertGreater(r._resume_hold[a.id], time.monotonic())
+        self.assertFalse(r.store.mark(self.agent.name, t["id"], "quota_admission_required"))
+        self.assertFalse(r._outage_paused())
+
 
 if __name__ == "__main__":
     unittest.main()

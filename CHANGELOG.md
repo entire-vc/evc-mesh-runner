@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.121 — 2026-11-22
+
+- Add the agy harness for Google Antigravity CLI in print mode, with resumable conversations, explicit session permissions, Mesh MCP filtering and admission commands before every start.
+- Retry an egress refusal for the affected lane without treating it as a quota or pausing other lanes.
+
 ## 0.2.120 — 2026-11-22
 
 - Hold a provider-limited task until its quota resets when no switch target is available, preserving its checkpoint and allowing other tasks to run.

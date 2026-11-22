@@ -36,10 +36,11 @@ BILLING_MODES = ("subscription", "api")
 _MODEL_PROVIDERS = ((re.compile(r"claude|anthropic"), "anthropic"),
                     (re.compile(r"(^|/)(gpt|o[0-9]|codex|chatgpt|openai)"), "openai"),
                     (re.compile(r"kimi|moonshot"), "moonshot"),
-                    (re.compile(r"glm|zhipu|z-ai|zai/"), "zai"))
+                    (re.compile(r"glm|zhipu|z-ai|zai/"), "zai"),
+                    (re.compile(r"gemini|google/"), "google"))
 # Harnesses that talk to one provider only. The Claude harness is not one: its endpoint may serve
 # another provider's model, so a Claude turn without a recognisable model has no provider.
-_HARNESS_PROVIDERS = {"codex": "openai", "kimi": "moonshot", "zcode": "zai"}
+_HARNESS_PROVIDERS = {"codex": "openai", "kimi": "moonshot", "zcode": "zai", "agy": "google"}
 # Anthropic API keys are the only API route of the runner (api_mode.py).
 API_ROUTE_PROVIDER = "anthropic"
 # A file's mtime comes from the kernel's coarse clock, a tick behind the wall clock the launch record
