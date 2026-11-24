@@ -240,6 +240,35 @@ if os.environ.get("FAKE_TRUST"):                # Claude's first-run question, "
             break
         if key.endswith(b"B"):
             choice = 1
+if kind == "claude" and os.environ.get("FAKE_ADD_DIR_MENU"):
+    # Claude Code 2.1.330: one question per --add-dir of an untrusted repository, "No, exit" preselected,
+    # the path wrapped mid-token at the pane width; FAKE_MENU_LAG: the next menu is drawn late
+    dirs = [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
+    for n, d in enumerate(dirs):
+        choice = 0
+        while True:
+            body = ["Adding a new directory:", d[:30], d[30:]]
+            if n % 2 == 0:
+                repo = d.rsplit("/", 1)[0] + ".git"
+                body += ["This directory is part of the repository at " + repo[:20], repo[20:] +
+                         ". Trusting it trusts that whole repository, including",
+                         "its other worktrees and subdirectories."]
+            body += ["This session hasn't worked here before. Is this a directory you created or one you trust?",
+                     "Security guide"]
+            sys.stdout.write("\x1b[2J\x1b[H" + "".join(" %s\r\n" % x for x in body))
+            for i, o in enumerate(["No, exit", "Yes, add it"]):
+                sys.stdout.write((" ❯ " if i == choice else "   ") + o + "\r\n")
+            sys.stdout.write(" Enter to confirm · Esc to cancel\r\n")
+            sys.stdout.flush()
+            key = os.read(fd, 8)
+            if key in (b"\r", b"\n"):
+                if choice == 0:
+                    sys.exit(1)
+                time.sleep(float(os.environ.get("FAKE_MENU_LAG", "0")))
+                break
+            if key.endswith(b"B"):
+                choice = 1
+    sys.stdout.write("\x1b[2J\x1b[H"); sys.stdout.flush()   # the answered menu leaves the screen
 if kind == "claude" and "--resume" in args and os.environ.get("FAKE_HISTORY"):
     # a resumed session draws its history: here it ends with the limit notice of the account it last ran on
     sys.stdout.write("\r\n> earlier prompt\r\n" + os.environ["FAKE_HISTORY"] + "\r\n")
@@ -332,9 +361,9 @@ class DriverTurns(unittest.TestCase):
         subprocess.run([TMUX, "-L", self.sock, "kill-server"], capture_output=True)
         self.tmp.cleanup()
 
-    def driver(self, kind, key="att-1", sid="", mode="start", kw=None, **env):
+    def driver(self, kind, key="att-1", sid="", mode="start", kw=None, extra=(), **env):
         kw = kw or {}
-        argv = [str(self.fake)]
+        argv = [str(self.fake), *extra]
         if kind == "claude":
             argv += ["--resume" if mode == "resume" else "--session-id", sid]
         elif mode == "resume" and sid:
@@ -470,6 +499,28 @@ class DriverTurns(unittest.TestCase):
         d, out = self.driver("claude", sid="s-1", FAKE_TRUST="1")
         self.assertEqual(d.run("hello"), 0, out.getvalue()[-400:])
         self.assertFalse(self.events(out)[-1]["is_error"])
+
+    def add_dirs(self, n):
+        return [x for i in range(n) for x in ("--add-dir", f"/fleet/worktrees/Lane/repo-{i}/slot-{i}")]
+
+    def test_claude_add_dir_trust_question_per_repository_is_answered_yes(self):
+        # five untrusted repositories, each its own menu drawn late: the start-up limit counts menus,
+        # not keys, and a stale screen never gets a second Enter that lands on the next menu's "No, exit"
+        d, out = self.driver("claude", sid="s-1", extra=self.add_dirs(5), FAKE_ADD_DIR_MENU="1",
+                             FAKE_MENU_LAG="0.8")
+        self.assertEqual(d.run("hello"), 0, out.getvalue()[-400:])
+        self.assertFalse(self.events(out)[-1]["is_error"])
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_start_up_menus_past_the_limit_name_the_menu_left_open(self):
+        d, out = self.driver("claude", sid="s-1", extra=self.add_dirs(4), FAKE_ADD_DIR_MENU="1")
+        d.t["startup_menus"] = 2
+        self.assertEqual(d.run("hello"), 1)
+        msg = self.events(out)[-1]["result"]
+        self.assertTrue(msg.startswith("interactive session did not become ready: "), msg)
+        self.assertIn("Adding a new directory: /fleet/worktrees/Lane/repo-2/slot-2", msg)
+        self.assertIn("No, exit", msg)
+        self.assertIn("Yes, add it", msg)
 
     def test_codex_side_task_notification_is_not_the_turn(self):
         d, out = self.driver("codex", FAKE_TITLE="1")
@@ -1265,6 +1316,52 @@ class DriverTurns(unittest.TestCase):
         self.assertEqual(set(closed), {"closed", "idle", "longwait"})
         self.assertEqual(set(self.tmux.windows(interactive.session_name("builder"))), {"running", "cimr"})
         self.assertFalse(interactive.meta_path(self.state, "closed").exists())
+
+
+# Claude Code 2.1.330, captured 24.11 at 120 columns: --add-dir of a worktree of a bare repository
+ADD_DIR_SCREEN = """\
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Adding a new directory:
+ /Volumes/fleet/mesh-runner/worktrees/Lane/evc-mesh-runner/slot-22/a/very/long/path/that/wraps/at/the/pane/widt
+ h/x
+ This directory is part of the repository at /Volumes/fleet/mesh-runner/repos/evc-mesh-runner/a/very/long/path/that/wrap
+ s/at/the/pane/width.git. Trusting it trusts that whole repository, including
+ its other worktrees and subdirectories.
+ This session hasn't worked here before. Is this a directory you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here. Its skills, commands, and agents load and can run
+ commands, and so can the git settings of its repository. Your answer holds for this session. Starting Claude Code in
+ this directory and trusting it there lasts, and covers its whole repository or everything below it.
+ Security guide
+ ❯ No, exit
+   Yes, add it
+ Enter to confirm · Esc to cancel
+"""
+
+
+class StartupMenus(unittest.TestCase):
+    def test_add_dir_menu_is_a_trust_question_named_by_its_directory(self):
+        self.assertTrue(tui_driver.TRUST_RE.search(ADD_DIR_SCREEN))
+        self.assertEqual(tui_driver.describe_menu(ADD_DIR_SCREEN),
+                         "Adding a new directory: /Volumes/fleet/mesh-runner/worktrees/Lane/evc-mesh-runner/slot-22"
+                         "/a/very/long/path/that/wraps/at/the/pane/width/x (repository /Volumes/fleet/mesh-runner/repos"
+                         "/evc-mesh-runner/a/very/long/path/that/wraps/at/the/pane/width.git); "
+                         "options: [No, exit] | Yes, add it")
+
+    def test_a_cursor_move_keeps_the_menu_identity_another_directory_does_not(self):
+        moved = ADD_DIR_SCREEN.replace(" ❯ No, exit\n   Yes, add it", "   No, exit\n ❯ Yes, add it")
+        self.assertNotEqual(moved, ADD_DIR_SCREEN)
+        self.assertEqual(tui_driver.menu_identity(moved), tui_driver.menu_identity(ADD_DIR_SCREEN))
+        other = ADD_DIR_SCREEN.replace("slot-22", "slot-23")
+        self.assertNotEqual(tui_driver.menu_identity(other), tui_driver.menu_identity(ADD_DIR_SCREEN))
+
+    def test_answer_picks_yes_add_it_like_yes_trust_this_folder(self):
+        sent = []
+        d = Driver.__new__(Driver)
+        d.tmux, d.target, d.sleep = mock.Mock(), "t", lambda s: None
+        d.tmux.run.side_effect = lambda *a: sent.append(a[-1])
+        d.answer_menu(ADD_DIR_SCREEN)
+        d.answer_menu(ADD_DIR_SCREEN.replace(" ❯ No, exit\n   Yes, add it", "   No, exit\n ❯ Yes, add it"))
+        self.assertEqual(sent, ["Down", "Enter"])
 
 
 class AdapterAndConfig(unittest.TestCase):
