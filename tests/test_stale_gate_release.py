@@ -10,6 +10,9 @@ own resumes from asking the gate again, and the lane stood.
 The unsent path now releases the gate like every other end of a turn, and each tick releases a gate
 still held by an attempt that has no turn (ready or waiting, no process): the slots stranded before this
 fix are freed by the fix itself.
+
+A confirmed unsent release also lifts the lane-wide capacity hold, like an ordinary turn end: before, the
+hold outlived the freed slot and the next card of the same identity waited out the hold's backoff.
 """
 import hashlib
 import json
@@ -110,6 +113,47 @@ class StaleGate(Bench):
             self.r._reconcile_interactive_prompt(a)
         self.assertEqual(self.r.store.get(a.id).state, "ready")
         self.assertEqual([p["gate"]["RES_ID"] for p in self.pending()], ["res-stale"])
+
+    def test_an_unsent_turn_lifts_the_lane_capacity_hold_for_the_next_card(self):
+        # a lane at its identity cap: the gate refused capacity and held the whole lane; the unsent
+        # end gives the slot back, so the next card of the same identity asks the gate at once
+        # instead of waiting out the hold's backoff
+        a = self.unsent_turn()
+        with patch.object(self.r, "_run_hook", return_value=(75, "HOLD_REASON_CODE=capacity", "")):
+            reason, _ = self.r._gate("reserve", "next-card", "work")
+        self.assertTrue(reason)
+        with patch.object(self.r, "_run_hook", side_effect=self.hook):
+            self.r._reconcile_interactive_prompt(a)
+            self.assertEqual(self.r._gate("reserve", "next-card", "work")[0], "")
+        # the slot went back first, then the gate itself was asked: the hold lifted, nothing bypassed it
+        self.assertEqual([h[0] for h in self.hooks], ["end", "reserve"])
+        self.assertEqual(self.hooks[0], ("end", "res-stale", "21", "pre-send-unsent"))
+
+    def assert_unsent_release_keeps_the_hold(self, end):
+        # the reservation stays pending, so the slot is not back and the lane stays held
+        a = self.unsent_turn()
+        with patch.object(self.r, "_run_hook", return_value=(75, "HOLD_REASON_CODE=capacity", "")):
+            self.r._gate("reserve", "next-card", "work")
+        with patch.object(self.r, "_run_hook", return_value=end):
+            self.r._reconcile_interactive_prompt(a)
+        self.assertEqual([p["gate"]["RES_ID"] for p in self.pending()], ["res-stale"])
+        with patch.object(self.r, "_run_hook", side_effect=self.hook):
+            self.assertTrue(self.r._gate("reserve", "next-card", "work")[0])
+        self.assertEqual(self.hooks, [])                 # held: the gate is not asked again
+
+    def test_a_failed_unsent_release_keeps_the_lane_capacity_hold(self):
+        self.assert_unsent_release_keeps_the_hold((1, "", "transport"))
+
+    def test_an_unsent_release_without_confirmation_keeps_the_lane_capacity_hold(self):
+        self.assert_unsent_release_keeps_the_hold((0, "", ""))   # exit 0, no RELEASE_CONFIRMED=1
+
+    def test_a_turn_end_without_a_reservation_lifts_the_hold_on_exit_zero(self):
+        # no server reservation (require_confirmation=False): exit 0 is the release
+        with patch.object(self.r, "_run_hook", return_value=(75, "HOLD_REASON_CODE=capacity", "")):
+            self.r._gate("reserve", "next-card", "work")
+        with patch.object(self.r, "_run_hook", return_value=(0, "", "")):
+            self.assertTrue(self.r._turn_end(self.t["id"], "work", None, {"RES_BACKEND": "local"}, "turn-end"))
+        self.assertIsNone(self.r._agent_gate_hold)
 
     # ------------------------------------------------------------- slots stranded before the fix
 

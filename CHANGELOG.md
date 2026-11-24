@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.125 — 2026-11-24
+
+- **An interactive Claude session answers one trust question per untrusted `--add-dir` repository.**
+  Claude Code 2.1.330 asks "Adding a new directory … Yes, add it" for every added directory whose
+  repository was never trusted. The start-up limit now counts menus (one per `--add-dir` plus three),
+  not keys, so a lane with many repositories becomes ready; a screen not yet redrawn after a key gets
+  no second key, so an Enter never lands on the next menu's preselected "No, exit". A start that
+  still fails names the menu left open (its directory, repository and options) instead of a cut
+  screen tail.
+- **A turn whose prompt was never sent lifts the lane's capacity hold.** A confirmed release on the
+  unsent end of a turn (`prompt_unsent_reconciled`) now clears the lane-wide capacity hold like an
+  ordinary turn end, so the next card of the same identity asks the start gate at once instead of
+  waiting out the hold's backoff (2-10 min) behind a slot that was already free.
+
 ## 0.2.124 — 2026-11-24
 
 - **A turn whose prompt was never sent gives its capacity reservation back.** The unsent end of a

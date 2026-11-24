@@ -136,6 +136,10 @@ RELEASE_PENDING = "release_pending"     # store mark: the lease of a release who
 # Mesh recorded after that settle (an interactive session that went on by itself) belongs to that turn.
 NO_OUTCOME_WINDOW = "no_outcome_window"
 RELEASE_RETRY_SECONDS = (30, 120, 300)  # backoff between retries of a pending release; the last step repeats
+# turn ends whose writer gave its capacity back: the lane-wide capacity hold is lifted at once, so
+# the next card of the same identity asks the gate again instead of waiting out the hold's backoff.
+# An unsent end (the prompt never pasted, the writer gone) frees its slot like an ordinary turn end.
+CAPACITY_RELEASING_OUTCOMES = ("turn-end", "pre-send-unsent")
 GATE_RELEASE_PENDING = "gate_release_pending"   # store mark: a gate reservation whose release was not confirmed
 GATE_RELEASE_WARN = 24 * 3600           # a gate release unconfirmed this long is reported (once a day); never dropped
 TURN_CAP_WINDOW = 10                # turn cap: how many recent outcomes are looked at for progress
@@ -12038,7 +12042,9 @@ class AgentRunner:
         env = self._hook_env(task_id, mode, "end", attempt, gate)
         env["MESH_RUNNER_OUTCOME"] = outcome
         rc, out, err = self._run_hook(self.agent.turn_end_command, env, timeout=60)
-        if (rc == 0 and outcome == "turn-end" and self._agent_gate_hold
+        # a reservation is released only when the hook confirms it; until then it stays pending
+        confirmed = rc == 0 and (not require_confirmation or self._kv(out).get("RELEASE_CONFIRMED") == "1")
+        if (confirmed and outcome in CAPACITY_RELEASING_OUTCOMES and self._agent_gate_hold
                 and self._agent_gate_hold[0] == GATE_PUBLIC_REASONS["capacity"]):
             # A local writer released real capacity: ask the gate again, never
             # treat the event itself as authorization to start another writer.
@@ -12046,7 +12052,7 @@ class AgentRunner:
         if rc != 0:
             log.warning("%s: turn-end hook #%s rc=%s: %s", self.agent.name, task_id[:8], rc,
                         (err or out).strip()[:200])
-        return rc == 0 and (not require_confirmation or self._kv(out).get("RELEASE_CONFIRMED") == "1")
+        return confirmed
 
     def _remember_gate(self, a: Attempt, gate: dict) -> None:
         stale = self.store.mark(self.agent.name, a.task_id, "gate")

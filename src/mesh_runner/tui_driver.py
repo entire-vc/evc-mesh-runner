@@ -81,7 +81,15 @@ CODEX_READY_RE = re.compile(r"(ask codex to do anything|\? for shortcuts)", re.I
 CODEX_STARTUP_RE = re.compile(r"waiting for startup", re.I)
 CODEX_RESUMING_RE = re.compile(r"resuming session", re.I)
 STARTUP_TAIL_LINES = 8         # the markers count in the last lines only: older text may quote them
-TRUST_RE = re.compile(r"trust this folder|do you trust the files|one you trust", re.I)
+# Claude Code 2.1.330 also asks once per --add-dir whose repository was never trusted ("Adding a new
+# directory: <path> ... This directory is part of the repository at <repo>. Trusting it trusts that whole
+# repository ..." with "No, exit" preselected and "Yes, add it"): one menu per untrusted repository
+TRUST_RE = re.compile(r"trust this folder|do you trust the files|one you trust|adding a new directory", re.I)
+ADD_DIR_RE = re.compile(r"adding a new directory:?", re.I)
+# start-up menus a session may show besides one per --add-dir (folder trust, update, one spare)
+STARTUP_MENUS = 3
+# keys one menu may take (Down to the wanted option, Enter, a lost key resent) before it counts as stuck
+STARTUP_MENU_KEYS = 4
 UPDATE_RE = re.compile(r"update available|update now|new version", re.I)
 # Codex exits with status 1 when its own account check times out during start-up
 # ("account/read failed during TUI bootstrap: ... workspace routing discovery timed out").
@@ -264,6 +272,51 @@ def limit_notice(text: str) -> str:
         if NATIVE_LIMIT_NOTICE_RE.search(line):
             return line[:300]
     return ""
+
+
+def menu_identity(text: str) -> str:
+    """One start-up menu whatever option the cursor is on: the screen without the cursor glyph and
+    without line breaks (a path wraps mid-token at the pane width)."""
+    out = []
+    for line in text.splitlines():
+        m = CURSOR_RE.match(line)
+        out.append((m.group(1) if m else line).strip())
+    return "".join(out)
+
+
+def describe_menu(text: str) -> str:
+    """Which start-up menu is open, for a failed start: its question (the directory and repository of
+    an --add-dir question, its wrapped lines joined) and its options, the selected one marked."""
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    head = ""
+    add = next((i for i, x in enumerate(lines) if ADD_DIR_RE.match(x)), None)
+    if add is not None:
+        path, j = ADD_DIR_RE.sub("", lines[add]).strip(), add + 1
+        while j < len(lines) and not lines[j].startswith("This ") and not CURSOR_RE.match(lines[j]):
+            path += lines[j]
+            j += 1
+        head = "Adding a new directory: " + path
+        repo = re.search(r"part of the repository at (\S+?)\.(?:\s|$)", "".join(lines[j:j + 4]))
+        if repo:
+            head += f" (repository {repo.group(1)})"
+    else:
+        head = next((x for x in lines if TRUST_RE.search(x) or UPDATE_RE.search(x)), "")
+    cur = next((i for i, x in enumerate(lines) if CURSOR_RE.match(x)), None)
+    opts = []
+    if cur is not None:
+        lo = cur
+        while lo > 0 and cur - lo < 5 and len(lines[lo - 1]) <= 60 and not TRUST_RE.search(lines[lo - 1]) \
+                and not lines[lo - 1].lower().startswith(("security guide", "this ")):
+            lo -= 1
+        hi = cur
+        while hi + 1 < len(lines) and hi - lo < 5 and len(lines[hi + 1]) <= 60 \
+                and not re.search(r"enter to confirm|esc to", lines[hi + 1], re.I):
+            hi += 1
+        for x in lines[lo:hi + 1]:
+            m = CURSOR_RE.match(x)
+            opts.append(f"[{m.group(1).strip()}]" if m else x)
+    out = head + ("; options: " + " | ".join(opts) if opts else "")
+    return (out or "unrecognised menu")[:600]
 
 
 class DriverError(Exception):
@@ -940,7 +993,10 @@ class Driver:
 
     def wait_ready(self) -> None:
         deadline = self.clock() + self.t["ready"]
-        answered = 0
+        # the limit counts menus, not keys: every untrusted --add-dir repository brings its own menu
+        limit = self.t.get("startup_menus") or STARTUP_MENUS + self.argv.count("--add-dir")
+        keys: dict[str, int] = {}                        # menu identity -> keys sent to it
+        keyed, keyed_at = None, 0.0                      # the screen a key last went to, and when
         last_screen = None
         while self.clock() < deadline:
             self.check_cancel()
@@ -967,10 +1023,29 @@ class Driver:
                 last_screen = text
                 self.sleep(self.t["poll"])
                 continue
-            if menu and answered < 6:                    # startup questions: trust yes, update skip
+            if menu:                                     # startup questions: trust yes, update skip
+                # a screen our key has not redrawn yet gets no second key: after Enter the next menu
+                # opens on "No, exit", and an Enter meant for this one would land there; a key lost
+                # before the TUI read it is sent again once the screen stood still for menu_settle
+                if text == keyed and self.clock() - keyed_at < self.t.get("menu_settle", 5.0):
+                    self.sleep(self.t["poll"])
+                    continue
+                ident = menu_identity(text)
+                if ident not in keys and len(keys) >= limit:
+                    raise DriverError(f"interactive session did not become ready: start-up menu {len(keys) + 1} "
+                                      f"is past the limit of {limit}: " + describe_menu(text), close=True)
+                if keys.get(ident, 0) >= STARTUP_MENU_KEYS:
+                    raise DriverError("interactive session did not become ready: start-up menu still open after "
+                                      f"{STARTUP_MENU_KEYS} keys: " + describe_menu(text), close=True)
+                keys[ident] = keys.get(ident, 0) + 1
                 self.answer_menu(text)
-                answered += 1
+                keyed, keyed_at = text, self.clock()
             self.sleep(self.t["poll"])
+        text = self.screen()
+        if TRUST_RE.search(text) or (self.harness == "codex" and UPDATE_RE.search(text)
+                                     and not CODEX_READY_RE.search(text)):
+            raise DriverError("interactive session did not become ready: start-up menu left open: "
+                              + describe_menu(text), close=True)
         raise DriverError("interactive session did not become ready: " + self.tail(), close=True)
 
     def answer_menu(self, text: str) -> None:
