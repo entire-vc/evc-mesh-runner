@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.124 — 2026-11-24
+
+- **A turn whose prompt was never sent gives its capacity reservation back.** The unsent end of a
+  turn (native process gone, attempt back to `ready`) released the start gate's reservation only
+  for a quota refusal; otherwise the consumed server slot outlived the turn. Enough of them filled a
+  lane's identity cap, every admit was refused `identity_cap_reached` and the lane stood. Each tick
+  now also releases a gate still held by a ready or waiting attempt with no process (log line
+  `attempt without a process held a gate reservation; releasing it`), which frees slots stranded
+  before this change; an unconfirmed release stays pending and is retried.
+
 ## 0.2.123 — 2026-11-22
 
 - **A git killed on its timeout no longer jams the slot with its `index.lock`.** When the Runner

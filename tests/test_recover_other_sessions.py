@@ -41,6 +41,8 @@ class RecoverOtherSessions(unittest.TestCase):
             cfg=types.SimpleNamespace(state_dir=self.state), agent=types.SimpleNamespace(name="planner"),
             store=self.store, life=lifecycle.AttemptStateMachine(self.store), _tmux=object(),
             _turn_over=lambda a: True,
+            # an unsent end gives the turn's gate reservation back
+            _release_gate=lambda a, outcome: self.events.append("gate:" + outcome),
             emit=lambda kind, a: self.events.append(kind))
         # the real checks whether the Runner itself stopped this turn, for a lost lock or at its limits
         # (it did neither here)
@@ -88,11 +90,13 @@ class RecoverOtherSessions(unittest.TestCase):
         self.assertEqual(a.state, "ready")
         self.assertTrue(a.wait["interactive_prompt_intent"]["retryable"])
         self.assertIn("prompt_unsent_reconciled", self.events)
+        self.assertIn("gate:pre-send-unsent", self.events)
 
     def assert_pending(self):
         self.assertFalse(self.tick())
         self.assertEqual(self.store.get(self.row.id).state, "unknown")
         self.assertNotIn("prompt_unsent_reconciled", self.events)
+        self.assertNotIn("gate:pre-send-unsent", self.events)
 
     def test_later_rollouts_bound_to_other_attempts_reconcile_the_row(self):
         for n in range(3):

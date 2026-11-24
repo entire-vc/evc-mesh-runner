@@ -5874,6 +5874,11 @@ class AgentRunner:
                     self.store.mark(self.agent.name, a.task_id, "quota_admission_required", a.id)
                     self._release_gate(a, "pre-send-quota")
                     self._route_limit(a, None, lambda: self._limit_text(intent.get("log_path")))
+                else:
+                    # The turn is over and its writer gone, so the capacity its gate
+                    # consumed goes back like at any other turn end. Kept, it outlived the turn:
+                    # dead slots filled the lane's identity cap and every later admit was refused.
+                    self._release_gate(a, "pre-send-unsent")
                 # The durable phase precedes every native paste, not an inference
                 # from an empty log. The former driver is gone (or never registered).
                 # A headless quota end ran the native process, but bound no session
@@ -12166,6 +12171,24 @@ class AgentRunner:
                 kept.append(update)
             self._save_pending(task_id, kept)    # a lane's marks are written by its own thread only
 
+    def release_stale_gates(self) -> None:
+        """Each tick, before this lane resumes or starts anything (so no start of it is in flight):
+        give back a gate reservation still held by an attempt that has no turn, ready or waiting
+        with no process. Every end of a turn releases its gate; one that did not (turns that
+        ended unsent before that path released) left a consumed server slot behind. Such slots
+        filled the lane's identity cap, and the lane-wide capacity hold then kept the holders' own
+        resumes, whose admit would have released them, from asking the gate again. Released through
+        ``_release_gate``: an unconfirmed release stays pending and is retried."""
+        for task_id in list(self.store.marked(self.agent.name, "gate")):
+            a = self.store.open_for_task(self.agent.name, task_id)
+            if a is None or a.state not in ("ready", "waiting"):
+                continue
+            if a.pid and interactive.pid_alive(a.pid):
+                continue                       # a process is there: not proven turnless, keep it
+            log.info("%s: #%s %s attempt without a process held a gate reservation; releasing it",
+                     self.agent.name, a.task8, a.state)
+            self._release_gate(a, "stale-gate")
+
     def _local_writer(self, task_id: str) -> str:
         """The writer hold of a card another lane of this runner still holds: a gate reservation of a
         running turn or one whose release is pending. The server admits one writer per card, so a
@@ -13572,6 +13595,7 @@ class AgentRunner:
         progress.step("releases")
         self.retry_releases()
         self.retry_gate_releases()
+        self.release_stale_gates()
         delivery_requests.consume(self.cfg.state_dir, self.agent.name, self._delivery_recheck_request)
         self._step("settle")
         self.settle_finished()
