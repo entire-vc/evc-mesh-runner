@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.131 — 2026-11-25
+
+- **Two-step reasoning effort per lane.** Optional `default_effort` and `escalate_effort` in
+  `[[agents]]` run the first pass at a base level and move one step up when the card shows a current
+  DO-NOT-SHIP, a second failed pipeline, an earlier failed attempt or a `security`/`architecture`/
+  `urgent`/`incident` label. Unset (the default) keeps every launch as before. Each launched turn
+  records its level, base, escalation and trigger as a store event and a `runner.log` line. See
+  `docs/effort-policy.md`.
+
 ## 0.2.130 — 2026-11-25
 
 - **A directive to a card's former owner is delivered while the card sits with its reviewer.** The

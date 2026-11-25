@@ -1595,6 +1595,168 @@ class MeshEffects(Bench):
         self.settle_all(r)
         self.assertEqual(calls(self.calls)[0]["effort"], "low")
 
+    # -- two-step effort policy ---------------------------------------------------------------
+    ARGS_EFFORT = "xhigh"
+
+    def lane_args_effort(self):
+        """The lane's args carry --effort xhigh, as on the live lanes: what an unset policy must keep."""
+        self.agent.args = ["--effort", self.ARGS_EFFORT]
+        if not getattr(self.adapter, "_args_effort", False):
+            start, resume = self.adapter.start_argv, self.adapter.resume_argv
+            self.adapter.start_argv = lambda *x: start(*x) + ["--effort", self.ARGS_EFFORT]
+            self.adapter.resume_argv = lambda *x: resume(*x) + ["--effort", self.ARGS_EFFORT]
+            self.adapter._args_effort = True
+
+    def effort_turn(self, t, *, default=None, escalate=None, prepare=None, mesh_setup=None):
+        """Launch one turn of ``t`` with the lane's policy fields; (the native --effort, the runner)."""
+        self.lane_args_effort()
+        self.agent.default_effort, self.agent.escalate_effort = default or "", escalate or ""
+        mesh = FakeMesh([t], max_concurrent=1)
+        if mesh_setup:
+            mesh_setup(mesh)
+        write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
+        r = self.runner(mesh)
+        if prepare:
+            prepare(r)
+        r.tick()
+        self.settle_all(r)
+        return calls(self.calls)[0]["effort"], r
+
+    def effort_records(self, r, t):
+        return [d for a in r.store.on_task(t["id"]) for _, k, d in r.store.events(a.id) if k == "effort_policy"]
+
+    def test_effort_policy_unset_keeps_the_launch_unchanged_even_with_trigger_facts(self):
+        # backward compatibility: no default_effort/escalate_effort -> the args' level, no record
+        t = task(1, labels=["security", "urgent"])
+        effort, r = self.effort_turn(t, mesh_setup=lambda m: m.add_comment(
+            t["id"], "Verify: DO-NOT-SHIP @" + "a" * 40, author="reviewer"))
+        self.assertEqual(effort, self.ARGS_EFFORT)
+        self.assertEqual(self.effort_records(r, t), [])
+        self.assertIsNone(r.store.mark("builder", t["id"], "effort_policy"))
+
+    def test_effort_policy_first_pass_runs_the_base_level_and_records_it(self):
+        t = task(1)
+        effort, r = self.effort_turn(t, default="medium", escalate="high")
+        self.assertEqual(effort, "medium")
+        self.assertEqual(self.effort_records(r, t),
+                         ["turn=1 effort=medium base=medium escalated=0 trigger=- source=policy"])
+
+    def test_effort_policy_escalate_only_keeps_the_args_until_a_trigger(self):
+        t, t2 = task(1), task(2, labels=["incident"])
+        effort, r = self.effort_turn(t, escalate="max")
+        self.assertEqual(effort, self.ARGS_EFFORT)
+        self.assertEqual(self.effort_records(r, t),
+                         ["turn=1 effort=xhigh base=xhigh escalated=0 trigger=- source=args"])
+        self.calls.write_text("")
+        effort, r = self.effort_turn(t2, escalate="max")
+        self.assertEqual(effort, "max")
+        self.assertEqual(self.effort_records(r, t2),
+                         ["turn=1 effort=max base=xhigh escalated=1 trigger=label:incident source=policy"])
+
+    def test_effort_policy_escalates_on_a_high_complexity_label(self):
+        t = task(1, labels=["Architecture"])
+        effort, r = self.effort_turn(t, default="medium", escalate="high")
+        self.assertEqual(effort, "high")
+        self.assertEqual(self.effort_records(r, t),
+                         ["turn=1 effort=high base=medium escalated=1 trigger=label:architecture source=policy"])
+
+    def test_effort_policy_escalates_on_a_current_do_not_ship_only(self):
+        t = task(1)
+        dns = "Verify: DO-NOT-SHIP @" + "a" * 40
+        effort, _ = self.effort_turn(t, default="medium", escalate="high", mesh_setup=lambda m: m.add_comment(
+            t["id"], dns, author="reviewer", at=dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc)))
+        self.assertEqual(effort, "high")
+        self.calls.write_text("")
+        # a newer SHIP outranks it: the rejection is no longer current
+        t2 = task(2)
+        effort, _ = self.effort_turn(t2, default="medium", escalate="high", mesh_setup=lambda m: (
+            m.add_comment(t2["id"], dns, author="reviewer", at=dt.datetime(2026, 10, 2, tzinfo=dt.timezone.utc)),
+            m.add_comment(t2["id"], "Verify: SHIP @" + "b" * 40, author="reviewer",
+                          at=dt.datetime(2026, 10, 3, tzinfo=dt.timezone.utc))))
+        self.assertEqual(effort, "medium")
+
+    def test_effort_policy_a_do_not_ship_between_turns_escalates_the_resumed_turn(self):
+        self.lane_args_effort()
+        self.agent.default_effort, self.agent.escalate_effort = "medium", "high"
+        t = task(1)
+        mesh = FakeMesh([t], max_concurrent=1)
+        write_replies(self.replies, {t["id"][:8]: next_turn(), t["id"][:8] + ":resume": wait_time(why="soak")})
+        r = self.runner(mesh)
+        r.tick()
+        self.assertEqual(self.finish_turn(r).state, "ready")
+        mesh.add_comment(t["id"], "Verify: DO-NOT-SHIP @" + "a" * 40, author="reviewer")
+        r.tick()
+        self.settle_all(r)
+        made = calls(self.calls)
+        self.assertEqual([c["effort"] for c in made], ["medium", "high"])
+        self.assertEqual(self.effort_records(r, t),
+                         ["turn=1 effort=medium base=medium escalated=0 trigger=- source=policy",
+                          "turn=2 effort=high base=medium escalated=1 trigger=do_not_ship source=policy"])
+
+    def test_effort_policy_an_enumerated_verdict_request_is_not_a_rejection(self):
+        t = task(1)
+        effort, _ = self.effort_turn(t, default="medium", escalate="high", mesh_setup=lambda m: m.add_comment(
+            t["id"], "Review: reply SHIP or DO-NOT-SHIP @" + "a" * 40, author="reviewer"))
+        self.assertEqual(effort, "medium")
+
+    def test_effort_policy_escalates_after_a_failed_attempt_on_the_work_only(self):
+        gave_up = "gave up: the session ended without a readable outcome twice"
+        cases = (("aborted", 1, gave_up, "medium"), ("failed", 0, gave_up, "medium"),
+                 ("failed", 1, "gave up: stopped after 4 failed turns: provider limit or overload", "medium"),
+                 ("failed", 1, "turn budget: 0 NEXT and 10 waits", "medium"),
+                 ("failed", 1, gave_up, "high"), ("failed", 1, "gave up: stopped after 30 turns on this task", "high"))
+        for n, (state, turns, note, want) in enumerate(cases, start=1):
+            with self.subTest(state=state, turns=turns, note=note):
+                t = task(n)
+
+                def prepare(r, t=t, state=state, turns=turns, note=note):
+                    a = r.store.create("builder", t["id"], "claude")
+                    r.store.update(a, state=state, turns=turns, note=note)
+                    # it ended a day ago and someone commented since: the card may start again
+                    day_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()
+                    r.store.db.execute("UPDATE attempts SET updated_at=? WHERE id=?", (day_ago, a.id))
+                    r.store.db.commit()
+                self.calls.write_text("")
+                effort, _ = self.effort_turn(t, default="medium", escalate="high", prepare=prepare,
+                                             mesh_setup=lambda m, t=t: m.add_comment(t["id"], "please retry",
+                                                                                     author="reviewer"))
+                self.assertEqual(effort, want)
+
+    def test_effort_policy_escalates_on_a_second_failed_pipeline(self):
+        # values are <sha>:<pipeline>:<status>; one pipeline seen by two waits (named jobs) counts once
+        cases = ((("1:failed",), "medium"), (("1:failed", "2:success"), "medium"),
+                 (("1:failed", "1:failed"), "medium"), (("1:failed", "2:failed"), "high"))
+        for n, (values, want) in enumerate(cases, start=1):
+            with self.subTest(values=values):
+                t = task(n)
+
+                def prepare(r, t=t, values=values):
+                    for i, value in enumerate(values):
+                        r.store.mark("builder", t["id"], f"ci_delivery:{i:064x}", f"{'c' * 40}:{value}")
+                self.calls.write_text("")
+                effort, _ = self.effort_turn(t, default="medium", escalate="high", prepare=prepare)
+                self.assertEqual(effort, want)
+
+    def test_effort_label_outranks_the_lane_policy(self):
+        t = task(1, labels=["effort:low", "security"])
+        effort, r = self.effort_turn(t, default="medium", escalate="high")
+        self.assertEqual(effort, "low")
+        self.assertEqual(self.effort_records(r, t),
+                         ["turn=1 effort=low base=medium escalated=0 trigger=- source=label"])
+
+    def test_effort_policy_is_not_applied_to_another_harness_route(self):
+        self.agent.default_effort, self.agent.escalate_effort = "medium", "high"
+        t = task(1)
+        r = self.runner(FakeMesh([t], max_concurrent=1))
+        r.store.mark("builder", t["id"], "effort_policy", "high|label:security")
+        argv = ["codex", "exec"]
+        self.assertEqual(r._with_override_marks(self.adapter, list(argv), t["id"], "codex"), argv)
+        self.assertEqual(r._with_override_marks(self.adapter, ["claude"], t["id"], "claude"),
+                         ["claude", "--effort", "high"])
+        # the policy switched off (a config rollback) ignores a mark left behind
+        self.agent.default_effort = self.agent.escalate_effort = ""
+        self.assertEqual(r._with_override_marks(self.adapter, ["claude"], t["id"], "claude"), ["claude"])
+
     def test_a_shipped_blocker_releases_only_a_shipped_edge(self):
         blocker, t = task(9, cat="review"), task(1)
         mesh = FakeMesh([t], max_concurrent=1)

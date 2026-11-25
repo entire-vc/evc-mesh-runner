@@ -198,6 +198,12 @@ class Store:
         rows = self.db.execute("SELECT task_id, value FROM marks WHERE agent=? AND key=? AND value!=''", (agent, key))
         return {r[0]: r[1] for r in rows}
 
+    def task_marks(self, agent: str, task_id: str, prefix: str) -> dict[str, str]:
+        """Every non-empty mark of this lane on the task whose key starts with ``prefix``: key -> value."""
+        rows = self.db.execute("SELECT key, value FROM marks WHERE agent=? AND task_id=? AND value!='' "
+                               "AND substr(key, 1, ?)=?", (agent, task_id, len(prefix), prefix))
+        return {r[0]: r[1] for r in rows}
+
     def mark_holders(self, task_id: str, key: str) -> dict[str, str]:
         """Every lane of this store with a non-empty ``key`` mark on the task: agent -> value."""
         rows = self.db.execute("SELECT agent, value FROM marks WHERE task_id=? AND key=? AND value!=''",
