@@ -43,7 +43,7 @@ class RecoverOtherSessions(unittest.TestCase):
             _turn_over=lambda a: True,
             # an unsent end gives the turn's gate reservation back
             _release_gate=lambda a, outcome: self.events.append("gate:" + outcome),
-            emit=lambda kind, a: self.events.append(kind))
+            emit=lambda kind, a, **detail: self.events.append(kind))
         # the real checks whether the Runner itself stopped this turn, for a lost lock or at its limits
         # (it did neither here)
         self.host._lock_loss_stop = lambda a: AgentRunner._lock_loss_stop(self.host, a)
