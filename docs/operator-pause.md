@@ -20,6 +20,20 @@ mkdir -p <state_dir>/pause.d/builder && echo "why" > <state_dir>/pause.d/builder
 rm <state_dir>/pause.d/builder/manual
 ```
 
+A token may say why it exists. When its content is a JSON object (at most 4 KiB), these string fields
+are shown in `status.json` under `pause_token_details`: `reason`, `card`, `by`, `created_at`,
+`expires_at` (ISO 8601 with an offset, e.g. `2026-12-01T00:00Z`) and `until_event`:
+
+```sh
+printf '%s' '{"reason":"drain before migration","by":"operator","expires_at":"2026-12-01T00:00Z"}' \
+  > <state_dir>/pause.d/builder/manual
+```
+
+A token whose `expires_at` has passed is not removed and keeps the lane paused: its entry reads
+`"expired": true` and `mesh_runner_agent_pause_tokens_expired{agent}` counts it, so a forgotten pause
+is visible rather than silently lifted. An empty, malformed or oversized token pauses as before and
+has no metadata.
+
 ## The old marker `<state_dir>/pause/<name>`
 
 Up to 0.2.5 a file `<state_dir>/pause/<name>` paused the lane too. Since 0.2.8 the runner turns each such
@@ -53,4 +67,5 @@ Token names match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. `take` is a single `O_CREA
 name (no temp file), so a crash leaves nothing or a complete token. A token left by a crashed operation
 keeps the lane paused (fail closed) until its owner removes it; an unreadable `pause.d` namespace
 also counts as paused. Tokens are listed in `status.json` (`pause_tokens`) and counted in
-`mesh_runner_agent_pause_tokens{agent}`; `mesh_runner_agent_paused` is 1 while any is present.
+`mesh_runner_agent_pause_tokens{agent}`; `mesh_runner_agent_paused` is 1 while any is present;
+`pause_token_details` adds each token's metadata and `expired` flag.

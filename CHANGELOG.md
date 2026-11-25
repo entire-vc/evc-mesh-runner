@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.126 — 2026-11-24
+
+- **A pause token can say why it exists, and an overdue one is flagged.** A token whose content is a
+  JSON object shows its `reason`, `card`, `by`, `created_at`, `expires_at` and `until_event` in
+  `status.json` `pause_token_details`. A token past its `expires_at` stays and keeps the lane paused,
+  but reads `"expired": true` and is counted in `mesh_runner_agent_pause_tokens_expired{agent}`.
+  Empty tokens pause exactly as before. See `docs/operator-pause.md`.
+
 ## 0.2.125 — 2026-11-24
 
 - **An interactive Claude session answers one trust question per untrusted `--add-dir` repository.**
