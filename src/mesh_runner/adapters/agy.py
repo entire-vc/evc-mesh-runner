@@ -76,6 +76,8 @@ LANE_PERMISSIONS = {"allow": ["command(*)", "read_file(*)", "write_file(*)", "re
                               "download_url(*)", "mcp(*)"], "deny": []}
 READ_ONLY_PERMISSIONS = {"allow": ["read_file(*)", "read_url(*)", "mcp(*)"],
                          "deny": ["command(*)", "write_file(*)", "download_url(*)"]}
+# output_tokens already counts thinking_tokens (on every recorded step total = input + output and
+# thinking <= output), which matches Gemini billing thinking as output; thinking is kept for display only
 _USAGE_KEYS = (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"),
                ("cache_read_tokens", "cache_read_input_tokens"), ("thinking_tokens", "thinking_tokens"))
 
@@ -344,6 +346,10 @@ class AgyAdapter(Adapter):
             stderr = log_path.with_suffix(".stderr").read_text(errors="replace")
         except OSError:
             stderr = ""
+        if "cache_read_input_tokens" in usage:
+            # Gemini caches implicitly only: no explicit cache, no write price, so the part of the
+            # input written to the cache at a price of its own is 0 (an unknown read stays unknown)
+            usage["cache_creation_input_tokens"] = 0
         r.usage = usage
         if result is not None:
             r.finished = True

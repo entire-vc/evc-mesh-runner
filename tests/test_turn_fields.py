@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from mesh_runner import turn_usage
+from mesh_runner.adapters.agy import AgyAdapter
 from mesh_runner.adapters.base import TurnResult
 from mesh_runner.adapters.claude import ClaudeAdapter
 from mesh_runner.catalog import PoolObserver, iso as epoch_iso
@@ -145,6 +146,22 @@ class Body(Accepted):
         self.assertNotIn("cache_write_1h", body)
         self.assertEqual((body["provider"], body["account_ref"], body["billing_mode"]),
                          ("openai", "codex/ops", "subscription"))
+
+    def test_agy_turn_reports_its_implicit_cache_with_no_write(self):
+        # Gemini caches implicitly only: no explicit cache, no write price, so the write part is 0
+        log = self.root / "turn.agy.jsonl"
+        log.write_text("\n".join(json.dumps(e) for e in (
+            {"event": "init", "conversation_id": "c1", "init": {"model": "gemini-4-neon-high"}},
+            {"event": "step_update", "step_update": {"state": "DONE", "step_type": "agent_response", "usage": {
+                "input_tokens": 9388, "output_tokens": 852, "thinking_tokens": 278, "cache_read_tokens": 220200,
+                "total_tokens": 10240}}},
+            {"event": "result", "result": {"conversation_id": "c1", "status": "SUCCESS", "response": "ok"}})) + "\n")
+        self.launch("agy", {"HOME": str(self.root)})
+        body = self.send(AgyAdapter().parse(log), harness="agy", log=log)
+        self.assert_mesh_accepts(body)
+        self.assertEqual((body["provider"], body["cache_read"], body["cache_write"]), ("google", 220200, 0))
+        self.assertFalse({"cache_read", "cache_write"} & set(body.get("unknown", [])))
+        self.assertEqual((body["tokens_in"], body["tokens_out"]), (9388 + 220200, 852))   # thinking inside output
 
     # AC1: a turn without usage
     def test_turn_without_usage_lists_its_cache_as_unknown_never_zero(self):
