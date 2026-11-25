@@ -42,6 +42,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from . import answer_desk
+from . import effort_policy
 from . import profile_runtime
 from . import api_mode
 from . import pricing
@@ -2547,7 +2548,9 @@ class AgentRunner:
         sid = a.session_id or (str(uuid.uuid4()) if adapter.session_id_known_upfront else "")
         # taken before the snapshot: a source that lands between the read and the spawn is not 'read'
         source_read_at = iso()
-        anchor = self._anchor(self._comments(a.task_id))
+        comments = self._comments(a.task_id)
+        anchor = self._anchor(comments)
+        effort_choice = self._effort_choice(a, comments)
 
         def build_argv() -> list[str]:
             argv = (adapter.resume_argv if resume else adapter.start_argv)(
@@ -2852,6 +2855,9 @@ class AgentRunner:
         self._lane_route[a.id] = lane_route
         if self.observations is not None:
             self._observe_start(a, adapter, interactive.native_tail(argv) if interactive_driver else argv, env)
+        if effort_choice is not None:
+            self._effort_record(a, effort_choice, log_path,
+                                interactive.native_tail(argv) if interactive_driver else argv)
         log.info("%s: %s #%s (%s) pid %s%s", self.agent.name, "resumed" if resume else "started",
                  a.task8, a.title[:60], proc.pid, f" reason={reason}" if reason else "")
         return True
@@ -11843,7 +11849,85 @@ class AgentRunner:
         effort = self.store.mark(self.agent.name, task_id, "effort")
         if effort and effort[0] and harness == override_harness:
             argv = adapter.with_effort(argv, effort[0])
+        elif harness == self.agent.harness and effort_policy.configured(self.agent.default_effort,
+                                                                        self.agent.escalate_effort):
+            # the lane's two-step policy, decided once per launch in _spawn (no Mesh read here: the
+            # launch capture shares this function); the lane's own harness only, an alt route keeps its args
+            mark = self.store.mark(self.agent.name, task_id, effort_policy.MARK)
+            chosen, _ = effort_policy.parse_mark(mark[0] if mark else "")
+            if chosen:
+                argv = adapter.with_effort(argv, chosen)
         return argv
+
+    def _effort_choice(self, a: Attempt, comments: list[dict]) -> "effort_policy.Choice | None":
+        """The lane's effort for the turn about to launch (None: no policy configured, nothing changes).
+        Written as a card mark the argv builders read. A fact that cannot be read counts as absent: the
+        turn runs its base level, never held."""
+        base, up = self.agent.default_effort, self.agent.escalate_effort
+        if not effort_policy.configured(base, up):
+            return None
+        fired = ""
+        if up:
+            try:
+                fired = self._effort_trigger(a, comments)
+            except Exception as e:              # noqa: BLE001 - a fact we cannot read never blocks a launch
+                log.warning("%s: #%s effort trigger unreadable (%s); base level", self.agent.name, a.task8,
+                            type(e).__name__)
+        choice = effort_policy.choose(base, up, fired)
+        self.store.mark(self.agent.name, a.task_id, effort_policy.MARK, choice.mark())
+        return choice
+
+    def _effort_trigger(self, a: Attempt, comments: list[dict]) -> str:
+        verdict = self._card_verdict(comments)
+        if verdict == "DO-NOT-SHIP":
+            return effort_policy.trigger(verdict=verdict)
+        delivered = self.store.task_marks(self.agent.name, a.task_id, "ci_delivery:")
+        ci_failures = effort_policy.failed_pipelines(delivered.values())
+        failed = sum(1 for x in self.store.on_task(a.task_id)
+                     if x.id != a.id and x.agent == self.agent.name and x.state == "failed" and x.turns >= 1
+                     and effort_policy.work_failure(x.note))
+        labels = []
+        if not (ci_failures >= effort_policy.CI_FAILURES_TO_ESCALATE or failed):
+            labels = (self._task(a.task_id) or {}).get("labels") or []
+        return effort_policy.trigger(verdict=verdict, ci_failures=ci_failures, failed_attempts=failed,
+                                     labels=labels)
+
+    def _card_verdict(self, comments: list[dict]) -> str:
+        """The newest review verdict on the card ('SHIP', 'DO-NOT-SHIP' or ''), read as the review gate
+        reads one: another author's verdict line, the lane's own only as a plain verdict line, never a
+        request that lists both verdicts. No commit is required: a rejection of any head is current
+        until a newer verdict outranks it."""
+        theirs, mine = self._verdict_re(), self._verdict_re(own=True)
+        for c in reversed(comments):
+            body = c.get("body") or ""
+            if body.startswith("[runner"):
+                continue
+            author = c.get("author_id") or (c.get("author") or {}).get("id")
+            pattern = mine if author == self.agent_id else theirs
+            if pattern is None:
+                continue
+            found = [m.groupdict().get("verdict") or "" for m in pattern.finditer(body)
+                     if not ENUMERATED_VERDICTS.search(verdict_line(body, m)[0])]
+            if found:
+                return found[-1]
+        return ""
+
+    def _effort_record(self, a: Attempt, choice: "effort_policy.Choice", log_path: Path,
+                       native_argv: list[str]) -> None:
+        """One record per launched turn: the attempt's store event and a runner.log line naming the turn
+        log, so the collector can join it. The level is read back from the turn's real command line."""
+        try:
+            from .execution_observations import launch_route
+            launched = launch_route(a.harness, list(native_argv)).effort or ""
+            args_effort = launch_route(self.agent.harness, list(self.agent.args)).effort or ""
+            label = self.store.mark(self.agent.name, a.task_id, "effort")
+            m = re.search(r"\.turn(\d+)\.", log_path.name)
+            detail = choice.detail(int(m.group(1)) if m else a.turns + 1, launched, args_effort,
+                                   label[0] if label else "")
+            self.store.event(a.id, effort_policy.EVENT, detail)
+            log.info("%s: #%s effort %s log=%s", self.agent.name, a.task8, detail, log_path.name)
+        except Exception as e:                  # noqa: BLE001 - telemetry never touches the attempt
+            log.debug("%s: effort record skipped: %s", self.agent.name, type(e).__name__)
 
     def _launch_read_only(self, a: Attempt | None) -> bool:
         """True when the launch of ``a`` is a sandboxed metadata-receipt turn (same rule as _spawn)."""

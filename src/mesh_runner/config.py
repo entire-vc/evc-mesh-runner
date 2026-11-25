@@ -67,7 +67,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import asks, catalog_launch
+from . import asks, catalog_launch, effort_policy
 from . import api_mode as _api_mode
 from . import pricing as _pricing
 from .selection import Policy
@@ -277,6 +277,9 @@ class AgentConfig:
     next_action_prep: bool = False             # opt-in: start the prep stage past typed blockers (next_action.py)
     queue_order_timeout_seconds: float = 3.0
     queue_order_cache_seconds: float = 60.0
+    # two-step reasoning effort (effort_policy.py): both '' = off, the args decide as before
+    default_effort: str = ""
+    escalate_effort: str = ""
     alt: dict = field(default_factory=dict)    # other harnesses the agent may be routed to: {"codex": {"profile", "args", "binary"}}
     task_route_harnesses: list[str] = field(default_factory=list)  # alt harnesses a card may select by label runner-harness:<h>; empty = none
     chat: dict = field(default_factory=dict)   # standing interactive session: session, command, idle_command, max_age_hours
@@ -1149,6 +1152,9 @@ def load(path: str | Path) -> RunnerConfig:
             api_primary_profile=_api_profile(a.get("api_primary_profile", ""), a["name"]),
             api_reserve_providers=_str_list(a.get("api_reserve_providers", []), "api_reserve_providers", a["name"]),
             decision_wake=_decision_wake(a.get("decision_wake", ""), f"agent {a['name']}", allow_empty=True),
+            **dict(zip(("default_effort", "escalate_effort"),
+                       effort_policy.fields(a.get("default_effort"), a.get("escalate_effort"),
+                                            f"agent {a['name']}"))),
             alt={str(k): dict(v) for k, v in (a.get("alt") or {}).items()},
             task_route_harnesses=[str(h) for h in (a.get("task_route_harnesses") or [])],
             env_file=_path(a.get("env_file")),
