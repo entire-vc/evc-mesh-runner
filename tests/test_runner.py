@@ -1493,22 +1493,31 @@ class MeshEffects(Bench):
         r.deliver_mentions()
         self.assertEqual([t for t in mesh.created if "mention-request" in (t.get("labels") or [])], [])
 
-    def mention_after_own_comment(self, body, metadata=None):
+    def mention_after_own_comment(self, body, metadata=None, *, attempts=(), assignee="agent-lead",
+                                  address="@builder signal: please check two sessions on one card",
+                                  replies=()):
         """A lead's ``@builder …`` line on a foreign card where builder's key wrote ``body`` first;
+        ``attempts``: (agent, mode) attempts the runner's store already holds on that card;
+        ``replies``: builder comments written after the address was filed (the request card's answer);
         -> (request cards filed, runner log lines)."""
-        theirs = task(2, assignee_id="agent-lead")
+        theirs = task(2, assignee_id=assignee)
         mesh = FakeMesh([theirs], max_concurrent=1)
         mine = mesh.add_comment(theirs["id"], body, author=AGENT_ID)
         if metadata is not None:
             mine["metadata"] = metadata
         mesh.mention_rows = [{"comment_id": f"c-{mine['id']}", "task_id": theirs["id"], "author_id": "agent-lead",
-                              "author_name": "lead", "comment_body": "@builder signal: please check two sessions on one card",
+                              "author_name": "lead", "comment_body": address,
                               "extracted_at": "2099-01-01T00:00:00Z", "mentioned_slug": "builder"}]
         for row in mesh.mention_rows:
             mesh.comment_log.setdefault(row["task_id"], []).append({
                 "id": row["comment_id"], "body": row["comment_body"], "author_id": row["author_id"],
                 "created_at": dt.datetime.now(dt.timezone.utc).isoformat()})
+        for reply in replies:
+            mesh.add_comment(theirs["id"], reply, author=AGENT_ID)
         r = self.runner(mesh)
+        for agent, mode in attempts:
+            a = r.store.create(agent, theirs["id"], "claude", mode=mode)
+            r.store.update(a, state="completed")
         r.refresh_me()
         with self.assertLogs("mesh_runner", "INFO") as logs:
             r.deliver_mentions()
@@ -1536,6 +1545,46 @@ class MeshEffects(Bench):
                 made, logs = self.mention_after_own_comment("@reviewer: could you check?", metadata)
                 self.assertEqual(made, [])
                 self.assertTrue(any("not filed: already in the conversation" in line for line in logs))
+
+    # The card's author sent it to review ("Result: review", its own comment under 24h), the
+    # card went to a reviewer lane, and the lead's directive to the author was dropped as "already in
+    # the conversation there": the author neither holds nor waits on the card, so it reached nobody.
+    LEAD = ("@builder решение по MR: !11 не вливать, закрыть MR как доставленный через !12; "
+            "!10 выводить из Draft и отдать на review.")
+    FENCE = "@builder оставь открытым один MR, остальные закрой как дубли."
+
+    def test_a_directive_to_the_former_owner_of_a_card_in_review_is_filed(self):
+        for address in (self.LEAD, self.FENCE):
+            with self.subTest(address=address[:30]):
+                made, logs = self.mention_after_own_comment(
+                    "Result: review. MR !11 ready", attempts=[("builder", "work")],
+                    assignee="agent-reviewer", address=address)
+                self.assertEqual(len(made), 1)
+                self.assertIn(address[:40], made[0]["description"])
+                self.assertTrue(any("addressed to its former owner" in line for line in logs))
+                self.assertFalse(any("not filed: already in the conversation" in line for line in logs))
+
+    def test_a_second_directive_after_the_owner_answered_is_still_filed(self):
+        # the author answered the first directive on the card: a fresh own comment does not make it a guest
+        made, logs = self.mention_after_own_comment(
+            "Result: review. MR !11 ready", attempts=[("builder", "work")], assignee="agent-reviewer",
+            address=self.LEAD, replies=["@lead done: !11 closed, !10 out of Draft"])
+        self.assertEqual(len(made), 1)
+
+    def test_a_past_review_turn_or_another_lanes_ownership_keeps_the_conversation(self):
+        for attempts in ([], [("builder", "review")], [("other-lane", "work")]):
+            with self.subTest(attempts=attempts):
+                made, logs = self.mention_after_own_comment(
+                    "@reviewer: could you check?", attempts=attempts, assignee="agent-reviewer",
+                    address=self.LEAD)
+                self.assertEqual(made, [])
+                self.assertTrue(any("not filed: already in the conversation" in line for line in logs))
+
+    def test_a_plain_notice_to_the_former_owner_files_nothing(self):
+        made, _ = self.mention_after_own_comment(
+            "Result: review. MR !11 ready", attempts=[("builder", "work")], assignee="agent-reviewer",
+            address="@builder merged !11, thanks.")
+        self.assertEqual(made, [])
 
     def test_effort_label_reaches_the_session(self):
         t = task(1, labels=["effort:low"])
