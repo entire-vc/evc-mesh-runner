@@ -13736,9 +13736,11 @@ class AgentRunner:
 
     def status(self) -> dict:
         rows = self.store.by_state(self.agent.name, ACTIVE + ("waiting", "ready"))
+        pause_details = op_pause.details(self.cfg.state_dir, self.agent.name)
         out = {"agent": self.agent.name, "cap": self.cap(), "paused": self.paused(),
                "launch_mode": self.launch_mode,
-               "pause_tokens": op_pause.tokens(self.cfg.state_dir, self.agent.name),
+               "pause_tokens": [d["token"] for d in pause_details],
+               "pause_token_details": pause_details,
                "repository_access": {**self.access.describe(),
                                      "lane_repos": sorted(r.name for r in self.lane_repos)},
                "auth_holds": auth.status(self.store, profiles=self._own_profiles()),
@@ -14060,6 +14062,7 @@ class Runner:
                  f"mesh_runner_checkpoint_gc_freed_bytes_estimate_total {getattr(self, 'checkpoint_gc_freed_bytes', 0)}",
                  "# TYPE mesh_runner_attempts gauge", "# TYPE mesh_runner_agent_error gauge",
                  "# TYPE mesh_runner_agent_paused gauge", "# TYPE mesh_runner_agent_pause_tokens gauge",
+                 "# TYPE mesh_runner_agent_pause_tokens_expired gauge",
                  "# TYPE mesh_runner_chat_hold_seconds gauge"]
         if getattr(self, "checkpoint_bytes", None) is not None:
             lines += ["# TYPE mesh_runner_checkpoint_bytes gauge", f"mesh_runner_checkpoint_bytes {self.checkpoint_bytes}"]
@@ -14068,6 +14071,8 @@ class Runner:
             lines.append(f'mesh_runner_agent_error{{agent="{name}"}} {1 if "error" in st else 0}')
             lines.append(f'mesh_runner_agent_paused{{agent="{name}"}} {1 if st.get("paused") else 0}')
             lines.append(f'mesh_runner_agent_pause_tokens{{agent="{name}"}} {len(st.get("pause_tokens", []))}')
+            expired = sum(1 for d in st.get("pause_token_details", []) if isinstance(d, dict) and d.get("expired"))
+            lines.append(f'mesh_runner_agent_pause_tokens_expired{{agent="{name}"}} {expired}')
             if "chat_hold_since" in st:        # how long the agent's standing chat has not been (re)started
                 held = st["chat_hold_since"]
                 lines.append(f'mesh_runner_chat_hold_seconds{{agent="{name}"}} {max(0, int(stamp - held)) if held else 0}')

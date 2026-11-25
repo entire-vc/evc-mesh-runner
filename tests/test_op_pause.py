@@ -136,6 +136,60 @@ class Tokens(unittest.TestCase):
         self.assertEqual(op_pause.tokens(self.d, "builder"), [])
 
 
+class TokenMetadata(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.ns = self.d / op_pause.DIRNAME / "builder"
+        self.ns.mkdir(parents=True)
+
+    def write(self, name, text):
+        (self.ns / name).write_text(text)
+
+    def test_json_token_is_described(self):
+        self.write("op-1", '{"reason": "drain\\nfor  migration", "card": "aaaaaaaa", "by": "operator",'
+                           ' "created_at": "2026-11-01T00:00Z", "expires_at": "2999-01-01T00:00Z", "extra": 1}')
+        [d] = op_pause.details(self.d, "builder")
+        self.assertEqual(d, {"token": "builder/op-1", "reason": "drain for migration", "card": "aaaaaaaa",
+                             "by": "operator", "created_at": "2026-11-01T00:00Z",
+                             "expires_at": "2999-01-01T00:00Z", "expired": False})
+
+    def test_expired_token_stays_and_pauses(self):
+        self.write("op-1", '{"reason": "r", "expires_at": "2026-01-01T00:00Z"}')
+        [d] = op_pause.details(self.d, "builder", now=op_pause.parse_time("2026-01-01T00:01Z"))
+        self.assertTrue(d["expired"])
+        self.assertTrue(op_pause.any_token(self.d, "builder"))
+        self.assertTrue((self.ns / "op-1").exists())
+
+    def test_naive_or_bad_expiry_is_never_expired(self):
+        for i, exp in enumerate(("2000-01-01T00:00", "yesterday", "")):
+            self.write(f"t{i}", '{"expires_at": "%s"}' % exp)
+        self.assertEqual([d["expired"] for d in op_pause.details(self.d, "builder")], [False] * 3)
+
+    def test_unparseable_tokens_keep_pausing_without_metadata(self):
+        self.write("empty", "")
+        self.write("legacy-pause-file", "why: maintenance")
+        self.write("list", "[1, 2]")
+        self.write("big", '{"reason": "%s"}' % ("x" * 5000))
+        (self.ns / "dir").mkdir()
+        os.symlink(self.ns / "empty", self.ns / "link")
+        os.mkfifo(self.ns / "fifo")
+        got = op_pause.details(self.d, "builder")
+        self.assertEqual([d["token"] for d in got], op_pause.tokens(self.d, "builder"))
+        self.assertEqual(len(got), 7)
+        for d in got:
+            self.assertEqual(set(d), {"token", "expired"}, d)
+
+    def test_unreadable_namespace_is_described_without_metadata(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        self.ns.chmod(0)
+        try:
+            self.assertEqual(op_pause.details(self.d, "builder"),
+                             [{"token": "builder/<unreadable>", "expired": False}])
+        finally:
+            self.ns.chmod(0o755)
+
+
 class RunnerPause(Bench):
     def _start(self, mesh):
         r = self.runner(mesh)
@@ -193,6 +247,32 @@ class RunnerPause(Bench):
         prom = self.cfg.metrics_file.read_text()
         self.assertIn('mesh_runner_agent_paused{agent="builder"} 1', prom)
         self.assertIn('mesh_runner_agent_pause_tokens{agent="builder"} 2', prom)
+
+    def test_status_and_metrics_show_token_metadata_and_expiry(self):
+        ns = self.cfg.state_dir / op_pause.DIRNAME / "builder"
+        ns.mkdir(parents=True)
+        (ns / "old").write_text('{"reason": "parked", "card": "aaaaaaaa", "expires_at": "2000-01-01T00:00Z"}')
+        op_pause.take(self.cfg.state_dir, "builder", "plain")
+        r = self._start(FakeMesh([], max_concurrent=1))
+        st = r.status()
+        self.assertTrue(st["paused"])
+        self.assertEqual(st["pause_tokens"], ["builder/old", "builder/plain"])
+        self.assertEqual(st["pause_token_details"], [
+            {"token": "builder/old", "reason": "parked", "card": "aaaaaaaa",
+             "expires_at": "2000-01-01T00:00Z", "expired": True},
+            {"token": "builder/plain", "expired": False}])
+        r.tick()
+        self.assertTrue(r.paused())
+        self.assertTrue((ns / "old").exists())
+        from mesh_runner.runner import Runner as R
+        from mesh_runner.store import Store
+        self.cfg.metrics_file = self.root / "runner.prom"
+        wrapper = R.__new__(R)
+        wrapper.cfg, wrapper.store, wrapper._lock = self.cfg, Store(self.root / "state" / "r.sqlite"), None
+        wrapper.agents = [r]
+        wrapper.write_status([st])
+        prom = self.cfg.metrics_file.read_text()
+        self.assertIn('mesh_runner_agent_pause_tokens_expired{agent="builder"} 1', prom)
 
     def test_unavailable_peer_check_sees_token(self):
         r = self._start(FakeMesh([], max_concurrent=1))
