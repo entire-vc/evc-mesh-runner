@@ -361,6 +361,9 @@ PROFILE_VAR = "MESH_RUNNER_PROFILE"
 TASK_ROUTE_PREFIX = "runner-harness:"       # card label selecting a permitted alt harness for that card only
 HARNESS_VAR = "MESH_RUNNER_HARNESS"         # env command: the harness this agent is routed to now
 TASK_HARNESS_VAR = "MESH_RUNNER_TASK_HARNESS"   # to the env command: the harness this one card is routed to
+# to the env command, on the standing chat's read only: the chat harnesses it can run, home first, so an
+# operator route may answer with one of them instead of a card-only harness (agy, kimi); a request, never env
+STANDING_CHAT_VAR = "MESH_RUNNER_STANDING_CHAT_HARNESSES"
 # A provider refused a card's content on one harness (Claude ``stop_reason: refusal``): the same session there
 # is refused again. The card goes on the lane's other harness of this pair, if the lane has it; the route is
 # a local mark of this agent and card, other cards of the lane keep the lane's route.
@@ -1020,13 +1023,15 @@ class AgentRunner:
                             self.agent.name, task_id[:8], name[:40])
         return ""
 
-    def _read_env(self, task_id: str = "", task_harness: str = "") -> dict[str, str]:
+    def _read_env(self, task_id: str = "", task_harness: str = "",
+                  chat_harnesses: list[str] | None = None) -> dict[str, str]:
         """Read the session environment: env file, then the operator's env
         command (e.g. the account the lane is routed to now), then inline values.
         A failure stops the start: a session on the wrong identity is worse than none.
         For a card start/resume the command sees MESH_RUNNER_TASK / MESH_RUNNER_LANE, so an
         operator route may pin one card to its own account (per-card overflow); a chat or card-less
-        read gets neither."""
+        read gets neither. Only the standing chat's read passes ``chat_harnesses``: the command sees
+        MESH_RUNNER_STANDING_CHAT_HARNESSES and may route the chat to one of them."""
         env: dict[str, str] = {}
         if self.agent.env_file:
             try:
@@ -1038,6 +1043,9 @@ class AgentRunner:
             # never reaches a chat or card-less read
             cmd_env = {k: v for k, v in os.environ.items() if k not in ("MESH_RUNNER_TASK", "MESH_RUNNER_LANE")}
             cmd_env.pop(TASK_HARNESS_VAR, None)
+            cmd_env.pop(STANDING_CHAT_VAR, None)
+            if chat_harnesses:
+                cmd_env[STANDING_CHAT_VAR] = ",".join(chat_harnesses)
             if task_id:
                 cmd_env.update(MESH_RUNNER_TASK=task_id, MESH_RUNNER_LANE=self.agent.name)
                 if task_harness:
@@ -1053,6 +1061,7 @@ class AgentRunner:
                     k, v = line.removeprefix("export ").split("=", 1)
                     env[k.strip()] = v.strip().strip("'\"")
         env.update(self.agent.inline_env)
+        env.pop(STANDING_CHAT_VAR, None)        # a request to the command, never session env
         return env
 
     def _route_env(self, env: dict[str, str]) -> tuple[dict[str, str], str, object]:
@@ -13583,10 +13592,17 @@ class AgentRunner:
         def env_of():
             # the chat routes by its own command's harness; nothing shared (adapter, agent.env, pool.env)
             # is written: a card turn's route stays what the card set
-            env, harness, profile = self._route_env(self._read_env())
+            # the command is told which harnesses the chat can run (home first): a lane whose cards go to
+            # agy/kimi still gets a chat env for one of them
+            supported = [self._chat_harness, *(h for h in self._chat_commands if h != self._chat_harness)]
+            raw = self._read_env(chat_harnesses=supported)
+            # the raw answer is checked before _route_env: that one folds a harness outside alt_adapters
+            # into the base harness, which would start the home command with another harness's env
+            asked = raw.get(HARNESS_VAR, "") or self.agent.harness
+            env, harness, profile = self._route_env(raw)
             env = session_env(env)
             command = self._chat_commands.get(harness)
-            if command is None:
+            if command is None or asked not in supported or harness != asked:
                 return env, None, None        # routed to a harness this session cannot run: held, no foreign env
             marks = {"MESH_RUNNER_PROFILE": str(profile or "")}
             if harness != self._chat_harness:  # an alt-harness session differs from the home one by its digest

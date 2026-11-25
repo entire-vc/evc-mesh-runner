@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.129 — 2026-11-25
+
+- **A standing chat stays up while the lane's cards go to a harness it cannot run (agy, kimi,
+  zcode).** The chat's env read now passes `MESH_RUNNER_STANDING_CHAT_HARNESSES` (the chat's
+  harnesses, home first, e.g. `claude,codex`) to the env command, so the operator route may answer
+  with an env for one of them; card and card-less reads never pass it, and an inherited value is
+  dropped. The raw `MESH_RUNNER_HARNESS` of the answer is checked against that list before routing:
+  anything else keeps the chat held (`no chat command for the routed harness`) instead of starting
+  a chat command with another harness's env. A command that ignores the variable behaves as before.
+
 ## 0.2.128 — 2026-11-25
 
 - **An agy lane may carry named non-Mesh MCP servers: `mcp_allow`.** `mcp_allow = ["playwright"]` in

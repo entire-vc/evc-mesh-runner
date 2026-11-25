@@ -189,5 +189,101 @@ class ChatRouting(Bench):
         self.assertIn("broken", r._chat_error)
 
 
+# A lane whose cards go to agy/kimi kept its standing chat on a held route ("no chat command for the routed
+# harness"): a gone session was never started again. The chat's env read now names the harnesses it can run.
+def scripted_route(tmp, body):
+    """An env command recording what it was asked, answering by ``body`` (python, ``asked`` is the request)."""
+    script = tmp / "route.py"
+    script.write_text("import json, os, sys\n"
+                      f"open({str(tmp / 'asked.jsonl')!r}, 'a').write(json.dumps({{k: os.environ.get(k) for k in "
+                      "('MESH_RUNNER_STANDING_CHAT_HARNESSES', 'MESH_RUNNER_TASK', 'MESH_RUNNER_TASK_HARNESS')}) + '\\n')\n"
+                      "asked = os.environ.get('MESH_RUNNER_STANDING_CHAT_HARNESSES', '')\n" + body)
+    return [sys.executable, str(script)]
+
+
+ANSWERS_CLAUDE = ("if 'claude' in asked.split(','):\n"
+                  "    print('MESH_RUNNER_HARNESS=claude'); print('CLAUDE_CONFIG_DIR=/acct/steward-max')\n"
+                  "else:\n"
+                  "    print('MESH_RUNNER_HARNESS=agy'); print('MESH_RUNNER_PROFILE=owner-ultra'); print('AGY_HOME=/acct/agy')\n")
+IGNORES = "print('MESH_RUNNER_HARNESS=agy'); print('MESH_RUNNER_PROFILE=owner-ultra'); print('AGY_HOME=/acct/agy')\n"
+
+
+class StandingChatHarnesses(Bench):
+    chat_runner = ChatRouting.chat_runner
+
+    def standing(self, body, commands=None, alts=("codex", "agy")):
+        import json
+        r = self.chat_runner(CLAUDE_CHAT, route=scripted_route(self.root, body),
+                             commands=commands if commands is not None else {"codex": ["codex", "--profile", "steward"]})
+        r.alt_adapters = {h: FakeProfileAdapter(r.adapter.script, f"{h}-base") for h in alts}
+        r.asked = lambda: [json.loads(x) for x in (self.root / "asked.jsonl").read_text().splitlines()]
+        return r
+
+    def test_the_chat_read_asks_for_its_harnesses_home_first_and_no_other_read_does(self):
+        r = self.standing(ANSWERS_CLAUDE)
+        with mock.patch.dict("os.environ", {"MESH_RUNNER_STANDING_CHAT_HARNESSES": "inherited"}):
+            r.keep_chat()
+            r._read_env()                                   # card-less
+            r._read_env("task-0001", "agy")             # a card on its own harness
+        chat, cardless, card = r.asked()
+        self.assertEqual(chat["MESH_RUNNER_STANDING_CHAT_HARNESSES"], "claude,codex")   # dict order is codex, claude
+        self.assertIsNone(cardless["MESH_RUNNER_STANDING_CHAT_HARNESSES"])
+        self.assertIsNone(card["MESH_RUNNER_STANDING_CHAT_HARNESSES"])
+        self.assertEqual(card["MESH_RUNNER_TASK_HARNESS"], "agy")
+        self.assertIsNone(chat["MESH_RUNNER_TASK"])
+
+    def test_a_command_echoing_the_request_does_not_put_it_in_the_env(self):
+        r = self.standing("print('MESH_RUNNER_STANDING_CHAT_HARNESSES=' + asked); print('X=1')\n")
+        self.assertNotIn("MESH_RUNNER_STANDING_CHAT_HARNESSES", r._read_env(chat_harnesses=["claude"]))
+
+    def test_a_command_ignoring_the_request_keeps_the_chat_held(self):
+        r = self.standing(IGNORES)
+        r.keep_chat()                                        # gone: not started
+        r.chat.start.assert_not_called()
+        self.assertIn("no chat command for the routed harness", r._chat_hold)
+        live = self.standing(IGNORES)
+        live.chat.state = mock.Mock(return_value="ours")
+        live.chat.option = mock.Mock(side_effect=lambda n: {"@mr_digest": "home", "@mr_started": "0"}.get(n, ""))
+        live.chat.idle = mock.Mock(return_value=True)
+        live.chat.stop = mock.Mock()
+        live.keep_chat()                                     # live: left alone
+        live.chat.stop.assert_not_called()
+        live.chat.start.assert_not_called()
+        self.assertEqual(live.chat.hold_kind, "route")
+
+    def test_a_claude_answer_while_cards_go_to_agy_starts_the_gone_chat_on_claude(self):
+        r = self.standing(ANSWERS_CLAUDE)
+        r._routed_harness = "agy"
+        r.keep_chat()
+        r.chat.start.assert_called_once()
+        env, digest, command = r.chat.start.call_args.args
+        self.assertEqual(command, CLAUDE_CHAT)
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/acct/steward-max")
+        self.assertNotIn("AGY_HOME", env)
+        self.assertNotIn("MESH_RUNNER_STANDING_CHAT_HARNESSES", env)
+        self.assertEqual(r._chat_hold, "")
+        self.assertEqual(r._routed_harness, "agy")           # the card route is untouched
+        self.assertEqual(r._read_env()["MESH_RUNNER_HARNESS"], "agy")   # a card-less read still routes to agy
+        r._chat_due = 0
+        r.keep_chat()
+        self.assertEqual(r.chat.start.call_args.args[1], digest)   # same profile, same digest: stable
+
+    def test_a_failing_env_command_starts_nothing(self):
+        r = self.standing("sys.exit(3)\n")
+        r.keep_chat()
+        r.chat.start.assert_not_called()
+        self.assertIn("env command failed (rc 3)", r._chat_error)
+
+    def test_a_raw_harness_outside_the_list_is_held_even_when_it_is_no_alt(self):
+        # _route_env folds a harness outside alt_adapters into the base one: claude would start with agy's env
+        r = self.standing(IGNORES, alts=("codex",))
+        r.keep_chat()
+        r.chat.start.assert_not_called()
+        self.assertEqual(r.chat.hold_kind, "route")
+
+
+CLAUDE_CHAT = ["/usr/bin/env", "DISABLE_AUTOUPDATER=1", "claude", "--model", "opus"]
+
+
 if __name__ == "__main__":
     unittest.main()
