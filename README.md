@@ -810,6 +810,12 @@ Without a command for the routed harness the session is held (a live one keeps r
 its current harness, a gone one is not started): the runner logs
 `chat session … held` once, reports `chat_hold` / `chat_hold_since` in its status and
 exports `mesh_runner_chat_hold_seconds{agent}` (0 = not held) for alerting.
+The chat's own env read tells the env command which harnesses the chat can run:
+`MESH_RUNNER_STANDING_CHAT_HARNESSES=claude,codex` (the chat command's harness first, then
+the keys of `commands`). A lane whose cards go to a harness without a chat command (agy,
+kimi) may answer it with the env of one of those harnesses; card and card-less reads never
+pass it. The answer's raw `MESH_RUNNER_HARNESS` must be in that list, else the chat is held
+as above: a chat command never starts with another harness's env.
 
 Host memory gate (`[runner] memory_hold_free_pct = 15`, `memory_release_free_pct = 20`,
 `memory_hold_swap_mb`, `memory_release_swap_mb`): no new or resumed sessions while
