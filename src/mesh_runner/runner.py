@@ -496,7 +496,8 @@ def mention_request(body: str, slug: str) -> bool:
         r"\b(?:please|could you|can you|need you|пожалуйста|прошу|нужно|нужен|нужна|"
         r"подтверди\w*|проверь\w*|ответь\w*|посмотри\w*|сделай\w*|дай|выдай\w*|"
         r"разреши\w*|установи\w*|перезапусти\w*|выполни\w*|обнови\w*|выложи\w*|"
-        r"смёржи\w*|смержи\w*|прими\w*|check|confirm|answer|review|deploy|install|restart|grant|merge)\b",
+        r"смёржи\w*|смержи\w*|прими\w*|оставь\w*|закрой\w*|закрыть|влей\w*|выведи\w*|сними\w*|"
+        r"верни\w*|исправь\w*|почини\w*|check|confirm|answer|review|deploy|install|restart|grant|merge)\b",
         text, re.I))
 
 
@@ -6539,11 +6540,23 @@ class AgentRunner:
         # proves nothing (anyone can type it); a runner only starts, and so only refuses, a card
         # assigned to its lane, so the refusal counts only when Mesh names the card's assignee
         # as the comment's author. A third party's "@A done" in that shape keeps the rule.
+        # A former owner is no guest in that conversation: the card's author handed it to a reviewer
+        # or another lane, and its own reports there ("Result: review") are its work, not a reply
+        # in someone else's thread. A lead's or a reviewer's "@author do X" on that card is a new
+        # directive that wakes nobody else, since the author neither holds nor waits on the card; the
+        # rule dropped it (a lead's directive to the author, six seconds after the card went
+        # to its reviewer). Ownership is this lane's own work attempt on the card
+        # in the runner's store; a past review turn is not ownership, the runner re-assigns reviewers.
         recent = now() - dt.timedelta(hours=24)
+        owner = not refusal and any(a.agent == self.agent.name and a.mode == "work"
+                                    for a in self.store.on_task(tid))
         if refusal:
             log.info("%s: mention by %s on #%s is a repository access refusal: filed whatever the "
                      "conversation", self.agent.name, m.get("author_name") or "someone", tid[:8])
-        for c in ([] if refusal or desk_fallback else self._comments(tid)):
+        elif owner:
+            log.info("%s: mention by %s on #%s is addressed to its former owner: filed whatever the "
+                     "conversation", self.agent.name, m.get("author_name") or "someone", tid[:8])
+        for c in ([] if refusal or owner or desk_fallback else self._comments(tid)):
             if automation_comment(c):
                 continue
             at = parse_time(c.get("created_at"))

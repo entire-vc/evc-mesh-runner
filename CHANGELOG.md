@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.130 — 2026-11-25
+
+- **A directive to a card's former owner is delivered while the card sits with its reviewer.** The
+  "already in the conversation there" rule dropped a lead's or a reviewer's `@<author> …` line on a
+  card the author had just sent to review: the author's own review report counted as taking part in
+  someone else's thread, though the author neither holds nor waits on the card. A lane with its own
+  `work` attempt on the card in the runner's store is now its former owner, and an address to it is
+  filed whatever the conversation (log: `addressed to its former owner`); a past review turn or no
+  attempt keeps the anti-ping-pong rule. The request vocabulary also takes the Russian imperatives of
+  such directives (`оставь`, `закрой`/`закрыть`, `влей`, `выведи`, `сними`, `верни`, `исправь`,
+  `почини`).
+
 ## 0.2.129 — 2026-11-25
 
 - **A standing chat stays up while the lane's cards go to a harness it cannot run (agy, kimi,
