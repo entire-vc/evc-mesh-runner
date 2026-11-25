@@ -17,7 +17,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from mesh_runner import auth, interactive
+from mesh_runner import auth, interactive, turn_usage
 from mesh_runner.adapters.agy import AgyAdapter, LANE_PERMISSIONS, READ_ONLY_PERMISSIONS, write_workspace_mcp
 from mesh_runner.adapters.base import Launch, LaunchProbeDenied
 from mesh_runner.runner import EGRESS_HINT, NO_SESSION_HINT, PROVIDER_OUTAGE_HINT, QUOTA_HINT
@@ -158,7 +158,7 @@ class Parse(unittest.TestCase):
         self.assertFalse(r.is_error)
         self.assertEqual((r.session_id, r.final_text, r.model), (CID, "OK\n", "gemini-3.8-flash-low"))
         self.assertEqual(r.usage, {"input_tokens": 9500, "output_tokens": 1, "cache_read_input_tokens": 0,
-                                   "thinking_tokens": 0})
+                                   "cache_creation_input_tokens": 0, "thinking_tokens": 0})
 
     def test_resume_by_conversation_id_counts_only_its_own_steps(self):
         r = self.ad.parse(write(RESUMED, requested=CID))
@@ -167,6 +167,16 @@ class Parse(unittest.TestCase):
         # result.usage is 11758 input for the whole conversation; this turn used 2258
         self.assertEqual(r.usage["input_tokens"], 2258)
         self.assertEqual(r.usage["cache_read_input_tokens"], 7457)
+
+    def test_implicit_cache_only_reports_no_cache_write(self):
+        # Gemini caches implicitly only (no explicit cache, no write price): a known read means write 0
+        r = self.ad.parse(write(RESUMED, requested=CID))
+        self.assertEqual(turn_usage.cache_fields(r.usage), ({"cache_read": 7457, "cache_write": 0}, []))
+
+    def test_unknown_cache_read_keeps_cache_unknown(self):
+        r = self.ad.parse(write(TOOL, requested=""))
+        self.assertNotIn("cache_creation_input_tokens", r.usage)
+        self.assertEqual(turn_usage.cache_fields(r.usage), ({}, ["cache_read", "cache_write"]))
 
     def test_resume_that_agy_silently_forked_is_a_missing_session(self):
         forked = [dict(e) for e in FRESH]

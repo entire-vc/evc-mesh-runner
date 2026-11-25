@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.132 — 2026-11-25
+
+- **agy turns report a cache write of 0.** Gemini caches implicitly only (no explicit cache, no
+  cache write price), so an agy turn with a known cache read now reports `cache_write: 0` instead of
+  leaving it unknown, and Mesh can price it. A turn without a cache read keeps both figures unknown.
+  `tokens_in` and `tokens_out` are unchanged: agy's `output_tokens` already counts thinking tokens.
+
 ## 0.2.131 — 2026-11-25
 
 - **Two-step reasoning effort per lane.** Optional `default_effort` and `escalate_effort` in
