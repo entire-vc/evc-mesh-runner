@@ -333,6 +333,110 @@ class Launching(unittest.TestCase):
         self.assertEqual(json.loads(log.with_suffix(".agy").read_text()), {"conversation": CID})
         self.assertIn(f"--conversation {CID} --print=hello", self.native.read_text())
 
+    # -- per-lane allowlist of other MCP servers (mcp_allow) ------------------------------
+    PLAYWRIGHT = {"command": "/u/bin/mcp-wrap",
+                  "args": ["/u/.local/bin/uv", "run", "--with", "mcp>=1.0,<2.0", "--with", "playwright==1.61.0",
+                           "--python", "/opt/homebrew/bin/python3.12", "--", "python3",
+                           "/u/ops/scripts/playwright-mcp-server.py"],
+                  "env": {"BROWSER_DEFAULT_PROFILE": "lane", "MCP_WRAP_NAME": "playwright"},
+                  "cwd": "/u/lane", "type": "stdio", "timeout": 30}
+
+    def write_mcp(self, servers):
+        (self.profile / ".mcp.json").write_text(json.dumps({"mcpServers": servers}))
+
+    def workspace(self):
+        return json.loads((self.profile / ".agents" / "mcp_config.json").read_text())["mcpServers"]
+
+    def test_an_allowed_server_is_carried_by_its_exact_name_with_its_launch_fields_only(self):
+        self.write_mcp({"evc-mesh": self.mesh, "playwright": self.PLAYWRIGHT,
+                        "github": {"command": "npx", "args": ["@github/mcp"]},
+                        "playwright-other": {"command": "/u/bin/mcp-wrap", "args": ["/u/bin/x"]}})
+        ad = AgyAdapter(str(self.root / "agy"), admission_commands=[["true"]], mcp_allow=["playwright"])
+        self.spawn(ad)
+        servers = self.workspace()
+        self.assertEqual(sorted(servers), ["evc-mesh", "playwright"])           # no pattern, no neighbour
+        self.assertEqual(servers["playwright"], {k: self.PLAYWRIGHT[k] for k in ("command", "args", "env", "cwd")})
+        self.assertEqual(servers["evc-mesh"], self.mesh)
+        target = self.profile / ".agents" / "mcp_config.json"
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_without_an_allowlist_the_named_server_is_still_dropped(self):
+        self.write_mcp({"evc-mesh": self.mesh, "playwright": self.PLAYWRIGHT})
+        self.assertTrue(write_workspace_mcp(self.profile))
+        self.assertEqual(sorted(self.workspace()), ["evc-mesh"])
+        self.assertTrue(write_workspace_mcp(self.profile, []))
+        self.assertEqual(sorted(self.workspace()), ["evc-mesh"])
+
+    def test_disabled_and_remote_allowed_servers_are_not_carried(self):
+        self.write_mcp({"evc-mesh": self.mesh, "playwright": {**self.PLAYWRIGHT, "disabled": True},
+                        "remote": {"url": "https://mcp.example/mcp"},
+                        "both": {"command": "/u/bin/x", "url": "https://mcp.example/mcp"}})
+        self.assertTrue(write_workspace_mcp(self.profile, ["playwright", "remote", "both"]))
+        self.assertEqual(sorted(self.workspace()), ["evc-mesh"])
+
+    def test_an_allowed_server_alone_is_no_mesh_server(self):
+        self.write_mcp({"playwright": self.PLAYWRIGHT})
+        self.assertFalse(write_workspace_mcp(self.profile, ["playwright"]))
+        self.assertFalse((self.profile / ".agents" / "mcp_config.json").exists())
+        ad = AgyAdapter(str(self.root / "agy"), admission_commands=[["true"]], mcp_allow=["playwright"])
+        with self.assertRaises(LaunchProbeDenied) as caught:
+            self.spawn(ad)
+        self.assertEqual(caught.exception.reason, "agy-mesh-mcp-missing")
+
+    def test_an_allowed_server_comes_from_the_lane_file_never_from_the_old_workspace_file(self):
+        target = self.profile / ".agents" / "mcp_config.json"
+        target.parent.mkdir()
+        target.write_text(json.dumps({"mcpServers": {"evc-mesh": self.mesh, "playwright": self.PLAYWRIGHT,
+                                                     "foreign": {"command": "/u/bin/other-mcp"}}}))
+        self.write_mcp({"evc-mesh": self.mesh})                    # the lane file no longer lists it
+        self.assertTrue(write_workspace_mcp(self.profile, ["playwright", "foreign"]))
+        self.assertEqual(sorted(self.workspace()), ["evc-mesh"])
+        target.write_text(json.dumps({"mcpServers": {"evc-mesh": self.mesh, "playwright": self.PLAYWRIGHT}}))
+        self.write_mcp({})                                         # no Mesh in the lane file: old Mesh kept
+        self.assertTrue(write_workspace_mcp(self.profile, ["playwright"]))
+        self.assertEqual(sorted(self.workspace()), ["evc-mesh"])
+        self.write_mcp({"evc-mesh": self.mesh, "playwright": self.PLAYWRIGHT})
+        self.assertTrue(write_workspace_mcp(self.profile, ["playwright"]))
+        self.assertTrue(write_workspace_mcp(self.profile, []))     # allowlist removed: dropped again
+        self.assertEqual(sorted(self.workspace()), ["evc-mesh"])
+
+    def test_an_allowed_name_cannot_replace_a_mesh_server(self):
+        self.write_mcp({"evc-mesh": self.mesh})
+        self.assertTrue(write_workspace_mcp(self.profile, ["evc-mesh"]))
+        self.assertEqual(self.workspace(), {"evc-mesh": self.mesh})
+        # the lane file renames another server to the Mesh name: the kept Mesh server wins
+        self.write_mcp({"evc-mesh": {"command": "/u/bin/other-mcp"}})
+        self.assertTrue(write_workspace_mcp(self.profile, ["evc-mesh"]))
+        self.assertEqual(self.workspace(), {"evc-mesh": self.mesh})
+
+    def test_an_allowlist_takes_exact_names_only(self):
+        for bad in (["*"], ["play*"], [""], ["a/b"], ["x)"], [1]):
+            with self.assertRaises(ValueError):
+                AgyAdapter("agy", mcp_allow=bad)
+
+    def test_read_only_denies_the_tools_of_allowed_servers(self):
+        ad = AgyAdapter("agy", mcp_allow=["playwright", "figma"])
+        argv = ad.with_read_only(ad.start_argv("", Path("/p"), []))
+        settings, = [json.loads(argv[i + 1]) for i, a in enumerate(argv[:-1]) if a == "--settings"]
+        rules = settings["permissions"]
+        self.assertEqual(rules["allow"], READ_ONLY_PERMISSIONS["allow"])
+        self.assertEqual(rules["deny"], READ_ONLY_PERMISSIONS["deny"] + ["mcp(figma/*)", "mcp(playwright/*)"])
+        lane = ad.start_argv("", Path("/p"), [])                    # an ordinary turn may use them
+        self.assertEqual([json.loads(lane[i + 1]) for i, a in enumerate(lane[:-1]) if a == "--settings"],
+                         [{"permissions": LANE_PERMISSIONS}])
+
+    def test_a_read_only_turn_never_denies_the_mesh_server_named_in_the_allowlist(self):
+        self.write_mcp({"evc-mesh": self.mesh, "playwright": self.PLAYWRIGHT})
+        ad = self.adapter(["true"])
+        ad.mcp_allow = ["evc-mesh", "playwright"]
+        self.spawn(ad, ad.with_read_only(ad.start_argv("", self.profile, [])))
+        ran = self.native.read_text()
+        settings = json.loads(ran[ran.index("{"):ran.rindex("}") + 1])
+        self.assertNotIn("mcp(evc-mesh/*)", settings["permissions"]["deny"])     # Mesh stays usable
+        self.assertIn("mcp(playwright/*)", settings["permissions"]["deny"])
+        self.assertIn("command(*)", settings["permissions"]["deny"])
+        self.assertEqual(sorted(self.workspace()), ["evc-mesh", "playwright"])
+
     def test_unchanged_workspace_file_is_not_rewritten(self):
         self.assertTrue(write_workspace_mcp(self.profile))
         target = self.profile / ".agents" / "mcp_config.json"

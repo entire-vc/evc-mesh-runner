@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.128 — 2026-11-25
+
+- **An agy lane may carry named non-Mesh MCP servers: `mcp_allow`.** `mcp_allow = ["playwright"]` in
+  `[[agents]]` (harness `agy`) or `[agents.alt.agy]` lists exact server names of the lane's `.mcp.json`;
+  their stdio launch fields (`command`, `args`, `env`, `cwd`) are written with the Mesh servers into
+  `<profile>/.agents/mcp_config.json` (0600, atomic). Without it the file stays Mesh-only. An allowed
+  server never comes from the old workspace file, a disabled or remote (`url`) one is not carried, and
+  it never stands in for the Mesh server (`agy-mesh-mcp-missing` still refuses the start). A read-only
+  turn denies `mcp(<name>/*)` for each allowed server
+  except one that is a Mesh server of the workspace. A pattern, an empty name or the key on another
+  harness is a config error.
+
+## 0.2.127 — 2026-11-24
+
+- **A launch whose prompt never left is told apart from a start.** `start`/`resume` in `events.jsonl`
+  and the `launch` event carry `delivery`, the launch's prompt token; `prompt_unsent_reconciled` and
+  `prompt_quota_unbound_reconciled` in `events.jsonl` carry the same `delivery`, `launched_turn` (the
+  launch's turn; the row's own `turn` is the restored count) and `delivered: false`, so a metric can drop
+  the start they cancel. The relaunch after such an end reads `restart_reason: prompt_unsent` instead of
+  `session_missing`; a resumed retry reads it instead of an empty reason.
+
 ## 0.2.126 — 2026-11-24
 
 - **A pause token can say why it exists, and an overdue one is flagged.** A token whose content is a

@@ -64,6 +64,28 @@ class HarnessKinds(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load(config('harness="claude"\n[agents.alt.agy]\n' + bad))
 
+    def test_agy_mcp_allow_reaches_the_adapter_in_both_places(self):
+        lane, = load(config('harness="agy"\nadmission_commands=[["true"]]\nmcp_allow=["playwright","figma"]\n')).agents
+        self.assertEqual(lane.mcp_allow, ["figma", "playwright"])
+        self.assertEqual(make_adapter(lane).mcp_allow, ["figma", "playwright"])
+        lane, = load(config('harness="codex"\n[agents.alt.agy]\nadmission_commands=[["true"]]\n'
+                            'mcp_allow=["playwright"]\n')).agents
+        self.assertEqual(make_alt_adapter("agy", lane.alt["agy"]).mcp_allow, ["playwright"])
+        lane, = load(config('harness="agy"\nadmission_commands=[["true"]]\n')).agents
+        self.assertEqual(make_adapter(lane).mcp_allow, [])                       # default: Mesh only
+
+    def test_malformed_or_misplaced_mcp_allow_is_refused(self):
+        for bad in ('mcp_allow="playwright"\n', 'mcp_allow=["*"]\n', 'mcp_allow=["play*"]\n',
+                    'mcp_allow=[""]\n', 'mcp_allow=[1]\n', 'mcp_allow=["a/b"]\n'):
+            with self.assertRaises(ConfigError):
+                load(config('harness="agy"\n' + bad))
+            with self.assertRaises(ConfigError):
+                load(config('harness="claude"\n[agents.alt.agy]\n' + bad))
+        with self.assertRaises(ConfigError):                                    # another harness ignores it
+            load(config('harness="codex"\nmcp_allow=["playwright"]\n'))
+        with self.assertRaises(ConfigError):
+            load(config('harness="agy"\n[agents.alt.claude]\nmcp_allow=["playwright"]\n'))
+
     def test_unknown_harness_and_alt_are_refused(self):
         with self.assertRaises(ConfigError):
             load(config('harness="gemini"\n'))

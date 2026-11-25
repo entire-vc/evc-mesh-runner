@@ -35,7 +35,9 @@ limit nor an authentication failure.
 Permissions are explicit per session (``--settings``, never saved): every action a lane turn needs is
 allowed and nothing asks, since print mode cannot answer a question. Mesh MCP comes from the
 workspace file ``<cwd>/.agents/mcp_config.json`` (``--settings`` does not take MCP servers), which the
-adapter writes before each start from the lane's ``.mcp.json``: the Mesh servers only.
+adapter writes before each start from the lane's ``.mcp.json``: the Mesh servers, plus the stdio servers
+the lane names in ``mcp_allow`` (exact names; none by default). A read-only turn denies the tools of
+those named servers in its own ``--settings``: the workspace file is shared by every session of the lane.
 
 Admission: before every start each configured ``admission_commands`` entry (an argv; ``{gemini_dir}``
 = the Gemini home of the launch environment) must exit 0, e.g. the secret guard check of that home and
@@ -66,6 +68,8 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MESH_MCP_COMMANDS = ("mesh-mcp-agent", "mesh-mcp")
 # exec wrappers that run their first argument as the server (stderr capture), nothing else
 MCP_WRAPPERS = ("mcp-wrap",)
+# a server name a lane may allow (exact, no pattern): also safe inside a permission rule mcp(<name>/*)
+MCP_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 ADMISSION_TIMEOUT = 30
 # Every action a lane turn takes; deny stays explicit. Read-only turns deny commands and writes.
 LANE_PERMISSIONS = {"allow": ["command(*)", "read_file(*)", "write_file(*)", "read_url(*)",
@@ -105,8 +109,9 @@ def _is_mesh(spec: dict) -> bool:
     return Path(executable).name in MESH_MCP_COMMANDS
 
 
-def mesh_servers(path: Path) -> dict:
-    """The Mesh MCP servers (stdio) of an MCP config file (``mcpServers``), {} when none or unreadable."""
+def _stdio_servers(path: Path) -> dict:
+    """The enabled stdio servers of an MCP config file (``mcpServers``), each reduced to ``command``,
+    ``args``, ``env``, ``cwd``; {} when none or unreadable. A remote (``url``) server is not one."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -114,20 +119,63 @@ def mesh_servers(path: Path) -> dict:
     servers = data.get("mcpServers") if isinstance(data, dict) else None
     out = {}
     for name, spec in (servers.items() if isinstance(servers, dict) else ()):
-        if isinstance(spec, dict) and spec.get("command") and _is_mesh(spec) and not spec.get("disabled"):
+        if (isinstance(spec, dict) and isinstance(spec.get("command"), str) and spec["command"]
+                and not spec.get("disabled") and not spec.get("url") and not spec.get("serverUrl")):
             out[str(name)] = {k: spec[k] for k in ("command", "args", "env", "cwd") if k in spec}
     return out
 
 
-def write_workspace_mcp(cwd: Path) -> bool:
-    """``<cwd>/.agents/mcp_config.json`` holds the Mesh servers of the lane's ``<cwd>/.mcp.json``
-    (written 0600, atomically, only when it differs). Without a Mesh server there, the Mesh servers of an
-    existing workspace file are kept and every other server is dropped from it: the session never sees a
-    server the filter refused. True when the workspace has a Mesh server."""
+def mesh_servers(path: Path) -> dict:
+    """The Mesh MCP servers (stdio) of an MCP config file (``mcpServers``), {} when none or unreadable."""
+    return {name: spec for name, spec in _stdio_servers(path).items() if _is_mesh(spec)}
+
+
+def allowed_servers(path: Path, allow) -> dict:
+    """The stdio servers of ``path`` whose names ``allow`` lists exactly (no pattern, no reading of the
+    executable: the name in the lane's own ``.mcp.json`` is what the lane config allows)."""
+    names = {n for n in allow or () if isinstance(n, str) and MCP_NAME_RE.fullmatch(n)}
+    return {name: spec for name, spec in _stdio_servers(path).items() if name in names}
+
+
+def _spare_mesh(argv: list[str], mesh) -> list[str]:
+    """``argv`` whose ``--settings`` deny no Mesh server: a read-only turn denies the tools of the
+    ``mcp_allow`` servers, and a name there that is a Mesh server of this workspace must stay usable."""
+    spared = {f"mcp({name}/*)" for name in mesh}
+    out = list(argv)
+    for i, a in enumerate(out):
+        value, prefix = ((out[i + 1], "") if a == "--settings" and i + 1 < len(out) else
+                         (a[len("--settings="):], "--settings=") if a.startswith("--settings=") else (None, ""))
+        if value is None:
+            continue
+        try:
+            settings = json.loads(value)
+            deny = settings["permissions"]["deny"]
+        except (ValueError, TypeError, KeyError):
+            continue
+        if not isinstance(deny, list) or not spared.intersection(d for d in deny if isinstance(d, str)):
+            continue
+        settings["permissions"]["deny"] = [d for d in deny if d not in spared]
+        body = prefix + json.dumps(settings, separators=(",", ":"))
+        if prefix:
+            out[i] = body
+        else:
+            out[i + 1] = body
+    return out
+
+
+def write_workspace_mcp(cwd: Path, allow=()) -> bool:
+    """``<cwd>/.agents/mcp_config.json`` holds the Mesh servers of the lane's ``<cwd>/.mcp.json`` plus
+    the stdio servers of that ``.mcp.json`` named in ``allow`` (written 0600, atomically, only when it
+    differs). Without a Mesh server there, the Mesh servers of an existing workspace file are kept; an
+    allowed server comes from ``.mcp.json`` only, never from the existing file, and every other server is
+    dropped: the session never sees a server the filter refused. True when the workspace has a Mesh
+    server; an allowed server alone is not one."""
     target = cwd / ".agents" / "mcp_config.json"
-    servers = mesh_servers(cwd / ".mcp.json") or mesh_servers(target)
-    if not servers:
+    source = cwd / ".mcp.json"
+    mesh = mesh_servers(source) or mesh_servers(target)
+    if not mesh:
         return False
+    servers = {**allowed_servers(source, allow), **mesh}
     body = json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n"
     try:
         if target.read_text() == body and target.stat().st_mode & 0o777 == 0o600:
@@ -163,10 +211,14 @@ class AgyAdapter(Adapter):
     name = "agy"
 
     def __init__(self, binary: str = "agy", extra_args: list[str] | None = None, shell: str = "/bin/sh",
-                 admission_commands: list[list[str]] | None = None):
+                 admission_commands: list[list[str]] | None = None, mcp_allow: list[str] | None = None):
         super().__init__(binary, extra_args)
         self.shell = shell
         self.admission_commands = [[str(x) for x in c] for c in admission_commands or [] if c]
+        bad = [n for n in mcp_allow or [] if not isinstance(n, str) or not MCP_NAME_RE.fullmatch(n)]
+        if bad:
+            raise ValueError(f"mcp_allow: not a server name: {bad[0]!r}")
+        self.mcp_allow = sorted(set(mcp_allow or []))
 
     def _argv(self, add_dirs: list[Path], conversation: str = "") -> list[str]:
         argv = [self.shell, "-c", _SHELL, self.binary, "--output-format", "stream-json"]
@@ -204,8 +256,12 @@ class AgyAdapter(Adapter):
 
     def with_read_only(self, argv: list[str]) -> list[str]:
         """Commands, file writes and downloads are denied by the session's own rules (deny wins over
-        allow, and a configured ``--settings`` is replaced); Mesh MCP and reads stay allowed."""
-        return _drop(argv, ("--settings",)) + ["--settings", _settings(READ_ONLY_PERMISSIONS)]
+        allow, and a configured ``--settings`` is replaced); Mesh MCP and reads stay allowed. The tools
+        of the lane's ``mcp_allow`` servers are denied too: the shared workspace file still lists them.
+        A listed name that is a Mesh server of the workspace is spared again at ``spawn``."""
+        rules = {"allow": list(READ_ONLY_PERMISSIONS["allow"]),
+                 "deny": list(READ_ONLY_PERMISSIONS["deny"]) + [f"mcp({n}/*)" for n in self.mcp_allow]}
+        return _drop(argv, ("--settings",)) + ["--settings", _settings(rules)]
 
     def with_slot_confined(self, argv: list[str]) -> list[str]:
         raise NotImplementedError("writes are not confined to the slot by this adapter")
@@ -232,10 +288,16 @@ class AgyAdapter(Adapter):
         if refused:
             raise LaunchProbeDenied(refused[:48])
         try:
-            if not write_workspace_mcp(Path(launch.cwd)):
+            if not write_workspace_mcp(Path(launch.cwd), self.mcp_allow):
                 raise LaunchProbeDenied("agy-mesh-mcp-missing")
         except OSError:
             raise LaunchProbeDenied("agy-mesh-mcp-unwritable") from None
+        if self.mcp_allow:
+            # a read-only turn denies the allowed servers by name; never the Mesh server it requires
+            mesh = mesh_servers(Path(launch.cwd) / ".agents" / "mcp_config.json")
+            argv = _spare_mesh(launch.argv, mesh)
+            if argv != launch.argv:
+                launch = Launch(argv, launch.cwd, launch.env, launch.prompt, launch.on_created, launch.gate_path)
         conversation = next((launch.argv[i + 1] for i, a in enumerate(launch.argv[:-1])
                              if a == "--conversation"), "")
         try:

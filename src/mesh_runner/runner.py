@@ -426,7 +426,8 @@ def make_adapter(agent: AgentConfig) -> Adapter:
     if agent.harness == "zcode":
         return ZCodeAdapter(agent.binary or "zcode", agent.args)
     if agent.harness == "agy":
-        return AgyAdapter(agent.binary or "agy", agent.args, admission_commands=agent.admission_commands)
+        return AgyAdapter(agent.binary or "agy", agent.args, admission_commands=agent.admission_commands,
+                          mcp_allow=agent.mcp_allow)
     return ClaudeAdapter(agent.binary or "claude", agent.args)
 
 
@@ -441,7 +442,8 @@ def make_alt_adapter(harness: str, spec: dict) -> Adapter:
         return ZCodeAdapter(spec.get("binary") or "zcode", list(spec.get("args") or []))
     if harness == "agy":
         return AgyAdapter(spec.get("binary") or "agy", list(spec.get("args") or []),
-                          admission_commands=list(spec.get("admission_commands") or []))
+                          admission_commands=list(spec.get("admission_commands") or []),
+                          mcp_allow=list(spec.get("mcp_allow") or []))
     raise ValueError(f"unknown harness {harness}")
 
 
@@ -1484,10 +1486,11 @@ class AgentRunner:
         except ValueError:
             return False
 
-    def _record_launch(self, a: Attempt, resume: bool) -> str:
+    def _record_launch(self, a: Attempt, resume: bool, delivery: str = "") -> str:
         """Attribution event for every launched turn (``a`` already carries this turn's count): the actual intent, the restart reason (a
         separate axis) and the assignee observed at launch. A foreign assignee is only
-        ``unknown`` here: the runner has no proof of a read-only mention. No secrets or prompts."""
+        ``unknown`` here: the runner has no proof of a read-only mention. No secrets or prompts.
+        ``delivery`` is the launch's prompt token; an unsent end of this launch names the same token."""
         try:
             task = self._task(a.task_id)
             holder = (task.get("assignee_id") or (task.get("assignee") or {}).get("id") or "") if task else ""
@@ -1506,6 +1509,16 @@ class AgentRunner:
                     reason = json.loads(detail).get("restart_reason") or reason
                 elif kind in ("session_missing", "harness_switch", "session_restart"):
                     reason = kind if kind != "session_restart" else (detail or "session_missing")
+                elif kind in ("prompt_unsent_reconciled", "prompt_quota_unbound_reconciled"):
+                    reason = "prompt_unsent"     # the previous launch never handed its prompt over
+        else:
+            # a resume is no restart, unless the previous launch of this attempt never handed its prompt
+            # over: the kept prompt is retried in the bound session, and a start metric must say so
+            for _, kind, _detail in self.store.events(a.id):
+                if kind == "launch":
+                    reason = ""
+                elif kind in ("prompt_unsent_reconciled", "prompt_quota_unbound_reconciled"):
+                    reason = "prompt_unsent"
         previous = {}
         if reason == "first_start" and a.mode == "work":
             # A new attempt on a card this lane already worked on is a restart, not a first
@@ -1518,6 +1531,7 @@ class AgentRunner:
         self.store.event(a.id, "launch", json.dumps({
             "task": a.task_id, "lane": self.agent.name, "attempt": a.id, "turn": a.turns,
             "intent": "resume" if resume else "start", "restart_reason": reason, **previous,
+            "delivery": delivery,
             "workspace_id": (self.me or {}).get("workspace_id") or "",
             "observed_assignee": holder,
             "classification": "owned" if holder and holder == self.agent_id else "unknown",
@@ -2821,8 +2835,9 @@ class AgentRunner:
         if self._quota_admission_required(a):
             self.store.mark(self.agent.name, a.task_id, "quota_admission_required", "")
         self._last_beat[a.id] = time.monotonic()
-        reason = self._record_launch(a, resume)
-        self.emit("resume" if resume else "start", a, title=a.title[:120], session=sid)
+        reason = self._record_launch(a, resume, intent["token"])
+        # ``delivery`` pairs this start with an unsent end of the same launch (prompt_unsent_reconciled)
+        self.emit("resume" if resume else "start", a, title=a.title[:120], session=sid, delivery=intent["token"])
         self._keep_launch_home(a, env)
         self._lane_route[a.id] = lane_route
         if self.observations is not None:
@@ -5898,7 +5913,9 @@ class AgentRunner:
                               + "; exact pending prompt will use normal admission", **prior):
                     kind = "prompt_quota_unbound_reconciled" if unbound else "prompt_unsent_reconciled"
                     self.store.event(a.id, kind, intent["token"])
-                    self.emit(kind, a)
+                    # not a start: names the launch it cancels (its ``start``/``resume`` carries the same
+                    # ``delivery``); ``turn`` here is the restored count, ``launched_turn`` the launch's own
+                    self.emit(kind, a, delivery=intent["token"], launched_turn=intent.get("turn"), delivered=False)
                 return False
             if resolution == "completed":
                 proof = ("headless.bound-terminal" if intent.get("kind") == "headless" else

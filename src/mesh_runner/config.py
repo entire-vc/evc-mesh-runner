@@ -270,6 +270,7 @@ class AgentConfig:
     launch_probe_command: list[str] = field(default_factory=list)  # Codex launch-context probe helper (stdin protocol)
     launch_probe_version: int = 1                                  # 2 = opt-in: reply also carries used percents
     admission_commands: list[list[str]] = field(default_factory=list)  # agy: argvs run before every start, all 0 = go
+    mcp_allow: list[str] = field(default_factory=list)  # agy: non-Mesh MCP servers of .mcp.json, by exact name; [] = Mesh only
     queue_order_command: list[str] = field(default_factory=list)   # ordinary-work start order helper; empty = off
     source_review_command: list[str] = field(default_factory=list)  # pinned external review units; empty = off
     source_review_timeout_seconds: float = 60.0
@@ -740,6 +741,14 @@ def _argv_list(value, key: str, name: str) -> list[list[str]]:
     return [list(c) for c in value]
 
 
+def _mcp_allow(value, key: str, name) -> list[str]:
+    """Exact MCP server names of the lane's ``.mcp.json`` (no pattern): letters, digits, ``_.-``."""
+    if not isinstance(value, list) or any(
+            not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", v) for v in value):
+        raise ConfigError(f"agent {name}: {key} must be a list of exact MCP server names")
+    return sorted(set(value))
+
+
 def _qo_argv(value, name: str, key: str = "queue_order_command") -> list[str]:
     if value in (None, []):
         return []
@@ -1090,6 +1099,13 @@ def load(path: str | Path) -> RunnerConfig:
                 raise ConfigError(f"agent {a.get('name')}: alt harness must be one of {', '.join(HARNESSES)}")
             if isinstance(spec, dict) and "admission_commands" in spec:
                 _argv_list(spec["admission_commands"], f"alt.{alt}.admission_commands", a.get("name"))
+            if isinstance(spec, dict) and "mcp_allow" in spec:
+                if alt != "agy":
+                    raise ConfigError(f"agent {a.get('name')}: alt.{alt}.mcp_allow is read by harness agy only")
+                spec["mcp_allow"] = _mcp_allow(spec["mcp_allow"], "alt.agy.mcp_allow", a.get("name"))
+        if "mcp_allow" in a and harness != "agy":
+            raise ConfigError(f"agent {a.get('name')}: mcp_allow is read by harness agy only "
+                              "(an agy route takes it under [agents.alt.agy])")
         repos = [_repo_spec(x, f"agent {a.get('name')} repos") for x in a.get("repos") or []]
         ident = a.get("identity")
         if "project_ids" in a:
@@ -1120,6 +1136,7 @@ def load(path: str | Path) -> RunnerConfig:
             launch_probe_command=list(a.get("launch_probe_command") or []),
             launch_probe_version=_probe_version(a.get("launch_probe_version", 1), a["name"]),
             admission_commands=_argv_list(a.get("admission_commands", []), "admission_commands", a["name"]),
+            mcp_allow=_mcp_allow(a.get("mcp_allow", []), "mcp_allow", a["name"]),
             queue_order_command=_qo_argv(a.get("queue_order_command"), a["name"]),
             source_review_command=_qo_argv(a.get("source_review_command"), a["name"], "source_review_command"),
             source_review_timeout_seconds=_qo_seconds(a.get("source_review_timeout_seconds", 60), "source_review_timeout_seconds", a["name"]),
