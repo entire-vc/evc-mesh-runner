@@ -171,6 +171,14 @@ class DeliveryRecheck(Bench):
         self.assertTrue(result.startswith('unresolved:'))
         self.assert_pending()
 
+    def test_missing_delivery_journal_stays_unresolved_unreadable(self):
+        interactive.delivery_path(self.directory, self.a.id).unlink()
+        observed = self.observed()
+        self.assertEqual(len(observed['evidence_sha256']), 64)
+        result = self.consume(self.submit(observed))
+        self.assertEqual(result, 'unresolved:native-evidence-unreadable')
+        self.assertEqual(self.assert_pending().state, 'unknown')
+
 
 class UnprovenIsolation(DeliveryRecheck):
     """S2: unresolved acceptance stays honest, isolated, idempotent and explained; never replayed."""

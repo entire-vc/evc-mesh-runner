@@ -9,8 +9,11 @@ used to stand until an operator token ended them. Now:
   a turn that has begun; a window whose prompt went in and whose driver is gone is never closed as idle;
 - no window starts while the host is under the memory floor, read right before the window (not a cached reading).
 """
+import errno
 import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
 import threading
@@ -20,7 +23,7 @@ from unittest import mock
 from pathlib import Path
 
 from fakes import FakeMesh, ask_agent, calls, task, wait_time, write_replies
-from mesh_runner import host_admission, hostmem, interactive, runner as runner_mod, tui_driver
+from mesh_runner import delivery_requests, host_admission, hostmem, interactive, runner as runner_mod, tui_driver
 from mesh_runner.adapters.base import interrupt_group, proc_stamp
 from test_runner import Bench
 
@@ -417,4 +420,129 @@ class HostGateBeforeAWindow(Bench):
             r.tick()
         self.assertEqual([x["resume"] for x in calls(self.calls)], [False])
         self.assertTrue(any("start held: host short of memory" in m for m in logs.output), logs.output)
+
+
+class MissingDeliveryJournal(UnknownAfterPaste):
+    """After an abrupt host crash, the delivery journal may be absent on disk while the attempt row is already
+    in SQLite and its process group is dead. Missing journal must yield a stable evidence digest so quiet
+    resolution closes the held attempt instead of resetting the quiet timer forever."""
+
+    def setUp(self):
+        super().setUp()
+        interactive.delivery_path(self.directory, self.a.id).unlink()
+
+    def test_unknown_signals_once_and_explains_itself(self):
+        for _ in range(3):
+            self.r.settle_finished()
+        a = self.r.store.get(self.a.id)
+        self.assertEqual(a.state, "unknown")
+        self.assertEqual(a.wait["interactive_prompt_intent"]["resolution"], "native-evidence-unreadable")
+        self.assertEqual(len(self.alerts()), 1)
+
+    def test_missing_journal_yields_stable_evidence_and_closes_quietly(self):
+        digest_a = delivery_requests.evidence(self.cfg.state_dir, self.a)
+        digest_b = delivery_requests.evidence(self.cfg.state_dir, self.a)
+        self.assertEqual(len(digest_a), 64)
+        self.assertEqual(digest_a, digest_b)
+
+        self.r.settle_finished()
+        a = self.r.store.get(self.a.id)
+        self.assertEqual(a.state, "unknown")
+        self.assertEqual(a.wait["interactive_prompt_intent"]["resolution"], "native-evidence-unreadable")
+        key = "unknown_quiet:" + self.a.id
+        first = json.loads(self.r.store.mark(self.agent.name, self.t["id"], key)[0])
+        self.assertEqual(first["evidence"], digest_a)
+
+        self.r.settle_finished()
+        second = json.loads(self.r.store.mark(self.agent.name, self.t["id"], key)[0])
+        self.assertEqual(second["since"], first["since"], "missing journal must not reset the quiet timer")
+
+        self.age_quiet_clock(runner_mod.UNKNOWN_QUIET_MINUTES + 1)
+        self.r.settle_finished()
+        a = self.r.store.get(self.a.id)
+        self.assertEqual(a.state, "completed")
+        self.assertNotIn("interactive_prompt_intent", a.wait)
+        self.assertIn("quiet_resolution", [k for _, k, _ in self.r.store.events(a.id)])
+
+    def test_corrupt_journal_still_resets_quiet_timer(self):
+        self.r.settle_finished()
+        self.age_quiet_clock(runner_mod.UNKNOWN_QUIET_MINUTES + 5)
+        interactive.delivery_path(self.directory, self.a.id).write_text("{corrupt")
+        with self.assertRaises(ValueError):
+            delivery_requests.evidence(self.cfg.state_dir, self.a)
+        self.r.settle_finished()
+        self.assertEqual(self.r.store.get(self.a.id).state, "unknown")
+        mark = self.r.store.mark(self.agent.name, self.t["id"], "unknown_quiet:" + self.a.id)
+        self.assertEqual(mark[0], "")
+
+    def test_io_error_reading_journal_still_resets_quiet_timer(self):
+        self.r.settle_finished()
+        self.age_quiet_clock(runner_mod.UNKNOWN_QUIET_MINUTES + 5)
+        with mock.patch.object(interactive, "read_delivery", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                delivery_requests.evidence(self.cfg.state_dir, self.a)
+            self.r.settle_finished()
+        self.assertEqual(self.r.store.get(self.a.id).state, "unknown")
+        mark = self.r.store.mark(self.agent.name, self.t["id"], "unknown_quiet:" + self.a.id)
+        self.assertEqual(mark[0], "")
+
+
+class WriteDeliveryDurability(Bench):
+    def test_darwin_uses_fullfsync_for_file_and_directory(self):
+        directory = self.root / "delivery-darwin"
+        kinds = []
+
+        def record_fcntl(fd, op):
+            self.assertEqual(op, 51)
+            mode = os.fstat(fd).st_mode
+            kinds.append("dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "other")
+            return 0
+
+        with mock.patch.object(interactive.sys, "platform", "darwin"), \
+             mock.patch.object(interactive.fcntl, "F_FULLFSYNC", 51, create=True), \
+             mock.patch.object(interactive.fcntl, "fcntl", side_effect=record_fcntl) as fcntl_mock, \
+             mock.patch.object(interactive.os, "fsync") as fsync_mock:
+            interactive.write_delivery(directory, "attempt-1", {"version": 1, "phase": "reserved"})
+
+        self.assertEqual(kinds, ["file", "dir"])
+        self.assertEqual(fcntl_mock.call_count, 2)
+        fsync_mock.assert_not_called()
+        self.assertEqual(interactive.read_delivery(directory, "attempt-1"), {"version": 1, "phase": "reserved"})
+
+    def test_darwin_falls_back_to_fsync_when_fullfsync_unsupported(self):
+        directory = self.root / "delivery-fallback"
+        fsync_kinds = []
+
+        def record_fsync(fd):
+            mode = os.fstat(fd).st_mode
+            fsync_kinds.append("dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "other")
+
+        with mock.patch.object(interactive.sys, "platform", "darwin"), \
+             mock.patch.object(interactive.fcntl, "F_FULLFSYNC", 51, create=True), \
+             mock.patch.object(interactive.fcntl, "fcntl",
+                               side_effect=OSError(errno.ENOTSUP, "not supported")) as fcntl_mock, \
+             mock.patch.object(interactive.os, "fsync", side_effect=record_fsync):
+            interactive.write_delivery(directory, "attempt-2", {"version": 1, "phase": "send-intent"})
+
+        self.assertEqual(fcntl_mock.call_count, 2)
+        self.assertEqual(fsync_kinds, ["file", "dir"])
+        self.assertEqual(interactive.read_delivery(directory, "attempt-2"), {"version": 1, "phase": "send-intent"})
+
+    def test_non_darwin_uses_fsync_for_file_and_directory(self):
+        directory = self.root / "delivery-linux"
+        fsync_kinds = []
+
+        def record_fsync(fd):
+            mode = os.fstat(fd).st_mode
+            fsync_kinds.append("dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "other")
+
+        with mock.patch.object(interactive.sys, "platform", "linux"), \
+             mock.patch.object(interactive.fcntl, "fcntl") as fcntl_mock, \
+             mock.patch.object(interactive.os, "fsync", side_effect=record_fsync):
+            interactive.write_delivery(directory, "attempt-3", {"version": 1, "phase": "received"})
+
+        fcntl_mock.assert_not_called()
+        self.assertEqual(fsync_kinds, ["file", "dir"])
+        self.assertEqual(interactive.read_delivery(directory, "attempt-3"), {"version": 1, "phase": "received"})
+
 

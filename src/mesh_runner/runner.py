@@ -6291,7 +6291,7 @@ class AgentRunner:
         try:
             seen = delivery_requests.evidence(self.cfg.state_dir, a)
         except (OSError, ValueError, KeyError, TypeError):
-            # a read that fails (a file changing under it, a missing file) is no proof of quiet: the clock starts again
+            # a read that fails (a file changing under it, a corrupt or unreadable file) is no proof of quiet: the clock starts again
             self.store.mark(self.agent.name, a.task_id, key, "")
             return
         mark = self.store.mark(self.agent.name, a.task_id, key)

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.133 — 2026-11-25
+
+- **Allow quiet resolution when a delivery journal is absent and use `F_FULLFSYNC` on macOS.**
+  `delivery_requests.evidence()` now treats a missing `.delivery.json` journal as absent
+  instead of failing on every tick, so an `unknown` attempt whose process group is gone can
+  close after `UNKNOWN_QUIET_MINUTES` while corrupt or changing files still reset the quiet
+  timer. `interactive.write_delivery()` now flushes both the journal file and its directory
+  with `fcntl.F_FULLFSYNC` on macOS (falling back to `os.fsync`).
+
 ## 0.2.132 — 2026-11-25
 
 - **agy turns report a cache write of 0.** Gemini caches implicitly only (no explicit cache, no
