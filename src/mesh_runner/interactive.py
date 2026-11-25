@@ -21,6 +21,7 @@ switch reads the limit from that typed verdict, not from a screen.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -98,6 +99,17 @@ def read_delivery(directory: Path, key: str) -> dict:
     return data
 
 
+def _full_fsync(fd: int) -> None:
+    """Flush file or directory data and metadata to stable storage; use F_FULLFSYNC on macOS when supported."""
+    if sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC"):
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
 def write_delivery(directory: Path, key: str, data: dict) -> None:
     """Durable before native send: a later phase can never roll back to 'unsent'."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -107,11 +119,11 @@ def write_delivery(directory: Path, key: str, data: dict) -> None:
     with os.fdopen(fd, "w") as fh:
         json.dump(data, fh)
         fh.flush()
-        os.fsync(fh.fileno())
+        _full_fsync(fh.fileno())
     os.replace(tmp, path)
     fd = os.open(directory, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        _full_fsync(fd)
     finally:
         os.close(fd)
 

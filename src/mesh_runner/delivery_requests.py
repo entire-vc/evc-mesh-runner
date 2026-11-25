@@ -30,7 +30,10 @@ def evidence(state: Path, a) -> str:
     intent = a.wait['interactive_prompt_intent']
     directory = interactive.agent_dir(state, a.agent)
     journal_path = interactive.delivery_path(directory, a.id)
-    journal = interactive.read_delivery(directory, a.id)
+    try:
+        journal = interactive.read_delivery(directory, a.id)
+    except FileNotFoundError:
+        journal = {}
     paths = {journal_path, directory / (a.id + '.events.jsonl'), Path(intent['log_path'])}
     if intent.get('kind') == 'headless' and intent.get('harness') == 'claude':
         paths.add(interactive.delivery_path(directory, headless_acceptance.receipt_key(a.id, intent['token'])))
