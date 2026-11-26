@@ -80,8 +80,9 @@ class PersistedMarkerBlockingWait(Bench):
         self.assertEqual(self.r.store.get(self.a.id).state, "waiting")
 
     def test_the_persons_answer_wakes(self):
-        self.r.mesh.add_comment(self.t["id"], "done, logged in", author="owner",
-                                at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1))
+        c = self.r.mesh.add_comment(self.t["id"], "done, logged in", author="owner",
+                                    at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=1))
+        c["author_type"] = "user"
         self.r._wake_one(self.r.store.get(self.a.id))
         b = self.r.store.get(self.a.id)
         self.assertEqual(b.state, "ready", b.wake_text)

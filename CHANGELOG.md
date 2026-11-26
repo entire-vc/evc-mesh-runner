@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.136 — 2026-11-26
+
+- **Keep human-gated blocking waits asleep on agent/bot comments and publish resume holds as `stopped`.**
+  Under a standing `human_gate`, comments from agents or bots (including alert notes and `@mention`s)
+  no longer wake a `blocking` wait in `wake.check` or `_review_event` or cancel its Mesh wait; only a
+  human answer or lifting the gate ends it. `effects.runtime_state()` and `Effects.publish()` now
+  report `stopped` (with `reason_code: "human_gate"` or the active resume-hold reason) instead of a
+  misleading `queued` for held `ready` attempts.
+
 ## 0.2.135 — 2026-11-26
 
 - **Bounded gate-release retries with one-time escalation and non-admitted intent cleanup.**

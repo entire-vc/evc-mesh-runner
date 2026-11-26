@@ -268,11 +268,13 @@ def wait_constraints(a: Attempt, until: str | None = None) -> list[dict]:
     return out
 
 
-def runtime_state(a: Attempt, lane: str) -> dict | None:
+def runtime_state(a: Attempt, lane: str, *, hold_reason: str = "") -> dict | None:
     """The runtime_state a task shows for this attempt (Mesh's vocabulary)."""
     if a.state in ("starting", "running", "unknown"):
         return {"kind": "working", "lane": lane}
     if a.state == "ready":
+        if hold_reason:
+            return skip_state(hold_reason, lane) or {"kind": "stopped", "reason": hold_reason[:200]}
         return {"kind": "queued", "lane": lane}
     if a.state != "waiting":
         return None
@@ -320,7 +322,8 @@ def skip_state(reason: str, lane: str) -> dict | None:
         if until and until > now() + dt.timedelta(seconds=30):   # never in the past for the server
             out["until"] = iso(until)
         return out
-    if r == "waiting for a human decision":
+    if r in ("waiting for a human decision", "waits for a human decision",
+             "gate: waiting for a human decision", "gate: waits for a human decision"):
         return _stopped("human_gate", "waits for a human decision")
     if r == "checked out by another writer":
         return _stopped("checked_out_elsewhere", "checked out by another writer")
@@ -514,7 +517,7 @@ class Effects:
         return bool(self.agent_id) and assignee == self.agent_id
 
     # ------------------------------------------------------------- runtime state
-    def publish(self, attempts: list[Attempt]) -> None:
+    def publish(self, attempts: list[Attempt], holds: dict[str, str] | None = None) -> None:
         if not self.enabled:
             return
         self.reconcile_decisions()
@@ -522,7 +525,8 @@ class Effects:
         current = now()
         tick_deadline = time.monotonic() + DIAGNOSTIC_TICK_SECONDS
         for a in attempts:
-            desired = runtime_state(a, self.lane)
+            hold_reason = (holds or {}).get(a.id) or (holds or {}).get(a.task_id) or ""
+            desired = runtime_state(a, self.lane, hold_reason=hold_reason)
             if desired is not None and a.state == "waiting" and a.wait.get("kind") == "card":
                 # A budget per card: one shared 3 s budget starved every card
                 # after the first uncached ones. The tick cap bounds the total.

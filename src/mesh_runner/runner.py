@@ -115,7 +115,7 @@ from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewh
                         known_category, order, parse_time, static_skip_reason)
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from . import observation_budget
-from .wake import (_read_pinned, ci_result_detail, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, foreign_comment, foreign_comments, wakes_on_comment,
+from .wake import (_read_pinned, ci_result_detail, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, foreign_comment, foreign_comments, is_human_comment, wakes_on_comment,
                    own_card_comment_event,
                    GITLAB_MR_URL, gitlab_mr_targets, vcs_event, typed_event, typed_wait, ci_delivery_key, ci_observation,
                    ci_observation_gen, manual_pipeline_text, pipeline_host, owner_action_delivered, Delivered, PIPELINE_DONE,
@@ -809,6 +809,7 @@ class AgentRunner:
         self._gate_failures: dict[tuple[str, str], int] = {}
         self._launch_obs: dict[str, tuple[str, float, launch_probe.Observation]] = {}   # task -> early candidate observation
         self._resume_hold: dict[str, float] = {}              # attempt -> until
+        self._resume_hold_reason: dict[str, str] = {}         # attempt -> last hold reason while ready
         self._capacity_resume: set[str] = set()               # attempts whose resume hold came from a capacity/profile refusal
         # attempt -> task of a provider-limit hold (`limit_hold_until` mark), and the attempts whose
         # persisted hold this process has already read back (a restart must not resume before the reset)
@@ -2059,7 +2060,8 @@ class AgentRunner:
             return False
         typed = self._typed_outcome(a, window)
         if typed is TYPED_UNREADABLE:
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS,
+                                  "turn outcomes unreadable on Mesh; the correction waits")
             self._log_hold("resume", a.task8, "turn outcomes unreadable on Mesh; the correction waits")
             return True
         if typed is None:
@@ -2460,7 +2462,8 @@ class AgentRunner:
                     if held.get("fingerprint") == observation.fingerprint:
                         self._release_gate(a, "launch-readiness-held")
                         self._release_checkout(a)
-                        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                        self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS,
+                                              str(held.get("reason") or "launch readiness denied"))
                         return False
                     return True  # clear only after the actual Popen succeeds
                 self.store.mark(self.agent.name, a.task_id, key, "")
@@ -2481,7 +2484,7 @@ class AgentRunner:
             self.store.event(a.id, "launch_readiness_held", observation.state + ":" + observation.reason)
         self._release_gate(a, "launch-readiness-held")
         self._release_checkout(a)
-        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, note)
         return False
 
     def _spawn(self, a: Attempt, prompt_text: str, resume: bool, expect: tuple[str, ...],
@@ -2497,7 +2500,7 @@ class AgentRunner:
             self._release_gate(a, "workspace-issue-held")
             self._release_checkout(a)
             self.store.update(a, pid=0, stamp="", note=str(exc)[:200])
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, str(exc)[:200])
             return False
         workspaces = [Path(p) for p in issued]
         if resume and issued != list(a.workspaces) and not prompt_is_complete:
@@ -2567,8 +2570,8 @@ class AgentRunner:
             return self._with_override_marks(adapter, argv, a.task_id, a.harness)
 
         argv = build_argv()
-        if self.pool.disk_hold():
-            self._disk_hold_attempt(a)
+        if disk_reason := self.pool.disk_hold():
+            self._disk_hold_attempt(a, reason=disk_reason)
             return False
         if resume and sid:
             try:
@@ -2605,7 +2608,7 @@ class AgentRunner:
                 self._release_gate(a, "disk-held")
                 self._release_checkout(a)
                 self.life.to_ready(a, pid=0, stamp="", note=reason)
-                self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, reason)
                 return False
             try:
                 sandboxed = read_only(self._task(a.task_id))
@@ -2623,12 +2626,12 @@ class AgentRunner:
                     self._release_gate(a, "read-only-unavailable")
                     self._release_checkout(a)
                     self.life.to_ready(a, pid=0, stamp="", note=reason)
-                    self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                    self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, reason)
                     return False
         # Session preparation may have consumed free space.
         # Check again before the durable authorization callback or writer creation.
-        if self.pool.disk_hold():
-            self._disk_hold_attempt(a)
+        if disk_reason := self.pool.disk_hold():
+            self._disk_hold_attempt(a, reason=disk_reason)
             return False
         # Memory and load too, read now: the tick's cached reading may be 30 s old, a resume never asks the
         # tick's gate, and a session started into an exhausted swap or an overloaded CPU does not take its
@@ -2647,7 +2650,7 @@ class AgentRunner:
         if held:
             log.info("%s: #%s start held: %s", self.agent.name, a.task8, held)
             self._start_held = True
-            self._disk_hold_attempt(a, hold_for)
+            self._disk_hold_attempt(a, hold_for, reason=held)
             return False
         # The turn's lock for the agent's own Mesh MCP, rewritten before the prompt can reach a session:
         # a resumed session writes with this attempt's lock and this turn's input_revision. Not written:
@@ -2656,7 +2659,8 @@ class AgentRunner:
             self._release_gate(a, "fence-held")
             self._release_checkout(a)
             self.store.update(a, pid=0, stamp="", note="start held: checkout fence file not written")
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS,
+                                  "start held: checkout fence file not written")
             return False
         interactive_driver = isinstance(adapter, interactive.InteractiveAdapter)
         if profile:
@@ -2904,7 +2908,7 @@ class AgentRunner:
             self._release_gate(a, "api-held")
             self._release_checkout(a)
             self.life.to_ready(a, pid=0, stamp="", note=f"API turn refused: {exc.reason}")
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, f"API turn refused: {exc.reason}")
             return False
 
     def _api_unspent(self, a: Attempt, key: str) -> None:
@@ -2959,21 +2963,23 @@ class AgentRunner:
         self._release_gate(a, "launch-probe-denied")
         self._release_checkout(a)
         if hold:                                        # a pause needs no timer: paused() gates the retry
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS,
+                                  "launch observation refused native exec: " + reason)
         return False
 
     def _auth_hold_attempt(self, a: Attempt, profile: str) -> None:
         """Preserve work, release writer authority and leave a diagnostic local hold."""
         self._release_gate(a, "auth-held")
         self._release_checkout(a)
-        self.life.to_ready(a, pid=0, stamp="", note=f"authentication held for profile {profile}")
-        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        note = f"authentication held for profile {profile}"
+        self.life.to_ready(a, pid=0, stamp="", note=note)
+        self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, note)
 
-    def _disk_hold_attempt(self, a: Attempt, seconds: float = GATE_HOLD_SECONDS) -> None:
+    def _disk_hold_attempt(self, a: Attempt, seconds: float = GATE_HOLD_SECONDS, reason: str = "") -> None:
         """Return writer authority without changing work, readiness or WAIT context."""
         self._release_gate(a, "disk-held")
         self._release_checkout(a)
-        self._resume_hold[a.id] = time.monotonic() + seconds
+        self._set_resume_hold(a, time.monotonic() + seconds, reason or "host capacity held")
 
     def _record_authentication_failure(self, a: Attempt, auth_only: bool, verification: bool = False) -> str:
         """Record the exact profile that produced the terminal auth failure.
@@ -3048,7 +3054,7 @@ class AgentRunner:
             if held is None or until > held:        # a later lane's shorter backoff never shortens the pause
                 self.store.mark(OUTAGE_OWNER, OUTAGE_TASK, OUTAGE_PAUSE_KEY, iso(until))
         self.life.to_ready(a, pid=0, stamp="", note="provider outage, retrying")
-        self._resume_hold[a.id] = time.monotonic() + delay
+        self._set_resume_hold(a, time.monotonic() + delay, "provider outage, retrying")
         log.info("%s: #%s provider outage (%d in a row); retry in %d s", name, a.task8, n, delay)
 
     def _authentication_failed(self, a: Attempt, profile: str, current_route: bool = False) -> None:
@@ -3056,7 +3062,7 @@ class AgentRunner:
         so the lane is on the held profile now (not only when an earlier turn launched)."""
         self._auth_hold_attempt(a, profile)
         if self._switch_on_auth(a, profile, current_route):
-            self._resume_hold.pop(a.id, None)  # next turn re-runs every admission/checkpoint gate
+            self._clear_resume_hold(a.id)  # next turn re-runs every admission/checkpoint gate
             self.store.update(a, note="authentication held; routed to another profile")
             self._signal_auth_hold(a, profile, routed=True)
             return
@@ -3095,8 +3101,9 @@ class AgentRunner:
             return False
         self._release_gate(a, "harness-upgrade-held")
         self._release_checkout(a)
-        self.life.to_ready(a, pid=0, stamp="", note=f"{harness} CLI upgrade required; lane held")
-        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        note = f"{harness} CLI upgrade required; lane held"
+        self.life.to_ready(a, pid=0, stamp="", note=note)
+        self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, note)
         self._signal_harness_hold(harness, held)
         return True
 
@@ -3144,8 +3151,9 @@ class AgentRunner:
         self.store.event(a.id, "harness_upgrade_required", str(a.turns))
         held, _ = harness_hold.hold(self.store, a.harness, self._harness_binary(a.harness),
                                     harness_hold.reason(text))
-        self.life.to_ready(a, pid=0, stamp="", note=f"{a.harness} CLI upgrade required; lane held")
-        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+        note = f"{a.harness} CLI upgrade required; lane held"
+        self.life.to_ready(a, pid=0, stamp="", note=note)
+        self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, note)
         log.warning("%s: #%s %s CLI refused by the provider as outdated; lane held",
                     self.agent.name, a.task8, a.harness)
         self._signal_harness_hold(a.harness, held)
@@ -4534,7 +4542,7 @@ class AgentRunner:
         delay = limit_hold.hold_seconds(streak, reset, at)
         until = time.monotonic() + delay
         if until > self._resume_hold.get(a.id, 0):      # a longer hold set meanwhile stands
-            self._resume_hold[a.id] = until
+            self._set_resume_hold(a, until, "provider limit, no account to switch to")
         # a confirmed pool or route change (invalidate_capacity_holds) may bring capacity before the reset
         self._capacity_resume.add(a.id)
         # the deadline outlives a runner restart: read back by _resume_hold_until
@@ -4569,12 +4577,54 @@ class AgentRunner:
             if left > 0:
                 hold = time.monotonic() + left
                 if hold > self._resume_hold.get(a.id, 0):
-                    self._resume_hold[a.id] = hold
+                    self._set_resume_hold(a, hold, "provider limit, no account to switch to")
                 self._capacity_resume.add(a.id)
                 self._limit_hold_tasks[a.id] = a.task_id
                 log.info("%s: #%s provider-limit hold read back: resume held %d s more",
                          self.agent.name, a.task8, left)
         return self._resume_hold.get(a.id, 0)
+
+    def _set_resume_hold(self, a: Attempt, until: float, reason: str = "") -> None:
+        """Record a local resume backoff and its public reason for runtime_state."""
+        self._resume_hold[a.id] = until
+        if reason:
+            self._resume_hold_reason[a.id] = reason
+
+    def _clear_resume_hold(self, attempt_id: str) -> None:
+        """Clear both the resume hold deadline and its published reason."""
+        self._resume_hold.pop(attempt_id, None)
+        self._resume_hold_reason.pop(attempt_id, None)
+
+    def _resume_holds(self, attempts: list[Attempt]) -> dict[str, str]:
+        """Active hold reasons for ``ready`` attempts so ``effects.publish`` reports ``stopped``
+        (e.g. ``reason_code: "human_gate"``) instead of a misleading ``queued``."""
+        ready_ids = {a.id for a in attempts if a.state == "ready"}
+        for aid in [k for k in self._resume_hold_reason if k not in ready_ids]:
+            del self._resume_hold_reason[aid]
+        holds: dict[str, str] = {}
+        paused = self.paused()
+        disk = self.pool.disk_hold()
+        mono = time.monotonic()
+        for a in attempts:
+            if a.state != "ready":
+                continue
+            reason = ""
+            if mono < self._resume_hold_until(a):
+                reason = self._resume_hold_reason.get(a.id, "") or a.note or "resume held"
+            else:
+                self._resume_hold_reason.pop(a.id, None)
+            if not reason:
+                if self._branch_blocked(a):
+                    reason = "branch checked out in another active slot"
+                elif self._maintenance_held(a):
+                    reason = "workspace maintenance held"
+                elif disk:
+                    reason = disk
+                elif paused:
+                    reason = "paused"
+            if reason:
+                holds[a.id] = reason
+        return holds
 
     @staticmethod
     def _limit_text(log_path: str | None) -> str:
@@ -9397,7 +9447,7 @@ class AgentRunner:
         # _resume_one also backs off this same suspension exception. Preserve a
         # newer admission hold if another reason has superseded that failure.
         if held["resume_hold"] is not None and self._resume_hold.get(a.id) == held["resume_hold"]:
-            self._resume_hold.pop(a.id, None)
+            self._clear_resume_hold(a.id)
         self.store.event(a.id, "checkpoint_quarantine_recheck", json.dumps({
             "step": "resume", "generation": held["generation"], "cause": held["cause"],
             "checkpoints": [r["checkpoint"] for r in rows]}))
@@ -9421,7 +9471,7 @@ class AgentRunner:
             self._branch_wait[a.id] = (exc.holder_attempt, exc.holder_path,
                                        time.monotonic() + TASK_HOLD_SECONDS)
         else:
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, str(exc)[:200])
         self._log_hold("resume", a.task8, str(exc), episode="resume branch")
 
     def _legacy_handoff_ready(self, a: Attempt, route: str) -> bool:
@@ -9501,7 +9551,7 @@ class AgentRunner:
                 self._release_gate(a, "quota-wait-policy-held")
                 self._release_checkout(a)
                 self._suspend_held_ready(a)
-                self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, reason)
                 self._log_hold("resume", a.task8, reason)
                 return
         scope = self.store.mark(self.agent.name, a.task_id, RECEIPT_KEY)
@@ -9511,9 +9561,9 @@ class AgentRunner:
             self._release_gate(a, "human-held")
             self._release_checkout(a)
             self._suspend_held_ready(a)
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, "waiting for a human decision")
             return
-        if self.pool.disk_hold():
+        if disk_reason := self.pool.disk_hold():
             # Existing leases do not grant permission to start below the floor.
             # Only finish already verified releases; never capture an unjournaled
             # repository here. Verification retains its separate scratch budget.
@@ -9527,7 +9577,7 @@ class AgentRunner:
                         raise WorkspaceError("checkpoint: writer group still alive")
                     self._suspend_workspaces(a, "resume")
             finally:
-                self._disk_hold_attempt(a)
+                self._disk_hold_attempt(a, reason=disk_reason)
             return
         if a.wait and self.effects.pending_cleanup(a.wait):
             wait = dict(a.wait)                  # an earlier wake could not undo its side effects
@@ -9548,12 +9598,12 @@ class AgentRunner:
                     return
             self.effects.on_end(a, wait, "resuming", close_request=False)
             self.store.update(a, wait=wait)
-        if a.mode == "review" and self._unstartable_hold(task, self._comments(a.task_id)):
+        if a.mode == "review" and (unstartable := self._unstartable_hold(task, self._comments(a.task_id))):
             self._suspend_held_ready(a)
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, unstartable)
             return                               # the gate keeps refusing this review: noticed, not retried
         if reason := self._assignment_scope_reason(task, a.mode, publish=True):
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, reason)
             self._log_hold("resume", a.task8, reason)
             return                               # preserve this attempt's leases and session
         if not metadata_only(task, a.mode) and self._repo_preflight_refused(
@@ -9565,13 +9615,14 @@ class AgentRunner:
         retry = (a.wait or {}).get("interactive_prompt_intent") or {}
         scope_recovery = (a.wait or {}).get("unsent_scope_recovery") if not retry else None
         if scope_recovery and not self._restored_unsent_ready(a):
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, "restored workspace scope pending")
             return
         legacy_candidate = (retry.get("harness") == "claude" and self._routed_harness == "codex"
                             and retry.get("retryable") and not self._quota_admission_required(a))
         if legacy_candidate and (not self._legacy_handoff_ready(a, self._routed_harness)
                                  or not self._release_legacy_gate(a)):
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS,
+                                  "legacy unsent writer or reservation is not proven stopped")
             self._log_hold("resume", a.task8, "legacy unsent writer or reservation is not proven stopped")
             return
         writer = self._local_writer(a.task_id)
@@ -9584,7 +9635,7 @@ class AgentRunner:
             if not reason:
                 if not a.checkout.get("token") and not self._acquire(a):
                     self._turn_end(a.task_id, a.mode, a, gate, "not-started")
-                    self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                    self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, "checkout refused")
                     return
                 a = self.store.get(a.id) or a
                 reason, gate = self._gate("admit", a.task_id, a.mode, a, gate, require_capacity=bool(legacy_candidate or scope_recovery))
@@ -9601,7 +9652,7 @@ class AgentRunner:
             self._turn_end(a.task_id, a.mode, a, gate, "held")
             if a.checkout.get("token"):            # nobody heartbeats a held checkout
                 self._release_checkout(a)
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, reason)
             if reason in CAPACITY_CLASS_REASONS:
                 self._capacity_resume.add(a.id)
             else:
@@ -9614,6 +9665,7 @@ class AgentRunner:
         if a.mode == "review":
             self.store.mark(self.agent.name, a.task_id, "review_gate_hold", "")
         self._clear_hold_log(a.task8, "resume")
+        self._resume_hold_reason.pop(a.id, None)
         self._remember_gate(a, gate)
         # Reserve may have switched the lane's route since the pre-gate environment read (a quota
         # restore, an allowed account): the launch follows the active record at the moment of the
@@ -9623,7 +9675,7 @@ class AgentRunner:
         except (RuntimeError, OSError, subprocess.SubprocessError):
             self._release_gate(a, "quota-route-environment-unavailable")
             self._release_checkout(a)
-            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, "quota route environment unavailable")
             raise
         restored = []
         fresh_paths: list[str] = []
@@ -9643,7 +9695,7 @@ class AgentRunner:
                     self._release_gate(a, "human-held")
                     self._release_checkout(a)
                     self._suspend_held_ready(a)
-                    self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                    self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, "waiting for a human decision")
                     return
             if a.turns - self.store.auth_turns(a.id) >= self.cfg.max_turns:
                 # An auth failure after real work can exhaust the existing cap.
@@ -9701,7 +9753,7 @@ class AgentRunner:
                     # quarantine the resume. Hold it like a start does, without an error.
                     self._release_gate(a, "workspace-admission-held")
                     self._release_checkout(a)
-                    self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                    self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, "no free worktree")
                     self._log_hold("resume", a.task8, "no free worktree", episode="resume workspace")
                     return
                 try:
@@ -9755,7 +9807,7 @@ class AgentRunner:
                         self._release_gate(a, "workspace-admission-held")
                         self._release_checkout(a)
                         self.store.update(a, pid=0, stamp="")
-                        self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+                        self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, "workspace admission held")
                         return
                     paths = []
                     for repo in self.lane_repos:
@@ -9789,7 +9841,7 @@ class AgentRunner:
                 delay = min(GATE_HOLD_SECONDS * 2 ** (n - 1), TASK_HOLD_SECONDS)
                 log.warning("%s: attempt %s refused resume (%s) workspaces=%d config=%s; retry in %ds",
                             self.agent.name, a.id[:8], exc, len(a.workspaces), key[1], delay)
-            self._resume_hold[a.id] = time.monotonic() + delay
+            self._set_resume_hold(a, time.monotonic() + delay, str(exc)[:200])
             raise
         self._clear_hold_log(a.task8)                 # resumed: every hold episode of this task is over
         first_start = a.turns == 0 and not a.session_id
@@ -11107,9 +11159,13 @@ class AgentRunner:
         self._review_ci_delivery.pop(task["id"], None)
         if declared and declared.kind == "blocking":
             # a question to a human: only a person's answer (a comment) or the gate it raised
-            # being lifted ends it. The gate is not set on this path (the card went to review
-            # in the same turn), so "no gate" says nothing; only a seen set -> cleared does.
-            c = foreign_comment(comments, self.agent_id, since)
+            # being lifted ends it. Under a standing human_gate, agent/bot notes (alerts,
+            # @-mentions) do not wake it. When no gate is set on this path (the card went to
+            # review in the same turn), "no gate" says nothing; only a seen set -> cleared does.
+            foreign = foreign_comments(comments, self.agent_id, since)
+            if task.get("human_gate"):
+                foreign = [x for x in foreign if is_human_comment(x)]
+            c = foreign[-1] if foreign else None
             if c:
                 who = c.get("author_name") or (c.get("author") or {}).get("name") or "someone"
                 return f"{who} commented: {(c.get('body') or '')[:300]}"
@@ -12436,6 +12492,7 @@ class AgentRunner:
             self._capacity_resume.discard(aid)
             if self._resume_hold.pop(aid, None) is not None:
                 lifted = True
+            self._resume_hold_reason.pop(aid, None)
             self._limit_hold_tasks.pop(aid, None)
         # every persisted provider-limit hold of the lane, also one a restarted runner has not read back
         # yet: the change makes it stale, a later restart must not restore it
@@ -13407,7 +13464,7 @@ class AgentRunner:
             self._repo_preflight_note(a.task_id, verdict)
             self.store.event(a.id, "repo_preflight_refused", json.dumps(verdict.as_dict()))
         if resume:
-            self._resume_hold[a.id] = backoff     # the attempt stays ready; no checkout, no model turn
+            self._set_resume_hold(a, backoff, f"repository preflight: {verdict.reason}")
             if verdict.needs_access:
                 self._access_resume_hold[a.id] = backoff
             return True
@@ -13720,6 +13777,8 @@ class AgentRunner:
             for key, until in mine.items():
                 if held is not None and held.get(key) == until:
                     held.pop(key, None)
+                    if held is getattr(self, "_resume_hold", None):
+                        getattr(self, "_resume_hold_reason", {}).pop(key, None)
             mine.clear()
         if not self.access.mesh:
             return
@@ -13818,7 +13877,7 @@ class AgentRunner:
                     if a.mode != source_review.MODE]
         for a in attempts:
             self.effects.taken(a.task_id)
-        self.effects.publish(attempts)
+        self.effects.publish(attempts, holds=self._resume_holds(attempts))
         self.publish_skips()
         self._step("chat")
         self.keep_chat()                           # last: it may wait on the env command and tmux

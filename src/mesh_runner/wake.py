@@ -509,6 +509,16 @@ def is_foreign(c: dict, agent_id: str) -> bool:
     return not body.startswith("[runner]")
 
 
+def is_human_comment(c: dict) -> bool:
+    """Whether a foreign comment carries positive human attribution.
+
+    Mesh sets ``author_type`` to ``"user"`` for people and ``"agent"``/``"bot"``/``"system"``
+    for automated actors. Missing or unknown ``author_type`` fails closed (False) so untyped
+    or automated notes cannot wake a blocking wait under a standing ``human_gate``."""
+    author_type = c.get("author_type") or (c.get("author") or {}).get("type")
+    return bool(author_type) and str(author_type).casefold() in ("user", "human")
+
+
 def foreign_comments(comments: list[dict], agent_id: str, since: dt.datetime) -> list[dict]:
     """Every foreign comment after ``since``, oldest first."""
     out = []
@@ -1390,7 +1400,12 @@ def check(mesh: MeshClient, cats: StatusCategories, gitlab: GitLab | None, task:
     since = parse_time(wait.get("since")) or now
     kind = wait.get("kind")
     foreign = foreign_comments(comments, agent_id, since)
-    if comment_wake == "addressed":
+    if kind == "blocking" and task.get("human_gate"):
+        # Under a standing human_gate, agent/bot notes (alerts, @-mentions, bystander remarks)
+        # cannot satisfy the gate: waking would cancel the Mesh wait and strand the attempt in
+        # ready behind the same gate. Only a person's comment (or lifting the gate below) wakes it.
+        foreign = [x for x in foreign if is_human_comment(x)]
+    elif comment_wake == "addressed":
         foreign = [x for x in foreign if wakes_on_comment(x, wait, agent_name, comment_wake_always_from)]
     answer_mode = decision_wake == "answer" and kind == "decision" and bool(wait.get("request"))
     held = []
