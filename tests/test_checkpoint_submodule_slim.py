@@ -148,7 +148,8 @@ class SubmoduleSlim(unittest.TestCase):
             self.assertEqual(replays, [])                 # no scratch replay at capture
             manifest = cps.read(cp)
             self.assertEqual(manifest['version'], 3)
-            self.assertIn('vendor/kit/cache/ignored', manifest['delta']['files'])
+            self.assertIn('vendor/kit/cache', manifest.get('ignored', []))
+            self.assertNotIn('vendor/kit/cache/ignored', manifest['delta']['files'])
             self.assertIn('vendor/kit/kit/d000/f00002.txt', manifest['delta']['deleted'])
             self.assertIn('vendor/kit/empty', manifest['delta']['dirs'])
             self.assertIn('notes.txt', manifest['delta']['files'])
@@ -157,7 +158,7 @@ class SubmoduleSlim(unittest.TestCase):
         self.assertEqual(len(replays), 1)
         target = self._restores_into_a_fresh_clone(cps, cp, 'restored')
         sub = target / 'vendor' / 'kit'
-        self.assertEqual((sub / 'cache' / 'ignored').read_text(), 'ignored in the submodule\n')
+        self.assertFalse((sub / 'cache').exists())
         self.assertEqual((sub / 'kit' / 'd000' / 'f00001.txt').read_text(), 'then changed again\n')
         self.assertFalse((sub / 'kit' / 'd000' / 'f00002.txt').exists())
         self.assertEqual((sub / 'tool').stat().st_mode & 0o777, 0o751)

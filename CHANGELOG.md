@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.134 — 2026-11-25
+
+- **Make populated submodule restore crash-idempotent and exclude submodule caches.**
+  `Checkpoints.restore()` now writes an in-progress replay marker after preflight checks pass,
+  assembles new submodule gitdirs and slim submodule worktrees in sibling staging directories
+  before atomically swapping them into place, and accepts retries over a provably partial
+  submodule replay (missing files, un-restored modes, truncated copies, or pre-delta HEAD blobs
+  with no completed marker) while still refusing foreign files, modified content, index changes,
+  or any mutation after a completed restore. `find_excludes()` and `find_ignored()` now also
+  exclude git-ignored regenerable directories (such as `node_modules` and build caches) inside
+  populated configured submodules, avoiding multi-megabyte submodule deltas and long replay windows.
+
 ## 0.2.133 — 2026-11-25
 
 - **Allow quiet resolution when a delivery journal is absent and use `F_FULLFSYNC` on macOS.**

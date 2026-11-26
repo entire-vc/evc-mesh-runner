@@ -12,7 +12,7 @@ from unittest.mock import patch
 from mesh_runner.checkpoint import DEFAULT_EXCLUDE_NAMES, Checkpoints, _gitdir, fingerprint, submodule_plan
 from mesh_runner.config import ConfigError, _exclude_names
 from mesh_runner.store import Store
-from mesh_runner.workspace import RepoSpec, RestoreRefused, WorkspacePool, WorkspaceError, git
+from mesh_runner.workspace import RESTORE_MARKER, RepoSpec, RestoreRefused, WorkspacePool, WorkspaceError, git
 from test_workspace import make_repo
 
 
@@ -859,18 +859,20 @@ class Checkpoint(unittest.TestCase):
         (sub / 'later').write_text('after the commit')
         plan = submodule_plan(self.source)
         self.assertEqual([(e['path'], e['populated'], e['gitdir']) for e in plan], [('materialized', True, True)])
-        expected = fingerprint(self.source, plan)
+        expected = fingerprint(self.source, plan, (), ('materialized/cache',))
         base_modules = sorted(p.name for p in (self.base / '.git' / 'modules').glob('*')) \
             if (self.base / '.git' / 'modules').exists() else []
         self.pool.suspend('attempt', {'session_id': 'old', 'wait': {'target': 'card'}}, writer_stopped=True)
         self.pool.lease('other', 'app'); self.pool.release('other')
         paths, manifests = self.restart().restore('attempt')
         restored = Path(paths[0])
-        self.assertEqual(fingerprint(restored, plan), expected)
+        self.assertEqual(fingerprint(restored, plan, tuple(manifests[0]['excludes']),
+                                     tuple(manifests[0].get('ignored', []))), expected)
         self.assertEqual(manifests[0]['version'], 3)               # slim, with the submodule's part
         self.assertIn('delta', manifests[0])
+        self.assertIn('materialized/cache', manifests[0].get('ignored', []))
         self.assertEqual((restored / 'materialized' / 'untracked').read_text(), 'untracked data')
-        self.assertEqual((restored / 'materialized' / 'cache' / 'ignored').read_text(), 'ignored data')
+        self.assertFalse((restored / 'materialized' / 'cache').exists())
         self.assertEqual((restored / 'materialized' / 'README').read_text(), 'unstaged in submodule')
         self.assertIn('unpublished local commit', git(restored / 'materialized', 'log', '-1', '--format=%s'))
         self.assertTrue((restored / 'materialized' / '.git').read_text().startswith('gitdir: '))
@@ -1354,6 +1356,8 @@ class Checkpoint(unittest.TestCase):
         checkpoints_a.restore(cp_a, slot)
         gd = _modules(slot) / 'never'
         self.assertEqual(_gitdir(gd, 'tag', '--list'), 'v1.0.0\nv1.1.0')
+        # Returning the slot to the pool drops card A's restore marker (`_forget_restore`).
+        (slot / '.git' / RESTORE_MARKER).unlink()
         checkpoints.restore(cp_b, slot)
         self.assertEqual(fingerprint(slot, plan_b), expected_b)
         self.assertFalse(os.path.lexists(gd))

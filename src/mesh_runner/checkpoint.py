@@ -669,8 +669,13 @@ def _stale_submodule_work(target: Path, entry: dict, gd: Path, known_tags: dict 
     return ''
 
 
-def find_excludes(source: Path, names: tuple) -> list:
-    """Outermost directories called one of `names` with no tracked file beneath them."""
+def find_excludes(source: Path, names: tuple, submodules: list = ()) -> list:
+    """Outermost directories called one of `names` with no tracked file beneath them.
+
+    Also searches populated configured submodules for git-ignored directories matching `names`
+    with no tracked file beneath them (only git-ignored ones: an unignored directory inside a
+    submodule marks its gitlink dirty in the superproject's `git status`). Opaque nested
+    repositories are never entered."""
     if not names:
         return []
     r = _run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True)
@@ -690,14 +695,47 @@ def find_excludes(source: Path, names: tuple) -> list:
                 continue
             name = child.relative_to(source).as_posix()
             if (source / name / '.git').exists():
-                # A populated submodule keeps its tracked files in its own repository; a nested repository
-                # is stored whole (see `inventory`), so nothing inside it is left out as regenerable.
+                # A populated submodule keeps its tracked files in its own repository (handled
+                # separately below); a nested repository is stored whole (see `inventory`), so
+                # nothing inside it is left out as regenerable.
                 continue
             if child.name in names and name not in tracked:
                 found.append(name)
             else:
                 walk(child)
     walk(source)
+    for entry in submodules:
+        if not entry.get('populated'):
+            continue
+        sub_path = entry['path']
+        sub = source / sub_path
+        candidates = find_excludes(sub, names)
+        if not candidates:
+            continue
+        # Only leave out directories that Git in the submodule already ignores: an unignored
+        # untracked file inside a submodule makes the superproject report the gitlink dirty.
+        # `--literal-pathspecs` prevents glob or pathspec-magic prefixes in filesystem paths
+        # (e.g. `app/[slug]/node_modules`) from hiding unignored files as clean.
+        st = _run(['git', '--literal-pathspecs', '-C', str(sub), 'status', '--porcelain=v1', '-z',
+                   '--untracked-files=all', '--', *candidates], capture_output=True)
+        if st.returncode:
+            raise _CheckpointListError('changed', 'status', st)
+        dirty = set()
+        parts = st.stdout.split(b'\0')
+        idx = 0
+        while idx < len(parts):
+            item = parts[idx]
+            idx += 1
+            if len(item) < 4:
+                continue
+            xy, rel = item[:2].decode(), item[3:].decode('utf-8', 'surrogateescape')
+            dirty.add(rel)
+            if 'R' in xy or 'C' in xy:
+                idx += 1
+        pre = sub_path + '/'
+        for cand in candidates:
+            if not any(d == cand or d.startswith(cand + '/') for d in dirty):
+                found.append(pre + cand)
     return found
 
 
@@ -907,20 +945,23 @@ def _clear_tree(root: Path) -> None:
 
 def fingerprint(path: Path, submodules: list | None = None, excludes: tuple = (), ignored: tuple = (),
                 nested_limit: int | None = None) -> dict:
+    subs = submodules or []
+    roots = tuple(e['path'] for e in subs if e['populated'])
     # Untracked-but-not-ignored excluded dirs show up in `status`; leave them out of it too.
-    spec = ['--', '.', *(f':(exclude,literal){e}' for e in excludes)] if excludes else []
+    # Submodule-internal excludes are git-ignored inside their submodule and never passed as
+    # superproject pathspecs across a gitlink boundary.
+    outer_excludes = [e for e in excludes if not any(e == r or e.startswith(r + '/') for r in roots)]
+    spec = ['--', '.', *(f':(exclude,literal){e}' for e in outer_excludes)] if outer_excludes else []
     def raw(*args):
         r = _run(['git', '-C', str(path), *args], capture_output=True)
         if r.returncode:
             raise WorkspaceError('checkpoint: cannot fingerprint git state')
         return hashlib.sha256(r.stdout).hexdigest()
-    subs = submodules or []
     result = {'head': git(path, 'rev-parse', 'HEAD'),
               'staged': raw('diff', '--cached', '--binary', '--no-ext-diff'),
               'unstaged': raw('diff', '--binary', '--no-ext-diff'),
               'status': raw('status', '--porcelain=v1', '-z', '--untracked-files=all', *spec),
-              'tree': inventory(path, tuple(e['path'] for e in subs if e['populated']), frozenset((*excludes, *ignored)),
-                                nested_limit)}
+              'tree': inventory(path, roots, frozenset((*excludes, *ignored)), nested_limit)}
     if subs:
         modules = _modules_dir(path)
         result['submodules'] = {e['path']: _submodule_state(path, e, modules) for e in subs}
@@ -953,9 +994,12 @@ def _status_entries(source: Path) -> list:
     return out
 
 
-def find_ignored(source: Path, covered: list) -> list:
+def find_ignored(source: Path, covered: list, submodules: list = ()) -> list:
     """Git-ignored paths (outermost), minus what a named exclude already covers: logs, caches and
-    build output that any clone regenerates. Tracked files are never listed here."""
+    build output that any clone regenerates. Tracked files are never listed here.
+
+    Also collects git-ignored paths inside populated configured submodules (prefixed with their
+    gitlink path), so regenerable submodule caches are left out of slim snapshots too."""
     r = _run(['git', '-C', str(source), 'ls-files', '-z', '--others', '--ignored', '--exclude-standard',
                         '--directory'], capture_output=True)
     if r.returncode:
@@ -965,6 +1009,14 @@ def find_ignored(source: Path, covered: list) -> list:
         name = item.decode('utf-8', 'surrogateescape').rstrip('/')
         if name and name != '.git' and not any(name == c or name.startswith(c + '/') for c in covered):
             found.append(name)
+    for entry in submodules:
+        if not entry.get('populated'):
+            continue
+        sub_path = entry['path']
+        pre = sub_path + '/'
+        sub_covered = [c[len(pre):] for c in covered if c.startswith(pre)]
+        for name in find_ignored(source / sub_path, sub_covered):
+            found.append(pre + name)
     return found
 
 
@@ -1002,9 +1054,9 @@ def _delta_plan(source: Path, before: dict, excludes: list, ignored: list, plan:
 
 def _repo_delta(source: Path, tree: dict, skip: list, prefix: str = '', roots: list = ()) -> tuple:
     """(files, deleted, dirs) of one repository: the superproject (no `prefix`; nothing beneath the
-    populated submodule `roots`) or the populated submodule at `prefix`. A submodule's part also holds
-    every file of it git does not track: its ignored files were always restored (the superproject's
-    ignore listing never enters a submodule), and they still are."""
+    populated submodule `roots`) or the populated submodule at `prefix`. Any remaining non-tracked
+    file still in `tree` beneath a submodule (git-ignored paths are already skipped in slim mode)
+    is included as a superset safeguard."""
     repo = source / prefix if prefix else source
     pre = prefix + '/' if prefix else ''
 
@@ -1328,10 +1380,10 @@ class Checkpoints:
         plan = submodule_plan(source)
         if git(source, 'rev-parse', '--shared-index-path'):
             raise WorkspaceError('checkpoint: split index unsupported')
-        excludes = find_excludes(source, self.exclude_names)
+        excludes = find_excludes(source, self.exclude_names, plan)
         ignored = []
         if slim:
-            ignored = find_ignored(source, excludes)
+            ignored = find_ignored(source, excludes, plan)
             excludes += find_large_untracked(source, [*excludes, *ignored], self.max_untracked_bytes)
         before = fingerprint(source, plan, tuple(excludes), tuple(ignored), self.max_nested_bytes)
         delta = _delta_plan(source, before, excludes, ignored, plan) if slim else None
@@ -1523,11 +1575,14 @@ class Checkpoints:
             names = [*tree, *delta.get('files', []), *delta.get('dirs', []), *delta.get('deleted', [])]
             if not all(_valid_tree_name(n, roots) for n in names):
                 raise ValueError()
-            for name in data.get('excludes', []):
-                p = Path(name)
-                if not isinstance(name, str) or p.is_absolute() or '..' in p.parts or '.git' in p.parts:
+            for key in ('excludes', 'ignored'):
+                if not isinstance(data.get(key, []), list):
                     raise ValueError()
-            if not isinstance(data.get('excludes', []), list) or not isinstance(data.get('objects', ''), str):
+                for name in data.get(key, []):
+                    p = Path(name)
+                    if not isinstance(name, str) or p.is_absolute() or '..' in p.parts or '.git' in p.parts:
+                        raise ValueError()
+            if not isinstance(data.get('objects', ''), str):
                 raise ValueError()
             return data
         except (OSError, ValueError, KeyError, TypeError):
@@ -1576,7 +1631,8 @@ class Checkpoints:
             if not ok:
                 raise WorkspaceError('checkpoint: ' + message)
 
-    def _replay(self, checkpoint: Path, target: Path, prove: bool = True) -> None:
+    def _replay(self, checkpoint: Path, target: Path, prove: bool = True, *,
+                completed: bool = False, marker: Path | None = None) -> None:
         data = self.read(checkpoint)
         # Validate stored tree before touching the destination (no link-following extraction).
         subs = data.get('submodules', [])
@@ -1588,7 +1644,7 @@ class Checkpoints:
         if inventory(checkpoint / 'tree', tuple(e['path'] for e in subs if e['populated'])) != expected:
             raise WorkspaceError('checkpoint: snapshot hash mismatch')
         modules = _modules_dir(target)
-        stale = self._check_target_submodules(checkpoint, target, data)
+        stale = self._check_target_submodules(checkpoint, target, data, completed=completed)
         # Parent target: no active writer. A retry after a partial replay must still be able to overwrite.
         gitdir = Path(git(target, 'rev-parse', '--absolute-git-dir'))
         if any(os.path.lexists(gitdir / lock) for lock in ('index.lock', 'HEAD.lock')):
@@ -1615,6 +1671,14 @@ class Checkpoints:
         elif prove:
             self._prove_bundle(checkpoint / 'commits.bundle', refspecs, 'bundle invalid; target untouched',
                                reference=_objects_dir(target) if bundle else None)
+        if marker is not None:
+            # Mark replay in progress only after all preflight checks pass, using `'replaying'`
+            # (never `'checkpoint'`) so an older runner cannot treat an interrupted replay as done.
+            atomic_json(marker, {'replaying': checkpoint.name, 'result': self._result_digest(data)})
+        if modules.parent.is_dir():
+            for leftover in modules.parent.glob('.runner-replay-gd-*'):
+                if leftover.is_dir() and not leftover.is_symlink():
+                    _rmtree(leftover, ignore_errors=True)
         self._set_aside_stale_submodules(target, stale)
         _mark('verify-fetch')
         # Replay never needs the target's own submodules; a set-aside gitdir would break the recursion.
@@ -1691,14 +1755,30 @@ class Checkpoints:
                                  lambda n: not any(n.startswith(r + '/') for r in roots))
 
     @staticmethod
-    def _apply_delta(tree: Path, target: Path, full: dict, delta: dict, mine) -> None:
+    def _apply_delta(tree: Path, target: Path, full: dict, delta: dict, mine,
+                     root_override: tuple[str, Path] | None = None) -> None:
         """The delta over a checkout already in `target`; then the recorded modes of the entries `mine`
-        selects (the checkout's repository: the superproject, or one populated submodule)."""
-        root = os.path.realpath(target)
+        selects (the checkout's repository: the superproject, or one populated submodule).
+
+        When `root_override` is `(prefix, stage_dir)`, every path starting with `prefix` is written
+        beneath `stage_dir` instead of `target / prefix` (atomic submodule worktree assembly)."""
+        if root_override is not None:
+            pre, dest_root = root_override
+        else:
+            pre, dest_root = '', target
+        root = os.path.realpath(dest_root)
+
+        def dest_path(name: str) -> Path:
+            if pre:
+                if not name.startswith(pre):
+                    raise WorkspaceError(f'checkpoint: delta path outside the restore root: {name}')
+                return dest_root / name[len(pre):]
+            return dest_root / name
+
         def inside(name: str) -> Path:
             # Defence in depth behind `read()`: whatever is written or removed lies under the restore root
             # (the last component may itself be a link, which is acted on, never followed).
-            p = target / name
+            p = dest_path(name)
             parent = os.path.realpath(p.parent)
             if parent != root and not parent.startswith(root + os.sep):
                 raise WorkspaceError(f'checkpoint: delta path outside the restore root: {name}')
@@ -1726,7 +1806,7 @@ class Checkpoints:
         for kind in ('file', 'link', 'dir'):
             for name in sorted((n for n, v in full.items() if v[0] == kind and mine(n)),
                                key=lambda n: (-len(Path(n).parts), n)):
-                p = target / name
+                p = dest_path(name)
                 if not os.path.lexists(p) or stat.S_IMODE(p.lstat().st_mode) == full[name][1]:
                     continue
                 try:
@@ -1734,10 +1814,12 @@ class Checkpoints:
                 except NotImplementedError:     # no lchmod on this platform: a link's mode is not enforced there
                     pass
 
-    def _check_target_submodules(self, checkpoint: Path, target: Path, data: dict) -> list:
+    def _check_target_submodules(self, checkpoint: Path, target: Path, data: dict,
+                                 *, completed: bool = False) -> list:
         """Validate the submodule gitdirs already present in the target.
 
-        A gitdir equal to the checkpointed one is kept (and must hold the same work). One that
+        A gitdir equal to the checkpointed one is kept (and must hold the same work, or a provably
+        partial replay of this checkpoint when no completed restore marker exists). One that
         differs is a leftover of an earlier lease of this pooled slot: it is returned for
         `_set_aside_stale_submodules` when it provably holds nothing the remote lacks, otherwise
         the restore is refused. Nothing is changed here."""
@@ -1763,7 +1845,7 @@ class Checkpoints:
                     continue
                 if any(os.path.lexists(gd / lock) for lock in ('index.lock', 'HEAD.lock')):
                     raise RestoreRefused(f"checkpoint: active git writer in target submodule {entry['path']}; lease retained")
-                self._require_same_submodule_work(checkpoint, target, entry, data, gd)
+                self._require_same_submodule_work(checkpoint, target, entry, data, gd, completed=completed)
         return stale
 
     def _set_aside_stale_submodules(self, target: Path, stale: list) -> None:
@@ -1855,72 +1937,222 @@ class Checkpoints:
         if _gitdir(gd, 'config', '--get', 'core.worktree', check=False):
             _gitdir(gd, 'config', 'core.worktree', os.path.relpath(os.path.realpath(wt), os.path.realpath(gd)), check=False)
 
-    def _require_same_submodule_work(self, checkpoint: Path, target: Path, entry: dict, data: dict, gd: Path) -> None:
-        """An existing target submodule may hold newer work; never replace anything that differs."""
+    def _require_same_submodule_work(self, checkpoint: Path, target: Path, entry: dict, data: dict, gd: Path,
+                                     *, completed: bool = False) -> None:
+        """An existing target submodule may hold newer work; never replace anything that differs.
+
+        When no completed restore marker exists for this checkpoint, a worktree that provably holds
+        only a partial replay of this checkpoint (missing files, un-restored modes, truncated copies,
+        or pre-delta HEAD blobs, with zero foreign files or index changes) may be retried."""
         i = data['submodules'].index(entry)
         saved = checkpoint / 'submodules' / str(i) / 'index'
         current = gd / 'index'
         wt = target / entry['path']
         present = wt.is_dir() and not wt.is_symlink() and any(wt.iterdir())
         # Stat refreshes rewrite index bytes without changing the staged content.
-        differs = (not present and current.is_file()
-                   and (not saved.is_file() or _submodule_index(gd, current) != _submodule_index(gd, saved)))
+        if current.is_file() and (not saved.is_file() or _submodule_index(gd, current) != _submodule_index(gd, saved)):
+            raise RestoreRefused(f"checkpoint: submodule work in target differs from checkpoint: {entry['path']}; lease retained")
         if present:
             have = _submodule_state(target, entry, _modules_dir(target))
             want = data['fingerprint']['submodules'][entry['path']]
-            differs = differs or have != want
             prefix = entry['path'] + '/'
             roots = tuple(e['path'] for e in data['submodules'] if e['populated'])
-            now = {k: v for k, v in inventory(target, roots, frozenset(data.get('excludes', []))).items() if k.startswith(prefix)}
-            differs = differs or now != {k: v for k, v in data['fingerprint']['tree'].items() if k.startswith(prefix)}
-        if differs:
-            raise RestoreRefused(f"checkpoint: submodule work in target differs from checkpoint: {entry['path']}; lease retained")
+            skip = frozenset((*data.get('excludes', []), *data.get('ignored', [])))
+            now = {k: v for k, v in inventory(target, roots, skip).items() if k.startswith(prefix)}
+            want_tree = {k: v for k, v in data['fingerprint']['tree'].items() if k.startswith(prefix)}
+            if have != want or now != want_tree:
+                if completed or not self._is_partial_submodule_replay(
+                        checkpoint, target, entry, data, gd, now, want_tree):
+                    raise RestoreRefused(
+                        f"checkpoint: submodule work in target differs from checkpoint: {entry['path']}; lease retained")
+
+    @staticmethod
+    def _is_partial_submodule_replay(checkpoint: Path, target: Path, entry: dict, data: dict,
+                                     gd: Path, now: dict, want_tree: dict) -> bool:
+        """True only when every entry present in `wt` is consistent with an interrupted replay of
+        this checkpoint (no foreign files, no user edits, valid `.git` pointer if present)."""
+        wt = target / entry['path']
+        pointer = wt / '.git'
+        if os.path.lexists(pointer):
+            if pointer.is_symlink() or not pointer.is_file():
+                return False
+            text = pointer.read_text(errors='surrogateescape')
+            if (not text.startswith('gitdir: ') or '\n' in text.strip()
+                    or os.path.realpath(wt / text[len('gitdir: '):].strip()) != os.path.realpath(gd)):
+                return False
+        prefix = entry['path'] + '/'
+        delta = data.get('delta')
+        if isinstance(delta, dict):
+            delta_files = {n for n in delta.get('files', []) if n.startswith(prefix)}
+            delta_deleted = {n for n in delta.get('deleted', []) if n.startswith(prefix)}
+        else:
+            delta_files, delta_deleted = set(), set()
+        deleted_parents = {p for n in delta_deleted for p in _parents(n)}
+        head_cache: dict[str, tuple[str, bytes] | None] = {}
+
+        def head_entry(rel: str):
+            if rel not in head_cache:
+                r = _run(['git', '--git-dir', str(gd), 'ls-tree', '-z', 'HEAD', '--', rel], capture_output=True)
+                if r.returncode or not r.stdout:
+                    head_cache[rel] = None
+                else:
+                    record = r.stdout.split(b'\0')[0]
+                    meta, _, _ = record.partition(b'\t')
+                    mode, kind, oid = meta.decode('ascii').split()
+                    if kind != 'blob':
+                        head_cache[rel] = None
+                    else:
+                        b = _run(['git', '--git-dir', str(gd), 'cat-file', 'blob', oid], capture_output=True)
+                        head_cache[rel] = (mode, b.stdout) if b.returncode == 0 else None
+            return head_cache[rel]
+
+        def matches_head(name: str, entry_val: list) -> bool:
+            he = head_entry(name[len(prefix):])
+            if he is None:
+                return False
+            h_mode, h_bytes = he
+            if h_mode == '120000':
+                return entry_val[0] == 'link' and os.fsencode(entry_val[2]) == h_bytes
+            if h_mode in ('100644', '100755'):
+                return (entry_val[0] == 'file' and entry_val[2] == len(h_bytes)
+                        and entry_val[3] == hashlib.sha256(h_bytes).hexdigest())
+            return False
+
+        def is_prefix_of_source(name: str, disk_size: int) -> bool:
+            if disk_size == 0:
+                return True
+            src_file = checkpoint / 'tree' / name
+            try:
+                if src_file.is_file() and not src_file.is_symlink():
+                    with src_file.open('rb') as f:
+                        want_prefix = f.read(disk_size)
+                    with (target / name).open('rb') as f:
+                        have_bytes = f.read(disk_size + 1)
+                    return len(have_bytes) == disk_size and have_bytes == want_prefix
+                he = head_entry(name[len(prefix):])
+                if he is not None and he[0] in ('100644', '100755') and len(he[1]) > disk_size:
+                    with (target / name).open('rb') as f:
+                        have_bytes = f.read(disk_size + 1)
+                    return len(have_bytes) == disk_size and have_bytes == he[1][:disk_size]
+            except OSError:
+                return False
+            return False
+
+        for k, v in now.items():
+            if k == prefix + '.git.runner-tmp':
+                if v[0] == 'file' and v[2] <= 4096:
+                    continue
+                return False
+            w = want_tree.get(k)
+            if w is None:
+                if v[0] == 'dir' and k in deleted_parents:
+                    continue
+                if k in delta_deleted and matches_head(k, v):
+                    continue
+                return False
+            if v == w:
+                continue
+            if v[0] == w[0] == 'dir' and v[2:] == w[2:]:
+                continue
+            if v[0] == w[0] == 'link' and v[2] == w[2]:
+                continue
+            if v[0] == w[0] == 'file':
+                if v[2] == w[2] and v[3] == w[3]:
+                    continue
+                if v[2] < w[2] and is_prefix_of_source(k, v[2]):
+                    continue
+            if k in delta_files and matches_head(k, v):
+                continue
+            return False
+        return True
 
     def _replay_submodule(self, src: Path, target: Path, modules: Path, entry: dict, data: dict,
                           delta: dict | None = None, tree: Path | None = None) -> None:
         """The submodule's gitdir from its bundle and index; a populated one gets its pointer back and, in
-        the slim form (`delta`: its part), its worktree: HEAD checked out, then that part over it."""
+        the slim form (`delta`: its part), its worktree: HEAD checked out, then that part over it.
+
+        New gitdirs and slim worktrees are assembled in sibling staging directories and renamed into
+        place atomically so an interruption mid-replay leaves no half-populated submodule tree."""
         gd = modules / entry['name']
+        wt = target / entry['path']
         want = data['fingerprint']['submodules'][entry['path']]
         if not os.path.lexists(gd):
             gd.parent.mkdir(parents=True, exist_ok=True)
-            _run(['git', 'init', '--bare', '--quiet', str(gd)], check=True, capture_output=True)
-            _gitdir(gd, 'fetch', '--quiet', str(src / 'commits.bundle'),
-                    '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*',
-                    '+refs/remotes/*:refs/remotes/*', '+refs/runner-checkpoints/*:refs/runner-checkpoints/*',
-                    '+HEAD:refs/runner-replay/HEAD')
-            if want['branch']:
-                _gitdir(gd, 'symbolic-ref', 'HEAD', want['branch'])
-            else:
-                _gitdir(gd, 'update-ref', '--no-deref', 'HEAD', want['head'])
-            _gitdir(gd, 'update-ref', '-d', 'refs/runner-replay/HEAD')
-            # Record the replayed refs the way a clone does (packed-refs): a fetch from the bundle
-            # leaves every tag loose, and a later restore into this slot would take the runner's
-            # own replay for someone's tags and refuse it.
-            _gitdir(gd, 'pack-refs', '--all')
-            wt = target / entry['path']
-            _gitdir(gd, 'config', 'core.bare', 'false')
-            _gitdir(gd, 'config', 'core.worktree', os.path.relpath(os.path.realpath(wt), os.path.realpath(gd)))
-        if any(os.path.lexists(gd / lock) for lock in ('index.lock', 'HEAD.lock')):
-            raise RestoreRefused(f"checkpoint: active git writer in target submodule {entry['path']}; lease retained")
+            gd_stage = Path(tempfile.mkdtemp(prefix='.runner-replay-gd-', dir=modules.parent))
+            try:
+                _run(['git', 'init', '--bare', '--quiet', str(gd_stage)], check=True, capture_output=True)
+                _gitdir(gd_stage, 'fetch', '--quiet', str(src / 'commits.bundle'),
+                        '+refs/heads/*:refs/heads/*', '+refs/tags/*:refs/tags/*',
+                        '+refs/remotes/*:refs/remotes/*', '+refs/runner-checkpoints/*:refs/runner-checkpoints/*',
+                        '+HEAD:refs/runner-replay/HEAD')
+                if want['branch']:
+                    _gitdir(gd_stage, 'symbolic-ref', 'HEAD', want['branch'])
+                else:
+                    _gitdir(gd_stage, 'update-ref', '--no-deref', 'HEAD', want['head'])
+                _gitdir(gd_stage, 'update-ref', '-d', 'refs/runner-replay/HEAD')
+                # Record the replayed refs the way a clone does (packed-refs): a fetch from the bundle
+                # leaves every tag loose, and a later restore into this slot would take the runner's
+                # own replay for someone's tags and refuse it.
+                _gitdir(gd_stage, 'pack-refs', '--all')
+                _gitdir(gd_stage, 'config', 'core.bare', 'false')
+                final_gd = Path(os.path.realpath(gd.parent)) / gd.name
+                _gitdir(gd_stage, 'config', 'core.worktree',
+                        os.path.relpath(os.path.realpath(wt), str(final_gd)))
+                if (src / 'index').is_file():
+                    shutil.copy2(src / 'index', gd_stage / 'index')
+                    _sync(gd_stage / 'index')
+                _sync(gd_stage)
+                os.rename(gd_stage, gd)
+                _sync(gd.parent)
+            except BaseException:
+                _rmtree(gd_stage, ignore_errors=True)
+                raise
+        else:
+            if any(os.path.lexists(gd / lock) for lock in ('index.lock', 'HEAD.lock')):
+                raise RestoreRefused(f"checkpoint: active git writer in target submodule {entry['path']}; lease retained")
+            if (src / 'index').is_file():
+                tmp = gd / 'runner-checkpoint-index.tmp'
+                shutil.copy2(src / 'index', tmp)
+                _sync(tmp)
+                os.replace(tmp, gd / 'index')
+                _sync(gd)
         if entry['populated']:
-            pointer = target / entry['path'] / '.git'
-            if pointer.is_symlink():
-                raise RestoreRefused(f"checkpoint: unsafe submodule pointer: {entry['path']}")
-            tmp = pointer.with_name('.git.runner-tmp')
-            tmp.write_text('gitdir: ' + os.path.relpath(os.path.realpath(gd), os.path.realpath(pointer.parent)) + '\n')
-            os.replace(tmp, pointer)
             if delta is not None:
-                self._checkout_submodule_head(gd, pointer.parent)
-                prefix = entry['path'] + '/'
-                self._apply_delta(tree, target, data['fingerprint']['tree'], delta, lambda n: n.startswith(prefix))
-        # The stored index last: the checkout above goes through a scratch index of HEAD.
-        if (src / 'index').is_file():
-            tmp = gd / 'runner-checkpoint-index.tmp'
-            shutil.copy2(src / 'index', tmp)
-            _sync(tmp)
-            os.replace(tmp, gd / 'index')
-            _sync(gd)
+                parent = wt.parent
+                parent_mode = stat.S_IMODE(parent.lstat().st_mode)
+                if parent_mode & 0o700 != 0o700:
+                    os.chmod(parent, parent_mode | 0o700)
+                wt_stage = Path(tempfile.mkdtemp(prefix='.runner-replay-wt-', dir=parent))
+                try:
+                    pointer = wt_stage / '.git'
+                    pointer.write_text('gitdir: ' + os.path.relpath(os.path.realpath(gd), os.path.realpath(wt)) + '\n')
+                    self._checkout_submodule_head(gd, wt_stage)
+                    prefix = entry['path'] + '/'
+                    self._apply_delta(tree, target, data['fingerprint']['tree'], delta,
+                                      lambda n: n.startswith(prefix), root_override=(prefix, wt_stage))
+                    wt_mode = data['fingerprint']['tree'].get(entry['path'], [None, None])[1]
+                    _sync(wt_stage)
+                    if os.path.lexists(wt) and wt.is_dir() and not wt.is_symlink():
+                        wt_cur_mode = stat.S_IMODE(wt.lstat().st_mode)
+                        if wt_cur_mode & 0o700 != 0o700:
+                            os.chmod(wt, wt_cur_mode | 0o700)
+                    os.replace(wt_stage, wt)
+                    if wt_mode is not None:
+                        os.chmod(wt, wt_mode)
+                    _sync(parent)
+                except BaseException:
+                    _rmtree(wt_stage, ignore_errors=True)
+                    raise
+                finally:
+                    if parent_mode & 0o700 != 0o700:
+                        os.chmod(parent, parent_mode)
+            else:
+                pointer = wt / '.git'
+                if pointer.is_symlink():
+                    raise RestoreRefused(f"checkpoint: unsafe submodule pointer: {entry['path']}")
+                tmp = pointer.with_name('.git.runner-tmp')
+                tmp.write_text('gitdir: ' + os.path.relpath(os.path.realpath(gd), os.path.realpath(pointer.parent)) + '\n')
+                os.replace(tmp, pointer)
 
     @staticmethod
     def _checkout_submodule_head(gd: Path, wt: Path) -> None:
@@ -2242,6 +2474,12 @@ class Checkpoints:
                 name = raw_name.decode('utf-8', 'surrogateescape')
                 if name and any(p in skip for p in (*_parents(name), name)):
                     raise _NotProvable('skip-tracked')
+            for root, where in inner.items():
+                pre = root + '/'
+                for raw_name in run_in(where, source / root, 'ls-files', '-z').stdout.split(b'\0'):
+                    name = pre + raw_name.decode('utf-8', 'surrogateescape') if raw_name else ''
+                    if name and any(p in skip for p in (*_parents(name), name)):
+                        raise _NotProvable('skip-tracked')
         # The replay's tree: checkout of HEAD, minus `deleted` (files and links), then the delta files
         # over it (a directory in the way is removed whole), then the empty directories. Same steps,
         # same order as `_replay` / `_overlay_delta`; then each populated submodule the same way, from
@@ -2368,7 +2606,9 @@ class Checkpoints:
             return r.stdout
         # As the replay does before its fingerprint; writes the probe's copy of the index only.
         _run(['git', '-C', str(source), 'update-index', '--really-refresh'], capture_output=True, env=env)
-        left_out = (*excludes, *ignored)
+        roots = tuple(e['path'] for e in data.get('submodules') or [] if e['populated'])
+        left_out = tuple(e for e in (*excludes, *ignored)
+                         if not any(e == r or e.startswith(r + '/') for r in roots))
         spec = ['--', '.', *(f':(exclude,literal){e}' for e in left_out)] if left_out else []
         return {'head': raw('rev-parse', 'HEAD').decode('ascii').strip(),
                 'staged': hashlib.sha256(raw('diff', '--cached', '--binary', '--no-ext-diff')).hexdigest(),
@@ -2546,27 +2786,42 @@ class Checkpoints:
 
     def restore(self, checkpoint: Path, target: Path) -> dict:
         """Replay over target. A completed restore leaves a marker holding the digest of its
-        result; a later restore of the same checkpoint refuses if target moved on since. No
-        marker (crash mid-replay) means a partial replay, which a retry must overwrite."""
+        result; a later restore of the same checkpoint refuses if target moved on since. An
+        in-progress marker for this checkpoint, or no marker at all (fresh/freed slot, or an
+        earlier runner killed mid-replay), allows retrying over a provably partial replay. Any
+        unexpected, corrupt, symlinked or foreign restore marker fails closed."""
         with _IO_LOCK:
             data = self.read(checkpoint)
+            expected_digest = self._result_digest(data)
             marker = self._marker(target)
-            try:
-                done = json.loads(marker.read_text())
-            except (OSError, ValueError):
-                done = None
-            if isinstance(done, dict) and done.get('checkpoint') == checkpoint.name:
+            completed = False
+            done = None
+            if os.path.lexists(marker):
+                if marker.is_symlink() or not marker.is_file():
+                    raise RestoreRefused('checkpoint: unexpected or unreadable restore marker in target; refused')
+                try:
+                    done = json.loads(marker.read_text())
+                except (OSError, ValueError):
+                    raise RestoreRefused('checkpoint: unexpected or unreadable restore marker in target; refused') from None
+                if not isinstance(done, dict):
+                    raise RestoreRefused('checkpoint: unexpected or unreadable restore marker in target; refused')
+                if done.get('checkpoint') == checkpoint.name and 'replaying' not in done:
+                    completed = True
+                elif (done.get('replaying') == checkpoint.name
+                      and 'checkpoint' not in done
+                      and done.get('result') == expected_digest):
+                    completed = False
+                else:
+                    raise RestoreRefused('checkpoint: restore marker belongs to another checkpoint or state; refused')
+            if completed:
                 # Submodule-specific refusals first: the plain fingerprint cannot see inside a populated submodule.
-                self._check_target_submodules(checkpoint, target, data)
+                self._check_target_submodules(checkpoint, target, data, completed=True)
                 current = hashlib.sha256(json.dumps(
                     fingerprint(target, data.get('submodules'), tuple(data.get('excludes', [])),
                                 tuple(data.get('ignored', []))), sort_keys=True).encode()).hexdigest()
                 if current != done.get('result'):
                     raise RestoreRefused('checkpoint: target has newer work since completed restore; refused')
             self._budget(target, data['bytes'] + data['object_bytes'])
-            # Drop the marker before touching target: an interrupted replay must stay retryable.
-            marker.unlink(missing_ok=True)
-            _sync(marker.parent)
-            self._replay(checkpoint, target)
-            atomic_json(marker, {'checkpoint': checkpoint.name, 'result': self._result_digest(data)})
+            self._replay(checkpoint, target, completed=completed, marker=marker)
+            atomic_json(marker, {'checkpoint': checkpoint.name, 'result': expected_digest})
             return data
