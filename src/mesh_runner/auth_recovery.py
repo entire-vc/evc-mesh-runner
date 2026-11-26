@@ -126,6 +126,7 @@ def consume(runner, payload):
         for attempt in store.by_state(ar.agent.name, ("ready",)):
             if attempt.note == f"authentication held for profile {profile}":
                 ar._resume_hold.pop(attempt.id, None)
+                getattr(ar, "_resume_hold_reason", {}).pop(attempt.id, None)
         return [ar.agent.name]
     finally:
         store.db.close()
