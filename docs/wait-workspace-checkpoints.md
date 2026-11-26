@@ -166,7 +166,13 @@ A snapshot stores only what the repository cannot give back:
   manifest says `slim_failed`. A repository with configured submodules takes the slim form too: the
   superproject's delta over its HEAD, and for each populated submodule its own part over that
   submodule's HEAD, which the replay checks out from the submodule's bundle before laying the part
-  over it (its git-ignored files included, as before); the manifest is then version 3, which an
+  over it. Git-ignored regenerable paths inside populated submodules (`node_modules` and other
+  ignored caches/build output) are left out just like in the superproject (recorded under
+  `excludes` / `ignored` prefixed with the submodule path), while tracked and untracked files are
+  preserved. During restore, new submodule gitdirs and slim submodule worktrees are assembled in
+  sibling staging directories and swapped into place atomically after writing an in-progress replay
+  marker; retrying after an interrupted submodule replay overwrites only a provably partial replay
+  and still refuses foreign or newer work. The manifest is then version 3, which an
   earlier runner refuses instead of replaying. With only empty submodules it stays version 2. Before
   this every such capture copied the whole worktree and replayed it in scratch (thousands of file
   events per suspension, a clean submodule included). The full form is
