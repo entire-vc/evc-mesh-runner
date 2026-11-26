@@ -445,7 +445,7 @@ class HandBackBetweenSteps(ShipBench):
         self._runners.append(rev)
         rev.ship_due, rev.lanes = r.ship_due, [r, rev]
         a = rev.store.create("reviewer", t["id"], "claude", "task 1", mode="review")
-        rev.store.mark("reviewer", t["id"], "gate", '{"RES_ID": "r1"}')
+        rev.store.mark("reviewer", t["id"], "gate", '{"RES_ID": "r1", "RES_ADMITTED": "1"}')
         rev._release_gate(a, "turn-end")
         self.assertEqual(r.ship_due.due(self.agent.name), [])     # the writer slot is still taken
         pending = rev._pending_releases(t["id"])

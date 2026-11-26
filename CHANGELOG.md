@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.135 — 2026-11-26
+
+- **Bounded gate-release retries with one-time escalation and non-admitted intent cleanup.**
+  Non-admitted gate intents (`RES_ADMITTED != "1"`) no longer enter or loop in
+  `gate_release_pending` (legacy non-admitted entries are cleaned up on the next retry pass).
+  Admitted releases retry up to `GATE_RELEASE_MAX_RETRIES` (10) times before emitting a single
+  non-repeating `operator_alert` (`gate_release_exhausted`), stopping further hook retries while
+  keeping the local writer hold. Resuming an attempt now checks `_local_writer()` before reserve
+  and checkout so pending or escalated releases cannot spin `checkout_generation`.
+
 ## 0.2.134 — 2026-11-25
 
 - **Make populated submodule restore crash-idempotent and exclude submodule caches.**

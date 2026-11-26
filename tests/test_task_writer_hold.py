@@ -98,7 +98,8 @@ class WriterHold(Bench):
         t = task(1)
         r = self._gated(self.runner(FakeMesh([t])))
         a = r.store.create("builder", t["id"], "claude", "task 1")
-        r.store.mark("builder", t["id"], "gate", json.dumps({"RES_ID": "r1", "RES_BACKEND": "server"}))
+        r.store.mark("builder", t["id"], "gate",
+                     json.dumps({"RES_ID": "r1", "RES_BACKEND": "server", "RES_ADMITTED": "1"}))
         with patch.object(r, "_run_hook", return_value=(0, "", "")):    # end ran, release not confirmed
             r._release_gate(a, "turn-end")
         [pend] = pending(r, t["id"])
@@ -129,34 +130,122 @@ class WriterHold(Bench):
         self.agent.start_gate_command = ["operator-gate"]
         self.agent.turn_end_command = []
         a = r.store.create("builder", t["id"], "claude", "task 1")
-        r.store.mark("builder", t["id"], "gate", json.dumps({"RES_ID": "r1"}))
+        r.store.mark("builder", t["id"], "gate", json.dumps({"RES_ID": "r1", "RES_ADMITTED": "1"}))
         r._release_gate(a, "turn-end")
         self.assertEqual([x["gate"]["RES_ID"] for x in pending(r, t["id"])], ["r1"])
 
-    def test_old_unconfirmed_release_is_reported_but_never_dropped(self):
+    def test_exhausted_unconfirmed_release_escalates_and_stops_retrying(self):
         t = task(1)
         r = self._gated(self.runner(FakeMesh([t])))
+        a = r.store.create("builder", t["id"], "claude", "task 1")
         old = "2000-01-01T00:00:00Z"
         r.store.mark("builder", t["id"], GATE_RELEASE_PENDING, json.dumps([{
-            "gate": {"RES_ID": "r1"}, "mode": "work", "attempt": "", "outcome": "turn-end", "tries": 50,
+            "gate": {"RES_ID": "r1", "RES_BACKEND": "server", "RES_ADMITTED": "1"},
+            "mode": "work", "attempt": a.id, "outcome": "turn-end",
+            "tries": rmod.GATE_RELEASE_MAX_RETRIES - 1,
             "first_at": old, "next_at": old}]))
-        with patch.object(r, "_run_hook", return_value=(0, "", "")), self.assertLogs("mesh_runner", "WARNING") as logs:
+        alerts = []
+        orig_emit = r.emit
+        def capture(kind, attempt, **fields):
+            if kind == "operator_alert":
+                alerts.append(fields)
+            return orig_emit(kind, attempt, **fields)
+        with patch.object(r, "emit", side_effect=capture), \
+                patch.object(r, "_run_hook", return_value=(0, "", "")) as hook, \
+                self.assertLogs("mesh_runner", "WARNING") as logs:
             r.retry_gate_releases()
+        self.assertEqual(hook.call_count, 1)
         [kept] = pending(r, t["id"])
-        self.assertEqual(kept["tries"], 51)
-        self.assertTrue(kept["warned_at"])
-        self.assertTrue(any("still retrying" in line for line in logs.output))
-        r.store.mark("builder", t["id"], GATE_RELEASE_PENDING, json.dumps([dict(kept, next_at=old)]))
-        with patch.object(r, "_run_hook", return_value=(0, "", "")), patch.object(rmod.log, "warning") as warn:
+        self.assertEqual(kept["tries"], rmod.GATE_RELEASE_MAX_RETRIES)
+        self.assertTrue(kept["escalated"])
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["incident"], "gate_release_exhausted")
+        self.assertEqual(alerts[0]["reservation_id"], "r1")
+        self.assertTrue(any("operator alert" in line for line in logs.output))
+        self.assertIn("gate_release_escalated", [k for _, k, _ in r.store.events(a.id)])
+        self.assertIn("state=release escalated", r._local_writer(t["id"]))
+
+        # Subsequent ticks (even past 6h) do NOT invoke the end hook again and never repeat the alert
+        with patch.object(r, "emit", side_effect=capture), \
+                patch.object(r, "_run_hook") as hook2:
             r.retry_gate_releases()
-        warn.assert_not_called()                                     # reported at most once a day
-        self.assertEqual(pending(r, t["id"])[0]["tries"], 52)
+            r._escalate_gate_release(t["id"], pending(r, t["id"])[0], rmod.GATE_RELEASE_MAX_RETRIES,
+                                     rmod.parse_time("2099-01-01T00:00:00Z"))
+        hook2.assert_not_called()
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(pending(r, t["id"])[0]["tries"], rmod.GATE_RELEASE_MAX_RETRIES)
+
+    def test_legacy_pending_already_at_or_over_cap_escalates_without_hook_call(self):
+        t = task(1)
+        r = self._gated(self.runner(FakeMesh([t])))
+        a = r.store.create("builder", t["id"], "claude", "task 1")
+        r.store.mark("builder", t["id"], GATE_RELEASE_PENDING, json.dumps([{
+            "gate": {"RES_ID": "r-old", "RES_BACKEND": "server", "RES_ADMITTED": "1"},
+            "mode": "work", "attempt": a.id, "outcome": "turn-end",
+            "tries": 232, "first_at": "2000-01-01T00:00:00Z", "next_at": "2099-01-01T00:00:00Z"}]))
+        alerts = []
+        orig_emit = r.emit
+        def capture(kind, attempt, **fields):
+            if kind == "operator_alert":
+                alerts.append(fields)
+            return orig_emit(kind, attempt, **fields)
+        with patch.object(r, "emit", side_effect=capture), \
+                patch.object(r, "_run_hook") as hook, \
+                self.assertLogs("mesh_runner", "WARNING"):
+            r.retry_gate_releases()
+        hook.assert_not_called()
+        [kept] = pending(r, t["id"])
+        self.assertEqual(kept["tries"], 232)
+        self.assertTrue(kept["escalated"])
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["incident"], "gate_release_exhausted")
+
+    def test_pending_or_escalated_release_blocks_resume_before_checkout(self):
+        t = task(1, cat="in_progress")
+        mesh = FakeMesh([t])
+        r = self._gated(self.runner(mesh))
+        a = r.store.create("builder", t["id"], "claude", "task 1")
+        r.store.update(a, state="ready")
+        r.store.mark("builder", t["id"], GATE_RELEASE_PENDING, json.dumps([{
+            "gate": {"RES_ID": "r1", "RES_BACKEND": "server", "RES_ADMITTED": "1"},
+            "mode": "work", "attempt": a.id, "outcome": "turn-end",
+            "tries": rmod.GATE_RELEASE_MAX_RETRIES, "escalated": True,
+            "first_at": "2000-01-01T00:00:00Z", "next_at": "2000-01-01T00:00:00Z"}]))
+        with patch.object(r, "_run_hook") as hook, \
+                patch.object(r, "_launch_ready", return_value=True), \
+                patch.object(r, "_fresh_env", return_value={}):
+            r._resume_one(r.store.get(a.id))
+        hook.assert_not_called()
+        self.assertEqual(mesh.checkouts, {})
+
+    def test_non_admitted_intent_is_never_kept_or_retried_in_gate_release_pending(self):
+        t = task(1)
+        r = self._gated(self.runner(FakeMesh([t])))
+        for gate_doc in ({"RES_ID": "r-intent", "RES_BACKEND": "server"},
+                         {"RES_ID": "r-intent-0", "RES_BACKEND": "server", "RES_ADMITTED": "0"}):
+            a = r.store.create("builder", t["id"], "claude", "task 1")
+            r.store.mark("builder", t["id"], "gate", json.dumps(gate_doc))
+            with patch.object(r, "_run_hook", return_value=(0, "", "")) as hook:
+                r._release_gate(a, "not-started")
+            self.assertEqual(hook.call_count, 1)
+            self.assertEqual(pending(r, t["id"]), [])
+            r.store.update(a, state="completed")
+
+        # Pre-existing legacy non-admitted entry in gate_release_pending is cleaned up on retry
+        r.store.mark("builder", t["id"], GATE_RELEASE_PENDING, json.dumps([{
+            "gate": {"RES_ID": "r-legacy-intent", "RES_BACKEND": "server"},
+            "mode": "work", "attempt": "", "outcome": "not-started", "tries": 42,
+            "first_at": "2000-01-01T00:00:00Z", "next_at": "2099-01-01T00:00:00Z"}]))
+        with patch.object(r, "_run_hook", return_value=(0, "", "")) as hook:
+            r.retry_gate_releases()
+        self.assertEqual(hook.call_count, 1)
+        self.assertEqual(pending(r, t["id"]), [])
 
     def test_reservation_is_recorded_before_the_end_hook_runs(self):
         t = task(1)
         r = self._gated(self.runner(FakeMesh([t])))
         a = r.store.create("builder", t["id"], "claude", "task 1")
-        r.store.mark("builder", t["id"], "gate", json.dumps({"RES_ID": "r1"}))
+        r.store.mark("builder", t["id"], "gate", json.dumps({"RES_ID": "r1", "RES_ADMITTED": "1"}))
         seen = []
 
         def hook(argv, env, timeout):            # a crash here must leave the reservation recorded
@@ -172,7 +261,7 @@ class WriterHold(Bench):
         r = self._gated(self.runner(FakeMesh([t])))
         for res in ("r1", "r2"):
             a = r.store.create("builder", t["id"], "claude", "task 1")
-            r.store.mark("builder", t["id"], "gate", json.dumps({"RES_ID": res}))
+            r.store.mark("builder", t["id"], "gate", json.dumps({"RES_ID": res, "RES_ADMITTED": "1"}))
             with patch.object(r, "_run_hook", return_value=(0, "", "")):
                 r._release_gate(a, "turn-end")
             r.store.update(a, state="completed")
