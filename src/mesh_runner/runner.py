@@ -142,7 +142,8 @@ RELEASE_RETRY_SECONDS = (30, 120, 300)  # backoff between retries of a pending r
 # An unsent end (the prompt never pasted, the writer gone) frees its slot like an ordinary turn end.
 CAPACITY_RELEASING_OUTCOMES = ("turn-end", "pre-send-unsent")
 GATE_RELEASE_PENDING = "gate_release_pending"   # store mark: a gate reservation whose release was not confirmed
-GATE_RELEASE_WARN = 24 * 3600           # a gate release unconfirmed this long is reported (once a day); never dropped
+GATE_RELEASE_WARN = 24 * 3600           # legacy constant kept for compatibility
+GATE_RELEASE_MAX_RETRIES = 10           # bounded retries before escalating and stopping the retry loop
 TURN_CAP_WINDOW = 10                # turn cap: how many recent outcomes are looked at for progress
 CAP_WAIT = "cap_wait"                # store mark: a capped task waiting for new input
 # store mark: the UTC day a RUNNER GAVE UP with nobody above this agent started the card again in a fresh session
@@ -644,6 +645,14 @@ TASK_WRITER_REFUSAL = re.compile(
 
 def writer_hold(reason: str) -> bool:
     return reason.startswith(GATE_PUBLIC_REASONS["writer"])
+
+
+def _requires_release_confirmation(gate: dict) -> bool:
+    """True only for an admitted reservation (``RES_ID`` + ``RES_ADMITTED == '1'``).
+    A non-admitted intent was never consumed on the server, so its end hook runs once
+    best-effort and must not enter or loop in ``gate_release_pending``."""
+    return (isinstance(gate, dict) and bool(gate.get("RES_ID"))
+            and str(gate.get("RES_ADMITTED") or "") == "1")
 
 
 # The start gate's admit says the server's slot table refused this card's profile and that it
@@ -9565,6 +9574,11 @@ class AgentRunner:
             self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
             self._log_hold("resume", a.task8, "legacy unsent writer or reservation is not proven stopped")
             return
+        writer = self._local_writer(a.task_id)
+        if writer:
+            self._resume_hold[a.id] = time.monotonic() + GATE_HOLD_SECONDS
+            self._log_hold("resume", a.task8, writer, episode="writer")
+            return
         for feed in (1, 2):
             reason, gate = self._gate("reserve", a.task_id, a.mode, a, require_capacity=bool(legacy_candidate or scope_recovery))
             if not reason:
@@ -12214,31 +12228,32 @@ class AgentRunner:
             del self._hold_log_at[k]
 
     def _release_gate(self, a: Attempt, outcome: str) -> None:
-        """Release what the gate holds for this task, once. A server reservation is first written
-        to ``gate_release_pending`` and only then taken off the ``gate`` mark, so a crash while the
-        end hook runs leaves it recorded; the pending entry goes once the hook confirms the release
-        (``RELEASE_CONFIRMED=1``). Unconfirmed (``release_pending``, transport, no end hook), it stays
-        and ``retry_gate_releases`` resends it: dropping it would leave the card's writer slot taken
-        until the server's own reconcile, and every next owner is refused ``task_writer_active``."""
+        """Release what the gate holds for this task, once. An admitted reservation
+        (``RES_ADMITTED=1``) is first written to ``gate_release_pending`` and only then taken off
+        the ``gate`` mark, so a crash while the end hook runs leaves it recorded; the pending entry
+        goes once the hook confirms the release (``RELEASE_CONFIRMED=1``). Non-admitted intents
+        (``RES_ADMITTED != "1"``) run the end hook once best-effort without arming
+        ``gate_release_pending``."""
         gate = self._gate_of(a)
         if not gate:
             if outcome == "turn-end":
                 self._ship_handed_back(a)      # no writer slot was held: the card is free now
             return
         res = str(gate.get("RES_ID") or "")
-        if res:
+        need_confirm = _requires_release_confirmation(gate)
+        if need_confirm:
             first = now()
             self._put_pending(a.task_id, {
                 "gate": gate, "mode": a.mode, "attempt": a.id, "outcome": outcome, "tries": 0,
                 "first_at": iso(first), "next_at": iso(first + dt.timedelta(seconds=RELEASE_RETRY_SECONDS[0]))})
         self.store.mark(self.agent.name, a.task_id, "gate", "")
-        confirmed = self._turn_end(a.task_id, a.mode, a, gate, outcome, require_confirmation=bool(res))
-        if res and confirmed:
+        confirmed = self._turn_end(a.task_id, a.mode, a, gate, outcome, require_confirmation=need_confirm)
+        if need_confirm and confirmed:
             self._drop_pending(a.task_id, res)
-        if not res or confirmed:
+        if not need_confirm or confirmed:
             if outcome == "turn-end":
                 self._ship_handed_back(a)      # the writer slot is free: the author may take the card now
-            return                             # (no res: nothing was reserved on the server)
+            return                             # (non-admitted intent or no res: nothing was admitted on the server)
         self.store.event(a.id, GATE_RELEASE_PENDING, outcome)
         log.warning("%s: #%s gate release unconfirmed (%s); reservation kept, retrying",
                     self.agent.name, a.task8, outcome)
@@ -12264,39 +12279,77 @@ class AgentRunner:
     def _drop_pending(self, task_id: str, res: str) -> None:
         self._save_pending(task_id, [x for x in self._pending_releases(task_id) if x["gate"]["RES_ID"] != res])
 
+    def _escalate_gate_release(self, task_id: str, pend: dict, tries: int, at: dt.datetime) -> None:
+        res_id = str((pend.get("gate") or {}).get("RES_ID") or "")
+        since = str(pend.get("first_at") or iso(at))
+        text = (f"[mesh-runner] Lane {self.agent.name} failed to confirm gate release for #{task_id[:8]} "
+                f"(res={res_id[:12] or '?'}, outcome={pend.get('outcome') or 'turn-end'}) after {tries} tries "
+                f"since {since}. Retries stopped; card held locally to prevent checkout_generation spin.")
+        operator_alert.signal(
+            self.store, f"gate_release:{self.agent.name}:{task_id[:8]}", since, text, self.emit,
+            now=at, repeat_hours=math.inf, incident="gate_release_exhausted", lane=self.agent.name,
+            task_id=task_id, reservation_id=res_id, tries=tries)
+
+    def _mark_gate_release_escalated(self, task_id: str, pend: dict, tries: int, at: dt.datetime) -> dict:
+        gate = pend["gate"]
+        update = dict(pend, tries=tries, escalated=True, escalated_at=iso(at))
+        attempt_id = pend.get("attempt") or ""
+        if attempt_id and self.store.get(attempt_id) is not None:
+            self.store.event(attempt_id, "gate_release_escalated",
+                             f"tries={tries} res={gate.get('RES_ID')}")
+        self._escalate_gate_release(task_id, update, tries, at)
+        return update
+
     def retry_gate_releases(self) -> None:
-        """Each tick: resend the gate releases that were not confirmed, on their own backoff. An entry
-        is kept until a release is confirmed: a reservation the server already settled answers
-        already_released, so the retry itself ends it; only the report is rate-limited."""
+        """Each tick: resend unconfirmed admitted gate releases on their backoff, bounded by
+        ``GATE_RELEASE_MAX_RETRIES``. Non-admitted intents are cleaned up and dropped; once a
+        release hits the retry cap it escalates once via ``operator_alert`` and stops retrying
+        while keeping the local writer hold so ``checkout_generation`` cannot spin."""
         for task_id in list(self.store.marked(self.agent.name, GATE_RELEASE_PENDING)):
             items = self._pending_releases(task_id)
             kept = []
             for pend in items:
+                gate = pend["gate"]
+                if not _requires_release_confirmation(gate):
+                    try:
+                        attempt = self.store.get(pend.get("attempt") or "")
+                        self._turn_end(task_id, pend.get("mode") or "work", attempt, gate,
+                                       pend.get("outcome") or "turn-end", require_confirmation=False)
+                    except Exception as e:
+                        log.warning("%s: non-admitted gate cleanup #%s: %s",
+                                    self.agent.name, task_id[:8], type(e).__name__)
+                    log.info("%s: #%s dropped non-admitted intent from gate_release_pending",
+                             self.agent.name, task_id[:8])
+                    continue
+                if pend.get("escalated"):
+                    kept.append(pend)
+                    continue
+                existing_tries = int(pend.get("tries") or 0)
+                if existing_tries >= GATE_RELEASE_MAX_RETRIES:
+                    kept.append(self._mark_gate_release_escalated(task_id, pend, existing_tries, now()))
+                    continue
                 due = parse_time(pend.get("next_at"))
                 if due is not None and now() < due:
                     kept.append(pend)
                     continue
-                gate = pend["gate"]
                 try:
                     attempt = self.store.get(pend.get("attempt") or "")
                     if self._turn_end(task_id, pend.get("mode") or "work", attempt, gate,
                                       pend.get("outcome") or "turn-end", require_confirmation=True):
                         log.info("%s: #%s gate release confirmed on retry %d", self.agent.name, task_id[:8],
-                                 int(pend.get("tries") or 0) + 1)
+                                 existing_tries + 1)
                         if attempt is not None and (pend.get("outcome") or "turn-end") == "turn-end":
                             self._ship_handed_back(attempt)
                         continue
                 except Exception as e:                   # never cost the rest of the tick
                     log.warning("%s: gate release retry #%s: %s", self.agent.name, task_id[:8], type(e).__name__)
-                tries = int(pend.get("tries") or 0) + 1
+                at = now()
+                tries = existing_tries + 1
+                if tries >= GATE_RELEASE_MAX_RETRIES:
+                    kept.append(self._mark_gate_release_escalated(task_id, pend, tries, at))
+                    continue
                 step = RELEASE_RETRY_SECONDS[min(tries, len(RELEASE_RETRY_SECONDS) - 1)]
-                update = dict(pend, tries=tries, next_at=iso(now() + dt.timedelta(seconds=step)))
-                first = parse_time(pend.get("first_at")) or now()
-                warned = parse_time(pend.get("warned_at")) or first
-                if (now() - warned).total_seconds() >= GATE_RELEASE_WARN:
-                    update["warned_at"] = iso(now())
-                    log.warning("%s: #%s gate release unconfirmed for %dh after %d tries; still retrying",
-                                self.agent.name, task_id[:8], int((now() - first).total_seconds() // 3600), tries)
+                update = dict(pend, tries=tries, next_at=iso(at + dt.timedelta(seconds=step)))
                 kept.append(update)
             self._save_pending(task_id, kept)    # a lane's marks are written by its own thread only
 
@@ -12324,9 +12377,12 @@ class AgentRunner:
         start now would create an attempt only to have admit refuse it (``task_writer_active``).
         Held before any attempt, checkout or lease; lifted by the holder's own release."""
         for agent in sorted(self.store.mark_holders(task_id, GATE_RELEASE_PENDING)):
-            if self._pending_releases(task_id, agent):
+            pending_items = self._pending_releases(task_id, agent)
+            if pending_items:
                 # this lane's own unconfirmed release too: a new reservation waits until it is settled
-                return f"{GATE_PUBLIC_REASONS['writer']} (holder={agent}, state=release pending, local)"
+                state = ("release escalated" if any(x.get("escalated") for x in pending_items)
+                         else "release pending")
+                return f"{GATE_PUBLIC_REASONS['writer']} (holder={agent}, state={state}, local)"
         for agent, raw in sorted(self.store.mark_holders(task_id, "gate").items()):
             if agent == self.agent.name:
                 continue
