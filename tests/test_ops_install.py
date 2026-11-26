@@ -105,11 +105,77 @@ class Install(unittest.TestCase):
                          ["/usr/bin/python3", str(new / "src/mesh_runner/launch_guard.py"), "--target-release",
                           str(new), "--config", "/etc/runner.toml", "--log-level", "INFO"])
         self.assertEqual(after["EnvironmentVariables"], {"PATH": "/bin", "PYTHONPATH": str(new / "src")})
-        self.assertEqual({k: v for k, v in after.items() if k not in ("ProgramArguments", "EnvironmentVariables")},
-                         {"Label": "x", "KeepAlive": True})
+        self.assertEqual(
+            {
+                k: v
+                for k, v in after.items()
+                if k not in ("ProgramArguments", "EnvironmentVariables", "SoftResourceLimits", "HardResourceLimits")
+            },
+            {"Label": "x", "KeepAlive": True},
+        )
+        self.assertEqual(after["SoftResourceLimits"], {"NumberOfFiles": 8192})
+        self.assertEqual(after["HardResourceLimits"], {"NumberOfFiles": 65536})
         self.assertEqual(install.running_release(after), new)
         self.assertEqual(install.running_release(before), old)                           # the input is untouched
         plistlib.dumps(after)                                                            # still a valid plist
+
+    def test_plist_for_sets_default_fd_limits_when_absent(self):
+        old, new = self.root / "old", self.root / "new"
+        before = self.plist(old)
+        after = install.plist_for(before, new)
+        self.assertEqual(after["SoftResourceLimits"]["NumberOfFiles"], 8192)
+        self.assertEqual(after["HardResourceLimits"]["NumberOfFiles"], 65536)
+        self.assertNotIn("SoftResourceLimits", before)
+        self.assertNotIn("HardResourceLimits", before)
+        plistlib.dumps(after)
+
+        legacy_after = install.plist_for(self.legacy_plist(old), new)
+        self.assertEqual(legacy_after["SoftResourceLimits"]["NumberOfFiles"], 8192)
+        self.assertEqual(legacy_after["HardResourceLimits"]["NumberOfFiles"], 65536)
+
+    def test_plist_for_raises_low_fd_limits_and_preserves_sibling_keys(self):
+        old, new = self.root / "old", self.root / "new"
+        before = self.plist(old)
+        before["SoftResourceLimits"] = {"NumberOfFiles": 256, "NumberOfProcesses": 512}
+        before["HardResourceLimits"] = {"NumberOfFiles": 4096, "NumberOfProcesses": 1024}
+        after = install.plist_for(before, new)
+        self.assertEqual(after["SoftResourceLimits"], {"NumberOfFiles": 8192, "NumberOfProcesses": 512})
+        self.assertEqual(after["HardResourceLimits"], {"NumberOfFiles": 65536, "NumberOfProcesses": 1024})
+        plistlib.dumps(after)
+
+        # Malformed or non-integer values are also normalized to at least the required minimums.
+        malformed = self.plist(old)
+        malformed["SoftResourceLimits"] = {"NumberOfFiles": True}
+        malformed["HardResourceLimits"] = None
+        fixed = install.plist_for(malformed, new)
+        self.assertEqual(fixed["SoftResourceLimits"]["NumberOfFiles"], 8192)
+        self.assertEqual(fixed["HardResourceLimits"]["NumberOfFiles"], 65536)
+        plistlib.dumps(fixed)
+
+    def test_plist_for_preserves_sufficient_and_higher_fd_limits(self):
+        old, new = self.root / "old", self.root / "new"
+        exact = self.plist(old)
+        exact["SoftResourceLimits"] = {"NumberOfFiles": 8192}
+        exact["HardResourceLimits"] = {"NumberOfFiles": 65536}
+        exact_after = install.plist_for(exact, new)
+        self.assertEqual(exact_after["SoftResourceLimits"]["NumberOfFiles"], 8192)
+        self.assertEqual(exact_after["HardResourceLimits"]["NumberOfFiles"], 65536)
+
+        higher = self.plist(old)
+        higher["SoftResourceLimits"] = {"NumberOfFiles": 16384}
+        higher["HardResourceLimits"] = {"NumberOfFiles": 131072}
+        higher_after = install.plist_for(higher, new)
+        self.assertEqual(higher_after["SoftResourceLimits"]["NumberOfFiles"], 16384)
+        self.assertEqual(higher_after["HardResourceLimits"]["NumberOfFiles"], 131072)
+
+        # When soft exceeds the default hard minimum, hard is raised so Hard >= Soft holds.
+        soft_above_hard = self.plist(old)
+        soft_above_hard["SoftResourceLimits"] = {"NumberOfFiles": 100000}
+        soft_above_hard["HardResourceLimits"] = {"NumberOfFiles": 65536}
+        soft_above_hard_after = install.plist_for(soft_above_hard, new)
+        self.assertEqual(soft_above_hard_after["SoftResourceLimits"]["NumberOfFiles"], 100000)
+        self.assertEqual(soft_above_hard_after["HardResourceLimits"]["NumberOfFiles"], 100000)
+        plistlib.dumps(soft_above_hard_after)
 
     def test_plist_that_does_not_launch_through_the_guard_is_not_rewritten(self):
         with self.assertRaises(install.Failed):

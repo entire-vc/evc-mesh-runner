@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.137 — 2026-11-26
+
+- **Guarantee launchd open-file limits in `ops/install.py`.** `plist_for` now enforces minimum
+  `SoftResourceLimits.NumberOfFiles >= 8192` and `HardResourceLimits.NumberOfFiles >= 65536`
+  (preserving any higher configured limits and ensuring `Hard >= Soft`) on every release install or
+  activation, preventing macOS launchd's default 256-FD cap from causing `EMFILE` under concurrent
+  turns.
+
 ## 0.2.136 — 2026-11-26
 
 - **Keep human-gated blocking waits asleep on agent/bot comments and publish resume holds as `stopped`.**

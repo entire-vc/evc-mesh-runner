@@ -51,6 +51,8 @@ CONFIG = HOME / ".mesh-runner" / "runner.toml"
 SOURCE_COMMIT = "SOURCE_COMMIT"
 COPIED = ("src", "pyproject.toml", "mesh-extension.json", "CHANGELOG.md", "README.md", "LICENSE", "requirements.lock",
           SOURCE_COMMIT)
+MIN_SOFT_OPEN_FILES = 8192
+MIN_HARD_OPEN_FILES = 65536
 
 
 class Failed(RuntimeError):
@@ -144,8 +146,20 @@ def preflight(release: Path, config: Path, python: str) -> None:
         raise Failed("the new release does not load the live config:\n" + (done.stderr or done.stdout)[-1500:])
 
 
+def _ensure_min_open_files(plist: dict, key: str, minimum: int) -> int:
+    section = plist.get(key)
+    if not isinstance(section, dict):
+        section = {}
+        plist[key] = section
+    raw = section.get("NumberOfFiles")
+    current = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+    value = max(current, minimum)
+    section["NumberOfFiles"] = value
+    return value
+
+
 def plist_for(current: dict, release: Path) -> dict:
-    """The same job, pointed at ``release``: guard path, target and PYTHONPATH; nothing else changes."""
+    """The same job, pointed at ``release``: guard path, target, PYTHONPATH and minimum FD limits."""
     new = json.loads(json.dumps(current))            # plain deep copy (the plist holds only JSON types)
     args = list(new["ProgramArguments"])
     guard = next((i for i, a in enumerate(args) if a.endswith("/src/mesh_runner/launch_guard.py")), None)
@@ -166,6 +180,8 @@ def plist_for(current: dict, release: Path) -> dict:
         del args[i:i + 2]
     new["ProgramArguments"] = args
     new.setdefault("EnvironmentVariables", {})["PYTHONPATH"] = str(release / "src")
+    soft = _ensure_min_open_files(new, "SoftResourceLimits", MIN_SOFT_OPEN_FILES)
+    _ensure_min_open_files(new, "HardResourceLimits", max(MIN_HARD_OPEN_FILES, soft))
     return new
 
 
