@@ -608,7 +608,7 @@ QUEUE_WAIT_GUIDANCE = (
     "current, not yet served `[fleet queue-request:...]` machine source, with the queue flag on. It wakes you "
     "once when ANY independent unit becomes ready for the listed targets after that source; it is not "
     "availability and grants no access. An unchanged or already served source has no event to wait for: "
-    "declare another condition (card, mr, pipeline, decision) or finish the card."
+    "declare another condition (card, mr, pipeline, decision) or finish_task to=done|review."
 )
 
 
@@ -617,7 +617,7 @@ MANUAL_WAIT_GUIDANCE = (
     "carries the `wake:manual` label (a lead's decision that no observable event exists). It has no timer and no "
     "age re-check: a comment by someone else on this card resumes it, or your own `continue_next`. Without that "
     "decision, end the turn with an observable condition (wait_for on=card, mr or pipeline; ask_agent) or "
-    "finish_task."
+    "finish_task to=done|review."
 )
 
 
@@ -653,8 +653,9 @@ so fix what it names and call again.
   continue_next note=<what you did, what is next>  — you did a piece of work (an edit, a commit, a check run,
       a result posted) and continue right away. Reading the task and writing a plan is not a piece of work:
       keep working in the same turn.
-  finish_task result_kind=change|defect|research|content|ops evidence=<proof of each criterion> [to=review]
-      — the task is finished (to=review: someone must accept a live result)
+  finish_task result_kind=change|defect|research|content|ops evidence=<proof of each criterion> to=done|review
+      — the task is finished; `to` is required. to=done: an independent verdict on the current head and the
+      criteria met; to=review: a live result awaits acceptance
   hand_off to=<agent> why=<what they must do, what is done>  — another agent does the next part
 After observing a CI result, pass the baseline you saw, copied from GitLab, never inferred from prose:
 until=merged takes after_sha=<full head sha> after_status=opened (not an approval pin: only the merge completes

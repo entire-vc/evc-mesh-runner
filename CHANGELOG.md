@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.140 — 2026-11-26
+
+- **`finish_task` names its target in every runner hint.** Mesh now refuses `finish_task` without
+  `to` (required, `done|review`). The outcome contract shows `to=done|review` instead of the optional
+  `[to=review]` and says when each applies; the manual and queue wait refusals and the merge-rights
+  card name `finish_task to=…` too, so a lane no longer spends a turn on the refusal.
+
 ## 0.2.139 — 2026-11-26
 
 - **A start_after someone else set holds the card at every turn, not only at selection.** A future
