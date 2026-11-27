@@ -279,7 +279,7 @@ class MeshClient:
         except budget.Exhausted:
             raise self._spent(method, path) from None
         try:
-            with self._open(req, timeout=allowed) as resp:
+            with budget.urlopen(self._open, req, allowed) as resp:
                 raw = budget.read(resp, None if max_bytes is None else max_bytes + 1)
                 if max_bytes is not None and len(raw) > max_bytes:
                     raise MeshError(0, "diagnostic response bound")

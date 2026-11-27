@@ -11,10 +11,10 @@ timeouts and retries stay with the caller. The one proxy addition is the explici
 """
 from __future__ import annotations
 
-import http.client
 import urllib.request
 
 from . import main_route
+from . import observation_budget as budget
 
 COALESCE_MAX = 64 * 1024        # the memory bound of the extra copy
 
@@ -32,8 +32,8 @@ class CoalesceSendMixin:
         self.send(msg + message_body)
 
 
-class CoalescingHTTPSConnection(CoalesceSendMixin, http.client.HTTPSConnection):
-    pass
+class CoalescingHTTPSConnection(CoalesceSendMixin, budget.GuardedHTTPSConnection):
+    """Also guarded: inside an observation the watchdog can shut its socket (``observation_budget.urlopen``)."""
 
 
 class CoalescingHTTPSHandler(urllib.request.HTTPSHandler):
@@ -47,7 +47,8 @@ def build_opener(*handlers) -> urllib.request.OpenerDirector:
     The caller's proxy policy (none given: the environment's; ``ProxyHandler({})``: no proxy) is kept for
     every origin; only main Mesh additionally honours the explicit route activation (``main_route``).
     """
-    return urllib.request.build_opener(*main_route.with_route(handlers), CoalescingHTTPSHandler())
+    return urllib.request.build_opener(*main_route.with_route(handlers), budget.GuardedHTTPHandler(),
+                                       CoalescingHTTPSHandler())
 
 
 _default = None

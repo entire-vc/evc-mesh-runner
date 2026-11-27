@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -18,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from mesh_runner import chat_protocol, coalesced_http as ch, main_route
+from mesh_runner import observation_budget as budget
 from mesh_runner.mesh import MeshClient, MeshError
 
 MAIN = "https://mesh.entire.host"
@@ -104,8 +106,10 @@ class TLSServer:
 class ConnectProxy:
     """A loopback CONNECT proxy: records each CONNECT head and every byte the client tunnels, forwards to target."""
 
-    def __init__(self, target_port):
+    def __init__(self, target_port, stall_reply=0.0, stall_tunnel=0.0):
         self.target = target_port
+        # whole stalls before the CONNECT reply and before the first tunnelled byte (the TLS handshake)
+        self.stall_reply, self.stall_tunnel = stall_reply, stall_tunnel
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(16)
@@ -129,7 +133,9 @@ class ConnectProxy:
             c.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
             return c.close()
         up = socket.create_connection(("127.0.0.1", self.target))
+        time.sleep(self.stall_reply)
         c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        time.sleep(self.stall_tunnel)
         if rest:
             self.tunnelled += rest
             up.sendall(rest)
@@ -203,6 +209,19 @@ class MainRoute(unittest.TestCase):
         return MeshClient(MAIN, KEY, timeout=10)
 
     # -- routed ----------------------------------------------------------------------------------------
+    def test_routed_read_stalled_in_tunnel_reply_and_handshake_ends_at_the_deadline(self):
+        # each stall is under the 2s idle timeout, together they pass a 2s wake budget: only a wall limit ends it
+        slow = ConnectProxy(self.srv.port, stall_reply=1.8, stall_tunnel=1.8)
+        self.addCleanup(slow.close)
+        self.activate(proxy_url=slow.url)
+        t0 = time.monotonic()
+        with budget.observe(2):
+            with self.assertRaises(MeshError) as caught:
+                self.client().request("GET", "/tasks/x")
+        self.assertLessEqual(time.monotonic() - t0, 2 + 1)
+        self.assertEqual(caught.exception.kind, "timeout")
+        self.assertEqual(len(slow.connects), 1)         # the routed path, not a direct connection
+
     def test_main_opt_in_end_to_end_tls_body_over_4k(self):
         self.env(NO_PROXY="mesh.entire.host", no_proxy="mesh.entire.host")    # the route overrides NO_PROXY
         self.activate()

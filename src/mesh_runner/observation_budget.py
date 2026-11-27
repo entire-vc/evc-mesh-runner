@@ -4,6 +4,10 @@ Without it each GET carried its own 30s timeout plus 1s/3s retries (up to ~94s p
 slow Mesh held a lane's tick for minutes and the cause was lost behind ``wake timed out``. The
 budget is per thread and per attempt; it only ever shortens a read, it never repeats one.
 
+The socket timeout ``cap`` gives is an idle timeout per recv, and ``read`` checks the wall deadline only once
+the body flows. Everything before the body (connect, proxy tunnel, TLS handshake, status line, headers) is
+held to the wall limit by ``urlopen``: a watchdog timer shuts the connection's socket when the limit passes.
+
 A failure is described by ``describe``: kind (timeout/transport/parse/http), stage (the endpoint
 shape, ids, slugs and query removed), the exception class (with the errno name of an OS error),
 elapsed seconds and retry count. No URL query, body, message or credential.
@@ -14,13 +18,16 @@ import contextlib
 import errno
 import http.client
 import json
+import logging
 import socket
 import ssl
 import threading
 import time
 import urllib.error
+import urllib.request
 
 KINDS = ("timeout", "transport", "parse", "http")
+log = logging.getLogger("mesh_runner")
 _local = threading.local()
 # the literal words of the Mesh REST and VCS paths the client builds; any other segment is a dynamic value
 _WORDS = frozenset((
@@ -139,6 +146,149 @@ def read(resp, max_bytes: int | None = None) -> bytes:
             break
         out += chunk
     return bytes(out)
+
+
+# -- the head watchdog ----------------------------------------------------------------------------------------
+# ``urlopen(req, timeout=t)`` returns only after the last header byte, and ``t`` restarts on every recv: a peer
+# or a proxy sending the head byte by byte holds the open for as long as it likes (runner.log, 11.2026: Mesh
+# reads at 165s inside a 45s budget). While a guarded open runs, each TCP socket a guarded connection makes is
+# registered with the open's guard; a timer at the open's wall limit shuts it down, which ends the recv
+# blocked in a proxy tunnel reply, the TLS handshake, the status line or the headers.
+
+
+def _shut(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass                                    # already closed by the peer or by its reader
+
+
+class _Guard:
+    def __init__(self, obs: Observation, seconds: float):
+        self.obs = obs
+        self.until = time.monotonic() + seconds
+        self.lock = threading.Lock()
+        self.socks: list[socket.socket] = []
+        self.fired = self.done = False
+        self.timer = threading.Timer(seconds, self._fire)
+        self.timer.name = "observation-watchdog"
+        self.timer.daemon = True
+
+    def left(self) -> float:
+        return self.until - time.monotonic()
+
+    def _fire(self) -> None:
+        with self.lock:
+            if self.done:
+                return
+            self.fired = True
+            for sock in self.socks:
+                _shut(sock)
+
+    def track(self, sock: socket.socket) -> None:
+        # A duplicate descriptor: TLS takes the connection over by detaching the original socket object, the
+        # duplicate keeps reaching it, and shutdown acts on the connection, not on one descriptor.
+        try:
+            dup = sock.dup()
+        except OSError:
+            return
+        with self.lock:
+            if not self.done:
+                self.socks.append(dup)
+                if self.fired:
+                    _shut(dup)          # connected after the limit: the first recv ends at once
+                return
+        dup.close()
+
+    def close(self) -> None:
+        self.timer.cancel()
+        with self.lock:
+            self.done = True
+            socks, self.socks = self.socks, []
+        for sock in socks:
+            sock.close()                # the reader's own descriptor stays open for the body
+        if self.timer.ident is not None:
+            self.timer.join()           # no timer thread outlives its open
+
+    def expired(self) -> TimeoutError:
+        # a timeout, never ``Exhausted``: the read was attempted and cut, as a socket timeout would cut it
+        if self.obs.deadline - time.monotonic() <= 0.05:
+            return TimeoutError("observation deadline reached before the response head arrived")
+        return TimeoutError("attempt limit reached before the response head arrived")
+
+
+def create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **kwargs):
+    """``socket.create_connection`` of a guarded connection: inside a guarded open the connect is held to what
+    is left of the open's limit and the socket is registered with its watchdog; otherwise the stock call."""
+    guard = getattr(_local, "guard", None)
+    if guard is not None and isinstance(timeout, (int, float)):
+        timeout = max(min(timeout, guard.left()), 0.05)
+    sock = socket.create_connection(address, timeout, source_address, **kwargs)
+    if guard is not None:
+        guard.track(sock)
+    return sock
+
+
+class GuardedConnection:
+    """Mixin for an ``http.client`` connection whose socket the watchdog of a guarded open can shut."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = create_connection
+
+
+class GuardedHTTPConnection(GuardedConnection, http.client.HTTPConnection):
+    pass
+
+
+class GuardedHTTPSConnection(GuardedConnection, http.client.HTTPSConnection):
+    pass
+
+
+class GuardedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(GuardedHTTPConnection, req)
+
+
+class GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(GuardedHTTPSConnection, req, context=self._context)
+
+
+def urlopen(opener, req, timeout: float):
+    """``opener(req, timeout=timeout)`` held to a wall limit of ``timeout`` from the connect to the last header
+    byte while an observation is open; outside one, the plain call. ``timeout`` is what ``cap`` allowed: the
+    attempt limit or the rest of the budget. Only connections made by a guarded connection class can be shut.
+
+    A fired watchdog fails the open whatever came back (a head cut short parses as a complete 200), with a
+    ``TimeoutError`` naming the budget or the attempt limit: the fault a socket timeout at that moment raises,
+    so the race between the two cannot change the outcome. The body is ``read``'s business."""
+    obs = current()
+    if obs is None:
+        return opener(req, timeout=timeout)
+    guard = _Guard(obs, timeout)
+    try:
+        guard.timer.start()
+    except RuntimeError:                # no thread to spare: the read goes unguarded, as before the watchdog
+        log.warning("observation watchdog unavailable; read unguarded")
+        return opener(req, timeout=timeout)
+    outer, _local.guard = getattr(_local, "guard", None), guard
+    try:
+        resp = opener(req, timeout=timeout)
+    except Exception as e:
+        if not guard.fired:
+            raise
+        close = getattr(e, "close", None)          # an HTTPError holds the response
+        if close is not None:
+            close()
+        raise guard.expired() from None
+    finally:
+        _local.guard = outer
+        guard.close()
+    if guard.fired:
+        resp.close()
+        raise guard.expired()
+    return resp
 
 
 # A bare OSError raised mid-read by the socket layer (urllib wraps only the connect): these errnos are
