@@ -27,8 +27,8 @@ class ResumeHumanHold(Bench):
         self.agent.turn_end_command = [sys.executable, "-c", "pass"]
         return vfile, log_file
 
-    def held_resume(self):
-        t = task(1, updated_at="2026-11-27T10:00:00Z", human_gate=True)
+    def held_resume(self, flag=True):
+        t = task(1, updated_at="2026-11-27T10:00:00Z", human_gate=flag)
         mesh = FakeMesh([t], max_concurrent=1)
         vfile, log_file = self.gate()
         write_replies(self.replies, {t["id"][:8]: wait_time(why="soak window")})
@@ -39,6 +39,7 @@ class ResumeHumanHold(Bench):
         a = r.store.by_state("builder", ("waiting",))[0]
         r.store.update(a, state="ready", wake_text="go on")
         vfile.write_text(json.dumps({"reserve": "human"}))
+        log_file.write_text("")                       # count only the gate runs of the resumes
         return t, mesh, r, a, log_file
 
     def retry(self, r, a, n):
@@ -54,25 +55,36 @@ class ResumeHumanHold(Bench):
                 r._resume_one(r.store.get(a.id))
         return builds
 
-    def test_refused_resume_builds_no_env_until_the_card_changes(self):
+    def test_an_open_human_gate_builds_no_env_until_a_decision(self):
         t, mesh, r, a, log_file = self.held_resume()
-        self.assertEqual(len(self.retry(r, a, 1)), 1)           # the first refusal: one build, one gate run
+        self.assertEqual(self.retry(r, a, 1), [])               # the first refusal: a gate run, no env build
         reserves = log_file.read_text().count("reserve")
+        self.assertEqual(reserves, 1)
         self.assertEqual(self.retry(r, a, 5), [])               # held: no env build ...
         self.assertEqual(log_file.read_text().count("reserve"), reserves)   # ... and no gate run
         self.assertEqual(r.store.get(a.id).state, "ready")
         self.assertEqual(r._resume_hold_reason[a.id], R.GATE_PUBLIC_REASONS["human"])
-        mesh.tasks[t["id"]]["updated_at"] = "2026-11-27T11:00:00Z"   # an answer moved the card
-        self.assertEqual(len(self.retry(r, a, 1)), 1)           # asked again at once
+        mesh.tasks[t["id"]]["updated_at"] = "2026-11-27T11:00:00Z"   # the card moved, no decision yet
+        self.assertEqual(self.retry(r, a, 1), [])               # asked again at once, still no build
+        self.assertEqual(log_file.read_text().count("reserve"), reserves + 1)
 
-    def test_gate_details_or_the_ttl_lift_the_hold(self):
-        t, mesh, r, a, _ = self.held_resume()
+    def test_gate_details_or_the_ttl_ask_again_without_a_build(self):
+        t, mesh, r, a, log_file = self.held_resume()
         self.retry(r, a, 1)
         mesh.tasks[t["id"]]["human_gate_info"] = {"decision_pending": True}   # updated_at unchanged
-        self.assertEqual(len(self.retry(r, a, 1)), 1)
+        self.assertEqual(self.retry(r, a, 1), [])
         held = r._resume_gate_hold[a.id]
         r._resume_gate_hold[a.id] = (held[0], time.monotonic() - 1, *held[2:])   # TASK_HOLD_SECONDS passed
+        self.assertEqual(self.retry(r, a, 1), [])
+        self.assertEqual(log_file.read_text().count("reserve"), 3)
+
+    def test_without_the_flag_the_gate_still_runs_after_one_build(self):
+        # the operator's predicate also gates cards the server never flags (user assignee, labels): those
+        # keep the build-then-gate order, and the standing refusal still spares the repeats
+        t, mesh, r, a, log_file = self.held_resume(flag=False)
         self.assertEqual(len(self.retry(r, a, 1)), 1)
+        self.assertEqual(self.retry(r, a, 5), [])
+        self.assertEqual(log_file.read_text().count("reserve"), 1)
 
     def test_a_passed_gate_drops_the_hold(self):
         t, mesh, r, a, _ = self.held_resume()

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.147 — 2026-11-27
+
+- **A resume of a card with an open human gate asks the start gate before it builds the environment.** The
+  gate needs no env, so a card waiting on a person's decision now costs no env command run (secrets, tool
+  config) at all, also when the standing refusal expires; a card the gate admits still builds its env as before.
+
 ## 0.2.146 — 2026-11-27
 
 - **A held standing chat no longer rebuilds the agent's environment every minute.** While a restart waits
