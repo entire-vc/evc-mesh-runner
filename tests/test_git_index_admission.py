@@ -536,7 +536,10 @@ class GitIndexAdmission(Bench):
     # Every launched prompt carries the proven state (resume, no-session start, persisted retry prompt)
     def launched(self, r, a, **update):
         from fakes import calls
-        r.store.update(r.store.get(a.id), state='ready', wait={}, **update)
+        cur = r.store.get(a.id)
+        # the time wait ends as a wake ends it: its own start_after goes back with it (on_end)
+        r.effects.on_end(cur, dict(cur.wait or {}), 'test: the time wait ended')
+        r.store.update(cur, state='ready', wait={}, **update)
         before = len(calls(self.calls))
         r.tick()
         self.settle_all(r)

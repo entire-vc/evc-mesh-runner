@@ -354,6 +354,9 @@ class RequeueStaysInPlace(ContractBench):
         self.agent.lead = "lead"
         r = self.runner(mesh)
         r.refresh_me()
+        # the date a time wait of this runner wrote: the requeue takes back only such a date
+        w = r.store.create(self.agent.name, t["id"], "claude")
+        r.store.update(w, state="completed", wait={"kind": "time", "scheduled": mesh.tasks[t["id"]]["start_after"]})
         ok = r._requeue_on_event(dict(mesh.tasks[t["id"]]), "no outcome", "NO OUTCOME", "no readable outcome",
                                  None, keep_lane=True)
         return r, ok

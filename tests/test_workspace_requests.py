@@ -51,6 +51,8 @@ class WorkspaceRequests(Bench):
         a = attempts[0]
         dependency = task(51, assignee_id='agent-lead')
         r.mesh.tasks[dependency['id']] = dependency
+        # the time wait ends before the card wait replaces it: its own start_after goes back with it (on_end)
+        r.effects.on_end(a, dict(r.store.get(a.id).wait or {}), 'test: the time wait ended')
         r.store.update(a, wait={'kind': 'card', 'target': dependency['id'][:8], 'started': iso()})
         source = Path(a.workspaces[0])
         (source / 'README').write_text('staged checkpoint\n')
