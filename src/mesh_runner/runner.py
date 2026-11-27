@@ -2544,6 +2544,19 @@ class AgentRunner:
                 self.store.update(a, harness=routed)
             a = self.store.get(a.id) or a
         adapter = self.adapter_for(a.harness)
+        if resume and a.session_id and first_prompt is not None and (over := self._context_overheated(a)):
+            # agy context control: the session's context grew past the limit in one call; resuming it would
+            # resend all of it on every call. The task continues in a new session, in this very turn, with
+            # the card's context of a fresh start and the event that woke it.
+            log.info("%s: #%s session %s carried %s tokens of context in one call (limit %s); new session",
+                     self.agent.name, a.task8, a.session_id[:8], over.get("peak"), over.get("limit"))
+            self.store.event(a.id, "context_rotation", json.dumps(over))
+            self.store.event(a.id, "session_restart", "context_rotation")
+            self.store.mark(self.agent.name, a.task_id, self.CONTEXT_ROTATE_MARK, "")
+            self.store.update(a, session_id="")
+            a = self.store.get(a.id) or a
+            resume, prompt_text = False, (first_prompt() + "\n\n[runner] The event that resumed this card, "
+                                          "now continued in this fresh session:\n" + prompt_text)
         guard_file = self._path_guard_launch(a) if resume and a.session_id else ""
         if guard_file is None:
             # The session's working copies moved and nothing on this launch would refuse the old paths
@@ -3437,6 +3450,7 @@ class AgentRunner:
                 pass
         if result.session_id and result.session_id != a.session_id:
             self.store.update(a, session_id=result.session_id)
+        self._note_context_overheat(a, result)
         base = self._report_spend(a, result)
         self._settle_api(a, result, base)
         self._record_rate_limit(a, result)
@@ -5370,6 +5384,35 @@ class AgentRunner:
         log.info("%s: #%s loop: %s", agent, a.task8, why)
         self._hand_up(a, task, "🔁 LOOP", why, "loop")
         return True
+
+    # store mark of the agy context control: the overheated session the next launch must not resume
+    CONTEXT_ROTATE_MARK = "context_rotate"
+
+    def _note_context_overheat(self, a: Attempt, result: TurnResult) -> None:
+        """agy context control: one model call of this turn carried at least
+        ``agy_context_rotate_tokens`` of context (``TurnResult.peak_context``, not the turn's sum). The
+        session is marked for rotation and a ``context_overheat`` event is written to runner.sqlite; the
+        next launch of the card starts a fresh session instead of resuming it (``_spawn``)."""
+        limit = self.cfg.agy_context_rotate_tokens
+        if a.harness != "agy" or not limit or not result.session_id or result.peak_context < limit:
+            return
+        over = {"turn": a.turns, "peak": result.peak_context, "limit": limit, "session": result.session_id}
+        log.info("%s: #%s turn %s: one call carried %s tokens of context (limit %s); session %s rotates",
+                 self.agent.name, a.task8, a.turns, result.peak_context, limit, result.session_id[:8])
+        self.store.event(a.id, "context_overheat", json.dumps(over))
+        self.store.mark(self.agent.name, a.task_id, self.CONTEXT_ROTATE_MARK, json.dumps(over))
+
+    def _context_overheated(self, a: Attempt) -> dict:
+        """The overheat note of the session this agy launch is about to resume; {} when there is none, the
+        mark names another session, or the control is off (0 turns a pending rotation off too)."""
+        if a.harness != "agy" or not self.cfg.agy_context_rotate_tokens or not a.session_id:
+            return {}
+        got = self.store.mark(self.agent.name, a.task_id, self.CONTEXT_ROTATE_MARK)
+        try:
+            over = json.loads(got[0]) if got and got[0] else {}
+        except ValueError:
+            return {}
+        return over if isinstance(over, dict) and over.get("session") == a.session_id else {}
 
     def _over_compaction_cap(self, a: Attempt, task: dict | None, new: int) -> bool:
         """Count the attempt's context compactions; past the cap the task goes up: a
@@ -10224,6 +10267,9 @@ class AgentRunner:
         "cwd_or_harness_changed": "this lane's harness or profile directory changed since your previous session",
         "ownership_return": "the card was closed (done or cancelled) and reopened since your previous session",
         "turn_cap": "your previous attempt stopped at the turn cap ({detail})",
+        "context_rotation": "one call of your previous session carried more context than this lane's limit, so "
+                            "the runner rotated it; the card, its comments and your working copies hold the "
+                            "state",
         "gave_up": "the runner gave up on your previous session ({detail}) and nobody above you can take the "
                    "card, so it started again in this fresh session; end every turn with exactly one Mesh "
                    "turn command",

@@ -28,9 +28,11 @@ RETIRED = ("mention_requests", "turn_cap_continue_on_progress", "queue_wait_fres
 # lists without a live-commit source is sent back (README, Waits and wakes). A path, so no default fits.
 # 47: completion_comment, back from retirement: a runner whose board people outside the team read turns
 # off the completion line, which names the harness, the session and the token counts.
-MAX_RUNNER_OPTIONS = 47
+# 48: agy_context_rotate_tokens, the agy context control: the owner asked for a configurable
+# threshold below 250k; 0 turns the rotation off without a release.
+MAX_RUNNER_OPTIONS = 48
 RUNNER_OPTIONS = frozenset("""
-announce_controllers archive_require_mount archive_root basic_auth_file cardless_question_lanes checkout_fence
+agy_context_rotate_tokens announce_controllers archive_require_mount archive_root basic_auth_file cardless_question_lanes checkout_fence
 comment_wake completion_comment
 comment_wake_always_from daily_next_budget daily_start_cap daily_step_budget daily_wait_budget
 decision_request_metadata_only_recipients deploy_inventory
@@ -55,6 +57,7 @@ def _settable(tmp: str) -> dict:
     auth.write_text("user:pw")
     auth.chmod(0o600)
     return {
+        "agy_context_rotate_tokens": ("180000", "agy_context_rotate_tokens", 180_000),
         "announce_controllers": ("true", "announce_controllers", True),
         "archive_require_mount": ('"/vol/mnt"', "archive_require_mount", Path("/vol/mnt")),
         "archive_root": ('"/vol/mnt/archive"', "archive_root", Path("/vol/mnt/archive")),
@@ -219,7 +222,7 @@ class RunnerOptions(Base):
 
     def test_the_option_count_is_capped(self):
         self.assertLessEqual(len(RUNNER_OPTIONS), MAX_RUNNER_OPTIONS)
-        self.assertEqual(len(RUNNER_OPTIONS), 47)
+        self.assertEqual(len(RUNNER_OPTIONS), 48)
 
     def test_retired_and_settable_do_not_overlap(self):
         retired = set(config_mod.RETIRED_RUNNER_OPTIONS)

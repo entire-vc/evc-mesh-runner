@@ -534,13 +534,13 @@ mesh-runner status --config runner.toml   # local view of attempts
 
 ### `[runner]` options
 
-The `[runner]` table has 47 options; every other key in it is either one of the two native-result
+The `[runner]` table has 48 options; every other key in it is either one of the two native-result
 adoption paths or a retired option. All are optional except `mesh_url`.
 
 | group | keys |
 |---|---|
 | Mesh and state | `mesh_url`, `state_dir`, `basic_auth_file`, `poll_seconds`, `announce_controllers`, `idempotency_keys` ([repeat-safe writes](docs/idempotent-writes.md)), `checkout_fence` ([checkout fence](docs/checkout-fence.md)), `completion_comment` (below) |
-| Daily budgets and caps | `daily_start_cap`, `daily_next_budget`, `daily_wait_budget`, `daily_step_budget`, `max_compactions` |
+| Daily budgets and caps | `daily_start_cap`, `daily_next_budget`, `daily_wait_budget`, `daily_step_budget`, `max_compactions`, `agy_context_rotate_tokens` (below) |
 | Interactive sessions | `tmux_binary`, `interactive_idle_minutes`, `interactive_max_sessions`, `turn_first_output_minutes`, `turn_idle_minutes` ([turn watchdog](docs/turn-watchdog.md)) |
 | Waits and wakes | `comment_wake`, `comment_wake_always_from`, `hold_labels` (below), `time_wait_ignore_names`, `deploy_inventory` (below), `workspace_wait_release_minutes`, `gmail_watch_v1`, `gmail_watch_reader` ([Gmail watch](docs/gmail-watch.md)) |
 | Questions and reviews | `login_ask_check`, `repo_access_contacts` ([repository access](docs/repository-access.md)), `decision_request_metadata_only_recipients` ([metadata producer](docs/decision-metadata-producer.md)), `cardless_question_lanes` (answer desk, below), `review_own_hold_hours`, `reviewer_select_command` ([reviewer merge](docs/reviewer-merge.md)) |
@@ -557,6 +557,16 @@ task: `[runner] ✅ completed in ~<minutes>m · session=<id> · <turns> turns ·
 counts>`. Set it to `false` on a runner whose board people outside the team read (a partner's
 instance): the line names the harness, the session and the token counts, and nothing else on the
 task needs it.
+
+`agy_context_rotate_tokens` (default `200000`, below `250000`, `0` = off): the context control of agy
+sessions. The agy adapter reports the largest context one model call of a turn carried (its fresh input
+plus the implicit cache read; not the turn's sum). When a turn's call reached the limit, the runner writes
+a `context_overheat` event (turn, peak, limit, session) to its state database and does not resume that
+session again: the card's next launch starts a fresh session, in the same turn, with the card, its latest
+comments, a "where you stopped" block naming the rotation and the event that woke it
+(`context_rotation` event; launch `restart_reason` `context_rotation`). Setting it to `0` also cancels a
+rotation still pending. The agy start and review prompts also tell the session to find its place in a
+`.d.ts` file or a file over 1000 lines with `rg -n`/`grep -n` and read only that range.
 
 Spend reports (`session_reports`, default `true`): after each turn the runner reports its tokens and
 cost on the agent's Mesh record. The separate `[spend_report]` table (`turn_fields`, default `false`)

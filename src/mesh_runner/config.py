@@ -16,8 +16,9 @@ written inline: ``key_file`` / ``key_env`` for the Mesh agent key and
     # merge_rerun_minutes = 5          # re-run a queued merge at least this often even if nothing changed
     # gmail_watch_v1 = false           # enables `WAIT gmail:<id>` on an operator-registered read-only Gmail observation (docs/gmail-watch.md)
     # gmail_watch_reader = ["ssh", "-o", "BatchMode=yes", "<host>", "<readonly-wrapper>"]   # fixed argv; JSON request on stdin
+    # agy_context_rotate_tokens = 200000   # agy: rotate a session past this context of one call (< 250k, 0 = off)
 
-    # The [runner] table has 42 operator options (README "[runner] options") plus native_result_dir /
+    # The [runner] table has 48 operator options (README "[runner] options") plus native_result_dir /
     # native_result_channels_dir, which the native-result adoption protocol reads from this file
     # (docs/native-result-config.md). Keys that used to be options are listed in RETIRED_RUNNER_OPTIONS
     # below: a file that still sets one loads with a warning, and the value stays fixed.
@@ -95,6 +96,20 @@ def _idle_hours(value, name: str = "ignored_cleanup_idle_hours") -> float:
 
 class ConfigError(Exception):
     pass
+
+
+# agy (Gemini) context control: a session is rotated before one call's context reaches this ceiling
+AGY_CONTEXT_CEILING = 250_000
+
+
+def _agy_context_rotate_tokens(value) -> int:
+    """Tokens of context one agy model call may carry before its session is rotated: an integer below
+    ``AGY_CONTEXT_CEILING``; 0 = no rotation."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"agy_context_rotate_tokens must be an integer, got {value!r}")
+    if not 0 <= value < AGY_CONTEXT_CEILING:
+        raise ConfigError(f"agy_context_rotate_tokens must be 0 (off) or below {AGY_CONTEXT_CEILING}, got {value!r}")
+    return value
 
 
 # "Verify: SHIP @1a2b3c4", "Verdict: DO-NOT-SHIP on 1a2b3c4d", "review: SHIP". The verdict
@@ -434,6 +449,10 @@ class RunnerConfig:
     daily_start_cap: int = 0           # starts of one task by one agent per UTC day; past it -> lead (0 = off).
                                        # A start an event woke does not count (docs/requeue-on-event.md)
     max_compactions: int = 0           # context compactions in one attempt; past it -> lead (0 = off)
+    # agy context control: a turn one of whose model calls carried at least this much context
+    # (fresh input + cache read) ends its session; the next turn starts a fresh one from the card. Below
+    # AGY_CONTEXT_CEILING (250k); 0 = off, the rollback without a release.
+    agy_context_rotate_tokens: int = 200_000
     max_failures: int = 3
     provider_outage_giveup_minutes: int = 360   # continuous provider outage before a task goes up (0 = never)
     provider_outage_backoff_seconds: int = 120  # first retry delay; doubles per failed turn
@@ -1191,6 +1210,7 @@ def load(path: str | Path) -> RunnerConfig:
         comment_wake=comment_wake,
         comment_wake_always_from=[v.strip() for v in always_from],
         max_compactions=int(r.get("max_compactions", 0)),
+        agy_context_rotate_tokens=_agy_context_rotate_tokens(r.get("agy_context_rotate_tokens", 200_000)),
         turn_first_output_minutes=_idle_hours(r.get("turn_first_output_minutes", 0.0), "turn_first_output_minutes"),
         turn_idle_minutes=_idle_hours(r.get("turn_idle_minutes", 0.0), "turn_idle_minutes"),
         min_free_gb=float(r.get("min_free_gb", 0.0)),

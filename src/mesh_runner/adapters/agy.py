@@ -20,7 +20,9 @@ Stream (NDJSON on stdout, recorded from agy 1.5.14):
     {"event": "result", "result": {"conversation_id", "status": "SUCCESS"|"ERROR"|"CANCELED"|
      "INTERRUPTED"|..., "response", "error", "num_turns", "usage", "denied_actions": [...]}}
 Exit 0 is not success: ``status`` is. ``result.usage`` counts the whole conversation, so a turn's
-usage is the sum of its own steps. A headless permission the settings do not grant is soft-denied:
+usage is the sum of its own steps. The context one model call carried is that step's ``input_tokens``
+plus its ``cache_read_tokens`` (the cached part is not inside the input); the largest of the turn is
+``peak_context``, which the runner's context control reads (``agy_context_rotate_tokens``). A headless permission the settings do not grant is soft-denied:
 the run goes on, ``denied_actions`` names it and stderr explains.
 
 Resume: ``--conversation <id>`` of an unknown id does NOT fail: agy warns on stderr and starts a new
@@ -340,6 +342,11 @@ class AgyAdapter(Adapter):
                         v = step["usage"].get(src)
                         if type(v) is int:
                             usage[dst] = usage.get(dst, 0) + v
+                    # the context this one call carried: its fresh input plus the implicit cache read
+                    # (input_tokens does not include the cached part)
+                    context = sum(v for v in (step["usage"].get("input_tokens"),
+                                              step["usage"].get("cache_read_tokens")) if type(v) is int)
+                    r.peak_context = max(r.peak_context, context)
             elif kind == "result" and isinstance(ev.get("result"), dict):
                 result = ev["result"]
         try:
