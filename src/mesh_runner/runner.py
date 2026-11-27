@@ -342,8 +342,9 @@ def startup_error_excerpt(text: str, limit: int = 300) -> str:
 
 
 class LockLost(Exception):
-    """A fenced write of the Runner was refused while it settled the turn: the attempt has ended failed
-    (``checkout lost``) and the settlement stops here, nothing more is written under it."""
+    """A fenced write of the Runner was refused while it settled the turn: the settlement stops here and
+    nothing more is written under the refused lock. The attempt has ended failed (``checkout lost``), or,
+    when the lock went with the card (review, the turn's own command), it is settled again next tick."""
 
 
 class AlreadyRunning(Exception):
@@ -1922,11 +1923,18 @@ class AgentRunner:
         a = self._holding(task_id)
         if a is None or code != checkout_fence.LOCK_LOST:
             return
-        why = self._lock_loss_reason(a, self._safe_task(a.task_id), body)
-        self._lock_lost(a, why)
+        task = self._safe_task(a.task_id)
+        why = self._lock_loss_reason(a, task, body)
+        self._lock_lost(a, why, task)
         current = self.store.get(a.id)
-        if self._settling == a.id and (current is None or current.state not in ACTIVE):
+        if self._settling != a.id:
+            return
+        if current is None or current.state not in ACTIVE:
             raise LockLost(f"checkout lost: {why}")       # settle() stops: nothing more under this attempt
+        if not current.checkout:
+            # the lock went with the card (review, or the turn's own command): this settle pass stops at the
+            # refused write; the next one reads the card again and settles it without the fence
+            raise LockLost(f"checkout released ({why}): settled again on the next tick")
 
     def _safe_task(self, task_id: str) -> dict | None:
         try:
@@ -1952,9 +1960,10 @@ class AgentRunner:
             return "taken over: another holder has the lock"
         return "released or expired: nobody holds the lock this turn worked under"
 
-    def _lock_lost(self, a: Attempt, why: str) -> None:
+    def _lock_lost(self, a: Attempt, why: str, task: dict | None = None) -> None:
         """The lock of the running attempt is gone and the card is not closed: stop the turn. Nothing more
-        is written under this attempt; settle ends it with ``why`` (see ``_lock_loss_stop``)."""
+        is written under this attempt; settle ends it with ``why`` (see ``_lock_loss_stop``).
+        ``task``: the card as Mesh shows it now, when the caller read it."""
         if self._lock_loss_stop(a) is not None:
             return                                   # already stopping this turn
         own = self._released_by_own_turn(a)
@@ -1964,6 +1973,14 @@ class AgentRunner:
             # The turn's own command (wait_for, finish_task, hand_off) let the lock go in Mesh while a
             # child of the session still runs: the turn has its outcome, settle reads it. Not a lost lock.
             self.store.event(a.id, "checkout_released_by_turn", own)
+            self._withdraw_fence(a)
+            self.store.update(a, checkout={})
+            return
+        if self._left_to_review(a, task):
+            # Handed over, not taken: the work card is in review (the agent's own move_task, or Mesh moving
+            # a parent whose last subtask closed, which lets the lock go too). The turn ends on its own and
+            # settle completes it as a card that left the working statuses.
+            self.store.event(a.id, "checkout_released_by_review", why)
             self._withdraw_fence(a)
             self.store.update(a, checkout={})
             return
@@ -1982,6 +1999,10 @@ class AgentRunner:
             return              # settle (the next tick) ends it with ``why``
         # not running, or settle() is ending this turn now: the attempt ends here
         self._finish(a, "failed", f"checkout lost: {why}", lock_lost=True)
+
+    def _left_to_review(self, a: Attempt, task: dict | None) -> bool:
+        """A work turn's card is in ``review`` now, whoever is its assignee."""
+        return a.mode == "work" and bool(task) and self.cats.category(task) == "review"
 
     def _released_by_own_turn(self, a: Attempt) -> str | None:
         """The kind and id of a turn command of this agent, recorded in Mesh since this turn started, that
@@ -2038,7 +2059,7 @@ class AgentRunner:
             if task is not None and self.cats.category(task) in ("done", "cancelled"):
                 return                               # closed: the heartbeat's closed path stops it
             body = {"context": {"reassigned": True}} if any(r.reassigned for r in lost) else None
-            self._lock_lost(a, self._lock_loss_reason(a, task, body))
+            self._lock_lost(a, self._lock_loss_reason(a, task, body), task)
 
     # Mesh turn-outcome rows whose command released the caller's checkout in the same step: wait_for,
     # ask_agent and ask_human record a "wait" row, finish_task and hand_off a done/review/handoff row.
@@ -5866,10 +5887,14 @@ class AgentRunner:
                 if not closed and self.cfg.checkout_fence:
                     # A card that is not closed: whoever holds it now (the agent's own checkout under
                     # the same identity, another lane, nobody) did not get it from this turn. The turn
-                    # stops; nothing more is written under this attempt.
-                    self._lock_lost(a, self._lock_loss_reason(a, task or None))
+                    # stops; nothing more is written under this attempt. A work card in review was
+                    # handed over: see _lock_lost.
+                    self._lock_lost(a, self._lock_loss_reason(a, task or None), task or None)
                     return
-                self.store.event(a.id, "checkout_lost", str(e))
+                # closed: the lock went with the card, nothing was lost
+                kind = ("checkout_released_on_close" if closed
+                        else "checkout_released_by_review" if self._left_to_review(a, task) else "checkout_lost")
+                self.store.event(a.id, kind, str(e))
                 self._withdraw_fence(a)
                 self.store.update(a, checkout={})
                 if closed:
@@ -5885,7 +5910,7 @@ class AgentRunner:
                 if a.id not in self._closed_seen:
                     self._closed_seen.add(a.id)
                     return
-                self.store.event(a.id, "checkout_lost", "heartbeat accepted on a closed card")
+                self.store.event(a.id, "checkout_released_on_close", "heartbeat accepted on a closed card")
                 self._withdraw_fence(a)
                 self.store.update(a, checkout={})
                 self.store.event(a.id, "kill", "task closed while the turn ran")

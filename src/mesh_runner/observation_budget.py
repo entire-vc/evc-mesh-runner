@@ -5,11 +5,13 @@ slow Mesh held a lane's tick for minutes and the cause was lost behind ``wake ti
 budget is per thread and per attempt; it only ever shortens a read, it never repeats one.
 
 A failure is described by ``describe``: kind (timeout/transport/parse/http), stage (the endpoint
-shape, ids and query removed), elapsed seconds and retry count. No URL query, body or credential.
+shape, ids, slugs and query removed), the exception class (with the errno name of an OS error),
+elapsed seconds and retry count. No URL query, body, message or credential.
 """
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.client
 import json
 import socket
@@ -20,11 +22,12 @@ import urllib.error
 
 KINDS = ("timeout", "transport", "parse", "http")
 _local = threading.local()
-# the literal words of the Mesh REST paths the client builds; any other segment is a dynamic value
+# the literal words of the Mesh REST and VCS paths the client builds; any other segment is a dynamic value
 _WORDS = frozenset((
-    "agents api assign by-short-id checkout comments compare-clear dependencies extend heartbeat me "
-    "mentionables mentions move projects release report runtime-state seen sessions start-after statuses "
-    "subtasks tasks v1 vcs-links workspaces vcs").split())
+    "actions agents api assign bridges by-short-id checkout comments compare-clear dependencies extend "
+    "github gitlab heartbeat jobs me mentionables mentions merge_requests move pipelines projects pulls "
+    "release report repos runs runtime-state seen sessions start-after statuses subtasks tasks trace v1 "
+    "vcs vcs-links workspaces").split())
 
 
 class Exhausted(Exception):
@@ -62,10 +65,22 @@ def current() -> Observation | None:
     return getattr(_local, "obs", None)
 
 
+# segments that name a project, whatever they spell: GitHub ``repos/<owner>/<repo>``, GitLab and Mesh
+# ``projects/<id or url-encoded path>``. A slug equal to a path word (an owner called ``actions``) is still a slug.
+_NAMES_AFTER = {"repos": 2, "projects": 1}
+
+
 def stage_of(method: str, path: str) -> str:
-    """``GET /tasks/:id/comments`` — the endpoint shape, never ids or a query string."""
-    parts = path.split("?", 1)[0].split("/")
-    return f"{method} " + "/".join(p if p in _WORDS or not p else ":id" for p in parts)
+    """``GET /tasks/:id/comments`` — the endpoint shape, never ids, slugs or a query string."""
+    out, names = [], 0
+    for p in path.split("?", 1)[0].split("/"):
+        if names and p:
+            out.append(":id")
+            names -= 1
+            continue
+        out.append(p if p in _WORDS or not p else ":id")
+        names = _NAMES_AFTER.get(p, 0)
+    return f"{method} " + "/".join(out)
 
 
 def cap(timeout: float, method: str = "", path: str = "") -> float:
@@ -126,6 +141,13 @@ def read(resp, max_bytes: int | None = None) -> bytes:
     return bytes(out)
 
 
+# A bare OSError raised mid-read by the socket layer (urllib wraps only the connect): these errnos are
+# the network's, so the read failed in the channel. A local OSError (a file, a permission) stays ''.
+_NET_ERRNOS = frozenset(getattr(errno, n) for n in (
+    "ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN", "ENETRESET", "ENOTCONN", "EADDRNOTAVAIL",
+    "ECONNABORTED", "ECONNRESET", "ECONNREFUSED", "EPIPE") if hasattr(errno, n))
+
+
 def classify(exc: BaseException) -> str:
     """timeout/transport/parse/http for a failed read; '' for anything that is not a read failure."""
     kind = getattr(exc, "kind", "")
@@ -143,7 +165,23 @@ def classify(exc: BaseException) -> str:
         return "parse"
     if isinstance(exc, (ConnectionError, socket.gaierror, ssl.SSLError, http.client.HTTPException)):
         return "transport"
+    if type(exc) is OSError and exc.errno == errno.ETIMEDOUT:
+        return "timeout"
+    if type(exc) is OSError and exc.errno in _NET_ERRNOS:
+        return "transport"
     return ""
+
+
+def cause_of(exc: BaseException) -> str:
+    """``URLError/ConnectionResetError:ECONNRESET``: the classes and the errno name, never a message."""
+    inner = getattr(exc, "reason", None) if isinstance(exc, urllib.error.URLError) else None
+    chain = [exc] + ([inner] if isinstance(inner, BaseException) else [])
+    names = "/".join(type(e).__name__ for e in chain)
+    last = chain[-1]
+    if isinstance(last, (socket.gaierror, socket.herror, ssl.SSLError)):
+        return names                     # their errno is a resolver or TLS code, not an errno value
+    code = getattr(last, "errno", None)
+    return f"{names}:{errno.errorcode[code]}" if isinstance(code, int) and code in errno.errorcode else names
 
 
 def describe(exc: BaseException, obs: Observation | None = None) -> str:
@@ -157,6 +195,9 @@ def describe(exc: BaseException, obs: Observation | None = None) -> str:
     stage = getattr(exc, "stage", "") or (obs.stage if obs else "")
     if stage:
         parts.append(f"stage={stage}")
+    cause = getattr(exc, "cause", "") or ("" if getattr(exc, "kind", "") else cause_of(exc))
+    if cause:
+        parts.append(f"cause={cause}")
     if obs is not None:
         parts += [f"elapsed={obs.elapsed():.1f}s", f"budget={obs.seconds:g}s", f"retries={obs.retries}"]
     return "wake read failed: " + " ".join(parts)

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.142 — 2026-11-26
+
+- **A work turn whose card moves to review is no longer stopped and failed as a lost checkout.** When
+  the turn's own move hands the card to a reviewer, or Mesh moves a parent card to review as its last
+  subtask closes and lets the checkout go, the Runner drops the turn's fence and checkout without a
+  kill (`checkout_released_by_review`) and the turn ends `completed` as a card that left the working
+  statuses. A review turn whose card is given to another reviewer still stops as a lost lock. A card
+  closed while its turn runs is recorded as `checkout_released_on_close` instead of `checkout_lost`, so
+  the audit count of lost checkouts holds only real losses.
+- **Merge request and pipeline reads for wakes retry a stalled or failed connection.** Each GitHub or
+  GitLab read waits at most 12 s and is retried after 1 s and 3 s on a timeout, a transport fault (a network
+  error the socket raises mid-read included) or a 502/503/504 answer, all inside the wake budget (previously one 30 s read). A `wake_read_failed`
+  line names the provider and endpoint shape (`stage=GET vcs/github/repos/:id/:id/pulls/:id`) and the
+  exception class (`cause=URLError/ConnectionResetError:ECONNRESET`); project names, ids, URLs and
+  tokens are never in it.
+
 ## 0.2.141 — 2026-11-26
 
 - **A headless CLI that exits with an error before it opens a conversation no longer holds the card
