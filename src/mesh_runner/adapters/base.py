@@ -37,6 +37,9 @@ class TurnResult:
     finished: bool = False          # the stream contains a terminal event
     model: str = ""
     compactions: int = 0            # context compactions the harness reported in this turn
+    # The largest context one model call of this turn carried (fresh input + cache read), as the harness
+    # reported it per call; 0 = not reported. ``usage`` sums every call of the turn, this does not.
+    peak_context: int = 0
     error_details: str = field(default="", repr=False)  # full local-only cause, never a display summary
     auth_failed: bool = False       # an adapter-verified terminal authentication banner
     auth_only: bool = False         # no assistant/tool work preceded that banner

@@ -160,6 +160,22 @@ def evidence_edges_block(task_id: str, rows, closed=None) -> str:
     return "\n".join(rows_out) + "\n"
 
 
+# agy only: Gemini sessions paged through monoliths and type declarations with 10-14 reads in a
+# row, and every read stays in the context each later call resends (peaks of 300k-500k per call).
+AGY_LARGE_FILE_RULE = """
+[runner] Reading large files: never page through a `.d.ts` file or any file over 1000 lines with consecutive
+read_file calls. Check the size with `wc -l` when unsure, find
+the place with a targeted `rg -n '<pattern>' <file>` or `grep -n`, then read only that range
+(`sed -n '<from>,<to>p' <file>`, at most 80 lines). Everything you read stays in this session's context and
+is sent again with every later call.
+"""
+
+
+def harness_rules(harness: str) -> str:
+    """Rules for one harness's sessions; '' for a harness that needs none (its prompt is unchanged)."""
+    return AGY_LARGE_FILE_RULE if harness == "agy" else ""
+
+
 def start_prompt(task: dict, agent_name: str, workspaces: list[str], comments: list[dict],
                  preamble: str = "", merge: bool = False, harness: str = "", stopped: str = "",
                  evidence: str = "") -> str:
@@ -176,7 +192,7 @@ You are {harness_note(agent_name, harness)}. This session belongs to this one ta
 {where}
 Work only in these checkouts; other clones of the same repositories belong to other sessions.
 The task is already checked out for you — do not check it out or release it yourself.
-
+{harness_rules(harness)}
 {description_block(task)}The comments below are the delta, not the whole thread: older history is not required by default;
 read it only for a concrete gap ({FETCH_HINT}).
 Latest comments:
@@ -270,7 +286,7 @@ Mesh task id: {task['id']}
 You are {harness_note(agent_name, harness)}. Checkouts you may use to verify it (read or test, do not push to others' branches):
 {where}
 The task is already checked out for you — do not check it out or release it yourself.
-
+{harness_rules(harness)}
 {description_block(task)}The comments below are the delta, not the whole thread; read older ones only for a concrete gap
 ({FETCH_HINT}).
 Latest comments:

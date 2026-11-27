@@ -173,6 +173,33 @@ class Parse(unittest.TestCase):
         r = self.ad.parse(write(RESUMED, requested=CID))
         self.assertEqual(turn_usage.cache_fields(r.usage), ({"cache_read": 7457, "cache_write": 0}, []))
 
+    def test_peak_context_is_the_largest_single_call_not_the_turn_sum(self):
+        # three model calls: 120k, 180k, 150k of context each (input + implicit cache read). The turn's
+        # usage sums them (450k read); the context one call carried peaked at 180k.
+        calls = [(20_000, 100_000), (30_000, 150_000), (10_000, 140_000)]
+        turn = [INIT, step(0, state="DONE", step_type="user_input")]
+        for i, (fresh, cached) in enumerate(calls, start=1):
+            turn.append(step(i, state="DONE", step_type="agent_response", text_delta="x",
+                             usage={"input_tokens": fresh, "output_tokens": 5, "thinking_tokens": 0,
+                                    "cache_read_tokens": cached, "total_tokens": fresh + 5}))
+        turn.append({"event": "result", "result": {"conversation_id": CID, "status": "SUCCESS", "response": "x",
+                                                   "num_turns": 1, "usage": {}}})
+        r = self.ad.parse(write(turn, requested=""))
+        self.assertEqual(r.peak_context, 180_000)
+        self.assertEqual(r.usage["input_tokens"] + r.usage["cache_read_input_tokens"], 450_000)
+
+    def test_peak_context_of_recorded_turns(self):
+        self.assertEqual(self.ad.parse(write(FRESH, requested="")).peak_context, 9500)
+        self.assertEqual(self.ad.parse(write(RESUMED, requested=CID)).peak_context, 2258 + 7457)
+        # a turn whose steps report no usage: no peak is known, so nothing can trigger a rotation
+        self.assertEqual(self.ad.parse(write(TOOL, requested="")).peak_context, 0)
+        # a step without cache_read: its context is the input alone
+        only_input = [INIT, step(1, state="DONE", step_type="agent_response", text_delta="x",
+                                 usage={"input_tokens": 4321, "output_tokens": 1}),
+                      {"event": "result", "result": {"conversation_id": CID, "status": "SUCCESS", "response": "x",
+                                                     "num_turns": 1, "usage": {}}}]
+        self.assertEqual(self.ad.parse(write(only_input, requested="")).peak_context, 4321)
+
     def test_unknown_cache_read_keeps_cache_unknown(self):
         r = self.ad.parse(write(TOOL, requested=""))
         self.assertNotIn("cache_creation_input_tokens", r.usage)

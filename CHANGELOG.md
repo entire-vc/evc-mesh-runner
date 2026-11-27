@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.138 — 2026-11-26
+
+- **agy context control.** The agy adapter reports the largest context one model call of a turn carried
+  (fresh input plus cache read), beside the summed usage. A turn whose call reached the new `[runner]`
+  option `agy_context_rotate_tokens` (default `200000`, must stay below `250000`, `0` = off) writes a
+  `context_overheat` event, and the card's next launch starts a fresh session with the card, its latest
+  comments, a "where you stopped" note and the wake event instead of resuming the overheated one
+  (`context_rotation`). The agy start and review prompts tell the session to search `.d.ts` files and files
+  over 1000 lines with `rg -n`/`grep -n` and read narrow ranges instead of paging through them.
+
 ## 0.2.137 — 2026-11-26
 
 - **Guarantee launchd open-file limits in `ops/install.py`.** `plist_for` now enforces minimum
