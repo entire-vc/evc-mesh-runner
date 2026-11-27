@@ -260,6 +260,17 @@ class CodexAdapter(Adapter):
     def with_effort(self, argv: list[str], effort: str) -> list[str]:
         return [argv[0], "-c", f'model_reasoning_effort="{effort}"', *argv[1:]]
 
+    def stream_opened(self, events: list[dict]) -> bool:
+        """False for an empty stream or one of typed top-level ``error`` events with a message and no
+        thread: the CLI refused before it started a thread. Any other event (``thread.started``, a turn,
+        an item, ``turn.failed``) reads as opened."""
+        for ev in events:
+            err = ev.get("error")
+            text = ev.get("message") or (err.get("message") if isinstance(err, dict) else err)
+            if ev.get("type") != "error" or ev.get("thread_id") or not (isinstance(text, str) and text.strip()):
+                return True
+        return False
+
     def parse(self, log_path: Path) -> TurnResult:
         r = TurnResult()
         r.model = self.profile_model()

@@ -117,6 +117,13 @@ class Adapter:
     def parse(self, log_path: Path) -> TurnResult:
         raise NotImplementedError
 
+    def stream_opened(self, events: list[dict]) -> bool:
+        """Whether a headless turn's stream shows the CLI got past its own start: opened a conversation,
+        named a session, worked or printed anything else. Only a stream that proves the opposite reads
+        False. By default any event counts as opened; a harness whose CLI writes a typed record of a
+        refusal before any conversation (``AgyAdapter``) narrows it to exactly that record."""
+        return bool(events)
+
     def observed_context(self, session_id: str, env: dict) -> dict:
         """What the harness itself recorded for its latest turn: ``{"model", "effort", "at"}`` (any may
         be missing). Only evidence the harness wrote counts; a configured or default value never does.

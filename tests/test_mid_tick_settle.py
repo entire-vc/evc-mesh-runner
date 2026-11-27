@@ -168,11 +168,33 @@ class MidTickSettle(Bench):
         self.assertEqual(r.store.get(a.id).state, "waiting")
         self.assertEqual(self.released(t1), 1)
 
+    def ended_before_its_stream(self, says: str):
+        """A turn whose harness exited with an error before its stream started, saying ``says`` on stderr;
+        the turn is over before any settle step ran."""
+        t1 = task(1)
+        mesh = FakeMesh([t1], max_concurrent=1)
+        write_replies(self.replies, {t1["id"][:8]: slow(f"DIE:{says}\n", wait_time(why="x"))})
+        r = self.runner(mesh)
+        r.tick()
+        (a,) = r.store.by_state(self.agent.name, ("running",))
+        wait_for(lambda: members(a.pid) in ([], [(a.pid, "Z")]), "the turn's leader to be gone or a zombie")
+        r._between()
+        r._between(step=True)
+        self.assertEqual(self.released(t1), 0)                     # only the settle step decides
+        r.settle_finished()
+        return r, t1, r.store.get(a.id)
+
+    def test_a_start_the_cli_refused_in_words_is_unsent_and_gives_its_slot_back_at_the_settle_step(self):
+        # the CLI exited with an error before its stream and said why: the prompt reached no model
+        r, t1, ended = self.ended_before_its_stream("refused before the stream")
+        self.assertEqual(ended.state, "ready")                     # unsent: kept for the next start
+        self.assertEqual(self.released(t1), 1)
+
     def test_an_ended_turn_without_proof_of_delivery_keeps_its_slot_for_the_settle_step(self):
         t1 = task(1)
         mesh = FakeMesh([t1], max_concurrent=1)
-        # the harness exits before it accepts the prompt: nothing proves the prompt was taken
-        write_replies(self.replies, {t1["id"][:8]: slow("DIE:refused before the stream\n", wait_time(why="x"))})
+        # the harness exits before its stream without a word: nothing proves the prompt was taken or not
+        write_replies(self.replies, {t1["id"][:8]: slow("DIE:\n", wait_time(why="x"))})
         r = self.runner(mesh)
         r.tick()
         (a,) = r.store.by_state(self.agent.name, ("running",))

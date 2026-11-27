@@ -222,6 +222,12 @@ QUOTA_HINT = re.compile(
 # Recovery of a headless print-mode turn that the provider's account limit ended before a session was bound
 # (``_headless_quota_unbound``): the exact pending prompt is kept for fresh account admission.
 HEADLESS_QUOTA_UNBOUND = "headless-quota-unbound"
+# A headless CLI that exited on its own with an error before its stream opened a conversation (a model
+# the account no longer offers, a bad flag): the prompt reached no model (``_headless_start_refused``).
+# Unsent, never the ``unknown`` hold; the same harness is tried ``max_startup_failures`` times in a row,
+# then the card goes up with the CLI's words. Its run is counted in START_REFUSED.
+HEADLESS_START_UNSENT = "headless-start-unsent"
+START_REFUSED = "headless_start_refused"
 # A provider-side outage, not a fault of the task: the CLI's typed auth failure, a 403 with no tokens,
 # codex failing to reach its account service at TUI bootstrap. It passes without anyone's action.
 PROVIDER_OUTAGE_HINT = re.compile(
@@ -328,8 +334,10 @@ SECRET_SHAPES = re.compile(r"(?i)(bearer\s+\S+|\b(?:sk|ghp|glpat|xox[abp])[-_][\
 
 def startup_error_excerpt(text: str, limit: int = 300) -> str:
     """The first ``limit`` characters of a harness error when no session ever began (bad flag,
-    prompt not pasted, window gone). Token-shaped strings are masked; the full text stays local."""
-    flat = " ".join(text.split())
+    prompt not pasted, window gone). Token-shaped strings are masked; the full text stays local. The
+    excerpt is published inside an inline code span: a backtick becomes an apostrophe, so CLI text
+    cannot close the span and its Markdown (links, emphasis) stays literal."""
+    flat = " ".join(text.split()).replace("`", "'")
     return SECRET_SHAPES.sub("[redacted]", flat)[:limit]
 
 
@@ -5932,6 +5940,94 @@ class AgentRunner:
                 and bool(QUOTA_HINT.search(failure)) and bool(named)
                 and all(QUOTA_HINT.search(x) for x in named))
 
+    @staticmethod
+    def _start_refusal_text(path: Path, result: TurnResult, typed_first: bool = False) -> str:
+        """The CLI's own words for a refused start (local only): its typed error and its stderr, or with
+        ``typed_first`` the typed error alone when the adapter read one, else the stderr."""
+        try:
+            stderr = path.with_suffix(".stderr").read_text(errors="replace")
+        except OSError:
+            stderr = ""
+        typed = (result.error_details or result.error).strip()
+        if typed_first and typed:
+            return typed
+        return f"{typed}\n{stderr}".strip()
+
+    def _headless_start_refused(self, a: Attempt, journal: dict, path: Path, events: list[dict],
+                                result: TurnResult) -> bool:
+        """The native CLI of a headless turn exited on its own, with an error, before its stream opened a
+        conversation: the gate recorded its exit (journal ``native-exited`` with a positive return code:
+        not a signal, not a process still running), the stream names no session and the adapter reads
+        nothing in it past the CLI's own start (``Adapter.stream_opened``), and the CLI said why. The
+        prompt reached no model, so it is unsent; any harness. A limit, a login, an outage, the egress
+        wrapper, a CLI the provider refuses as outdated, a provider or policy refusal or a missing
+        session keeps its own reading: each has its own path, and this one would only spend the card's
+        start budget on it. A source review keeps its reading too: it has its own end and never goes up
+        to a lead.
+        The gate writes ``native-exited`` only after it saw the CLI exit: a Runner stop signals the whole
+        process group, the gate with it, and leaves the journal at ``native-exec-confirmed``."""
+        code = journal.get("returncode")
+        if (a.mode == source_review.MODE
+                or journal.get("phase") != "native-exited" or type(code) is not int or code <= 0
+                or result.session_id or self.adapter_for(a.harness).stream_opened(events)):
+            return False
+        text = self._start_refusal_text(path, result)
+        return bool(text) and not (
+            result.auth_failed or result.verification_required or result.upgrade_required
+            or result.provider_refusal or result.rate_limit_rejected
+            or QUOTA_HINT.search(text) or PROVIDER_OUTAGE_HINT.search(text) or EGRESS_HINT.search(text)
+            or POLICY_REFUSAL_HINT.search(text) or NO_SESSION_HINT.search(text)
+            or UNSUPPORTED_RESUME_HINT.search(text) or harness_hold.is_upgrade_required(text))
+
+    def _end_after_start_refusals(self, a: Attempt, intent: dict) -> bool:
+        """A headless start refused before any conversation (``HEADLESS_START_UNSENT``) is counted per attempt
+        and harness, once per launch (its prompt token: reading the same launch again counts nothing). Below
+        ``max_startup_failures`` in a row: False, and the caller keeps the exact prompt unsent for the next start. At the limit the same start on the same harness would be refused the same
+        way, so the attempt ends here: the intent is archived in a mark (never consumed or replayed, pending
+        wake deliveries stay undelivered) and the card goes up naming the CLI's words, as a turn whose
+        session never began does in ``settle``. True when the attempt ended."""
+        path = Path(intent["log_path"])
+        text = self._start_refusal_text(path, self.adapter_for(a.harness).parse(path), typed_first=True)
+        excerpt = startup_error_excerpt(text)
+        got = self.store.mark(self.agent.name, a.task_id, START_REFUSED)
+        try:
+            run = json.loads(got[0]) if got and got[0] else {}
+        except ValueError:
+            run = {}
+        same = isinstance(run, dict) and run.get("attempt") == a.id and run.get("harness") == a.harness
+        token = str(intent.get("token") or "")
+        if same and token and run.get("token") == token:
+            count = int(run.get("count") or 0)          # this launch was counted already
+        else:
+            count = (int(run.get("count") or 0) if same else 0) + 1
+            self.store.mark(self.agent.name, a.task_id, START_REFUSED,
+                            json.dumps({"attempt": a.id, "harness": a.harness, "count": count, "token": token}))
+            self.store.event(a.id, "headless_start_refused", json.dumps({"harness": a.harness, "count": count}))
+            log.warning("%s: #%s turn %s: the %s CLI exited before it opened a conversation (%d in a row): %s",
+                        self.agent.name, a.task8, intent.get("turn"), a.harness, count, excerpt)
+        if count < self.cfg.max_startup_failures:
+            return False
+        try:
+            task = self._task(a.task_id)
+        except MeshError:
+            return False                    # unread: kept unsent; the next refusal decides again
+        if not self._still_ours(task, a.mode):
+            return False                    # the card left: the ordinary paths end the attempt
+        wait = {k: v for k, v in a.wait.items() if k != "interactive_prompt_intent"}
+        record = json.dumps({"intent": intent, "reason": "headless start refused", "at": iso()})
+        if not self.store.update_with_marks(a, {"start_refused_intent:" + a.id: record, START_REFUSED: ""},
+                                            expect=a.state, expect_wait=a.wait, wait=wait):
+            return False
+        a = self.store.get(a.id)
+        self.store.event(a.id, "prompt_ended_by_start_refusal", a.harness)
+        # like ``prompt_unsent_reconciled``: names the launch it cancels, so a metric drops that start
+        self.emit("prompt_ended_by_start_refusal", a, harness=a.harness, count=count, delivery=intent["token"],
+                  launched_turn=intent.get("turn"), delivered=False)
+        public_error = public_harness_error(text) + f" — startup: `{excerpt}`"
+        self._give_up(a, task, f"the {a.harness} CLI did not start a session in {count} launches "
+                               f"(it exited before it opened a conversation): {public_error}")
+        return True
+
     def _recover_headless_prompt(self, a: Attempt, intent: dict) -> str:
         resolution, source = self._headless_verdict(a, intent)
         if resolution != "completed":
@@ -5963,7 +6059,8 @@ class AgentRunner:
             [e.get("thread_id") for e in events if e.get("type") == "thread.started"] == [result.session_id]
             and bool(result.session_id)
             and len([e for e in events if e.get("type") == "turn.started"]) == 1)
-        if not result.finished and not accepted:
+        refused_start = not accepted and self._headless_start_refused(a, journal, path, events, result)
+        if not result.finished and not accepted and not refused_start:
             return "headless-native-result-incomplete", ""
         if not result.session_id and accepted and a.harness == "claude":
             result.session_id = intent["session_id"]
@@ -5976,6 +6073,8 @@ class AgentRunner:
             if result.auth_failed:
                 # the CLI refused its login before it opened a conversation: the prompt reached no model
                 return AGY_AUTH_UNSENT, ""
+        if refused_start:
+            return HEADLESS_START_UNSENT, ""
         if not result.session_id or (intent.get("session_id") and result.session_id != intent["session_id"]):
             return "headless-native-session-mismatch", ""
         # A unique per-turn file is owned by the registered process group. The
@@ -6037,6 +6136,10 @@ class AgentRunner:
                         self.store.other_sessions(a.id))
             except (OSError, ValueError, KeyError, TypeError):
                 resolution = "native-evidence-unreadable"
+            if resolution == HEADLESS_START_UNSENT:
+                if self._end_after_start_refusals(a, intent):
+                    return False
+                resolution = "unsent"           # below the limit: the exact prompt is kept for the next start
             if resolution in ("unsent", "quota-unsent", HEADLESS_QUOTA_UNBOUND, AGY_AUTH_UNSENT):
                 if resolution == AGY_AUTH_UNSENT:
                     # the login of that launch is held; the next admission meets the hold and runs the
@@ -6091,6 +6194,8 @@ class AgentRunner:
                     marks[delivery["key"]] = delivery["value"]
                     if key == "queue_delivery":
                         marks[queue_wait.FLOOR_KEY] = delivery["floor"]
+            if (self.store.mark(self.agent.name, a.task_id, START_REFUSED) or ("",))[0]:
+                marks[START_REFUSED] = ""       # a delivered prompt ends a run of refused starts
             wait.pop("interactive_prompt_intent")
             wait.pop("unsent_scope_recovery", None)
             return self.life.to_running(a, marks=marks, expect=a.state, expect_wait=a.wait,

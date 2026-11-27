@@ -25,6 +25,11 @@ plus its ``cache_read_tokens`` (the cached part is not inside the input); the la
 ``peak_context``, which the runner's context control reads (``agy_context_rotate_tokens``). A headless permission the settings do not grant is soft-denied:
 the run goes on, ``denied_actions`` names it and stderr explains.
 
+A refusal before any conversation (recorded from agy 1.5.x: a model the account no longer offers) is
+one ``result`` with ``status: "ERROR"``, an empty ``conversation_id``, ``num_turns: 0`` and zero usage,
+the same text on stderr as ``error: invalid model selection (...)``, and exit 1. No ``init`` and no
+step: the prompt reached no model (``stream_opened`` is False).
+
 Resume: ``--conversation <id>`` of an unknown id does NOT fail: agy warns on stderr and starts a new
 conversation. ``session_known`` checks the conversation store first; ``parse`` reports a returned id
 that differs from the requested one as a missing session (the runner starts the task over once).
@@ -319,6 +324,24 @@ class AgyAdapter(Adapter):
         except (OSError, ValueError):
             return ""
         return str(mark.get("conversation") or "") if isinstance(mark, dict) else ""
+
+    def stream_opened(self, events: list[dict]) -> bool:
+        """False only for an empty stream or agy's typed refusal before any conversation: every event is a
+        ``result`` with ``status: "ERROR"``, an error text, no conversation, ``num_turns: 0`` and a usage
+        block of zeros (no ``init``, no step). Any other result without a conversation (a success, a
+        cancel, a missing count or usage) reads as opened: it does not prove the prompt reached no model."""
+        for ev in events:
+            result = ev.get("result")
+            if ev.get("event") != "result" or not isinstance(result, dict):
+                return True
+            error, turns, usage = result.get("error"), result.get("num_turns"), result.get("usage")
+            refusal = (result.get("status") == "ERROR" and isinstance(error, str) and bool(error.strip())
+                       and not result.get("conversation_id") and type(turns) is int and turns == 0
+                       and isinstance(usage, dict) and bool(usage)
+                       and all(type(v) is int and v == 0 for v in usage.values()))
+            if not refusal:
+                return True
+        return False
 
     def parse(self, log_path: Path) -> TurnResult:
         r = TurnResult()

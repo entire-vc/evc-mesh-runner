@@ -314,6 +314,12 @@ class Loop(Bench):
                 self.assertIn("[redacted]", out)
         self.assertEqual(len(startup_error_excerpt("x " * 400)), 300)
 
+    def test_startup_error_excerpt_cannot_leave_its_code_span(self):
+        # published as `excerpt`: a backtick in CLI text would close the span and render its Markdown
+        out = startup_error_excerpt("bad `x` [see](https://example.invalid/x) **now**")
+        self.assertNotIn("`", out)
+        self.assertEqual(out, "bad 'x' [see](https://example.invalid/x) **now**")
+
     def test_public_harness_error_only_exposes_fixed_categories(self):
         for reason, category in (("Usage limit reached Bearer superprivate", "provider limit or overload"),
                                  ("Prompt is too long https://user:password@host", "context limit"),
