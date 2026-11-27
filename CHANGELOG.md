@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.141 — 2026-11-26
+
+- **A headless CLI that exits with an error before it opens a conversation no longer holds the card
+  for 15 minutes.** When the native CLI (any headless harness) exits on its own with a positive return
+  code and its stream shows nothing past its own start (agy: one `result` with status `ERROR`, an
+  error text, no conversation, no turn and zero usage; codex: only typed `error` events and no thread;
+  others: an empty stream), the prompt reached no model: it is kept unsent for the next start, with no
+  `unknown` hold and no operator alert (`headless-start-unsent`; previously
+  `headless-native-session-mismatch`). A model the account no longer offers or a bad flag is refused
+  the same way every time, so after `max_startup_failures` such starts in a row on the same harness
+  the attempt ends and the card goes up with the CLI's own words. A startup excerpt published on a
+  card (here and when a harness never starts a session) turns backticks into apostrophes, so CLI text
+  cannot leave its code span. Limits, logins, provider and policy refusals, the egress wrapper, a
+  missing session and a conversation that did open keep their reading.
+
 ## 0.2.140 — 2026-11-26
 
 - **`finish_task` names its target in every runner hint.** Mesh now refuses `finish_task` without
