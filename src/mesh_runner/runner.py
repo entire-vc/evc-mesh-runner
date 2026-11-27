@@ -4851,6 +4851,20 @@ class AgentRunner:
         return json.dumps([t.get("updated_at") or "", t.get("human_gate"), t.get("human_gate_info")],
                           sort_keys=True, default=str)
 
+    def _resume_gate_first(self, a: Attempt, task: dict) -> str:
+        """A card with an open human gate asks the start gate BEFORE the env build: the gate needs no env,
+        and a refusal for a person's decision then costs no env build at all, not one per refusal. Any other
+        answer is handed back (the reservation released) and the ordinary path asks again after the build."""
+        reason, gate = self._gate("reserve", a.task_id, a.mode, a)
+        if reason and self._gate_task_only and reason.startswith(GATE_PUBLIC_REASONS["human"]):
+            self._turn_end(a.task_id, a.mode, a, gate, "held")
+            if a.checkout.get("token"):
+                self._release_checkout(a)
+            self._note_resume_human_hold(a, task, reason, gate)
+            return reason
+        self._turn_end(a.task_id, a.mode, a, gate, "held" if reason else "not-started")
+        return ""
+
     def _resume_human_hold(self, a: Attempt, task: dict) -> str:
         """The standing human-decision refusal of this resume ('' = none or lifted: ask the gate again)."""
         held = self._resume_gate_hold.get(a.id)
@@ -10088,7 +10102,10 @@ class AgentRunner:
         if not metadata_only(task, a.mode) and self._repo_preflight_refused(
                 a, task, time.monotonic() + GATE_HOLD_SECONDS, resume=True):
             return                               # before any Mesh checkout or model turn
-        if held := self._resume_human_hold(a, task):
+        held = self._resume_human_hold(a, task)
+        if not held and task.get("human_gate"):
+            held = self._resume_gate_first(a, task)
+        if held:
             # the start gate's standing refusal for a person's decision: no env build (secrets, tool config) and no
             # gate run until the card changes, not one of each every GATE_HOLD_SECONDS
             self._release_gate(a, "human-held")
