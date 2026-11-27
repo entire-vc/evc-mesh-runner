@@ -54,6 +54,7 @@ from . import progress
 from . import spend
 from . import operator_alert
 from . import harness_hold
+from . import start_hold
 from . import op_resolve
 from . import asks
 from . import card_wait_reconcile
@@ -228,6 +229,9 @@ HEADLESS_QUOTA_UNBOUND = "headless-quota-unbound"
 # then the card goes up with the CLI's words. Its run is counted in START_REFUSED.
 HEADLESS_START_UNSENT = "headless-start-unsent"
 START_REFUSED = "headless_start_refused"
+# The pause before a refused start's retry ({"attempt", "until"}): it outlives a runner restart, so the retry
+# cannot come early and hand the card up before another card's refusal shows the cause is the host's.
+START_PAUSE = "headless_start_pause"
 # A provider-side outage, not a fault of the task: the CLI's typed auth failure, a 403 with no tokens,
 # codex failing to reach its account service at TUI bootstrap. It passes without anyone's action.
 PROVIDER_OUTAGE_HINT = re.compile(
@@ -824,6 +828,7 @@ class AgentRunner:
         # persisted hold this process has already read back (a restart must not resume before the reset)
         self._limit_hold_tasks: dict[str, str] = {}
         self._limit_hold_read: set[str] = set()
+        self._start_pause_read: set[str] = set()              # START_PAUSE read back, once per attempt
         self._hold_route: str | None = None                   # routed harness when the lane hold was taken
         self._route_hold_seen: tuple[str, dt.datetime] | None = None   # (route reason, first seen) of the lane
         # attempt -> (holder attempt, holder slot path, recheck at): resume held because its branch is
@@ -1009,8 +1014,75 @@ class AgentRunner:
 
     def _fresh_env(self, task_id: str = "") -> dict[str, str]:
         route = self._task_route(task_id) if task_id else ""
+        if task_id and not route:
+            self._start_route_back(task_id)     # before the read: account routing reads the lane's record
         env = self._read_env(task_id, route)
         return self._apply_env(env, route)
+
+    def _start_route_back(self, task_id: str) -> None:
+        """A lane its routing moved off a held harness (``start_hold``: ``moved``) comes back to it once the
+        hold no longer covers the lane's configuration of it: lifted by a probe elsewhere, cleared, dropped
+        out as stale, reopened as another generation, or the lane's model/flags changed. A moved lane
+        launches nothing there, so it also takes its turn at the hold's probe: one launch per probe interval
+        for the whole host. Account routing reads ``returned`` and puts the lane back on its primary."""
+        for harness, (raw, record) in start_hold.routes(self.store, self.agent.name).items():
+            if record.get("state") != start_hold.MOVED:
+                continue
+            hold = start_hold.active(self.store, harness)
+            fp = self._start_fingerprint(harness, str(record.get("task") or task_id))
+            cause = ("lifted" if not hold or hold.get("since") != record.get("since")
+                     or fp not in (hold.get("fps") or {}) else "")
+            if not cause and start_hold.probe(self.store, harness, hold):
+                cause = "probe"
+            if not cause:
+                continue
+            value = {**record, "state": start_hold.RETURNED, "cause": cause, "at": iso()}
+            value.pop("probe", None)
+            if cause == "probe":
+                value["probe"] = True
+            if start_hold.set_route(self.store, self.agent.name, harness, raw, value):
+                self.emit("start_route", None, harness=harness, state=start_hold.RETURNED, cause=cause,
+                          since=str(record.get("since") or ""))
+                log.warning("%s: the %s start hold %s: the lane's route returns to %s", self.agent.name, harness,
+                            "lets this lane probe" if cause == "probe" else "no longer covers this lane",
+                            harness)
+
+    def _start_route_off(self, a: Attempt, harness: str, held: dict) -> bool:
+        """A held launch on the lane's route asks the lane's routing to move it off ``harness``, as a provider
+        limit does, once per lane and hold generation: ``MESH_RUNNER_LIMIT_SOURCE=start_hold``
+        with the harness and the hold's ``since``, which account routing checks against this store before it
+        follows the lane's quota_edges. True when the route moved (exit 0): the next read of the lane's env
+        routes elsewhere and the card's unsent prompt goes there. Any other exit keeps the hold, with no
+        provider-limit streak and no limit hold. A card on its own route (label, provider refusal) never moves
+        the lane."""
+        if getattr(self, "_card_routed", False) or not self.agent.on_limit_command:
+            return False
+        since, lane = str(held.get("since") or ""), self.agent.name
+        raw, record = start_hold.route(self.store, lane, harness)
+        if not since or not start_hold.may_move(record, since):
+            return False
+        if not start_hold.set_route(self.store, lane, harness, raw,
+                                    {"since": since, "state": start_hold.CALLING, "task": a.task_id, "at": iso()}):
+            return False                        # another launch of the lane took this generation's call
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("MESH_RUNNER_MODE", "MESH_RUNNER_LIMIT_WINDOW", "MESH_RUNNER_LIMIT_RESETS_AT",
+                            "MESH_RUNNER_AUTH_PROFILE")}
+        env.update(MESH_RUNNER_AGENT=lane, MESH_RUNNER_TASK=a.task_id, MESH_RUNNER_LIMIT_SOURCE="start_hold",
+                   MESH_RUNNER_START_HOLD_HARNESS=harness, MESH_RUNNER_START_HOLD_SINCE=since)
+        try:
+            res = progress.run(self.agent.on_limit_command, text=True, timeout=120, env=env)
+            rc, said = res.returncode, (res.stdout or "").strip()[:200]
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rc, said = None, type(exc).__name__
+        state = start_hold.MOVED if rc == 0 else start_hold.REFUSED
+        raw, _ = start_hold.route(self.store, lane, harness)
+        start_hold.set_route(self.store, lane, harness, raw,
+                             {"since": since, "state": state, "task": a.task_id, "rc": rc, "at": iso()})
+        self.store.event(a.id, "start_route", json.dumps({"harness": harness, "since": since, "rc": rc}))
+        self.emit("start_route", a, harness=harness, state=state, rc=rc, since=since, detail=said)
+        log.warning("%s: #%s %s start hold since %s: the lane's routing %s (rc=%s) %s", lane, a.task8, harness,
+                    since, "moved the lane" if rc == 0 else "kept the lane", rc, said)
+        return rc == 0
 
     def _refusal_route(self, task_id: str) -> str:
         """The harness this card was moved to after a provider refused its content on another one
@@ -2582,6 +2654,8 @@ class AgentRunner:
             return False
         if self._harness_held(a, routed):
             return False
+        if self._start_refusal_held(a, routed):
+            return False
         # Recheck under the Runner's existing single state-directory owner, after
         # workspace/auth checks and before changing session or durable outbox.
         if handoff_guard is not None and not handoff_guard():
@@ -2775,6 +2849,7 @@ class AgentRunner:
                   "sha256": hashlib.sha256(prompt_text.encode()).hexdigest(), "prompt": prompt_text,
                   "resume": resume, "workspaces": list(a.workspaces), "harness": a.harness,
                   "kind": "interactive" if interactive_driver else "headless", "session_id": sid,
+                  "start_fp": self._start_fingerprint(a.harness, a.task_id),
                   "prior": {key: getattr(a, key) for key in
                             ("turns", "session_id", "log_path", "turn_started_at", "source_read_at")}}
         # Journal first: a crash between the two writes leaves an orphan journal that no intent
@@ -3237,6 +3312,81 @@ class AgentRunner:
         return operator_alert.signal(self.store, "upgrade:" + harness, str(held.get("since") or ""), text,
                                      self.emit, incident="harness_upgrade", harness=harness,
                                      reason=str(held.get("reason") or "")[:300])
+
+    def _start_fingerprint(self, harness: str, task_id: str) -> str:
+        """The launch configuration of ``harness`` for this card that a host start hold is about
+        (``start_hold.fingerprint``): a start's argv without session or working copies, with the card's
+        model/effort marks, the native tail of an interactive wrapper; the same on every lane that
+        launches the same flags and model."""
+        adapter = self.adapter_for(harness)
+        try:
+            argv = adapter.start_argv("", Path("/"), [])
+            argv = self._with_override_marks(adapter, argv, task_id, harness)
+            if isinstance(adapter, interactive.InteractiveAdapter):
+                argv = interactive.native_tail(argv)
+        except Exception:                       # noqa: BLE001 - an unreadable argv is its own configuration
+            argv = []
+        return start_hold.fingerprint(harness, argv)
+
+    def _start_refusal_held(self, a: Attempt, harness: str) -> bool:
+        """A launch whose configuration the host's start hold covers is not made (``start_hold``): the card
+        stays with its executor, ready, with its unsent prompt, and is looked at again after a pause. One
+        launch per probe interval goes through; its conversation lifts the hold."""
+        if not start_hold.active(self.store, harness):
+            return False
+        if effort_policy.configured(self.agent.default_effort, self.agent.escalate_effort):
+            # the lane policy's effort for this launch is chosen further on and read from a card mark:
+            # choose it now, so a launch one level up is a new configuration, not held under the old one
+            self._effort_choice(a, self._comments(a.task_id))
+        held = start_hold.covers(self.store, harness, self._start_fingerprint(harness, a.task_id))
+        if not held:
+            return False
+        raw, record = start_hold.route(self.store, self.agent.name, harness)
+        if (record.get("state") == start_hold.RETURNED and record.get("probe")
+                and record.get("since") == held.get("since") and not getattr(self, "_card_routed", False)
+                and start_hold.set_route(self.store, self.agent.name, harness, raw,
+                                         {**record, "state": start_hold.PROBING, "task": a.task_id, "at": iso()})):
+            # the lane came back from its fallback to take the probe (_start_route_back)
+            self.store.event(a.id, "start_hold_probe", harness)
+            log.info("%s: #%s %s start hold: this launch is the probe of a lane back from its fallback",
+                     self.agent.name, a.task8, harness)
+            return False
+        if start_hold.probe(self.store, harness, held):
+            self.store.event(a.id, "start_hold_probe", harness)
+            log.info("%s: #%s %s start hold: this launch is the probe", self.agent.name, a.task8, harness)
+            return False
+        self._release_gate(a, "harness-start-held")
+        self._release_checkout(a)
+        note = f"{harness} CLI refuses to start on this host; held"
+        self.life.to_ready(a, pid=0, stamp="", note=note)
+        self._signal_start_hold(harness, held)
+        if self._start_route_off(a, harness, held):
+            # the next read of the lane's env routes elsewhere: the card goes there now, with its unsent prompt
+            self._set_resume_hold(a, time.monotonic(), f"{harness} CLI refuses to start on this host; "
+                                                       "the lane's route moved off it")
+        else:
+            self._set_resume_hold(a, time.monotonic() + start_hold.PAUSE_SECONDS, note)
+        return True
+
+    def _signal_start_hold(self, harness: str, held: dict, reasons: list[str] | None = None) -> int:
+        """One operator signal per harness and reason of a start hold, with the CLI's words (the masked
+        excerpt kept by the hold). ``reasons``: those to signal (default: all of the hold's; a reason
+        signalled already is a no-op). Returns how many this caller signalled."""
+        sent = 0
+        known = held.get("reasons") or {}
+        for reason in (known if reasons is None else reasons):
+            row = known.get(reason) or {}
+            excerpt = str(row.get("excerpt") or "")[:300]
+            text = (f"[mesh-runner] The {harness} CLI refuses to start on this host before any conversation "
+                    f"(cards: {len(held.get('cards') or [])}+): every launch with that configuration is held, "
+                    "cards keep their unsent prompts and their executors. Fix the model or flags in the lane "
+                    "config: a changed configuration is not held; otherwise one probe launch every "
+                    f"{start_hold.PROBE_MINUTES:g} min lifts it once it starts. CLI said: `{excerpt}`")
+            if operator_alert.signal(self.store, f"start:{harness}:{reason}", str(row.get("since") or ""),
+                                     text, self.emit, repeat_hours=math.inf, incident="harness_start_hold",
+                                     harness=harness, reason=excerpt):
+                sent += 1
+        return sent
 
     @property
     def merge_enabled(self) -> bool:
@@ -4658,6 +4808,18 @@ class AgentRunner:
                 self._limit_hold_tasks[a.id] = a.task_id
                 log.info("%s: #%s provider-limit hold read back: resume held %d s more",
                          self.agent.name, a.task8, left)
+        if a.id not in self._start_pause_read:
+            self._start_pause_read.add(a.id)
+            mark = self.store.mark(self.agent.name, a.task_id, START_PAUSE)
+            try:
+                rec = json.loads(mark[0]) if mark and mark[0] else None
+            except ValueError:
+                rec = None
+            until = parse_time(rec.get("until")) if isinstance(rec, dict) and rec.get("attempt") == a.id else None
+            left = min((until - now()).total_seconds(), start_hold.PAUSE_SECONDS) if until else 0
+            if left > 0 and time.monotonic() + left > self._resume_hold.get(a.id, 0):
+                self._set_resume_hold(a, time.monotonic() + left,
+                                      f"{a.harness} CLI refused to start; retry after a pause")
         return self._resume_hold.get(a.id, 0)
 
     def _set_resume_hold(self, a: Attempt, until: float, reason: str = "") -> None:
@@ -5927,6 +6089,22 @@ class AgentRunner:
         except MeshError:
             return None
 
+    def _start_refused_unsent(self, a: Attempt, intent: dict) -> bool:
+        """The launch of this retryable headless ``intent`` is still proven a start its CLI refused before any
+        conversation (``HEADLESS_START_UNSENT``): the attempt's journal names that very launch and its log
+        reads so with the intent's own harness."""
+        harness = str(intent.get("harness") or "")
+        if harness != self.agent.harness and harness not in self.alt_adapters:
+            return False                        # no adapter of that harness reads this log any more
+        try:
+            if hashlib.sha256(intent["prompt"].encode("utf-8")).hexdigest() != intent.get("sha256"):
+                return False
+            if any(e.get("type") == "mesh_runner.prompt_ack" for e in read_events(Path(intent["log_path"]))):
+                return False
+            return self._headless_verdict(dataclasses.replace(a, harness=harness), intent)[0] == HEADLESS_START_UNSENT
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+            return False
+
     def _headless_quota_unbound(self, a: Attempt, intent: dict, result: TurnResult | None = None) -> bool:
         """The provider's account limit ended this Kimi headless print-mode turn before the harness
         bound it to a session: the native process ran (journal ``native-exec-confirmed``/``native-exited`` for
@@ -6014,6 +6192,28 @@ class AgentRunner:
         path = Path(intent["log_path"])
         text = self._start_refusal_text(path, self.adapter_for(a.harness).parse(path), typed_first=True)
         excerpt = startup_error_excerpt(text)
+        # The host's view first (``start_hold``): this refusal is one (lane, card) observation of the
+        # harness. With another card refused within the window the harness is held: the card is not the
+        # cause, so it keeps its unsent prompt and its executor and its own run of refusals does not count.
+        fp = str(intent.get("start_fp") or self._start_fingerprint(a.harness, a.task_id))
+        held, added = start_hold.observe(self.store, a.harness, self.agent.name, a.task_id, fp, excerpt)
+        if held:
+            raw, record = start_hold.route(self.store, self.agent.name, a.harness)
+            if record.get("state") == start_hold.PROBING and record.get("task") == a.task_id:
+                # the probe of a lane back from its fallback was refused too: its next held launch may move it
+                start_hold.set_route(self.store, self.agent.name, a.harness, raw,
+                                     {**record, "state": start_hold.RETURNED, "cause": "probe_refused",
+                                      "probe": False, "at": iso()})
+            if (self.store.mark(self.agent.name, a.task_id, START_REFUSED) or ("",))[0]:
+                self.store.mark(self.agent.name, a.task_id, START_REFUSED, "")
+            self.store.event(a.id, "start_hold", json.dumps({"harness": a.harness, "since": held.get("since")}))
+            log.warning("%s: #%s turn %s: the %s CLI exited before it opened a conversation; host start hold "
+                        "since %s: %s", self.agent.name, a.task8, intent.get("turn"), a.harness,
+                        held.get("since"), excerpt)
+            self._signal_start_hold(a.harness, held, added)
+            self._set_resume_hold(a, time.monotonic() + start_hold.PAUSE_SECONDS,
+                                  f"{a.harness} CLI refuses to start on this host; held")
+            return False
         got = self.store.mark(self.agent.name, a.task_id, START_REFUSED)
         try:
             run = json.loads(got[0]) if got and got[0] else {}
@@ -6031,6 +6231,12 @@ class AgentRunner:
             log.warning("%s: #%s turn %s: the %s CLI exited before it opened a conversation (%d in a row): %s",
                         self.agent.name, a.task8, intent.get("turn"), a.harness, count, excerpt)
         if count < self.cfg.max_startup_failures:
+            # the retry waits a pause: a refusal of another card in it shows the cause is the host's
+            self._set_resume_hold(a, time.monotonic() + start_hold.PAUSE_SECONDS,
+                                  f"{a.harness} CLI refused to start; retry after a pause")
+            self._start_pause_read.add(a.id)
+            self.store.mark(self.agent.name, a.task_id, START_PAUSE, json.dumps(
+                {"attempt": a.id, "until": iso(now() + dt.timedelta(seconds=start_hold.PAUSE_SECONDS))}))
             return False
         try:
             task = self._task(a.task_id)
@@ -6221,6 +6427,14 @@ class AgentRunner:
                         marks[queue_wait.FLOOR_KEY] = delivery["floor"]
             if (self.store.mark(self.agent.name, a.task_id, START_REFUSED) or ("",))[0]:
                 marks[START_REFUSED] = ""       # a delivered prompt ends a run of refused starts
+            harness, fp = str(intent.get("harness") or a.harness), str(intent.get("start_fp") or "")
+            if fp and start_hold.succeeded(self.store, harness, fp):
+                # the probe (or a launch of the same configuration) got a conversation: the host's start
+                # hold of that configuration lifts for every lane
+                self.store.event(a.id, "start_hold_lifted", harness)
+                self.emit("start_hold_lifted", a, harness=harness)
+                log.warning("%s: #%s the %s CLI started a conversation again; host start hold lifted",
+                            self.agent.name, a.task8, harness)
             wait.pop("interactive_prompt_intent")
             wait.pop("unsent_scope_recovery", None)
             return self.life.to_running(a, marks=marks, expect=a.state, expect_wait=a.wait,
@@ -10098,7 +10312,14 @@ class AgentRunner:
                         interactive.agent_dir(self.cfg.state_dir, self.agent.name), a.id, retry)
                          if retry.get("kind") == "interactive" else self._headless_quota_unbound(a, retry)))
                 legacy_handoff = legacy_candidate and self._legacy_handoff_ready(a, routed)
-                handoff = quota_handoff or legacy_handoff
+                # A headless start its CLI refused before any conversation reached no model either: the
+                # lane's route moved meanwhile (a host start hold lasts), so the prompt goes to the new one.
+                start_handoff = (not quota_handoff and not legacy_handoff and retry.get("kind") == "headless"
+                    and retry.get("harness") != routed and not a.pid
+                    and (routed == self.agent.harness or routed in self.alt_adapters)
+                    and (a.harness == retry.get("harness") or (a.harness == routed and not a.session_id))
+                    and self._start_refused_unsent(a, retry))
+                handoff = quota_handoff or legacy_handoff or start_handoff
                 if (not same_workspaces(retry.get("workspaces"), a.workspaces)
                         or (retry.get("harness") != a.harness and not handoff)
                         or (retry.get("harness") != routed and not handoff)):
@@ -10133,7 +10354,8 @@ class AgentRunner:
                                     "previous turn stopped on a provider quota limit before it kept a session. "
                                     "Inspect the existing workspaces and preserve completed work:\n" + retry["prompt"])
                         reason = ("because the previous harness reported a quota limit" if quota_handoff
-                                  else "and its previous native writer has stopped")
+                                  else "because the previous harness refused to start before any conversation"
+                                  if start_handoff else "and its previous native writer has stopped")
                         return context + "\n\n[runner] This exact pending request was never sent " + reason + ":\n" + retry["prompt"]
                     def legacy_guard():
                         current = self.store.get(a.id)
@@ -14224,6 +14446,7 @@ class AgentRunner:
                                      "lane_repos": sorted(r.name for r in self.lane_repos)},
                "auth_holds": auth.status(self.store, profiles=self._own_profiles()),
                "harness_holds": harness_hold.status(self.store),
+               "start_holds": start_hold.status(self.store),
                "attempts": [{"task": a.task8, "task_id": a.task_id, "state": a.state, "title": a.title[:60],
                              "session": a.session_id, "wait": a.wait.get("kind", ""), "harness": a.harness,
                              "turns": a.turns, "since": a.updated_at,
@@ -14510,6 +14733,7 @@ class Runner:
                 status["auth_holds"] = auth.status(self.store, self.cfg.config_path or "<runner.toml>",
                                                    profiles=in_use)
                 status["harness_holds"] = harness_hold.status(self.store)
+                status["start_holds"] = start_hold.status(self.store)
             except (sqlite3.Error, AttributeError):
                 pass
             try:                # bound to this snapshot; a failure never carries a (stale) digest

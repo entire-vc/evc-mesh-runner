@@ -2573,6 +2573,7 @@ class Hardening(Bench):
         for _ in range(self.cfg.max_failures + 2):
             r.tick()
             self.settle_all(r)
+            r._resume_hold.clear()      # a refused start is retried after a pause (start_hold): it has passed
         bodies = " ".join(c["body"] for c in mesh.comment_log.get(t["id"], []))
         self.assertIn("Not inside a trusted directory", bodies)
 

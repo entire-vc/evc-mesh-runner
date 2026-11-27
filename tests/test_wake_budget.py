@@ -6,16 +6,21 @@ Mesh server itself (the true external boundary).
 import datetime as dt
 import errno
 import json
+import re
+import socket
+import ssl
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fakes import AGENT_ID, STATUSES, task
+from mesh_runner import coalesced_http
 from mesh_runner import observation_budget as budget
 from mesh_runner import wake as wake_mod
 from mesh_runner.config import load
@@ -23,6 +28,7 @@ from mesh_runner.mesh import MeshClient, MeshError
 from mesh_runner.runner import AgentRunner
 from mesh_runner.store import Store
 from mesh_runner.wake import GitHub, GitLab
+from test_coalesced_http import _cert
 from test_runner import Bench
 
 KEY = 'fixture-agent-key-7f3a'
@@ -60,6 +66,18 @@ class Server:
                     self.end_headers()
                     self.wfile.flush()
                     time.sleep(5)
+                    return
+                elif mode == 'trickle_head':
+                    # the status line arrives whole, the header block one byte at a time: every byte lands
+                    # well inside the socket's idle timeout, the head never ends in time
+                    self.wfile.write(b'HTTP/1.1 200 OK\r\n')
+                    try:
+                        for b in b'X-Pad: ' + b'p' * 60 + b'\r\nContent-Length: 2\r\n\r\n{}':
+                            self.wfile.write(bytes([b]))
+                            self.wfile.flush()
+                            time.sleep(0.05)
+                    except OSError:
+                        pass
                     return
                 elif mode == 'trickle':
                     # each byte arrives well inside the socket timeout, the whole body never ends in time
@@ -310,6 +328,18 @@ class WakeBudget(Bench):
         self.assertLess(time.monotonic() - t0, 3.0)          # 100 bytes x 0.2s would be 20s
         (cause,) = self.failed_events(r, a)
         self.assertIn('kind=timeout', cause)
+
+    def test_trickled_headers_cannot_outlive_the_deadline(self):
+        # the socket timeout is an idle timeout per recv; a head sent byte by byte reset it
+        r, (a,), _ = self.flow(budget_s=1.5)
+        self.srv.modes['*'] = 'trickle_head'
+        t0 = time.monotonic()
+        r.check_wakes()
+        self.assertLess(time.monotonic() - t0, 2.5)          # 80 header bytes x 0.05s would be 4s
+        (cause,) = self.failed_events(r, a)
+        self.assertIn('kind=timeout', cause)
+        elapsed = float(re.search(r'elapsed=([\d.]+)s', cause)[1])
+        self.assertLessEqual(elapsed, 1.5 + 1)
 
     def test_stalled_body_after_late_headers_respects_the_remaining_budget(self):
         r, (a,), _ = self.flow(budget_s=1.2)        # the client's own timeout is 1s
@@ -599,3 +629,211 @@ class StageRedaction(unittest.TestCase):
         self.assertEqual(stage, 'GET /tasks/:id/comments')
         self.assertEqual(budget.stage_of('GET', '/projects/Acme_Corp/statuses'), 'GET /projects/:id/statuses')
         self.assertNotIn('Acme', budget.stage_of('GET', '/workspaces/ws-prod-1/mentionables'))
+
+
+class Trickle:
+    """Raw HTTP/1.1 fixture, plain or TLS. ``shape`` says where the answer starts to trickle, one byte per
+    ``gap``: ``status`` (the status line itself), ``headers`` (status line whole, then the header block),
+    ``body`` (the head at once, then the body), ``ok`` (everything at once). Every gap is far inside the
+    client's idle timeout, so only a wall deadline can end the read. ``chunk`` bytes go per gap: a loaded host
+    stretches each short wait, so a positive control sends a few chunks rather than many single bytes."""
+
+    def __init__(self, shape, ctx=None, gap=0.04, body=b'{"ok": true}', pre_tls=0.0, pre_head=0.0, chunk=1):
+        self.shape, self.ctx, self.gap, self.body, self.chunk = shape, ctx, gap, body, chunk
+        self.pre_tls, self.pre_head = pre_tls, pre_head        # whole stalls before the handshake / the head
+        self.stop = threading.Event()
+        self.sock = socket.socket()
+        self.sock.bind(('127.0.0.1', 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        scheme, host = ('https', 'localhost') if ctx else ('http', '127.0.0.1')
+        self.url = f'{scheme}://{host}:{self.port}'
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def answer(self) -> bytes:
+        # the length header comes last: a head cut short reads as a 200 with an empty body
+        return (b'HTTP/1.1 200 OK\r\n' + b''.join(b'X-Pad-%d: %s\r\n' % (i, b'p' * 12) for i in range(3))
+                + b'Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n'
+                % len(self.body) + self.body)
+
+    def _accept(self):
+        while True:
+            try:
+                raw, _ = self.sock.accept()
+            except OSError:
+                return                                  # the listener was closed
+            threading.Thread(target=self._serve, args=(raw,), daemon=True).start()
+
+    def _serve(self, raw):
+        conn = raw
+        try:
+            if self.ctx:
+                if self.pre_tls and self.stop.wait(self.pre_tls):
+                    return
+                conn = self.ctx.wrap_socket(raw, server_side=True)
+            buf = b''
+            while b'\r\n\r\n' not in buf:
+                part = conn.recv(65536)
+                if not part:
+                    return
+                buf += part
+            if self.pre_head and self.stop.wait(self.pre_head):
+                return
+            out = self.answer()
+            at = {'status': 0, 'headers': out.index(b'\r\n') + 2,
+                  'body': out.index(b'\r\n\r\n') + 4, 'ok': len(out)}[self.shape]
+            conn.sendall(out[:at])
+            for i in range(at, len(out), self.chunk):
+                if self.stop.wait(self.gap):
+                    return
+                conn.sendall(out[i:i + self.chunk])
+        except OSError:
+            pass                                        # the client gave up: the point of the test
+        finally:
+            conn.close()
+
+    def close(self):
+        self.stop.set()
+        self.sock.close()
+
+
+def watchdogs() -> list:
+    return [t for t in threading.enumerate() if t.name == 'observation-watchdog' and t.is_alive()]
+
+
+class HeaderDeadline(unittest.TestCase):
+    """The observation deadline is a wall deadline from connect to the last header byte, not only
+    an idle timeout per recv. Real MeshClient and VCS readers, real sockets; the server is the only fake."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.crt, cls.key = _cert(cls.tmp.name)
+        cls.server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        cls.server_ctx.load_cert_chain(cls.crt, cls.key)
+        cls.client_ctx = ssl.create_default_context(cafile=cls.crt)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def serve(self, shape, tls=False, **kw):
+        srv = Trickle(shape, self.server_ctx if tls else None, **kw)
+        self.addCleanup(srv.close)
+        return srv
+
+    def mesh(self, srv, timeout=30.0):
+        opener = None
+        if srv.ctx:      # the production HTTPS path, trusting the fixture's certificate
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                coalesced_http.CoalescingHTTPSHandler(context=self.client_ctx)).open
+        return MeshClient(srv.url, KEY, timeout=timeout, opener=opener)
+
+    def timed(self, seconds, call):
+        """(result or exception, wall seconds) of ``call`` inside a ``seconds`` observation."""
+        t0 = time.monotonic()
+        with budget.observe(seconds):
+            try:
+                out = call()
+            except Exception as e:      # noqa: BLE001 - the test inspects what came out
+                out = e
+        return out, time.monotonic() - t0
+
+    # AC1 -------------------------------------------------------------------------------------
+    def test_mesh_read_with_a_trickled_status_line_ends_at_the_deadline(self):
+        srv = self.serve('status')
+        out, took = self.timed(1.5, lambda: self.mesh(srv).request('GET', '/tasks/by-short-id/0000aaaa'))
+        self.assertLessEqual(took, 1.5 + 1)             # 160 head bytes x 0.04s would be over 6s
+        self.assertIsInstance(out, MeshError)
+        self.assertEqual(out.kind, 'timeout')
+        # a read cut at the deadline names its fault like a socket timeout does: it was attempted
+        self.assertIn('cause=TimeoutError', budget.describe(out))
+
+    def test_mesh_read_with_a_trickled_header_block_ends_at_the_deadline(self):
+        # a head cut short by the watchdog must not pass for a 200 with an empty body
+        srv = self.serve('headers')
+        out, took = self.timed(1.5, lambda: self.mesh(srv).request('GET', '/tasks/x/comments'))
+        self.assertLessEqual(took, 1.5 + 1)
+        self.assertIsInstance(out, MeshError)
+        self.assertEqual(out.kind, 'timeout')
+
+    def test_mesh_read_over_tls_with_a_trickled_header_block_ends_at_the_deadline(self):
+        srv = self.serve('headers', tls=True)
+        out, took = self.timed(1.5, lambda: self.mesh(srv).request('GET', '/tasks/x'))
+        self.assertLessEqual(took, 1.5 + 1)
+        self.assertIsInstance(out, MeshError)
+        self.assertEqual(out.kind, 'timeout')
+
+    def test_stalls_split_across_handshake_and_head_end_at_the_deadline(self):
+        # each stall is under the 2s idle timeout, together they pass the budget: only a wall limit ends it
+        srv = self.serve('ok', tls=True, pre_tls=1.8, pre_head=1.8)
+        out, took = self.timed(2, lambda: self.mesh(srv).request('GET', '/tasks/by-short-id/0000aaaa'))
+        self.assertLessEqual(took, 2 + 1)
+        self.assertIsInstance(out, MeshError)
+        self.assertEqual(out.kind, 'timeout')
+
+    def test_no_watchdog_thread_reads_unguarded_and_leaves_no_guard_behind(self):
+        srv = self.serve('ok')
+        client = self.mesh(srv)
+        with mock.patch.object(threading.Timer, 'start', side_effect=RuntimeError("can't start new thread")):
+            out, _ = self.timed(5, lambda: client.request('GET', '/tasks/x'))
+        self.assertEqual(out, {'ok': True})
+        self.assertIsNone(getattr(budget._local, 'guard', None))
+        out, _ = self.timed(5, lambda: client.request('GET', '/tasks/x'))      # the next guarded read is whole
+        self.assertEqual(out, {'ok': True})
+        self.assertEqual(client.request('GET', '/tasks/x'), {'ok': True})      # and outside an observation
+
+    def test_attempt_limit_bounds_the_head_inside_a_longer_budget(self):
+        srv = self.serve('headers')
+        out, took = self.timed(10, lambda: self.mesh(srv, timeout=0.6)._request('GET', '/tasks/x'))
+        self.assertLessEqual(took, 0.6 + 1)
+        self.assertIsInstance(out, MeshError)
+        self.assertEqual(out.kind, 'timeout')
+        self.assertIn('attempt limit', str(out))        # the attempt ran out, not the observation
+
+    # AC2 -------------------------------------------------------------------------------------
+    def test_github_pull_request_read_with_trickled_headers_ends_at_the_deadline(self):
+        srv = self.serve('headers')
+        out, took = self.timed(1.5, lambda: GitHub(api_url=srv.url).get_mr('org/repo!7'))
+        self.assertLessEqual(took, 1.5 + 1)
+        self.assertIsInstance(out, Exception)
+        self.assertEqual(budget.classify(out), 'timeout')
+
+    def test_gitlab_read_with_a_trickled_status_line_ends_at_the_deadline(self):
+        srv = self.serve('status')
+        out, took = self.timed(1.5, lambda: GitLab(srv.url, 'glpat-fixture').get('projects/x/merge_requests/7'))
+        self.assertLessEqual(took, 1.5 + 1)
+        self.assertIsInstance(out, Exception)
+        self.assertEqual(budget.classify(out), 'timeout')
+
+    # AC3: positive controls -----------------------------------------------------------------
+    def test_plain_answers_still_read(self):
+        for tls in (False, True):
+            with self.subTest(tls=tls):
+                srv = self.serve('ok', tls=tls)
+                out, _ = self.timed(5, lambda: self.mesh(srv).request('GET', '/tasks/x'))
+                self.assertEqual(out, {'ok': True})
+        srv = self.serve('ok')
+        out, _ = self.timed(5, lambda: GitHub(api_url=srv.url).get_mr('org/repo!7'))
+        self.assertEqual(out['state'], 'opened')
+        out, _ = self.timed(5, lambda: GitLab(srv.url, 'glpat-fixture').get('projects/x'))
+        self.assertEqual(out, {'ok': True})
+        self.assertEqual(watchdogs(), [])               # no timer outlives its read
+
+    def test_slow_body_inside_the_budget_reads_past_the_attempt_limit(self):
+        # the attempt limit (0.6s) bounds the head only; a body that keeps coming inside the budget is read
+        srv = self.serve('body', gap=0.4, chunk=12, body=b'{"ok": true, "pad": "' + b'q' * 12 + b'"}')
+        out, took = self.timed(10, lambda: self.mesh(srv, timeout=0.6).request('GET', '/tasks/x'))
+        self.assertEqual(out, {'ok': True, 'pad': 'q' * 12})
+        self.assertGreater(took, 0.6 + 0.3)             # three body chunks 0.4s apart
+        srv = self.serve('body', gap=0.4, chunk=5)
+        out, _ = self.timed(10, lambda: GitLab(srv.url, 'glpat-fixture').get('projects/x'))
+        self.assertEqual(out, {'ok': True})
+        self.assertEqual(watchdogs(), [])
+
+    def test_late_but_whole_head_inside_the_budget_reads(self):
+        srv = self.serve('headers', gap=0.25, chunk=40)  # the head in four pieces, about 1s, inside the budget
+        out, took = self.timed(10, lambda: self.mesh(srv, timeout=3).request('GET', '/tasks/x'))
+        self.assertGreater(took, 0.6)
+        self.assertEqual(out, {'ok': True})

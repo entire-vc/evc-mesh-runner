@@ -68,6 +68,18 @@ VCS_RETRY_DELAYS = (1.0, 3.0)
 _VCS_RETRY_HTTP = frozenset({502, 503, 504})
 
 
+_vcs_opener: urllib.request.OpenerDirector | None = None
+
+
+def _vcs_open(req: urllib.request.Request, timeout: float):
+    """The stock ``urllib.request.urlopen`` (environment proxies, redirects, certificate checks) over
+    connections the observation watchdog can shut."""
+    global _vcs_opener
+    if _vcs_opener is None:
+        _vcs_opener = urllib.request.build_opener(budget.GuardedHTTPHandler(), budget.GuardedHTTPSHandler())
+    return _vcs_opener.open(req, timeout=timeout)
+
+
 def _vcs_read(req: urllib.request.Request, stage: str, *, max_bytes: int | None = None) -> bytes:
     """One idempotent VCS GET with bounded per-attempt timeout and transient retry inside the
     active observation budget (mirroring MeshClient GET retry discipline)."""
@@ -76,7 +88,7 @@ def _vcs_read(req: urllib.request.Request, stage: str, *, max_bytes: int | None 
         progress.beat()
         timeout = budget.cap(VCS_TIMEOUT, "GET", stage)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with budget.urlopen(_vcs_open, req, timeout) as r:
                 return budget.read(r, max_bytes)
         except Exception as e:
             if isinstance(e, budget.Exhausted):

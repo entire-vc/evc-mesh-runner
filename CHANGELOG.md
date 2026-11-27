@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.2.145 — 2026-11-26
+
+- **A wake read can no longer outlive its budget while the answer's head arrives byte by byte.** The
+  socket timeout restarts on every received byte, so a server or proxy sending the status line and
+  headers slowly held a Mesh read for up to 165 s inside a 45 s budget. Mesh and GitHub/GitLab reads now
+  hold everything before the body (connect, proxy tunnel, TLS handshake, status line, headers) to the wall
+  limit: the rest of the wake budget, or the per-attempt limit when that is shorter. When the limit
+  passes, the connection is shut and the read fails as `kind=timeout`. The body was already bounded by the
+  budget, and a slow body that fits the budget is still read in full. Reads outside a wake are unchanged.
+
+## 0.2.144 — 2026-11-26
+
+- **A host start hold moves a lane with a fallback off the held harness, as a provider limit does.** A
+  launch the start hold keeps (`start_hold`) on the lane's route now asks the lane's routing command
+  (`on_limit_command`) once per lane and hold generation to move it, with
+  `MESH_RUNNER_LIMIT_SOURCE=start_hold`, `MESH_RUNNER_START_HOLD_HARNESS` and
+  `MESH_RUNNER_START_HOLD_SINCE` (no `MESH_RUNNER_MODE`). Exit 0: the next turn of every held card runs
+  where the lane's route now points, with its exact unsent prompt. Any other exit keeps the hold, with no
+  provider-limit streak and no `limit_hold_until`. A card on its own route (label, provider refusal)
+  never moves the lane. The lane's record on the harness (`start_route` mark: calling, moved, refused,
+  returned, probing) is what account routing reads: a moved lane comes back (`returned`) once the hold no
+  longer covers its configuration (a probe elsewhere got a conversation, the hold dropped out or
+  reopened, the lane's model or flags changed), and it takes its turn at the hold's probe, since it
+  launches nothing on the held harness; a refused probe lets its next held launch move it again.
+  `start_holds` in status.json lists each lane's record under `lanes`.
+
+## 0.2.143 — 2026-11-26
+
+- **A headless CLI that refuses to start on several cards of the host holds those launches, not the
+  cards.** A start refused before any conversation (`headless-start-unsent`) is now also one (lane,
+  card) observation of its harness. Two different (lane, card) refusals of the same harness within
+  10 minutes open a host start hold (`start_hold`): every launch with a refused launch configuration
+  (the harness's flags, model and effort, the lane policy's effort chosen for that very launch included;
+  never the binary's file identity) is held, the cards stay with their
+  executors with their unsent prompts and no card goes up (no RUNNER GAVE UP). One `operator_alert`
+  (`incident: harness_start_hold`) per harness and reason names the CLI's words (masked excerpt);
+  status.json lists the hold under `start_holds`. The hold lifts for a launch whose configuration
+  changed, and for all of them once a probe launch (one every 30 minutes, single-flight) gets a
+  conversation; a configuration nobody launches for 6 hours drops out. One card refused again and
+  again holds nothing and still goes up after `max_startup_failures`; its retry after a first refusal
+  now waits a 2-minute pause (kept in the store, so a runner restart does not cut it short), so a refusal of another card can show the cause is the host's. A refused
+  start's unsent prompt now follows a route change of its lane to another harness (new session, the
+  exact pending request) instead of waiting for owner resolution in `unknown`.
+
 ## 0.2.142 — 2026-11-26
 
 - **A work turn whose card moves to review is no longer stopped and failed as a lost checkout.** When
