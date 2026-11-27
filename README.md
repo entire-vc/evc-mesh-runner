@@ -822,6 +822,11 @@ Without a command for the routed harness the session is held (a live one keeps r
 its current harness, a gone one is not started): the runner logs
 `chat session … held` once, reports `chat_hold` / `chat_hold_since` in its status and
 exports `mesh_runner_chat_hold_seconds{agent}` (0 = not held) for alerting.
+A restart that waits for an idle moment asks `idle_command` on each check and builds the
+environment (env command) only when the session is idle or once per 5 minutes. The hold's start
+is kept in `state_dir/chat/<agent>.hold.json` across runner restarts; a hold older than 30
+minutes raises one `operator_alert` (`chat_hold:<agent>`). Every env command run sees
+`MESH_RUNNER_ENV_REASON` (`chat-check`, `start`, `resume`, `probe`, `merge-gate`, `lane`).
 The chat's own env read tells the env command which harnesses the chat can run:
 `MESH_RUNNER_STANDING_CHAT_HARNESSES=claude,codex` (the chat command's harness first, then
 the keys of `commands`). A lane whose cards go to a harness without a chat command (agy,

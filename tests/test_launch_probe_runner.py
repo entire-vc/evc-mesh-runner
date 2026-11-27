@@ -83,7 +83,7 @@ class ProbeWiring(HeadlessFixture):
         a = self.prepare(r, t)
         r._gate('reserve', t['id'], a.mode, a)
         self.agent.inline_env = {**self.agent.inline_env, 'CODEX_HOME': str(self.root / 'other-home')}
-        r._read_env = lambda *a: dict(self.agent.inline_env)
+        r._read_env = lambda *a, **kw: dict(self.agent.inline_env)
         r._gate('admit', t['id'], a.mode, a)
         self.assertEqual(self.runs(), 2)
 
