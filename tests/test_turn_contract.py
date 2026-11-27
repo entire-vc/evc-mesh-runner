@@ -121,3 +121,29 @@ class TurnContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinishTaskTarget(unittest.TestCase):
+    """Mesh refuses finish_task without `to` (schema Required, Enum done|review): every closing hint names it."""
+
+    def test_the_contract_requires_to_done_or_review(self):
+        for merge in (False, True):
+            text = contract(merge)
+            line = next(l.strip() for l in text.splitlines() if l.strip().startswith("finish_task "))
+            self.assertIn(" to=done|review", line)
+            self.assertNotIn("[to=", text)
+            explained = " ".join(text.split())
+            self.assertIn("to=done: an independent verdict on the current head and the criteria met", explained)
+            self.assertIn("to=review: a live result awaits acceptance", explained)
+
+    def test_closing_hints_name_the_target(self):
+        from mesh_runner import reviewer_merge
+        for name in ("MANUAL_WAIT_GUIDANCE", "QUEUE_WAIT_GUIDANCE"):
+            with self.subTest(name):
+                self.assertIn("finish_task to=done|review", " ".join(getattr(outcome_mod, name).split()))
+        req = {"project": "g/p", "iid": 1, "source_task": "0" * 36, "reason": reviewer_merge.RIGHTS_REASON,
+               "author_lane": "a", "reviewer_lane": "r", "reviewer_username": "r", "sha": "f" * 40,
+               "key": "k"}
+        with self.subTest("merge-rights card"):
+            body = " ".join(str(v) for v in reviewer_merge.card_fields(req, "p", "s").values())
+            self.assertIn("finish_task to=done", body)

@@ -42,9 +42,11 @@ checkouts. Each task keeps its own native session and isolated worktrees.
 
 1. The agent works on the task and calls exactly one Mesh turn command.
    `continue_next` records completed work and requests another turn; `wait_for`
-   parks it on the declared event; `finish_task` records delivery evidence or
-   sends the result to review with `to=review`. Questions and hand-offs have
-   their own commands, listed below.
+   parks it on the declared event; `finish_task` always names its target:
+   `to=done` records delivery evidence (an independent verdict on the current
+   head, criteria met), `to=review` sends a live result to acceptance. Mesh
+   refuses it without `to`. Questions and hand-offs have their own commands,
+   listed below.
 2. Mesh stores a typed outcome. The runner settles it only after the harness
    process **and all its children** exit, so a background command keeps the slot
    busy instead of racing the next writer. Waiting releases execution capacity
@@ -58,7 +60,7 @@ checkouts. Each task keeps its own native session and isolated worktrees.
    blocked or changed. An independent SHIP on the linked, open MR can start this
    wait automatically. `wait_for on=mr until=merged` only observes an MR.
 5. After merge, the author installs or publishes the result where required,
-   verifies its ordinary user path, and calls `finish_task` with the evidence.
+   verifies its ordinary user path, and calls `finish_task to=done` with the evidence.
 
 See [docs/architecture.md](docs/architecture.md), the outcome contract below and
 [Merge waits](#merge-waits-merge_command) for configuration and failure handling.
@@ -80,7 +82,7 @@ wait_for on=time until_at=<RFC3339 with offset> event_ref=<stable reference> sou
 ask_agent to=<agent> question=<question>
 ask_human to=<username> question=<one question, with the recommended default>
 continue_next note=<what was done, what is next>
-finish_task result_kind=change|defect|research|content|ops evidence=<proof> [to=review]
+finish_task result_kind=change|defect|research|content|ops evidence=<proof> to=done|review
 hand_off to=<agent> why=<what they must do, what is done>
 ```
 
