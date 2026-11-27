@@ -4,22 +4,25 @@ Real MeshClient over a local HTTP fixture, real runner, Store and SQLite; the on
 Mesh server itself (the true external boundary).
 """
 import datetime as dt
+import errno
 import json
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fakes import AGENT_ID, STATUSES, task
 from mesh_runner import observation_budget as budget
+from mesh_runner import wake as wake_mod
 from mesh_runner.config import load
 from mesh_runner.mesh import MeshClient, MeshError
 from mesh_runner.runner import AgentRunner
 from mesh_runner.store import Store
-from mesh_runner.wake import GitLab
+from mesh_runner.wake import GitHub, GitLab
 from test_runner import Bench
 
 KEY = 'fixture-agent-key-7f3a'
@@ -78,6 +81,8 @@ class Server:
                     return self.send('{not json', raw=True)
                 elif mode == '403':
                     return self.send({'message': 'forbidden'}, 403)
+                elif mode == '503':
+                    return self.send({'message': 'unavailable'}, 503)
                 self.send(outer.route(path))
 
             def do_POST(self):
@@ -325,7 +330,187 @@ class WakeBudget(Bench):
             cause = budget.describe(caught.exception, obs)
         self.assertIn('kind=http', cause)
         self.assertIn('status=403', cause)
+        self.assertIn('cause=HTTPError', cause)
         self.assertNotIn('glpat', cause)
+        self.assertEqual(obs.retries, 0)                                 # 4xx is never retried
+
+    def test_vcs_get_retries_transient_reset_and_succeeds_within_budget(self):
+        self.flow()
+        self.srv.modes['*'] = 'reset'
+        orig_route = self.srv.route
+        attempts = {'n': 0}
+
+        # Override mode to clear after the first dropped connection
+        real_get = self.srv.http.RequestHandlerClass.do_GET
+
+        def flaky_do_GET(handler):
+            attempts['n'] += 1
+            if attempts['n'] >= 2:
+                self.srv.modes.clear()
+            return real_get(handler)
+
+        self.srv.route = lambda path: {'state': 'open', 'head': {'sha': 'abc'}, 'base': {'ref': 'main'}}
+        gh = GitHub(api_url=self.srv.url)
+        with mock.patch.object(self.srv.http.RequestHandlerClass, 'do_GET', flaky_do_GET), \
+                mock.patch.object(wake_mod, 'VCS_RETRY_DELAYS', (0.05, 0.05)):
+            with budget.observe(5) as obs:
+                mr = gh.get_mr('github:acme/widgets!5733')
+        self.assertEqual(mr['state'], 'opened')
+        self.assertEqual(obs.retries, 1)
+        self.assertEqual(attempts['n'], 2)
+        self.srv.route = orig_route
+
+    def test_vcs_get_retries_a_5xx_gateway_answer_and_succeeds(self):
+        self.flow()
+        self.srv.modes['*'] = '503'
+        real_get = self.srv.http.RequestHandlerClass.do_GET
+        attempts = {'n': 0}
+
+        def flaky_do_GET(handler):
+            attempts['n'] += 1
+            if attempts['n'] >= 2:
+                self.srv.modes.clear()
+            return real_get(handler)
+
+        orig_route = self.srv.route
+        self.srv.route = lambda path: {'id': 39965, 'status': 'success'}
+        gl = GitLab(self.srv.url, 'glpat-fixture')
+        with mock.patch.object(self.srv.http.RequestHandlerClass, 'do_GET', flaky_do_GET), \
+                mock.patch.object(wake_mod, 'VCS_RETRY_DELAYS', (0.05, 0.05)):
+            with budget.observe(5) as obs:
+                row = gl.get_pipeline('acme/widgets#39965')
+        self.srv.route = orig_route
+        self.assertEqual(row['status'], 'success')
+        self.assertEqual((attempts['n'], obs.retries), (2, 1))
+
+    def test_vcs_5xx_on_every_attempt_is_retried_then_described(self):
+        self.flow()
+        self.srv.modes['*'] = '503'
+        gl = GitLab(self.srv.url, 'glpat-fixture')
+        before = len(self.srv.log)
+        with mock.patch.object(wake_mod, 'VCS_RETRY_DELAYS', (0.05, 0.05)):
+            with budget.observe(5) as obs:
+                with self.assertRaises(Exception) as caught:
+                    gl.get_pipeline('secret-org/secret-repo#39965')
+                cause = budget.describe(caught.exception, obs)
+        self.assertEqual(len(self.srv.log) - before, 3)                  # first try and both retries
+        for part in ('kind=http', 'status=503', 'stage=GET vcs/gitlab/projects/:id/pipelines/:id',
+                     'cause=HTTPError', 'retries=2'):
+            self.assertIn(part, cause)
+        for leaked in ('secret-org', '39965', 'glpat', 'unavailable'):
+            self.assertNotIn(leaked, cause)
+
+    def test_vcs_get_retries_per_attempt_timeout_within_budget(self):
+        self.flow()
+        self.srv.modes['*'] = 'seq'
+        self.srv.seq = [1.5, 0.0]                                        # first attempt stalls, retry answers fast
+        self.srv.route = lambda path: {'id': 39965, 'status': 'success'}
+        gl = GitLab(self.srv.url, 'glpat-fixture')
+        self.assertLessEqual(wake_mod.VCS_TIMEOUT, 15.0)
+        self.assertEqual(wake_mod.VCS_RETRY_DELAYS, (1.0, 3.0))
+        with mock.patch.object(wake_mod, 'VCS_TIMEOUT', 0.4), \
+                mock.patch.object(wake_mod, 'VCS_RETRY_DELAYS', (0.05, 0.05)):
+            with budget.observe(5) as obs:
+                row = gl.get_pipeline('acme/widgets#39965')
+        self.assertEqual(row['status'], 'success')
+        self.assertEqual(obs.retries, 1)
+
+    def test_vcs_stall_on_every_attempt_names_endpoint_cause_and_retries(self):
+        # one 30s read and no retry was logged as `stage=GET vcs elapsed=31s`
+        self.flow()
+        self.srv.modes['*'] = 'slow'
+        self.srv.delay = 1.0
+        gh = GitHub(api_url=self.srv.url)
+        with mock.patch.object(wake_mod, 'VCS_TIMEOUT', 0.2), \
+                mock.patch.object(wake_mod, 'VCS_RETRY_DELAYS', (0.05, 0.05)):
+            with budget.observe(5) as obs:
+                with self.assertRaises(Exception) as caught:
+                    gh.get_mr('github:acme/widgets!5733')
+                cause = budget.describe(caught.exception, obs)
+        self.assertIn('kind=timeout', cause)
+        self.assertIn('stage=GET vcs/github/repos/:id/:id/pulls/:id', cause)
+        self.assertRegex(cause, r' cause=[A-Za-z/]*Timeout')
+        self.assertIn('retries=2', cause)
+        self.assertLess(obs.elapsed(), 1.5)                              # three short attempts, not one long one
+        self.assertNotIn('widgets', cause)
+
+    def test_stage_redacts_project_slugs_that_spell_a_path_word(self):
+        self.assertEqual(budget.stage_of('GET', 'vcs/github/repos/actions/runs/pulls/5733'),
+                         'GET vcs/github/repos/:id/:id/pulls/:id')
+        self.assertEqual(budget.stage_of('GET', 'vcs/github/repos/jobs/trace/actions/runs/77'),
+                         'GET vcs/github/repos/:id/:id/actions/runs/:id')
+        self.assertEqual(budget.stage_of('GET', 'vcs/gitlab/projects/pipelines/merge_requests/9?x=1'),
+                         'GET vcs/gitlab/projects/:id/merge_requests/:id')
+        self.assertEqual(budget.stage_of('GET', '/api/v1/projects/tasks/tasks'), 'GET /api/v1/projects/:id/tasks')
+
+    def test_a_bare_network_os_error_is_transport_and_a_local_one_is_not(self):
+        for exc, kind in ((OSError(errno.ENETUNREACH, 'x'), 'transport'), (OSError(errno.EHOSTUNREACH, 'x'), 'transport'),
+                          (OSError(errno.ENETDOWN, 'x'), 'transport'), (OSError(errno.ETIMEDOUT, 'x'), 'timeout'),
+                          (FileNotFoundError(errno.ENOENT, 'x'), ''), (PermissionError(errno.EACCES, 'x'), ''),
+                          (OSError(errno.ENOSPC, 'x'), ''), (OSError('no errno'), '')):
+            with self.subTest(exc=repr(exc)):
+                self.assertEqual(budget.classify(exc), kind)
+        self.assertIn('kind=transport', budget.describe(OSError(errno.ENETUNREACH, 'x')))
+        self.assertIn('cause=OSError:ENETUNREACH', budget.describe(OSError(errno.ENETUNREACH, 'x')))
+
+    def test_vcs_get_retries_a_bare_socket_error_raised_mid_read_and_succeeds(self):
+        self.flow()
+        self.srv.route = lambda path: {'state': 'open', 'head': {'sha': 'abc'}, 'base': {'ref': 'main'}}
+        real_read = budget.read
+        calls = {'n': 0}
+
+        def flaky_read(resp, max_bytes=None):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise OSError(errno.ENETUNREACH, 'Network is unreachable')   # not wrapped by urllib
+            return real_read(resp, max_bytes)
+
+        gh = GitHub(api_url=self.srv.url)
+        with mock.patch.object(wake_mod.budget, 'read', flaky_read), \
+                mock.patch.object(wake_mod, 'VCS_RETRY_DELAYS', (0.05, 0.05)):
+            with budget.observe(5) as obs:
+                mr = gh.get_mr('github:acme/widgets!5733')
+        self.assertEqual(mr['state'], 'opened')
+        self.assertEqual(calls['n'], 2)
+        self.assertEqual(obs.retries, 1)
+
+    def test_cause_names_errno_only_where_it_is_an_errno(self):
+        import socket, ssl
+        self.assertEqual(budget.cause_of(urllib.error.URLError(ConnectionResetError(errno.ECONNRESET, 'peer'))),
+                         'URLError/ConnectionResetError:ECONNRESET')
+        self.assertEqual(budget.cause_of(urllib.error.URLError(socket.gaierror(socket.EAI_NONAME, 'host'))),
+                         'URLError/gaierror')                            # EAI_NONAME is 8 = ENOEXEC on macOS
+        self.assertEqual(budget.cause_of(urllib.error.URLError(ssl.SSLError(1, 'tls'))), 'URLError/SSLError')
+        self.assertEqual(budget.cause_of(TimeoutError('timed out')), 'TimeoutError')
+
+    def test_vcs_stage_names_provider_and_endpoint_without_leaking_slugs_or_ids(self):
+        self.flow()
+        self.srv.modes['*'] = '403'
+        gh = GitHub(api_url=self.srv.url)
+        gl = GitLab(self.srv.url, 'glpat-fixture', gh)
+        with budget.observe(5) as obs:
+            with self.assertRaises(Exception) as caught:
+                gh.get_mr('github:secret-org/secret-repo!5733')
+            gh_cause = budget.describe(caught.exception, obs)
+        self.assertIn('stage=GET vcs/github/repos/:id/:id/pulls/:id', gh_cause)
+        for leaked in ('secret-org', 'secret-repo', '5733', '127.0.0.1'):
+            self.assertNotIn(leaked, gh_cause)
+
+        with budget.observe(5) as obs:
+            with self.assertRaises(Exception) as caught:
+                gl.get_pipeline('secret-org/secret-repo#39965')
+            gl_cause = budget.describe(caught.exception, obs)
+        self.assertIn('stage=GET vcs/gitlab/projects/:id/pipelines/:id', gl_cause)
+        for leaked in ('secret-org', 'secret-repo', '39965', 'glpat', '127.0.0.1'):
+            self.assertNotIn(leaked, gl_cause)
+
+        with budget.observe(5) as obs:
+            with self.assertRaises(Exception) as caught:
+                gl.job_trace_tail('secret-org/secret-repo#39965', 897945)
+            tr_cause = budget.describe(caught.exception, obs)
+        self.assertIn('stage=GET vcs/gitlab/projects/:id/jobs/:id/trace', tr_cause)
+        for leaked in ('secret-org', '897945', 'glpat', '127.0.0.1'):
+            self.assertNotIn(leaked, tr_cause)
 
     # A2 -------------------------------------------------------------------------------------
     def test_failure_kinds_are_distinguishable_and_never_a_dependency_done(self):
@@ -339,6 +524,10 @@ class WakeBudget(Bench):
                 self.assertIn('kind=' + kind, cause)
                 if kind == 'http':
                     self.assertIn('status=403', cause)
+                if kind in ('timeout', 'transport'):
+                    self.assertRegex(cause, r' cause=[A-Za-z]+')         # the class names the fault
+                else:
+                    self.assertNotIn('cause=', cause)
                 self.assertEqual(r.store.get(a.id).state, 'waiting')
                 self.assertEqual([m for m, _ in self.srv.log if m != 'GET'], [])
 

@@ -11,13 +11,16 @@ import json
 import hashlib
 import logging
 import re
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+from . import observation_budget as budget
+from . import progress
 from .mesh import MeshClient, MeshError
 from .outcome import mr_merged_wait
-from . import observation_budget as budget
 from .selection import AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, parse_time, satisfied
 
 log = logging.getLogger("mesh_runner")
@@ -57,6 +60,35 @@ TRACE_CHARS = 2000
 FAILED_LISTED = 5
 _TRACE_NOISE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|section_(?:start|end):\d+:[^\r\n]*?(?=\r|\n|$)|\r")
 
+# Per-attempt timeout and transient retry delays for idempotent VCS GETs (GitHub / GitLab).
+# Normal RTT is <1s; a 12s per-attempt cap with (1s, 3s) backoff fits inside the 45s wake
+# observation budget (12 + 1 + 12 + 3 + 12 = 40s) and recovers from single-socket stalls/resets.
+VCS_TIMEOUT = 12.0
+VCS_RETRY_DELAYS = (1.0, 3.0)
+_VCS_RETRY_HTTP = frozenset({502, 503, 504})
+
+
+def _vcs_read(req: urllib.request.Request, stage: str, *, max_bytes: int | None = None) -> bytes:
+    """One idempotent VCS GET with bounded per-attempt timeout and transient retry inside the
+    active observation budget (mirroring MeshClient GET retry discipline)."""
+    delays = list(VCS_RETRY_DELAYS)
+    while True:
+        progress.beat()
+        timeout = budget.cap(VCS_TIMEOUT, "GET", stage)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return budget.read(r, max_bytes)
+        except Exception as e:
+            if isinstance(e, budget.Exhausted):
+                raise
+            retryable = budget.classify(e) in ("timeout", "transport") or (
+                isinstance(e, urllib.error.HTTPError) and e.code in _VCS_RETRY_HTTP
+            )
+            if retryable and delays and budget.sleep_allowed(delays[0]):
+                time.sleep(delays.pop(0))
+                continue
+            raise
+
 
 def split_provider(target: str) -> tuple[str, str]:
     """(provider, target without the selector): ``github:org/repo!N`` -> ("github", "org/repo!N");
@@ -94,12 +126,15 @@ class GitHub:
         return any(project == o or project.startswith(o.rstrip("/") + "/") for o in self.orgs)
 
     def get(self, path: str) -> dict:
-        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "mesh-runner",
+        }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(f"{self.api_url.rstrip('/')}/{path}", headers=headers)
-        with urllib.request.urlopen(req, timeout=budget.cap(30, "GET", "vcs")) as r:
-            return json.loads(budget.read(r))
+        return json.loads(_vcs_read(req, f"vcs/github/{path}"))
 
     def get_mr(self, target: str) -> dict:
         project, number = split_provider(target)[1].rsplit("!", 1)
@@ -148,8 +183,7 @@ class GitLab:
             raise ValueError("no [gitlab] base_url configured")
         req = urllib.request.Request(f"{self.base_url.rstrip('/')}/api/v4/{path}",
                                      headers={"PRIVATE-TOKEN": self.token})
-        with urllib.request.urlopen(req, timeout=budget.cap(30, "GET", "vcs")) as r:
-            return json.loads(budget.read(r))
+        return json.loads(_vcs_read(req, f"vcs/gitlab/{path}"))
 
     @staticmethod
     def project(path: str) -> str:
@@ -216,10 +250,10 @@ class GitLab:
         """The end of a job's log (Ф1). Asks for the last 64 KiB; a server that ignores the range
         and sends a log over 4 MiB gives '' rather than its beginning."""
         project = split_provider(target)[1].rsplit("#", 1)[0]
-        req = urllib.request.Request(f"{self.base_url.rstrip('/')}/api/v4/projects/{self.project(project)}/jobs/{int(job_id)}/trace",
+        path = f"projects/{self.project(project)}/jobs/{int(job_id)}/trace"
+        req = urllib.request.Request(f"{self.base_url.rstrip('/')}/api/v4/{path}",
                                      headers={"PRIVATE-TOKEN": self.token, "Range": f"bytes=-{TRACE_RANGE}"})
-        with urllib.request.urlopen(req, timeout=budget.cap(30, "GET", "vcs")) as r:
-            body = budget.read(r, TRACE_MAX + 1)
+        body = _vcs_read(req, f"vcs/gitlab/{path}", max_bytes=TRACE_MAX + 1)
         if len(body) > TRACE_MAX:
             return ""
         return body.decode("utf-8", "replace")

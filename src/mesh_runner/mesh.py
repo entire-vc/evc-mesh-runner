@@ -111,7 +111,7 @@ def _parse_retry_after(value: Any) -> float | None:
 
 class MeshError(Exception):
     def __init__(self, status: int, message: str, body: Any = None, retry_after: float | None = None,
-                 endpoint: str = "", kind: str = "", stage: str = ""):
+                 endpoint: str = "", kind: str = "", stage: str = "", cause: str = ""):
         super().__init__(f"HTTP {status}: {message}" + (f" [{endpoint}]" if endpoint else "")
                          + (f" retry-after={retry_after:g}s" if retry_after is not None else ""))
         self.status = status
@@ -121,6 +121,7 @@ class MeshError(Exception):
         # timeout/transport/parse/http; a status-0 error without a named cause is a transport fault
         self.kind = kind or ("http" if status else "transport")
         self.stage = stage
+        self.cause = cause                  # exception class and errno name of a transport fault, no message
 
 
 @dataclass
@@ -299,7 +300,7 @@ class MeshClient:
             raise self._spent(method, path) from None
         except (OSError, ValueError) as e:      # URLError, timeouts, resets
             raise MeshError(0, f"{type(e).__name__}: {str(e)[:200]}", kind=budget.classify(e) or "parse",
-                            stage=budget.stage_of(method, path)) from None
+                            stage=budget.stage_of(method, path), cause=budget.cause_of(e)) from None
         if not raw:
             return None
         try:

@@ -14,11 +14,12 @@ import urllib.error
 from unittest import mock
 from pathlib import Path
 
-from fakes import AGENT_ID, FakeMesh, HarnessGate, calls, finish, task, wait_card, write_replies
+from fakes import AGENT_ID, CAT_TO_STATUS, FakeMesh, HarnessGate, calls, finish, task, wait_card, write_replies
 from test_runner import Bench
 
 from mesh_runner import checkout_fence
 from mesh_runner.mesh import Checkout, MeshClient, MeshError
+from mesh_runner.runner import LockLost
 
 
 class CountingMesh(FakeMesh):
@@ -185,6 +186,7 @@ class FenceScenarios(Bench):
         self.assertFalse(ended.checkout)
         self.assertIsNone(r._fence().read(t["id"]))
         self.assertNotIn("error:settle", [k for _, k, _ in r.store.events(a.id)])
+        self.assertFalse([k for k in r._errors if k[0] == a.id])        # stopped by LockLost, not by an error
 
     def test_takeover_refused_heartbeat_stops_the_turn_and_writes_nothing(self):
         t = task(6)
@@ -233,6 +235,182 @@ class FenceScenarios(Bench):
         self.settle_all(r)
         self.assertEqual(r.store.get(a.id).state, "completed")
         self.assertNotIn("lock_lost_stop", [k for _, k, _ in r.store.events(a.id)])
+        self.assertNotIn("checkout_lost", [k for _, k, _ in r.store.events(a.id)])
+
+    def own_move_to_review_and_reassign(self, mesh, tid, reviewer):
+        """The turn's own move_task(review) and assign_task(reviewer), as Mesh applies them.
+
+        The agent's MCP calls go to Mesh, not through the Runner: the Runner only sees what
+        they leave behind (the card in review under another assignee, the lock released with
+        the reassignment) and the refusal of the turn's next fenced call."""
+        mesh.move(tid, CAT_TO_STATUS["review"])     # move_task status=review
+        mesh.assign(tid, reviewer)                  # assign_task to the reviewer
+        mesh.checkouts.pop(tid, None)               # Mesh releases the lock on reassignment
+
+    def test_work_card_moved_to_review_and_reassigned_refusal_completes_not_lock_lost(self):
+        # A batch lane's work turn moves its own card to review and assigns the reviewer,
+        # then calls finish_task which gets 409 checkout_precondition_failed (reassigned=True).
+        t = task(22)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, a, gate = self.start_gated(mesh, t, reply="handed off to review")
+        self.cfg.heartbeat_seconds = 3600
+        self.own_move_to_review_and_reassign(mesh, t["id"], "agent-lead")
+        self.assertEqual(mesh.tasks[t["id"]]["status_id"], CAT_TO_STATUS["review"])
+        self.assertEqual(mesh.tasks[t["id"]]["assignee_id"], "agent-lead")
+        self.mcp_refusal(r, a, checkout_fence.LOCK_LOST, reassigned=True, tool="finish_task")
+        r.tick()
+        cur = r.store.get(a.id)
+        self.assertEqual(cur.state, "running")                           # not killed mid-exit
+        self.assertFalse(cur.checkout)
+        self.assertIsNone(r._fence().read(t["id"]))
+        kinds = [k for _, k, _ in r.store.events(a.id)]
+        self.assertIn("checkout_released_by_review", kinds)
+        self.assertNotIn("checkout_lost", kinds)
+        self.assertNotIn("lock_lost_stop", kinds)
+        self.assertNotIn("kill", kinds)
+        gate.release()
+        self.settle_all(r, timeout=15)
+        ended = r.store.get(a.id)
+        self.assertEqual(ended.state, "completed")
+        self.assertIn("task left the agent's working statuses", ended.note)
+
+    def test_work_card_auto_moved_to_review_same_assignee_refusal_completes_not_lock_lost(self):
+        # Mesh auto-moves a parent card to review when its last subtask closes,
+        # releasing checkout while assignee stays the author; wait_for gets 409 LOCK_LOST.
+        t = task(23)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, a, gate = self.start_gated(mesh, t, reply="wait_for got 409 after auto-review")
+        self.cfg.heartbeat_seconds = 3600
+        mesh.set_category(t["id"], "review")
+        mesh.checkouts.pop(t["id"], None)
+        self.mcp_refusal(r, a, checkout_fence.LOCK_LOST, reassigned=False, tool="wait_for")
+        r.tick()
+        cur = r.store.get(a.id)
+        self.assertEqual(cur.state, "running")
+        self.assertFalse(cur.checkout)
+        self.assertIsNone(r._fence().read(t["id"]))
+        kinds = [k for _, k, _ in r.store.events(a.id)]
+        self.assertIn("checkout_released_by_review", kinds)
+        self.assertNotIn("checkout_lost", kinds)
+        self.assertNotIn("lock_lost_stop", kinds)
+        gate.release()
+        self.settle_all(r, timeout=15)
+        ended = r.store.get(a.id)
+        self.assertEqual(ended.state, "completed")
+        self.assertIn("task left the agent's working statuses", ended.note)
+
+    def test_work_card_moved_to_review_refused_heartbeat_releases_without_kill_and_completes(self):
+        # Mesh auto-moved the parent to review and let its checkout go; the next heartbeat is refused.
+        t = task(24)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, a, gate = self.start_gated(mesh, t)
+        mesh.set_category(t["id"], "review")
+        mesh.checkouts.pop(t["id"], None)
+        r.tick()
+        cur = r.store.get(a.id)
+        self.assertEqual(cur.state, "running")                           # handed over: not killed
+        self.assertFalse(cur.checkout)
+        self.assertIsNone(r._fence().read(t["id"]))
+        gate.release()
+        self.settle_all(r, timeout=15)
+        ended = r.store.get(a.id)
+        self.assertEqual(ended.state, "completed")
+        kinds = [k for _, k, _ in r.store.events(a.id)]
+        self.assertNotIn("checkout_lost", kinds)
+        self.assertNotIn("lock_lost_stop", kinds)
+        self.assertNotIn("kill", kinds)
+        self.assertIn("checkout_released_by_review", kinds)
+
+    def test_runner_write_refused_on_a_card_moved_to_review_releases_without_kill(self):
+        # The Runner's own fenced write is the first to hear of the auto-release: same answer as the
+        # agent's refused write (above), and settle then writes nothing fenced and completes.
+        t = task(26)
+        mesh = RefusingMesh([t], max_concurrent=1)
+        r, a, gate = self.start_gated(mesh, t, reply="looked at it")    # the agent itself moves nothing
+        self.cfg.heartbeat_seconds = 3600                 # no heartbeat sees it first: the fenced write does
+        mesh.set_category(t["id"], "review")
+        mesh.refuse = True
+        with self.assertRaises(MeshError):
+            mesh.add_comment(t["id"], "[runner] a note while the turn runs")
+        self.assertEqual(mesh.refused_writes, 1)
+        cur = r.store.get(a.id)
+        self.assertEqual(cur.state, "running")                           # handed over: not killed
+        self.assertFalse(cur.checkout)
+        self.assertIsNone(r._fence().read(t["id"]))
+        gate.release()
+        self.settle_all(r, timeout=15)
+        ended = r.store.get(a.id)
+        self.assertEqual(ended.state, "completed")
+        self.assertEqual(mesh.refused_writes, 1)                         # nothing more went out fenced
+        self.assertEqual(mesh.tasks[t["id"]]["status_id"], CAT_TO_STATUS["review"])   # where Mesh put it
+        kinds = [k for _, k, _ in r.store.events(a.id)]
+        self.assertIn("checkout_released_by_review", kinds)
+        for kind in ("checkout_lost", "lock_lost_stop", "kill", "error:settle"):
+            self.assertNotIn(kind, kinds)
+
+    def test_runner_write_refused_while_settling_a_card_moved_to_review_stops_that_pass_only(self):
+        # The refused write stops the settle pass (nothing more goes out under the refused lock); the attempt
+        # is not failed, and the next pass reads the card again and completes it without the fence.
+        t = task(28)
+        mesh = RefusingMesh([t], max_concurrent=1)
+        r, a, gate = self.start_gated(mesh, t, reply="looked at it")
+        self.cfg.heartbeat_seconds = 3600
+        mesh.set_category(t["id"], "review")
+        mesh.refuse = True
+        r._settling = a.id                                # as settle() sets it around its writes
+        try:
+            with self.assertRaises(LockLost):
+                mesh.add_comment(t["id"], "[runner] a settle note")
+        finally:
+            r._settling = None
+        self.assertEqual(mesh.refused_writes, 1)
+        cur = r.store.get(a.id)
+        self.assertEqual(cur.state, "running")                           # not ended failed
+        self.assertFalse(cur.checkout)
+        gate.release()
+        self.settle_all(r, timeout=15)
+        ended = r.store.get(a.id)
+        self.assertEqual(ended.state, "completed")
+        self.assertEqual(mesh.refused_writes, 1)
+        kinds = [k for _, k, _ in r.store.events(a.id)]
+        for kind in ("checkout_lost", "lock_lost_stop", "kill", "error:settle"):
+            self.assertNotIn(kind, kinds)
+
+    def test_card_closed_while_the_turn_ran_is_not_a_lost_checkout(self):
+        t = task(27)
+        mesh = FakeMesh([t], max_concurrent=1)
+        r, a, gate = self.start_gated(mesh, t)
+        mesh.set_category(t["id"], "done")
+        mesh.checkouts.pop(t["id"], None)
+        r.tick()                                                         # first observation: left alone
+        self.assertEqual(r.store.get(a.id).state, "running")
+        r.tick()                                                         # second: the turn is stopped
+        self.settle_all(r, timeout=15)
+        kinds = [k for _, k, _ in r.store.events(a.id)]
+        self.assertIn("checkout_released_on_close", kinds)
+        self.assertIn("kill", kinds)
+        self.assertNotIn("checkout_lost", kinds)
+
+    def test_review_mode_card_reassigned_still_stops_as_lock_lost(self):
+        # Positive control: a review-mode attempt reassigned to another reviewer IS a lost lock.
+        t = task(25, cat="review")
+        mesh = FakeMesh([t], max_concurrent=1)
+        gate = HarnessGate(self.root / f"gate-{t['id'][:8]}")
+        write_replies(self.replies, {t["id"][:8]: gate.reply(finish())})
+        r = self.runner(mesh)
+        r.tick()
+        a = r.store.by_state(self.agent.name, ("starting", "running"))[0]
+        self.assertEqual(a.mode, "review")
+        deadline = time.monotonic() + 10
+        while not gate.started.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        r.tick()
+        self.cfg.heartbeat_seconds = 3600
+        mesh.tasks[t["id"]]["assignee_id"] = "agent-lead"
+        self.mcp_refusal(r, r.store.get(a.id), checkout_fence.LOCK_LOST, reassigned=True)
+        r.tick()
+        self.assert_stopped(r, t, a, "reassigned")
 
     # ---------------------------------------------------------------- input_revision
     def test_finish_refused_for_a_changed_task_is_not_a_turn_without_an_outcome(self):
