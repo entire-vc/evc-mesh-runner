@@ -379,6 +379,9 @@ TASK_HARNESS_VAR = "MESH_RUNNER_TASK_HARNESS"   # to the env command: the harnes
 # to the env command, on the standing chat's read only: the chat harnesses it can run, home first, so an
 # operator route may answer with one of them instead of a card-only harness (agy, kimi); a request, never env
 STANDING_CHAT_VAR = "MESH_RUNNER_STANDING_CHAT_HARNESSES"
+# to the env command: why this env is built (chat-check / start / resume / probe / merge-gate / lane), so its
+# log tells a routine build from a session (re)launch; a request, never session env
+ENV_REASON_VAR = "MESH_RUNNER_ENV_REASON"
 # A provider refused a card's content on one harness (Claude ``stop_reason: refusal``): the same session there
 # is refused again. The card goes on the lane's other harness of this pair, if the lane has it; the route is
 # a local mark of this agent and card, other cards of the lane keep the lane's route.
@@ -817,6 +820,9 @@ class AgentRunner:
         self.ramp = StartRamp(cfg.host_ramp_start_interval_seconds, cfg.host_ramp_seconds,
                               (self.memgate, self.loadgate))
         self._gate_hold: dict[str, tuple[str, float]] = {}    # task -> (reason, until) from the start gate
+        # attempt -> (reason, until, task updated_at, wake) of a resume the start gate refused for a human
+        # decision: the resume is not re-tried (no env build, no gate run) until the card or its wake changes
+        self._resume_gate_hold: dict[str, tuple] = {}
         self._gate_implementations: dict[str, str] = {}      # bytes observed before the refused hook ran
         self._agent_gate_hold: tuple[str, float, str] | None = None
         self._gate_failures: dict[tuple[str, str], int] = {}
@@ -1012,11 +1018,11 @@ class AgentRunner:
             return self.adapter
         return got
 
-    def _fresh_env(self, task_id: str = "") -> dict[str, str]:
+    def _fresh_env(self, task_id: str = "", reason: str = "") -> dict[str, str]:
         route = self._task_route(task_id) if task_id else ""
         if task_id and not route:
             self._start_route_back(task_id)     # before the read: account routing reads the lane's record
-        env = self._read_env(task_id, route)
+        env = self._read_env(task_id, route, reason=reason or ("start" if task_id else "lane"))
         return self._apply_env(env, route)
 
     def _start_route_back(self, task_id: str) -> None:
@@ -1117,7 +1123,7 @@ class AgentRunner:
         return ""
 
     def _read_env(self, task_id: str = "", task_harness: str = "",
-                  chat_harnesses: list[str] | None = None) -> dict[str, str]:
+                  chat_harnesses: list[str] | None = None, reason: str = "") -> dict[str, str]:
         """Read the session environment: env file, then the operator's env
         command (e.g. the account the lane is routed to now), then inline values.
         A failure stops the start: a session on the wrong identity is worse than none.
@@ -1137,6 +1143,9 @@ class AgentRunner:
             cmd_env = {k: v for k, v in os.environ.items() if k not in ("MESH_RUNNER_TASK", "MESH_RUNNER_LANE")}
             cmd_env.pop(TASK_HARNESS_VAR, None)
             cmd_env.pop(STANDING_CHAT_VAR, None)
+            cmd_env.pop(ENV_REASON_VAR, None)
+            if reason:
+                cmd_env[ENV_REASON_VAR] = reason
             if chat_harnesses:
                 cmd_env[STANDING_CHAT_VAR] = ",".join(chat_harnesses)
             if task_id:
@@ -1155,6 +1164,7 @@ class AgentRunner:
                     env[k.strip()] = v.strip().strip("'\"")
         env.update(self.agent.inline_env)
         env.pop(STANDING_CHAT_VAR, None)        # a request to the command, never session env
+        env.pop(ENV_REASON_VAR, None)
         return env
 
     def _route_env(self, env: dict[str, str]) -> tuple[dict[str, str], str, object]:
@@ -2619,7 +2629,7 @@ class AgentRunner:
     def _spawn(self, a: Attempt, prompt_text: str, resume: bool, expect: tuple[str, ...],
                first_prompt=None, before_spawn=None, env=None, prompt_is_complete=False,
                handoff_guard=None) -> bool:
-        env = self._fresh_env(a.task_id) if env is None else env
+        env = self._fresh_env(a.task_id, reason="resume" if resume else "start") if env is None else env
         if not self._launch_ready(a, env, expect):
             return False
         try:
@@ -2639,7 +2649,7 @@ class AgentRunner:
                             + " are aliases of them and are not available to you.\n")
         # ONE environment build per spawn: a resume prepares it before restoring
         # checkpoints, so a held profile never leases their worktrees prematurely.
-        env = self._fresh_env(a.task_id) if env is None else env
+        env = self._fresh_env(a.task_id, reason="resume" if resume else "start") if env is None else env
         routed = self._routed_harness
         lane_route = not getattr(self, "_card_routed", False)
         api_route = self._api_route(a, routed)
@@ -4822,6 +4832,37 @@ class AgentRunner:
                                       f"{a.harness} CLI refused to start; retry after a pause")
         return self._resume_hold.get(a.id, 0)
 
+    def _note_resume_human_hold(self, a: Attempt, task: dict, reason: str, gate: dict) -> None:
+        """The start gate refused this resume for a person's decision on this card only (exit 76): as at the
+        start (``_gate_hold``), the refusal stands until the card changes (an answer), its declared wake file
+        changes, or TASK_HOLD_SECONDS pass, instead of a new env build and gate run every GATE_HOLD_SECONDS."""
+        if not (self._gate_task_only and reason.startswith(GATE_PUBLIC_REASONS["human"])):
+            self._resume_gate_hold.pop(a.id, None)
+            return
+        wake = hold_wake(gate)
+        ttl = HOLD_WAKE_GUARD_SECONDS if wake else TASK_HOLD_SECONDS
+        self._resume_gate_hold[a.id] = (reason, time.monotonic() + ttl, self._gate_signature(task), wake)
+
+    @staticmethod
+    def _gate_signature(task: dict | None) -> str:
+        """What an answer changes on a gated card: its update time, the gate flag and the gate's details
+        (a decision posted or claimed may move ``human_gate_info`` without ``updated_at``)."""
+        t = task or {}
+        return json.dumps([t.get("updated_at") or "", t.get("human_gate"), t.get("human_gate_info")],
+                          sort_keys=True, default=str)
+
+    def _resume_human_hold(self, a: Attempt, task: dict) -> str:
+        """The standing human-decision refusal of this resume ('' = none or lifted: ask the gate again)."""
+        held = self._resume_gate_hold.get(a.id)
+        if not held:
+            return ""
+        reason, until, updated, wake = held
+        woke = bool(wake) and read_hold_wake(wake[0]) not in (None, wake[1])
+        if time.monotonic() < until and updated == self._gate_signature(task) and not woke:
+            return reason
+        self._resume_gate_hold.pop(a.id, None)
+        return ""
+
     def _set_resume_hold(self, a: Attempt, until: float, reason: str = "") -> None:
         """Record a local resume backoff and its public reason for runtime_state."""
         self._resume_hold[a.id] = until
@@ -4839,6 +4880,8 @@ class AgentRunner:
         ready_ids = {a.id for a in attempts if a.state == "ready"}
         for aid in [k for k in self._resume_hold_reason if k not in ready_ids]:
             del self._resume_hold_reason[aid]
+        for aid in [k for k in self._resume_gate_hold if k not in ready_ids]:
+            del self._resume_gate_hold[aid]
         holds: dict[str, str] = {}
         paused = self.paused()
         disk = self.pool.disk_hold()
@@ -9575,7 +9618,7 @@ class AgentRunner:
         if order:
             return order
         try:
-            env = self._fresh_env()
+            env = self._fresh_env(reason="merge-gate")
         except Exception as e:                 # noqa: BLE001 - the lane's identity could not be built
             m["env_errors"] = int(m.get("env_errors", 0)) + 1
             if m["env_errors"] >= MERGE_ENV_RETRIES:
@@ -10045,7 +10088,16 @@ class AgentRunner:
         if not metadata_only(task, a.mode) and self._repo_preflight_refused(
                 a, task, time.monotonic() + GATE_HOLD_SECONDS, resume=True):
             return                               # before any Mesh checkout or model turn
-        env = self._fresh_env(a.task_id)
+        if held := self._resume_human_hold(a, task):
+            # the start gate's standing refusal for a person's decision: no env build (secrets, tool config) and no
+            # gate run until the card changes, not one of each every GATE_HOLD_SECONDS
+            self._release_gate(a, "human-held")
+            self._release_checkout(a)
+            self._suspend_held_ready(a)
+            self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, held)
+            self._log_hold("resume", a.task8, held)
+            return
+        env = self._fresh_env(a.task_id, reason="resume")
         if not self._launch_ready(a, env, ("ready",)):
             return
         retry = (a.wait or {}).get("interactive_prompt_intent") or {}
@@ -10088,6 +10140,7 @@ class AgentRunner:
             self._turn_end(a.task_id, a.mode, a, gate, "held")
             if a.checkout.get("token"):            # nobody heartbeats a held checkout
                 self._release_checkout(a)
+            self._note_resume_human_hold(a, task, reason, gate)
             self._set_resume_hold(a, time.monotonic() + GATE_HOLD_SECONDS, reason)
             if reason in CAPACITY_CLASS_REASONS:
                 self._capacity_resume.add(a.id)
@@ -10102,12 +10155,13 @@ class AgentRunner:
             self.store.mark(self.agent.name, a.task_id, "review_gate_hold", "")
         self._clear_hold_log(a.task8, "resume")
         self._resume_hold_reason.pop(a.id, None)
+        self._resume_gate_hold.pop(a.id, None)
         self._remember_gate(a, gate)
         # Reserve may have switched the lane's route since the pre-gate environment read (a quota
         # restore, an allowed account): the launch follows the active record at the moment of the
         # start, never the one read before the gate.
         try:
-            env = self._fresh_env(a.task_id)
+            env = self._fresh_env(a.task_id, reason="resume")
         except (RuntimeError, OSError, subprocess.SubprocessError):
             self._release_gate(a, "quota-route-environment-unavailable")
             self._release_checkout(a)
@@ -12508,7 +12562,7 @@ class AgentRunner:
         selection. Once per candidate (reserve and admit share it); a changed route/profile/argv/
         binary/config recaptures. Evidence only: it never grants capacity."""
         try:
-            env = self._fresh_env(task_id)
+            env = self._fresh_env(task_id, reason="probe")
             harness = self._routed_harness
             adapter = self._probe_adapter(harness)
             if adapter is None:
@@ -14263,7 +14317,7 @@ class AgentRunner:
             # the command is told which harnesses the chat can run (home first): a lane whose cards go to
             # agy/kimi still gets a chat env for one of them
             supported = [self._chat_harness, *(h for h in self._chat_commands if h != self._chat_harness)]
-            raw = self._read_env(chat_harnesses=supported)
+            raw = self._read_env(chat_harnesses=supported, reason="chat-check")
             # the raw answer is checked before _route_env: that one folds a harness outside alt_adapters
             # into the base harness, which would start the home command with another harness's env
             asked = raw.get(HARNESS_VAR, "") or self.agent.harness
@@ -14280,16 +14334,37 @@ class AgentRunner:
             reason, _ = self._gate("transport", "", "chat")
             if reason:
                 self._chat_hold = "transport: " + reason
+                self._note_chat_hold()
                 return                              # leave any existing pane and retry budget untouched
             outcome = self.chat.check(env_of)
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             self._chat_error = f"chat session check failed: {type(e).__name__}: {str(e)[:160]}"
             log.warning("%s: %s", self.agent.name, self._chat_error)
+            self._note_chat_hold()
             return
         self._chat_error = self.chat.error
-        self._chat_hold = ("restart pending since " + time.strftime("%H:%M", time.localtime(self.chat.held_since))
+        self._chat_hold = ("restart pending since "
+                           + time.strftime("%Y-%m-%d %H:%M", time.localtime(self.chat.held_since))
                            + (" (no chat command for the routed harness)" if self.chat.hold_kind == "route" else "")
                            if self.chat.held_since else "")
+        self._note_chat_hold()
+
+    def _note_chat_hold(self) -> bool:
+        """One operator alert per hold episode once the standing chat has waited HOLD_ALERT_SECONDS for its
+        restart (counted from the episode's start, kept across runner restarts). True when this call signalled."""
+        held = self.chat.held_since if self.chat is not None else None
+        if not held or not self.chat.hold_overdue():
+            return False
+        at = dt.datetime.fromtimestamp(self.chat.clock(), dt.timezone.utc)
+        since = iso(dt.datetime.fromtimestamp(held, dt.timezone.utc))
+        minutes = int((self.chat.clock() - held) // 60)
+        why = ("routed to a harness without a chat command" if self.chat.hold_kind == "route"
+               else "a restart waits for an idle moment that does not come")
+        text = (f"[mesh-runner] Lane {self.agent.name}: standing chat session {self.chat.spec.session} has been "
+                f"held for {minutes} min ({why}). Held since {since}; the chat may be unanswered.")
+        return operator_alert.signal(self.store, "chat_hold:" + self.agent.name, since, text, self.emit,
+                                     now=at, repeat_hours=math.inf, incident="chat_hold",
+                                     lane=self.agent.name, reason=why)
 
     def tick(self) -> dict:
         # progress.step names each phase: a lane bound by the runner republishes its row from

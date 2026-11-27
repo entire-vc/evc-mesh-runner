@@ -22,6 +22,7 @@ session's shell reads and deletes before it execs the agent.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -42,6 +43,7 @@ ROUTING_KEYS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "MESH_RUNNER_PROFILE", "ANTHR
 CRASH_WINDOW = 300.0          # a session gone within this after its start counts as a crash
 CRASH_BACKOFF = 600.0
 COMPARE_EVERY = 300.0         # how often a live session's routing is compared (builds the env)
+HOLD_ALERT_SECONDS = 1800.0   # a restart held this long is an operator signal (the runner raises it)
 
 
 class ChatConfigError(ValueError):
@@ -83,6 +85,32 @@ class ChatKeeper:
                                                    # "route": routed to a harness without a command
         self.error = ""
         self._compared_at = -1e18
+        self._env_failed = False                  # the last env build raised: no idle-driven rebuild before
+                                                   # COMPARE_EVERY (a 60 s env timeout must not run each minute)
+        self.hold_file = self.dir / f"{agent}.hold.json"
+        self._load_hold()
+
+    # ------------------------------------------------------------------ hold record
+    def _load_hold(self) -> None:
+        """A hold outlives a runner restart: its start stays the episode's start, so a chat held since the
+        night is not shown (and not alerted) as held since the last restart."""
+        try:
+            rec = json.loads(self.hold_file.read_text())
+            since = float(rec["since"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return
+        self.held_since, self.hold_kind = since, str(rec.get("kind") or "idle")
+        log.info("%s: chat session %s held since %s (kept across the restart)", self.agent, self.spec.session,
+                 time.strftime("%Y-%m-%d %H:%M", time.localtime(since)))
+
+    def _save_hold(self) -> None:
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            tmp = self.hold_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"since": self.held_since, "kind": self.hold_kind}))
+            os.replace(tmp, self.hold_file)
+        except OSError as e:                      # the hold itself still works; only its memory is lost
+            log.warning("%s: chat hold record not written: %s", self.agent, e)
 
     # ------------------------------------------------------------------ tmux
     def _tmux(self, *args: str) -> subprocess.CompletedProcess:
@@ -162,12 +190,22 @@ class ChatKeeper:
     def _hold(self, now: float, why: str, kind: str = "idle") -> str:
         if self.held_since is None:                # once per episode: the hold is visible in the log
             log.warning("%s: chat session %s held: %s", self.agent, self.spec.session, why)
+        changed = self.held_since is None or self.hold_kind != kind
         self.held_since = self.held_since or now
         self.hold_kind = kind
+        if changed:
+            self._save_hold()
         return "held"
 
     def _release(self) -> None:
+        if self.held_since is not None:
+            self.hold_file.unlink(missing_ok=True)
         self.held_since, self.hold_kind = None, ""
+
+    def hold_overdue(self, now: float | None = None) -> bool:
+        """Held longer than HOLD_ALERT_SECONDS (counted from the episode's start, across restarts)."""
+        return (self.held_since is not None
+                and (self.clock() if now is None else now) - self.held_since >= HOLD_ALERT_SECONDS)
 
     def check(self, env_of) -> str:
         """One check; env_of() builds the agent's environment (only called when
@@ -199,14 +237,21 @@ class ChatKeeper:
         self.env_file.unlink(missing_ok=True)       # the shell has read it (or never will)
         if state == "unknown":
             return "kept"                          # tmux did not answer: decide next time
-        if state == "ours" and now - self._compared_at < COMPARE_EVERY and self.hold_kind != "idle":
-            # alive and recently verified: no env build (a route hold changes only with the route)
-            return "held" if self.held_since is not None else "kept"
         if state == "foreign" and not self.spec.adopt:
             self.error = f"tmux session {self.spec.session} exists and is not the runner's (adopt = false)"
             return "foreign"
+        if now - self._compared_at < COMPARE_EVERY:
+            # alive and recently verified: no env build (a route hold changes only with the route). A restart
+            # waiting for an idle moment asks the cheap idle probe first and builds the env (secrets, tool config)
+            # only when the session is idle, so a busy chat costs one build per COMPARE_EVERY, not per check
+            if self.hold_kind != "idle":
+                return "held" if self.held_since is not None else "kept"
+            if self.held_since is not None and (self._env_failed or not self.idle()):
+                return "held"
+        self._compared_at = now                    # stamped before the build: a failing build waits too
+        self._env_failed = True
         env, digest, command = _unpack(env_of())
-        self._compared_at = now
+        self._env_failed = False
         if digest is None:                         # the live session stays on its old route, visibly
             return self._hold(now, "routed to a harness without a chat command; the live session "
                                    "keeps its current harness", "route")

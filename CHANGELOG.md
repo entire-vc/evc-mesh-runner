@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.146 — 2026-11-27
+
+- **A held standing chat no longer rebuilds the agent's environment every minute.** While a restart waits
+  for an idle moment the runner asks the cheap idle probe first and runs the env command (secrets, tool config)
+  only when the session is idle, or once per 5 minutes; a failing env build waits the same 5 minutes. The
+  hold is kept in `state_dir/chat/<agent>.hold.json`, so `chat_hold` / `chat_hold_since` show the episode's
+  real start (with its date) after a runner restart, and a hold older than 30 minutes raises one
+  `operator_alert` (`chat_hold:<agent>`).
+- **A resume the start gate refuses for a person's decision is not re-tried every 2 minutes.** The refusal
+  (exit 76, `HOLD_REASON_CODE=human`) stands, with no env build and no gate run, until the card or its gate
+  details change, its wake file changes, or 10 minutes pass, as a refused start already did.
+- **The env command learns why it runs.** `MESH_RUNNER_ENV_REASON` is `chat-check`, `start`, `resume`,
+  `probe`, `merge-gate` or `lane`, so its log can tell a routine env build from a session relaunch.
+
 ## 0.2.145 — 2026-11-26
 
 - **A wake read can no longer outlive its budget while the answer's head arrives byte by byte.** The
