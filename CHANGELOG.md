@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.139 — 2026-11-26
+
+- **A start_after someone else set holds the card at every turn, not only at selection.** A future
+  start_after that no wait of this runner wrote (an agent's or a person's date) now closes the attempt
+  at the turn end (no outcome, unparsed, NEXT) and on resume (NEXT, reprompt, wake) and keeps its
+  session, as a `park:*` label does: no correction turn, no miss counted, the card keeps its status,
+  and after the date the ordinary start resumes the same session once. The start re-reads the card
+  after its checkout and releases it without a turn when a date was written after the selection's
+  read. The requeue (caps, no outcome, gave up) takes back only dates the runner's own waits wrote
+  (any attempt's `scheduled` / `scheduled_maybe`, or a clear still being retried); anyone else's
+  date stays. A runner write is known by its moment and the `start_after_receipt_id` Mesh gave it,
+  so a date someone set again for the same moment is theirs: neither the wait's end, the orphan
+  check nor the requeue takes it back. A gate owner's admitted answer still gets its one turn on
+  a scheduled card.
+
 ## 0.2.138 — 2026-11-26
 
 - **agy context control.** The agy adapter reports the largest context one model call of a turn carried

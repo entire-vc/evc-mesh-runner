@@ -27,6 +27,12 @@ class CapBench(Bench):
         self.cfg.agents.append(ag)
         return ag
 
+    def scheduled_by_a_wait(self, r, t, agent="builder"):
+        """The card's start_after is one a time wait of this runner wrote (its attempt has ended): the
+        requeue takes back only such a date, anyone else's stays."""
+        a = r.store.create(agent, t["id"], "claude")
+        r.store.update(a, state="completed", wait={"kind": "time", "scheduled": t["start_after"]})
+
     def started(self, r, t, n=2, agent="builder"):
         for _ in range(n):
             a = r.store.create(agent, t["id"], "claude")
@@ -48,6 +54,7 @@ class StartCap(CapBench):
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
+        self.scheduled_by_a_wait(r, t)
         r._start_cap(dict(mesh.tasks[t["id"]]), 2)
         got = mesh.tasks[t["id"]]
         self.assertEqual(got["assignee_id"], AGENT_ID)
@@ -211,6 +218,7 @@ class StartCap(CapBench):
         r = self.runner(mesh)
         r.refresh_me()
         self.started(r, t)
+        self.scheduled_by_a_wait(r, t)
         mesh.patch_task = lambda tid, f: (_ for _ in ()).throw(MeshError(503, "down"))
         r._start_cap(dict(mesh.tasks[t["id"]]), 2)
         got = mesh.tasks[t["id"]]

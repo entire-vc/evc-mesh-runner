@@ -104,7 +104,7 @@ from . import config_receipt
 from . import config as config_mod
 from .config import AgentConfig, RunnerConfig, read_env_file
 from .effects import (ACCESS_LABELS, BACKLOG_BLOCKER, EDGE_REMOVED_MARK, DECISION_REQUEST_LABEL, SKIP_EVALUATE, SKIP_EVERY, Effects, own_schedule,
-                      skip_state, is_ops_request)
+                      own_schedule_of, skip_state, is_ops_request)
 from .chat import ChatConfigError, ChatKeeper, ChatSpec, env_digest
 from .hostmem import LoadGate, LoadThresholds, MemoryGate, StartRamp, Thresholds
 from .mesh import Checkout, MeshClient, MeshError, automation_comment
@@ -112,7 +112,7 @@ from .outcome import QUOTA_TIME_WAIT_GUIDANCE, quota_time_wait, open_mr_time_wai
 from . import gate_owner
 from . import card_wait
 from .selection import (AMBIGUOUS, CLOSED, StatusCategories, _read_unique_elsewhere, blocking_edges, blocking_tasks,
-                        known_category, order, parse_time, static_skip_reason)
+                        known_category, order, parse_time, start_after_hold, static_skip_reason)
 from .store import ACTIVE, OPEN, Attempt, Store, iso, now
 from . import observation_budget
 from .wake import (_read_pinned, ci_result_detail, GitHub, GitLab, ProviderUnavailable, red_merge_statuses, wait_generation, changed_since, check as wake_check, foreign_comment, foreign_comments, is_human_comment, wakes_on_comment,
@@ -1758,6 +1758,34 @@ class AgentRunner:
         self.store.event(a.id, "parked", json.dumps({"label": label, "at": where}))
         log.info("%s: #%s held: label %s (%s: attempt closed, session kept)", self.agent.name, a.task8, label, where)
         self._finish(a, "completed", f"parked: label {label}")
+
+    def _schedule_hold_reason(self, a: Attempt, task: dict | None, owner_turn: bool = False) -> str:
+        """``start_after <when>`` (the start path's own words, ``start_after_hold``) while the card carries
+        a future start_after that no wait of this runner set, else "". The start path holds such a card;
+        the turn end, the resume path and the start after checkout read the same date, so a card someone
+        scheduled is not run before its date by an ``↻ NEXT``, a reprompt, a wake or a selection that read
+        the card before the date was written. The runner's own time wait (this attempt's,
+        another attempt's, or one whose clear is still being retried; the moment and, when known, the
+        receipt of its write, ``same_schedule``) is no hold: its end takes it back.
+        ``owner_turn``: the turn is a gate owner's answer (``_gate_decision``), which the start path admits
+        past a schedule too."""
+        if not task:
+            return ""
+        reason = start_after_hold(dict(task, _gate_decision="admitted" if owner_turn else None), now())
+        if not reason:
+            return ""
+        if own_schedule_of(task, a.wait) or self.effects.runner_schedule_of(a.task_id, task):
+            return ""
+        return reason
+
+    def _schedule_hold(self, a: Attempt, task: dict, reason: str, where: str) -> None:
+        """Close the attempt of a card held by someone's future start_after and keep its session, as
+        ``_park`` does for a label: the card keeps its status, nothing is cleared or counted, and after
+        the date the ordinary start resumes the same session once (``_ownership_return_verdict``)."""
+        self._note_ownership_loss(a, task)
+        self.store.event(a.id, "schedule_held", json.dumps({"reason": reason, "at": where}))
+        log.info("%s: #%s held: %s (%s: attempt closed, session kept)", self.agent.name, a.task8, reason, where)
+        self._finish(a, "completed", f"held: {reason}")
 
     def _handed_back(self, task: dict | None) -> bool:
         """The attempt ended with the task in the work statuses for this agent: assigned to it, or
@@ -3636,6 +3664,11 @@ class AgentRunner:
             # park:* is the turn's outcome in work and review; NEXT must not bypass the label
             self._park(a, task, label, "turn end")
             return
+        if ((outcome is None or outcome.kind in ("unparsed", "next"))
+                and (held := self._schedule_hold_reason(a, task))):
+            # someone's future start_after holds the card as the start path does: no correction, no NEXT
+            self._schedule_hold(a, task, held, "turn end")
+            return
         if (outcome is None or outcome.kind == "unparsed") and result.upgrade_required:
             # the turn ended on the provider's refusal of this CLI version: no outcome was
             # possible, so this is a held lane, not a miss of the card
@@ -5100,8 +5133,8 @@ class AgentRunner:
     def _requeue_on_event(self, task: dict, kind: str, banner: str, why: str, a: Attempt | None = None,
                           fp: dict | None = None, keep_lane: bool = False) -> bool:
         """A cap put the task back in the queue. Same assignee, status todo,
-        no ``start_after`` (taken back by compare-clear; one that will not clear is retried per tick and
-        does not stop the requeue), no backoff: it starts again when its inputs change (see inputs.py),
+        no ``start_after`` of the runner's own waits (taken back by compare-clear; one that will not clear
+        is retried per tick and does not stop the requeue; anyone else's date stays), no backoff: it starts again when its inputs change (see inputs.py),
         or at once on a free peer of its pool for a fresh start. False when it could not be done safely
         (the inputs are unreadable, or the move to todo failed): nothing is marked or said, and the
         caller keeps the older behaviour."""
@@ -5164,9 +5197,11 @@ class AgentRunner:
         return True
 
     def _back_to_todo(self, task: dict) -> bool:
-        """Status todo, and the task's start_after taken back. False only when the move to todo
-        failed. A start_after that could not be cleared (a person's date, a card that changed twice,
-        Mesh unreachable) is not a reason to hand the task up: the clear is kept and retried per tick
+        """Status todo, and a start_after a wait of this runner set taken back. False only when the move
+        to todo failed. Only the runner's own dates go (``Effects.runner_schedule_of``: the instant and the
+        receipt its waits' writes got): another agent's, a person's, one set again for the same moment
+        or any other date stays and holds the card until it passes. An own date that could not be cleared (a card that changed twice, Mesh
+        unreachable) is not a reason to hand the task up: the clear is kept and retried per tick
         (``Effects.clear_start_after``) and the task waits in todo, held by that date if it stays."""
         tid = task["id"]
         try:
@@ -5176,11 +5211,16 @@ class AgentRunner:
         except MeshError as e:
             log.warning("%s: requeue #%s: %s", self.agent.name, tid[:8], e)
             return False
-        if task.get("start_after"):
-            outcome = self.effects.clear_start_after(tid, task["start_after"])
+        current = task.get("start_after")
+        own = self.effects.runner_schedule_of(tid, task)
+        if own:
+            outcome = self.effects.clear_start_after(tid, *own)
             if outcome not in ("cleared", "gone"):
                 log.info("%s: requeue #%s: start_after not cleared yet (%s); the task stays in the queue",
                          self.agent.name, tid[:8], outcome)
+        elif current:
+            log.info("%s: requeue #%s: start_after %s was not set by a wait of this runner; left alone",
+                     self.agent.name, tid[:8], current)
         return True
 
     def _keep_until_tomorrow(self, task_id: str, text: str, kind: str = "start cap") -> None:
@@ -9580,6 +9620,15 @@ class AgentRunner:
             return
         if self._late_outcome(a, task):
             return                               # the late command settled the turn: no correction on a dead lease
+        if not a.wait.get("quota_wait_rejected") and self._schedule_hold_reason(a, task):
+            # someone's future start_after: a ready attempt (NEXT, reprompt, wake) must not bypass it. The
+            # gate owner's answer still has its one turn (the shared ``gate_held`` claim), as at the start;
+            # the quota-rejected resume keeps its own policy check below.
+            owner = bool(self.agent.policy.human_gate and task.get("human_gate")) and gate_held(task) is False
+            if held := self._schedule_hold_reason(a, task, owner_turn=owner):
+                self._retire_proven_unsent_intent(a)
+                self._schedule_hold(self.store.get(a.id) or a, task, held, "resume")
+                return
         if a.wait.get("quota_wait_rejected"):
             # Removing our obsolete quota date grants no exemption from a
             # person's schedule, human gate, labels or other ordinary policy.
@@ -13296,9 +13345,18 @@ class AgentRunner:
             if not self._still_ours(task, mode):
                 self._finish(a, "completed", "task left the agent before starting")
                 return False
-            if (self.agent.policy.human_gate and task.get("human_gate")
-                    and not self._gate_decision_for(task, consume=True, attempt_id=a.id)):
+            owner_turn = bool(self.agent.policy.human_gate and task.get("human_gate"))
+            if owner_turn and not self._gate_decision_for(task, consume=True, attempt_id=a.id):
                 self._finish(a, "aborted", "waiting for a human decision")
+                return False
+            if held := self._schedule_hold_reason(a, task, owner_turn=owner_turn):
+                # a start_after written after the selection read the card (the selection holds by it only
+                # from then on): no turn before that date; the checkout goes back with the attempt
+                self.store.event(a.id, "schedule_held", json.dumps({"reason": held, "at": "start"}))
+                log.info("%s: #%s held: %s (start: checkout released, no turn)", self.agent.name, a.task8, held)
+                self._finish(a, "aborted", f"held: {held}")
+                # a feed that still lags behind the date does not check the card out again every tick
+                self._task_backoff[a.task_id] = time.monotonic() + GATE_HOLD_SECONDS
                 return False
             no_workspace = metadata_only(task, mode)
             journal = [] if no_workspace else self._ownership_checkpoints(a, task)

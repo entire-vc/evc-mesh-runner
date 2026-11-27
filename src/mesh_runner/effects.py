@@ -157,6 +157,52 @@ def own_schedule(start_after: str | None, wait: dict | None) -> bool:
     return any(same_instant(start_after, v) for v in (w.get("scheduled"), w.get("scheduled_maybe")) if v)
 
 
+def schedule_receipt(answer) -> str:
+    """The ``start_after_receipt_id`` Mesh shows in an answer (a task, or ``{"task": ...}``); "" if none."""
+    t = answer.get("task", answer) if isinstance(answer, dict) else None
+    rid = t.get("start_after_receipt_id") if isinstance(t, dict) else None
+    return str(rid) if rid else ""
+
+
+def wait_schedules(wait: dict | None) -> list[tuple[str, str]]:
+    """The schedules a wait wrote, as (instant, receipt): the confirmed one with the receipt Mesh gave
+    it (``scheduled_receipt``, "" from an older runner), and one whose answer was lost (no receipt)."""
+    w = wait or {}
+    return [(v, r) for v, r in ((w.get("scheduled"), w.get("scheduled_receipt") or ""),
+                                (w.get("scheduled_maybe"), "")) if v]
+
+
+def same_schedule(task: dict | None, instant: str | None, receipt: str | None = "") -> bool:
+    """The card's start_after is the schedule written as ``instant`` with ``receipt``: the same moment
+    and, when both the write and the card name a receipt, the same receipt. Mesh keeps the receipt
+    while the date stays and gives a new one to a new write, so a date someone set again for the
+    same moment is theirs; a write whose receipt is unknown (an older runner, a lost answer) is
+    matched by the moment alone."""
+    t = task or {}
+    if not same_instant(t.get("start_after"), instant):
+        return False
+    current = t.get("start_after_receipt_id")
+    return not receipt or not current or str(current) == str(receipt)
+
+
+def own_schedule_of(task: dict | None, wait: dict | None) -> bool:
+    """The card's start_after is the schedule this wait set (``same_schedule``)."""
+    return any(same_schedule(task, v, r) for v, r in wait_schedules(wait))
+
+
+def _marked_schedules(value: str) -> list[tuple[str, str]]:
+    """The (instant, receipt) pairs an ``UNSCHEDULE_MARK`` keeps; a mark of an older runner names
+    instants only (no receipt: matched by the moment)."""
+    try:
+        data = json.loads(value)
+        kept, receipts = data.get("scheduled") or [], data.get("receipts") or {}
+    except (ValueError, AttributeError):
+        return []
+    kept = [kept] if isinstance(kept, str) else [str(v) for v in kept]
+    receipts = receipts if isinstance(receipts, dict) else {}
+    return [(v, str(receipts.get(v) or "")) for v in kept]
+
+
 def _error_code(e: MeshError) -> str:
     """Mesh's machine-readable ``error_code`` of a refusal ('' when it sent none)."""
     return str(e.body.get("error_code") or e.body.get("code") or "") if isinstance(e.body, dict) else ""
@@ -776,8 +822,13 @@ class Effects:
                          "and its URL is not https; the wait stays local", self.lane, a.task8)
             return
         try:
-            self.mesh.patch_task(a.task_id, {"start_after": when, "start_after_evidence": evidence})
+            answer = self.mesh.patch_task(a.task_id, {"start_after": when, "start_after_evidence": evidence})
             wait["scheduled"] = when
+            # the write's identity: a date set again for the same moment by someone else is not ours
+            if receipt := schedule_receipt(answer):
+                wait["scheduled_receipt"] = receipt
+            else:
+                wait.pop("scheduled_receipt", None)
             wait.pop("scheduled_maybe", None)
             wait.pop("schedule_skipped", None)
             self._forget_unschedule(a.task_id)     # the lane owns the task's schedule again
@@ -817,25 +868,28 @@ class Effects:
     def _end_schedule(self, a: Attempt, wait: dict) -> None:
         """Take back the start_after this wait set. Never forgets one it could not clear:
         a failure is kept in the store and retried by ``retry_unschedules``."""
-        mine = [v for v in (wait.get("scheduled"), wait.get("scheduled_maybe")) if v]
+        mine = wait_schedules(wait)
         outcome, held = self._unschedule(a.task_id, mine)
         if outcome in ("cleared", "gone"):
             self._forget_unschedule(a.task_id)
         elif self.store is not None:
-            self._remember_unschedule(a.task_id, [held] if held else mine)
+            self._remember_unschedule(a.task_id, [p for p in mine if p[0] == held] if held else mine)
             log.warning("%s: unschedule #%s: %s; retried on later ticks", self.lane, a.task8, outcome)
         else:
             log.warning("%s: unschedule #%s: %s", self.lane, a.task8, outcome)
             return                             # no store: the wait keeps it, the next wake retries
         wait.pop("scheduled", None)
+        wait.pop("scheduled_receipt", None)
         wait.pop("scheduled_maybe", None)
 
-    def _unschedule(self, task_id: str, mine: list[str]) -> tuple[str, str]:
-        """Clear the task's start_after if it is one of ``mine``. Returns (outcome, instant):
+    def _unschedule(self, task_id: str, mine: list) -> tuple[str, str]:
+        """Clear the task's start_after if it is one of ``mine`` (instants, or (instant, receipt) as
+        ``same_schedule`` matches them). Returns (outcome, instant):
         ``cleared``; ``gone`` (no schedule, someone else's, a person's, or the task is gone: left
         alone); anything else is the error that kept it. Mesh clears an agent's start_after only
         through compare-clear, which removes exactly the schedule that was read: on a 409 the task
         is read again and the clear tried once more."""
+        mine = [(m, "") if isinstance(m, str) else (str(m[0]), str(m[1] or "")) for m in mine]
         last = ""
         for attempt in range(UNSCHEDULE_TRIES):
             try:
@@ -845,8 +899,7 @@ class Effects:
                     return "gone", ""
                 return str(e), ""
             task = task.get("task", task) if isinstance(task, dict) else {}
-            current = task.get("start_after")
-            held = next((v for v in mine if same_instant(current, v)), "")
+            held = next((v for v, r in mine if same_schedule(task, v, r)), "")
             if not held:
                 return "gone", ""              # nothing to clear, or a schedule someone else set
             try:
@@ -882,21 +935,44 @@ class Effects:
             idempotency_key=f"mesh-runner:{self.lane}:{receipt or origin}:{version}"[:200],
             reason="the runner's wait ended; it takes back the start_after it set")
 
-    def clear_start_after(self, task_id: str, current: str) -> str:
+    def clear_start_after(self, task_id: str, current: str, receipt: str = "") -> str:
         """Take back ``current`` (a start_after read from the task) outside a wait's own end, for a
         task that goes back to the queue. Never raises: what could not be cleared is kept for the
-        per-tick retry and the caller carries on. Returns the outcome of ``_unschedule``."""
-        outcome, held = self._unschedule(task_id, [current])
+        per-tick retry and the caller carries on. ``receipt``: the one the runner's write got, so a
+        date set again for the same moment by someone else is left alone. Returns the outcome of
+        ``_unschedule``."""
+        outcome, held = self._unschedule(task_id, [(current, receipt)])
         if outcome not in ("cleared", "gone"):
             if self.store is not None:
-                self._remember_unschedule(task_id, [held or current])
+                self._remember_unschedule(task_id, [(held or current, receipt)])
             log.warning("%s: unschedule #%s: %s%s", self.lane, task_id[:8], outcome,
                         "; retried on later ticks" if self.store is not None else "")
         return outcome
 
-    def _remember_unschedule(self, task_id: str, scheduled: list[str]) -> None:
+    def runner_schedules(self, task_id: str) -> list[tuple[str, str]]:
+        """Every start_after a wait of this runner wrote on the task, as (instant, receipt): what any
+        attempt's wait holds (``wait_schedules``, as ``reconcile_orphan_schedule`` reads them) and
+        what this lane still has to take back (``UNSCHEDULE_MARK``: a wait's clear that failed is kept
+        there after the wait has forgotten it). Any other date on the card is someone else's: an
+        agent's, a person's, or a schedule set through the API; the runner never clears or overrides it."""
+        if self.store is None or not task_id:
+            return []
+        found = [p for a in self.store.on_task(task_id) for p in wait_schedules(a.wait)]
+        mark = self.store.mark(self.lane, task_id, UNSCHEDULE_MARK)
+        return found + (_marked_schedules(mark[0]) if mark and mark[0] else [])
+
+    def runner_schedule_of(self, task_id: str, task: dict | None) -> tuple[str, str] | None:
+        """The runner schedule (instant, receipt) the card's start_after is (``same_schedule``), or None:
+        a date no wait of this runner wrote."""
+        if not task or not task.get("start_after"):
+            return None
+        return next((p for p in self.runner_schedules(task_id) if same_schedule(task, *p)), None)
+
+    def _remember_unschedule(self, task_id: str, scheduled: list) -> None:
+        pairs = [(s, "") if isinstance(s, str) else (str(s[0]), str(s[1] or "")) for s in scheduled]
         self.store.mark(self.lane, task_id, UNSCHEDULE_MARK,
-                        json.dumps({"scheduled": scheduled, "since": iso()}))
+                        json.dumps({"scheduled": [v for v, _ in pairs],
+                                    "receipts": {v: r for v, r in pairs if r}, "since": iso()}))
         self._unschedule_due[task_id] = (now() + UNSCHEDULE_RETRY, UNSCHEDULE_RETRY)
 
     def _forget_unschedule(self, task_id: str) -> None:
@@ -917,13 +993,8 @@ class Effects:
             due = self._unschedule_due.get(task_id)
             if due and now() < due[0]:
                 continue
-            try:
-                scheduled = json.loads(value).get("scheduled") or []
-            except (ValueError, AttributeError):
-                scheduled = []
-            scheduled = [scheduled] if isinstance(scheduled, str) else [str(v) for v in scheduled]
             # a schedule that has passed holds nothing any more: stop retrying it
-            scheduled = [v for v in scheduled if (parse_time(v) or now()) > now()]
+            scheduled = [p for p in _marked_schedules(value) if (parse_time(p[0]) or now()) > now()]
             if not scheduled:
                 self._forget_unschedule(task_id)
                 continue
@@ -959,12 +1030,9 @@ class Effects:
         # attempt closed long ago can still hold the task (the task_id index keeps this cheap)
         attempts = self.store.on_task(task_id)
 
-        def schedules(a: Attempt) -> list[str]:
-            w = a.wait or {}
-            return [v for v in (w.get("scheduled"), w.get("scheduled_maybe")) if v]
         if any(a.state in OPEN for a in attempts):
             return False                       # an open attempt owns the task's waits
-        mine = [v for a in attempts for v in schedules(a) if same_instant(current, v)]
+        mine = [p for a in attempts for p in wait_schedules(a.wait) if same_schedule(task, *p)]
         if not mine:
             return False
         outcome, _ = self._unschedule(task_id, mine)

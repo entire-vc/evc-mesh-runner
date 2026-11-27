@@ -34,6 +34,21 @@ def parse_time(value: str | None) -> dt.datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
+def start_after_hold(task: dict, now: dt.datetime) -> str:
+    """``start_after <when>`` while the task's start_after is in the future, else "". The start path
+    holds by it here; the turn end and the resume path hold by the same words (runner.py
+    ``_schedule_hold_reason``), so a scheduled card is not run by an ``↻ NEXT``, a reprompt or a wake."""
+    start_after = parse_time(task.get("start_after"))
+    # The same admitted gate-owner answer also passes a future start_after: Mesh reports
+    # that delivery for a scheduled card (comment_delivery_outcome), so the runner must not
+    # hold it by the schedule. The marker is only ever set together with human_gate, so
+    # ordinary work keeps both holds; the schedule itself is left untouched.
+    owner_turn = bool(task.get("human_gate") and task.get("_gate_decision"))
+    if start_after and start_after > now and not owner_turn:
+        return f"start_after {start_after.isoformat(timespec='minutes')}"
+    return ""
+
+
 def static_skip_reason(task: dict, policy: Policy, now: dt.datetime) -> str:
     """Reasons that need no extra API call. Empty string means eligible so far."""
     labels = [str(x) for x in task.get("labels") or []]
@@ -47,14 +62,8 @@ def static_skip_reason(task: dict, policy: Policy, now: dt.datetime) -> str:
         # ask's addressee answered and THIS agent owns the live ask (gate_owner.py); it
         # admits one bounded turn and never lifts the gate.
         return "waiting for a human decision"
-    start_after = parse_time(task.get("start_after"))
-    # The same admitted gate-owner answer also passes a future start_after: Mesh reports
-    # that delivery for a scheduled card (comment_delivery_outcome), so the runner must not
-    # hold it by the schedule. The marker is only ever set together with human_gate, so
-    # ordinary work keeps both holds; the schedule itself is left untouched.
-    owner_turn = bool(task.get("human_gate") and task.get("_gate_decision"))
-    if start_after and start_after > now and not owner_turn:
-        return f"start_after {start_after.isoformat(timespec='minutes')}"
+    if reason := start_after_hold(task, now):
+        return reason
     if (task.get("delegation_level") or "") == "supervised":
         return "supervised task"
     expires = parse_time(task.get("checkout_expires") or task.get("checkout_expires_at"))
